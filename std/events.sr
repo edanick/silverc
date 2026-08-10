@@ -1,0 +1,104 @@
+mod export events;
+
+class event {
+    public string name;
+    public object data;
+
+    construct(string name, object data) {
+        this.name = name;
+        this.data = data;
+    }
+}
+
+class listener {
+    private string eventName;
+    private emitter parent;
+
+    construct(string ev, emitter p) {
+        this.eventName = ev;
+        this.parent = p;
+    }
+
+    public void off() {
+        this.parent.off(this.eventName);
+    }
+}
+
+class emitter {
+    private kvp<string, void callback(event)[]> handlers;
+    private kvp<string, void callback(event)[]> onceHandlers;
+    private void errorHandler;
+
+    construct() { }
+
+    public listener on(string name, void callback(event)) {
+        void callback(event)[] existing = this.handlers.get(name);
+        if (existing == null) {
+            existing = [];
+            this.handlers.set(name, existing);
+        }
+        existing.push(callback);
+        return new listener(name, this);
+    }
+
+    public void once(string name, void callback(event)) {
+        void callback(event)[] existing = this.onceHandlers.get(name);
+        if (existing == null) {
+            existing = [];
+            this.onceHandlers.set(name, existing);
+        }
+        existing.push(callback);
+    }
+
+    public void onAsync(string name, void callback(event)) {
+        this.on(name, callback);
+    }
+
+    public void onError(void callback(string, exception)) {
+        this.errorHandler = callback;
+    }
+
+    public void emit(string name, object data) {
+        event e = new event(name, data);
+        void callback(event)[] handlers = this.handlers.get(name);
+
+        string[] parts = name.split(".");
+        string wildcard = parts[0] + ".*";
+        void callback(event)[] wildHandlers = this.handlers.get(wildcard);
+
+        if (handlers != null) {
+            for (int i = 0; i < handlers.length(); i++) {
+                try { handlers[i](e); } catch (exception ex) {
+                    if (this.errorHandler != null) { this.errorHandler(name, ex); }
+                }
+            }
+        }
+        if (wildHandlers != null) {
+            for (int i = 0; i < wildHandlers.length(); i++) {
+                try { wildHandlers[i](e); } catch (exception ex) {
+                    if (this.errorHandler != null) { this.errorHandler(name, ex); }
+                }
+            }
+        }
+
+        void callback(event)[] once = this.onceHandlers.get(name);
+        if (once != null) {
+            for (int i = 0; i < once.length(); i++) {
+                try { once[i](e); } catch (exception ex) {
+                    if (this.errorHandler != null) { this.errorHandler(name, ex); }
+                }
+            }
+            this.onceHandlers.remove(name);
+        }
+    }
+
+    public void emit(string name, object data, object context) {
+        this.emit(name, data);
+    }
+
+    public void off(string name) {
+        this.handlers.remove(name);
+    }
+}
+
+public emitter global = new emitter();

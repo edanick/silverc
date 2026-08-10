@@ -1,0 +1,156 @@
+mod export fs;
+
+class FileOps {
+    construct () {}
+
+    public bool exists(string path) << GetFileAttributesA(path) != -1;
+    public void delete(string path) << DeleteFileA(path);
+    public void rename(string oldPath, string newPath) << MoveFileA(oldPath, newPath);
+
+    public string readString(string path) {
+        int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
+        if (h == -1) { return ""; }
+        int size = GetFileSize(h, null);
+        byte[] buf[size];
+        int read = 0;
+        ReadFile(h, buf, size, &read, null);
+        CloseHandle(h);
+        string result = "";
+        foreach (byte b in buf) { result += char(b); }
+        return result;
+    }
+
+    public void write(string path, byte[] data) {
+        int h = CreateFileA(path, 0x40000000, 0, null, 2, 0x80, 0);
+        if (h == -1) { return; }
+        int wrote = 0;
+        WriteFile(h, data, data.length, &wrote, null);
+        CloseHandle(h);
+    }
+}
+
+class FolderOps {
+    construct () {}
+
+    public string[] list(string path) {
+        string sp = path + "\\*";
+        int h = FindFirstFileA(sp, null);
+        if (h == -1) { return []; }
+        string[] names = [];
+        bool cont = true;
+        while (cont) {
+            string name;
+            if (name != "." && name != "..") { names.add(name); }
+            cont = FindNextFileA(h, null);
+        }
+        FindClose(h);
+        return names;
+    }
+
+    public string[] list() << this.list(".");
+
+    public string[] files() {
+        string[] all = this.list();
+        string[] result = [];
+        foreach (string f in all) {
+            if (GetFileAttributesA(f) != 0x10) { result.add(f); }
+        }
+        return result;
+    }
+
+    public string[] folders() {
+        string[] all = this.list();
+        string[] result = [];
+        foreach (string f in all) {
+            if (GetFileAttributesA(f) == 0x10) { result.add(f); }
+        }
+        return result;
+    }
+
+    public string[] entries() << this.list();
+
+    public string[] list(string[] exts) {
+        string[] all = this.list();
+        string[] result = [];
+        foreach (string f in all) {
+            foreach (string ext in exts) {
+                if (f.endsWith("." + ext)) { result.add(f); break; }
+            }
+        }
+        return result;
+    }
+
+    public void create(string path) << CreateDirectoryA(path, null);
+
+    public void create(string path, bool ignoreExistence) {
+        CreateDirectoryA(path, null);
+    }
+}
+
+public FileOps file;
+public FolderOps folder;
+
+public string readString(string path) {
+    int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
+    if (h == -1) { return ""; }
+    int size = GetFileSize(h, null);
+    byte[] buf[size];
+    int read = 0;
+    ReadFile(h, buf, size, &read, null);
+    CloseHandle(h);
+    string result = "";
+    foreach (byte b in buf) { result += char(b); }
+    return result;
+}
+
+public byte[] read(string path) {
+    int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
+    if (h == -1) { return []; }
+    int size = GetFileSize(h, null);
+    byte[] buf[size];
+    int read = 0;
+    ReadFile(h, buf, size, &read, null);
+    CloseHandle(h);
+    return buf;
+}
+
+public void writeString(string path, string content) {
+    int h = CreateFileA(path, 0x40000000, 0, null, 2, 0x80, 0);
+    if (h == -1) { return; }
+    byte[] buf = content.toBytes();
+    int wrote = 0;
+    WriteFile(h, buf, buf.length, &wrote, null);
+    CloseHandle(h);
+}
+
+public void write(string path, byte[] data) {
+    int h = CreateFileA(path, 0x40000000, 0, null, 2, 0x80, 0);
+    if (h == -1) { return; }
+    int wrote = 0;
+    WriteFile(h, data, data.length, &wrote, null);
+    CloseHandle(h);
+}
+
+public bool exists(string path) << GetFileAttributesA(path) != -1;
+public void delete(string path) << DeleteFileA(path);
+public void rename(string oldPath, string newPath) << MoveFileA(oldPath, newPath);
+public string[] listDir(string path) {
+    string sp = path + "\\*";
+    int h = FindFirstFileA(sp, null);
+    if (h == -1) { return []; }
+    string[] names = [];
+    bool cont = true;
+    while (cont) {
+        string name;
+        if (name != "." && name != "..") { names.add(name); }
+        cont = FindNextFileA(h, null);
+    }
+    FindClose(h);
+    return names;
+}
+public void createDir(string path) << CreateDirectoryA(path, null);
+
+construct () {
+    file = new FileOps();
+    folder = new FolderOps();
+}

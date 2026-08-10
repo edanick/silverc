@@ -1,0 +1,53 @@
+mod export compiler;
+
+class MiniAsm {
+    public prop int[] buf;
+
+    construct () {
+        this.buf = [];
+    }
+
+    public void emitU8(int b) {
+        this.buf.add(b & 0xFF);
+    }
+
+    public void movRI64(int dst, int64 imm) {
+        int dFlag = dst > 7 ? 1 : 0;
+        this.emitU8(0x48 | dFlag);
+        this.emitU8(0xB8 + (dst & 7));
+        this.emitU64(imm);
+    }
+
+    public void movRMBase(int r, int base, int disp) {
+        int rex = 0x48;
+        if (r > 7) { rex = rex | 0x04; }
+        if (base > 7) { rex = rex | 0x01; }
+        this.emitU8(rex);
+        this.emitU8(0x8B);
+        if (base == 5 || base == 13) {
+            this.emitU8(0x85 | ((r & 7) << 3) | (base & 7));
+            this.emitU32(disp);
+        } elif (base == 4 || base == 12) {
+            this.emitU8(((r & 7) << 3) | 0x04);
+            this.emitU8(0x24);
+            if (disp != 0) {
+                this.emitU32(disp);
+            }
+        } else {
+            if (disp == 0 && base != 5 && base != 13) {
+                this.emitU8(((r & 7) << 3) | (base & 7));
+            } elif (disp >= -128 && disp <= 127) {
+                this.emitU8(0x40 | ((r & 7) << 3) | (base & 7));
+                this.emitU8(disp & 0xFF);
+            } else {
+                this.emitU8(0x80 | ((r & 7) << 3) | (base & 7));
+                this.emitU32(disp);
+            }
+        }
+    }
+}
+
+void main() {
+    MiniAsm a = new MiniAsm();
+    a.emitU8(0x48);
+}

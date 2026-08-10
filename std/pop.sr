@@ -1,0 +1,71 @@
+mod export pop;
+
+class message {
+    public string from;
+    public string subject;
+    public string body;
+    public string raw;
+
+    construct(string raw) { this.raw = raw; }
+}
+
+class client {
+    private int sock;
+    private string host;
+    private int port;
+
+    construct(string host, int port) {
+        this.host = host;
+        this.port = port;
+    }
+
+    public void login(string user, string pass) {
+        this.sock = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = (this.port & 0xFF) << 8 | (this.port >> 8) & 0xFF;
+        addr.sin_addr.s_addr = inet_addr(this.host);
+        connect(this.sock, &addr, 16);
+        recvLine();
+        sendLine("USER " + user);
+        recvLine();
+        sendLine("PASS " + pass);
+        recvLine();
+    }
+
+    private void sendLine(string cmd) {
+        byte[] bytes = (cmd + "\r\n").toBytes();
+        send(this.sock, bytes, bytes.length, 0);
+    }
+
+    private string recvLine() {
+        byte[] buf[1024];
+        int n = recv(this.sock, buf, 1024, 0);
+        if (n <= 0) { return ""; }
+        string result = "";
+        for (int i = 0; i < n; i++) { result += char(buf[i]); }
+        return result;
+    }
+
+    public int count() {
+        sendLine("STAT");
+        string resp = recvLine();
+        int space = resp.indexOf(" ");
+        if (space < 0) { return 0; }
+        int space2 = resp.indexOf(" ", space + 1);
+        if (space2 < 0) { return int(resp.substr(space + 1)); }
+        return int(resp.substr(space + 1, space2 - space - 1));
+    }
+
+    public message retrieve(int id) {
+        sendLine("RETR " + id);
+        string resp = recvLine();
+        return new message(resp);
+    }
+
+    public void quit() {
+        sendLine("QUIT");
+        recvLine();
+        closesocket(this.sock);
+    }
+}

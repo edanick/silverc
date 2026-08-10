@@ -1,0 +1,84 @@
+mod export imap;
+
+class message {
+    public string from;
+    public string subject;
+    public string body;
+    public string raw;
+
+    construct(string raw) { this.raw = raw; }
+}
+
+class client {
+    private int sock;
+    private string host;
+    private int port;
+    private int tag;
+
+    construct(string host, int port) {
+        this.host = host;
+        this.port = port;
+        this.tag = 1;
+    }
+
+    public void login(string user, string pass) {
+        this.sock = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = (this.port & 0xFF) << 8 | (this.port >> 8) & 0xFF;
+        addr.sin_addr.s_addr = inet_addr(this.host);
+        connect(this.sock, &addr, 16);
+        recvResp();
+        cmd("LOGIN " + user + " " + pass);
+        recvResp();
+    }
+
+    public void select(string mailbox) {
+        cmd("SELECT " + mailbox);
+        recvResp();
+    }
+
+    private string cmd(string c) {
+        string full = this.tag + " " + c + "\r\n";
+        byte[] bytes = full.toBytes();
+        send(this.sock, bytes, bytes.length, 0);
+        this.tag++;
+        return full;
+    }
+
+    private string recvResp() {
+        byte[] buf[4096];
+        int n = recv(this.sock, buf, 4096, 0);
+        if (n <= 0) { return ""; }
+        string result = "";
+        for (int i = 0; i < n; i++) { result += char(buf[i]); }
+        return result;
+    }
+
+    public int[] search(string criteria) {
+        cmd("SEARCH " + criteria);
+        string resp = recvResp();
+        int[] ids;
+        if (resp.indexOf("SEARCH") >= 0) {
+            int start = resp.indexOf("SEARCH") + 7;
+            string nums = resp.substr(start).trim();
+            string[] parts = nums.split(" ");
+            foreach (string p in parts) {
+                if (p.length() > 0) { ids.push(int(p)); }
+            }
+        }
+        return ids;
+    }
+
+    public message fetch(int id) {
+        cmd("FETCH " + id + " (RFC822)");
+        string resp = recvResp();
+        return new message(resp);
+    }
+
+    public void logout() {
+        cmd("LOGOUT");
+        recvResp();
+        closesocket(this.sock);
+    }
+}

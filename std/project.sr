@@ -1,0 +1,262 @@
+mod export project;
+
+import * from fs;
+import * from string;
+
+bool projectHasSuffix(string path, string suffix) {
+    if (path.length < suffix.length) { return false; }
+    int start = path.length - suffix.length;
+    for (int i = 0; i < suffix.length; i = i + 1) {
+        int suffixIndex = start + i;
+        if (path[suffixIndex] != suffix[i]) { return false; }
+    }
+    return true;
+}
+
+string projectManifestValue(string manifest, string key) {
+    // Keep this helper to one projectFind call. The self-hosted stage-2
+    // backend has a bad lowering edge case when the same string helper is
+    // called repeatedly in one function; the remaining scan is local and
+    // preserves the multiline .srp format used by the Rust loader.
+    int keyPos = projectFind(manifest, key, 0);
+    if (keyPos < 0) { return ""; }
+    int colon = keyPos + key.length;
+    while (colon < manifest.length && manifest[colon] != ':') {
+        colon = colon + 1;
+    }
+    if (colon >= manifest.length) { return ""; }
+    int quote = colon + 1;
+    while (quote < manifest.length && manifest[quote] != '\"') {
+        quote = quote + 1;
+    }
+    if (quote >= manifest.length) { return ""; }
+    int end = quote + 1;
+    while (end < manifest.length && manifest[end] != '\"') {
+        end = end + 1;
+    }
+    string result = "";
+    for (int i = quote + 1; i < end; i = i + 1) {
+        result = result + manifest[i];
+    }
+    return result;
+}
+
+string projectDirname(string path) {
+    int last = -1;
+    for (int i = 0; i < path.length; i = i + 1) {
+        if (path[i] == '/' || path[i] == '\\') { last = i; }
+    }
+    if (last < 0) { return "."; }
+    return projectSlice(path, 0, last);
+}
+
+string projectJoin(string root, string path) {
+    if (cliArgEq(root, ".")) { return path; }
+    if (path.length > 0 && (path[0] == '/' || path[0] == '\\')) {
+        return root + path;
+    }
+    return root + "\\" + path;
+}
+
+string[] projectManifestSources(string manifest) {
+    string[] result = [];
+    int keyPos = projectFind(manifest, "sources", 0);
+    if (keyPos < 0) { return result; }
+    int cursor = keyPos;
+    while (cursor < manifest.length && manifest[cursor] != '[') {
+        cursor = cursor + 1;
+    }
+    if (cursor >= manifest.length) { return result; }
+    cursor = cursor + 1;
+    while (cursor < manifest.length && manifest[cursor] != ']') {
+        while (cursor < manifest.length && manifest[cursor] != '"' && manifest[cursor] != ']') {
+            cursor = cursor + 1;
+        }
+        if (cursor >= manifest.length || manifest[cursor] == ']') { break; }
+        int start = cursor + 1;
+        cursor = start;
+        while (cursor < manifest.length && manifest[cursor] != '"') {
+            cursor = cursor + 1;
+        }
+        if (cursor <= manifest.length) {
+            result.add(projectSlice(manifest, start, cursor));
+        }
+        cursor = cursor + 1;
+    }
+    return result;
+}
+
+string projectSourcePath(string root, string[] sourceDirs, string moduleName) {
+    for (int i = 0; i < sourceDirs.length; i = i + 1) {
+        string sourceDir = sourceDirs[i];
+        string candidate = "";
+        if (projectHasSuffix(sourceDir, ".sr")) {
+            if (cliArgEq(sourceDir, moduleName + ".sr")) {
+                candidate = projectJoin(root, sourceDir);
+            }
+        } else {
+            candidate = projectJoin(root, sourceDir + "\\" + moduleName + ".sr");
+        }
+        if (!cliArgEq(candidate, "") && file.exists(candidate)) {
+            return candidate;
+        }
+    }
+    return "";
+}
+
+bool projectBuiltin(string name) {
+    return cliArgEq(name, "fs") || cliArgEq(name, "json") || cliArgEq(name, "yaml")
+        || cliArgEq(name, "llmai") || cliArgEq(name, "LLMAI")
+        || cliArgEq(name, "os");
+}
+
+string projectImportModule(string statement) {
+    int i = 0;
+    while (i < statement.length && (statement[i] == ' ' || statement[i] == '\t' || statement[i] == '\r' || statement[i] == '\n')) {
+        i = i + 1;
+    }
+    int fromPos = projectFind(statement, "from", i);
+    if (i < statement.length && (statement[i] == '*' || statement[i] == '{')) {
+        if (fromPos < 0) { return ""; }
+        i = fromPos + 4;
+    }
+    while (i < statement.length && (statement[i] == ' ' || statement[i] == '\t' || statement[i] == '\r' || statement[i] == '\n')) {
+        i = i + 1;
+    }
+    int start = i;
+    while (i < statement.length && ((statement[i] >= 'a' && statement[i] <= 'z') || (statement[i] >= 'A' && statement[i] <= 'Z') || (statement[i] >= '0' && statement[i] <= '9') || statement[i] == '_')) {
+        i = i + 1;
+    }
+    return projectSlice(statement, start, i);
+}
+
+bool projectVisited(string[] visited, string path) {
+    for (int i = 0; i < visited.length; i = i + 1) {
+        if (cliArgEq(visited[i], path)) { return true; }
+    }
+    return false;
+}
+
+string projectCollect(string path, string root, string[] sourceDirs, string[] visited) {
+    if (projectVisited(visited, path)) { return ""; }
+    visited.add(path);
+    string source = file.readString(path);
+    string result = "";
+    int cursor = 0;
+    while (cursor < source.length) {
+        int importPos = projectFind(source, "import", cursor);
+        if (importPos < 0) { break; }
+        int semi = projectFind(source, ";", importPos + 6);
+        if (semi < 0) { break; }
+        string statement = projectSlice(source, importPos + 6, semi);
+        string moduleName = projectImportModule(statement);
+        if (moduleName.length > 0 && !projectBuiltin(moduleName)) {
+            string importPath = projectSourcePath(root, sourceDirs, moduleName);
+            if (!cliArgEq(importPath, "")) {
+                result = result + projectCollect(importPath, root, sourceDirs, visited) + "\n";
+            }
+        }
+        cursor = semi + 1;
+    }
+    return result + source + "\n";
+}
+
+string projectBuildSource(string projectPath) {
+    string manifest = file.readString(projectPath);
+    string root = projectDirname(projectPath);
+    string entry = projectManifestValue(manifest, "entry");
+    string[] sourceDirs = projectManifestSources(manifest);
+    if (sourceDirs.length == 0) { sourceDirs.add("."); }
+
+    string entryPath = projectJoin(root, entry);
+    string[] pending = [];
+    string[] visited = [];
+    pending.add(entryPath);
+    string body = "";
+    int next = 0;
+    while (next < pending.length) {
+        string current = pending[next];
+        next = next + 1;
+        if (projectVisited(visited, current)) { continue; }
+        visited.add(current);
+        string source = file.readString(current);
+        body = body + source + "\n";
+
+        int cursor = 0;
+        while (cursor < source.length) {
+            int importPos = cursor;
+            bool foundImport = false;
+            while (importPos + 5 < source.length) {
+                if (source[importPos] == 'i' && source[importPos + 1] == 'm' && source[importPos + 2] == 'p' && source[importPos + 3] == 'o' && source[importPos + 4] == 'r' && source[importPos + 5] == 't') {
+                    foundImport = true;
+                    break;
+                }
+                importPos = importPos + 1;
+            }
+            if (!foundImport) { break; }
+            // Avoid nested dynamic string-search calls here. The self-hosted
+            // stage-2 backend has a code-generation edge case when two
+            // dynamic string searches are emitted in the same function.
+            // Scan the terminator inline instead; this also keeps the bounds
+            // explicit before the statement is copied.
+            int semi = importPos + 6;
+            while (semi < source.length && source[semi] != ';') {
+                semi = semi + 1;
+            }
+            if (semi >= source.length) { break; }
+            string statement = "";
+            int statementPos = importPos + 6;
+            while (statementPos < semi) {
+                statement = statement + source[statementPos];
+                statementPos = statementPos + 1;
+            }
+            // Parse the module name inline. Calling projectImportModule here
+            // would add another dynamic projectFind to this function, which
+            // is unsafe in a stage-2 self-compiled binary.
+            int modulePos = 0;
+            while (modulePos < statement.length && (statement[modulePos] == ' ' || statement[modulePos] == '\t' || statement[modulePos] == '\r' || statement[modulePos] == '\n')) {
+                modulePos = modulePos + 1;
+            }
+            if (modulePos < statement.length && (statement[modulePos] == '*' || statement[modulePos] == '{')) {
+                int fromPos = modulePos;
+                while (fromPos + 3 < statement.length) {
+                    if (statement[fromPos] == 'f' && statement[fromPos + 1] == 'r' && statement[fromPos + 2] == 'o' && statement[fromPos + 3] == 'm') {
+                        break;
+                    }
+                    fromPos = fromPos + 1;
+                }
+                if (fromPos + 3 < statement.length) {
+                    modulePos = fromPos + 4;
+                } else {
+                    modulePos = statement.length;
+                }
+            }
+            while (modulePos < statement.length && (statement[modulePos] == ' ' || statement[modulePos] == '\t' || statement[modulePos] == '\r' || statement[modulePos] == '\n')) {
+                modulePos = modulePos + 1;
+            }
+            string moduleName = "";
+            while (modulePos < statement.length && ((statement[modulePos] >= 'a' && statement[modulePos] <= 'z') || (statement[modulePos] >= 'A' && statement[modulePos] <= 'Z') || (statement[modulePos] >= '0' && statement[modulePos] <= '9') || statement[modulePos] == '_')) {
+                moduleName = moduleName + statement[modulePos];
+                modulePos = modulePos + 1;
+            }
+            if (moduleName.length > 0 && !projectBuiltin(moduleName)) {
+                string importPath = projectSourcePath(root, sourceDirs, moduleName);
+                if (!cliArgEq(importPath, "") && !projectVisited(visited, importPath)) {
+                    pending.add(importPath);
+                }
+            }
+            cursor = semi + 1;
+        }
+    }
+
+    string metadata = "";
+    string name = projectManifestValue(manifest, "name");
+    string version = projectManifestValue(manifest, "version");
+    string license = projectManifestValue(manifest, "license");
+    if (!cliArgEq(name, "")) { metadata = metadata + "const string APP_NAME = \"" + name + "\";\n"; }
+    if (!cliArgEq(version, "")) { metadata = metadata + "const string APP_VERSION = \"" + version + "\";\n"; }
+    if (!cliArgEq(license, "")) { metadata = metadata + "const string APP_LICENSE = \"" + license + "\";\n"; }
+    metadata = metadata + "const string LANG_VERSION = \"0.3.0\";\n";
+    metadata = metadata + "const string APP_COPYRIGHT = \"Edan M. © 2025\";\n";
+    return metadata + body;
+}

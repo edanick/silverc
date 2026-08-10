@@ -1,0 +1,126 @@
+mod export http_server;
+import * from headers;
+import * from encoding;
+import {stringify} from json;
+
+class request {
+    public string method;
+    public string path;
+    public string version;
+    public string body;
+    public headers.multimap headers;
+
+    construct(string raw) {
+        int lineEnd = raw.indexOf("\r\n");
+        if (lineEnd < 0) { return; }
+        string first = raw.substr(0, lineEnd);
+        int i1 = first.indexOf(" ");
+        int i2 = first.lastIndexOf(" ");
+        if (i1 < 0 || i2 < 0 || i1 == i2) { return; }
+        this.method = first.substr(0, i1);
+        this.path = first.substr(i1 + 1, i2 - i1 - 1);
+        this.version = first.substr(i2 + 1);
+        int hdrEnd = raw.indexOf("\r\n\r\n");
+        if (hdrEnd < 0) { return; }
+        string hdrStr = raw.substr(lineEnd + 2, hdrEnd - lineEnd - 2);
+        this.headers = headers.parse(hdrStr);
+        this.body = raw.substr(hdrEnd + 4);
+    }
+}
+
+class response {
+    private int statusCode;
+    private string statusText;
+    private headers.multimap headers;
+    private string body;
+    private int socket;
+
+    construct(int sock) {
+        this.socket = sock;
+        this.statusCode = 200;
+        this.statusText = "OK";
+        this.headers = new headers.multimap();
+    }
+
+    public response status(int code) {
+        this.statusCode = code;
+        this.statusText = "OK";
+        if (code == 404) { this.statusText = "Not Found"; }
+        if (code == 500) { this.statusText = "Internal Server Error"; }
+        if (code == 405) { this.statusText = "Method Not Allowed"; }
+        if (code == 301) { this.statusText = "Moved Permanently"; }
+        return this;
+    }
+
+    public response header(string name, string value) {
+        this.headers.set(name, value);
+        return this;
+    }
+
+    public void send(string body) {
+        this.body = body;
+        string resp = "HTTP/1.1 " + this.statusCode + " " + this.statusText + "\r\n";
+        resp += this.headers.serialize();
+        if (!this.headers.has("Content-Type")) {
+            resp += "Content-Type: text/plain\r\n";
+        }
+        resp += "Content-Length: " + body.length() + "\r\n";
+        resp += "Connection: close\r\n\r\n";
+        resp += body;
+        sendRaw(resp, this.socket);
+    }
+
+    public void json(object data) {
+        this.header("Content-Type", "application/json");
+        this.send(json.stringify(data));
+    }
+
+    public void html(string content) {
+        this.header("Content-Type", "text/html");
+        this.send(content);
+    }
+
+    public void redirect(string url) {
+        this.status(301).header("Location", url);
+        this.send("Moved to " + url);
+    }
+}
+
+private void sendRaw(string data, int sock) {
+    byte[] bytes = data.toBytes();
+    send(sock, bytes, bytes.length, 0);
+}
+
+public void serve(int port, void callbackFunc(request, response)) {
+    int server = socket(AF_INET, SOCK_STREAM, 0);
+    if (server < 0) { printline("Failed to create socket"); return; }
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = 0;
+    addr.sin_port = (port & 0xFF) << 8 | (port >> 8) & 0xFF;
+
+    int opt = 1;
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &opt, 4);
+    if (bind(server, &addr, 16) < 0) {
+        closesocket(server);
+        printline("Failed to bind to port " + port);
+        return;
+    }
+    listen(server, 10);
+    printline("HTTP server listening on port " + port);
+    while (true) {
+        int client = accept(server, null, null);
+        if (client < 0) { continue; }
+        byte[] buf[8192];
+        int n = recv(client, buf, 8192, 0);
+        if (n > 0) {
+            string raw = "";
+            for (int i = 0; i < n; i++) { raw += char(buf[i]); }
+            request req = new request(raw);
+            response res = new response(client);
+            callbackFunc(req, res);
+        }
+        closesocket(client);
+    }
+}

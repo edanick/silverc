@@ -1,0 +1,85 @@
+mod export smtp;
+import {base64Encode} from encoding;
+
+class client {
+    private int sock;
+    private string host;
+    private int port;
+    private string fromAddr;
+    private string toAddr;
+    private string ccAddr;
+    private string subj;
+    private string bodyContent;
+    private bool isHtml;
+    private string[] attachments;
+
+    construct(string host, int port) {
+        this.host = host;
+        this.port = port;
+    }
+
+    public void startTLS() { }
+
+    public void login(string user, string pass) {
+        this.sock = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = (this.port & 0xFF) << 8 | (this.port >> 8) & 0xFF;
+        addr.sin_addr.s_addr = inet_addr(this.host);
+        connect(this.sock, &addr, 16);
+        recvResp();
+        sendCmd("EHLO " + this.host);
+        recvResp();
+        sendCmd("AUTH LOGIN");
+        recvResp();
+        sendCmd(encoding.base64Encode(user));
+        recvResp();
+        sendCmd(encoding.base64Encode(pass));
+        recvResp();
+    }
+
+    private void sendCmd(string cmd) {
+        byte[] bytes = (cmd + "\r\n").toBytes();
+        send(this.sock, bytes, bytes.length, 0);
+    }
+
+    private string recvResp() {
+        byte[] buf[1024];
+        int n = recv(this.sock, buf, 1024, 0);
+        if (n <= 0) { return ""; }
+        string result = "";
+        for (int i = 0; i < n; i++) { result += char(buf[i]); }
+        return result;
+    }
+
+    public void from(string addr) { this.fromAddr = addr; }
+    public void to(string addr) { this.toAddr = addr; }
+    public void cc(string addr) { this.ccAddr = addr; }
+    public void subject(string s) { this.subj = s; }
+    public void body(string b) { this.bodyContent = b; this.isHtml = false; }
+    public void html(string h) { this.bodyContent = h; this.isHtml = true; }
+    public void attach(string path) { this.attachments.push(path); }
+
+    public void send() {
+        sendCmd("MAIL FROM:<" + this.fromAddr + ">");
+        recvResp();
+        sendCmd("RCPT TO:<" + this.toAddr + ">");
+        recvResp();
+        sendCmd("DATA");
+        recvResp();
+        string msg = "From: " + this.fromAddr + "\r\n";
+        msg += "To: " + this.toAddr + "\r\n";
+        if (this.ccAddr.length() > 0) { msg += "Cc: " + this.ccAddr + "\r\n"; }
+        msg += "Subject: " + this.subj + "\r\n";
+        msg += "Content-Type: " + (this.isHtml ? "text/html" : "text/plain") + "\r\n\r\n";
+        msg += this.bodyContent + "\r\n.\r\n";
+        sendCmd(msg);
+        recvResp();
+    }
+
+    public void close() {
+        sendCmd("QUIT");
+        recvResp();
+        closesocket(this.sock);
+    }
+}
