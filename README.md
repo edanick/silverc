@@ -4,7 +4,7 @@ A modern, expressive systems language for turning limitless imagination into
 powerful creations, tools, command-line applications, and experiences.
 
 Silver brings familiar C-style structure together with concise syntax,
-strong types, native compilation, and a growing standard library—giving you
+strong types, native compilation, and a growing standard library, giving you
 one language for many possibilities.
 
 ## Credits
