@@ -1,0 +1,111 @@
+mod export ws;
+import {sleep} from time;
+
+class socket {
+    private int fd;
+    private bool connected;
+
+    construct(int fd) { this.fd = fd; this.connected = true; }
+
+    public void onOpen(void callback()) {
+        callback();
+    }
+
+    public void onMessage(void callback(string data)) {
+        byte[] buf[4096];
+        while (this.connected) {
+            int n = recv(this.fd, buf, 4096, 0);
+            if (n <= 0) { this.connected = false; break; }
+            string data = "";
+            for (int i = 0; i < n; i++) { data += char(buf[i]); }
+            callback(data);
+        }
+    }
+
+    public void onClose(void callback()) {
+        callback();
+    }
+
+    public void send(string data) {
+        byte[] frame = encodeFrame(data);
+        send(this.fd, frame, frame.length, 0);
+    }
+
+    public void close() { this.connected = false; closesocket(this.fd); }
+
+    private byte[] encodeFrame(string data) {
+        byte[] payload = data.toBytes();
+        int len = payload.length;
+        byte[] frame;
+        if (len < 126) { frame = new byte[2 + len]; frame[0] = 0x81; frame[1] = len; }
+        else if (len < 65536) { frame = new byte[4 + len]; frame[0] = 0x81; frame[1] = 126; frame[2] = (len >> 8) & 0xFF; frame[3] = len & 0xFF; }
+        else { frame = new byte[10 + len]; frame[0] = 0x81; frame[1] = 127; for (int i = 0; i < 8; i++) { frame[2 + i] = (len >> (56 - i * 8)) & 0xFF; } }
+        for (int i = 0; i < len; i++) { frame[frame.length - len + i] = payload[i]; }
+        return frame;
+    }
+}
+
+class server {
+    private int fd;
+    private int port;
+
+    construct(int port) { this.port = port; }
+
+    public void onConnection(void callback(socket client)) {
+        this.fd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = 0;
+        addr.sin_port = (this.port & 0xFF) << 8 | (this.port >> 8) & 0xFF;
+        bind(this.fd, &addr, 16);
+        listen(this.fd, 10);
+        while (true) {
+            int client = accept(this.fd, null, null);
+            if (client >= 0) {
+                socket ws = new socket(client);
+                callback(ws);
+            }
+        }
+    }
+
+    public void start() {
+        this.fd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = 0;
+        addr.sin_port = (this.port & 0xFF) << 8 | (this.port >> 8) & 0xFF;
+        bind(this.fd, &addr, 16);
+        listen(this.fd, 10);
+    }
+
+    public void wait() {
+        while (true) { time.sleep(1000); }
+    }
+}
+
+public socket connect(string url) {
+    string host = url;
+    int port = 80;
+    if (host.indexOf("ws://") == 0) { host = host.substr(5); }
+    if (host.indexOf("wss://") == 0) { host = host.substr(6); port = 443; }
+    int colon = host.indexOf(":");
+    int slash = host.indexOf("/");
+    if (colon >= 0) { port = int(host.substr(colon + 1, slash - colon - 1)); host = host.substr(0, colon); }
+    else if (slash >= 0) { host = host.substr(0, slash); }
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = (port & 0xFF) << 8 | (port >> 8) & 0xFF;
+    addr.sin_addr.s_addr = inet_addr(host);
+    if (connect(sock, &addr, 16) < 0) { return null; }
+
+    string key = "dGhlIHNhbXBsZSBub25jZQ==";
+    string httpUpgrade = "GET / HTTP/1.1\r\nHost: " + host + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    byte[] reqBytes = httpUpgrade.toBytes();
+    send(sock, reqBytes, reqBytes.length, 0);
+
+    byte[] resp[1024];
+    recv(sock, resp, 1024, 0);
+    return new socket(sock);
+}

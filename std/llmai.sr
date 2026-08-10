@@ -1,0 +1,168 @@
+mod export llmai;
+
+def Compatibility = enum {
+    OpenAI,
+    Anthropic,
+    Gemini,
+    DeepSeek,
+    Qwen,
+    Zhipu,
+    Moonshot,
+    Baichuan,
+    Doubao,
+    MiniMax,
+    Custom
+};
+
+class LlmHeaders {
+    public prop string contentType;
+    public prop string authorization;
+    public prop string extraName;
+    public prop string extraValue;
+
+    construct(string key, Compatibility compatibility) {
+        this.contentType = "application/json";
+        this.authorization = "Bearer " + key;
+        this.extraName = "";
+        this.extraValue = "";
+    }
+
+    private bool same(string a, string b) {
+        if (a.length != b.length) { return false; }
+        for (int i = 0; i < a.length; i = i + 1) {
+            char ca = a[i];
+            char cb = b[i];
+            if (ca >= 'a' && ca <= 'z') { ca = ca - 32; }
+            if (cb >= 'a' && cb <= 'z') { cb = cb - 32; }
+            if (ca != cb) { return false; }
+        }
+        return true;
+    }
+
+    public bool has(string name) {
+        return this.same(name, "Content-Type") || this.same(name, "Authorization")
+            || (this.extraName.length > 0 && this.same(name, this.extraName));
+    }
+
+    public string get(string name) {
+        if (this.same(name, "Content-Type")) { return this.contentType; }
+        if (this.same(name, "Authorization")) { return this.authorization; }
+        if (this.extraName.length > 0 && this.same(name, this.extraName)) {
+            return this.extraValue;
+        }
+        return "";
+    }
+
+    public void set(string name, string value) {
+        if (this.same(name, "Content-Type")) {
+            this.contentType = value;
+        } elif (this.same(name, "Authorization")) {
+            this.authorization = value;
+        } else {
+            this.extraName = name;
+            this.extraValue = value;
+        }
+    }
+
+    public string serialize() {
+        string result = "Content-Type: " + this.contentType + "\r\n";
+        result += "Authorization: " + this.authorization + "\r\n";
+        if (this.extraName.length > 0) {
+            result += this.extraName + ": " + this.extraValue + "\r\n";
+        }
+        return result;
+    }
+}
+
+class ChatResponseMessage {
+    public prop string content;
+
+    construct() {
+        this.content = "";
+    }
+}
+
+class ChatChoice {
+    public prop ChatResponseMessage message;
+
+    construct() {
+        this.message = new ChatResponseMessage();
+    }
+}
+
+class ChatCompletionResponse {
+    public prop ChatChoice[] choices;
+
+    construct() {
+        this.choices = [new ChatChoice()];
+    }
+}
+
+class ChatCompletionRequest {
+    public prop string model;
+    public prop string messageRole;
+    public prop string messageContent;
+    public prop ChatCompletionResponse response;
+
+    construct(string modelName) {
+        this.model = modelName;
+        this.messageRole = "";
+        this.messageContent = "";
+        this.response = new ChatCompletionResponse();
+    }
+
+    public void addMessage(string role, string content) {
+        this.messageRole = role;
+        this.messageContent = content;
+    }
+
+    public string serialize() {
+        return "{\"model\":\"" + this.model
+            + "\",\"messages\":[{\"role\":\"" + this.messageRole
+            + "\",\"content\":\"" + this.messageContent + "\"}]}";
+    }
+
+    public void updateResponse(string raw) {
+        this.response.choices[0].message.content = raw;
+    }
+}
+
+class ChatCompletions {
+    public prop string url;
+    public prop LlmHeaders headers;
+
+    construct(string endpoint, LlmHeaders requestHeaders) {
+        this.url = endpoint;
+        this.headers = requestHeaders;
+    }
+
+    public string create(ChatCompletionRequest request) {
+        string raw = llmai.chat(this.url, this.headers.serialize(), request.serialize());
+        request.updateResponse(raw);
+        return raw;
+    }
+}
+
+class ChatRoot {
+    public prop ChatCompletions completions;
+
+    construct(string endpoint, LlmHeaders requestHeaders) {
+        this.completions = new ChatCompletions(endpoint, requestHeaders);
+    }
+}
+
+class LLMClient {
+    public prop string url;
+    public prop string apiKey;
+    public prop Compatibility compatibility;
+    public prop LlmHeaders headers;
+    public prop ChatRoot chat;
+
+    construct(string endpoint, string key, Compatibility mode) {
+        this.url = endpoint;
+        this.apiKey = key;
+        this.compatibility = mode;
+        this.headers = new LlmHeaders(key, mode);
+        this.chat = new ChatRoot(endpoint, this.headers);
+    }
+}

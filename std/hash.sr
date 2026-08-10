@@ -1,0 +1,49 @@
+mod export hash;
+import {toHexString} from encoding;
+import {readString} from fs;
+
+private string computeHash(string data, string alg) {
+    int prov = 0;
+    CryptAcquireContext(&prov, null, null, 1, 0xF0000000);
+    if (prov == 0) { return ""; }
+    int hash = 0;
+    int algId = 0x8003;
+    if (alg == "MD5") { algId = 0x8003; }
+    else if (alg == "SHA1") { algId = 0x8004; }
+    else if (alg == "SHA256") { algId = 0x800C; }
+    else if (alg == "SHA512") { algId = 0x800E; }
+    CryptCreateHash(prov, algId, 0, 0, &hash);
+    byte[] bytes = data.toBytes();
+    CryptHashData(hash, bytes, bytes.length, 0);
+    byte[] result = new byte[64];
+    int resultLen = 64;
+    CryptGetHashParam(hash, 2, result, &resultLen, 0);
+    CryptDestroyHash(hash);
+    CryptReleaseContext(prov, 0);
+    return encoding.toHexString(result);
+}
+
+private string computeHashFile(string path, string alg) {
+    string data = fs.readString(path);
+    return computeHash(data, alg);
+}
+
+public string md5(string data) { return computeHash(data, "MD5"); }
+public string sha1(string data) { return computeHash(data, "SHA1"); }
+public string sha256(string data) { return computeHash(data, "SHA256"); }
+public string sha512(string data) { return computeHash(data, "SHA512"); }
+public string md5File(string path) { return computeHashFile(path, "MD5"); }
+public string sha256File(string path) { return computeHashFile(path, "SHA256"); }
+
+public string hmacSha256(string message, string key) {
+    return computeHash(key + message, "SHA256");
+}
+
+public bool compare(string a, string b) {
+    if (a.length() != b.length()) { return false; }
+    int result = 0;
+    for (int i = 0; i < a.length(); i++) {
+        result |= int(a[i]) ^ int(b[i]);
+    }
+    return result == 0;
+}

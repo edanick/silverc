@@ -1,0 +1,137 @@
+mod export xml;
+
+class node {
+    public string name;
+    public string text;
+    private kvp<string, string> attrs;
+    private node[] childNodes;
+
+    construct() { }
+
+    public node[] children(string tag) {
+        node[] result;
+        foreach (node child in this.childNodes) {
+            if (child.name == tag) { result.push(child); }
+        }
+        return result;
+    }
+
+    public string attribute(string name) {
+        return this.attrs.get(name);
+    }
+
+    public node query(string path) {
+        if (path.indexOf("//") == 0) {
+            return deepFind(this, path.substr(2));
+        }
+        return this;
+    }
+
+    private node deepFind(node n, string tag) {
+        foreach (node child in n.childNodes) {
+            if (child.name == tag) { return child; }
+            node found = deepFind(child, tag);
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+}
+
+class document {
+    public node root;
+}
+
+class builder {
+    private string output;
+    private int indent;
+
+    construct() { this.output = ""; this.indent = 0; }
+
+    public void start(string name) {
+        for (int i = 0; i < this.indent; i++) { this.output += "  "; }
+        this.output += "<" + name + ">\n";
+        this.indent++;
+    }
+
+    public void start(string name, object attrs) {
+        for (int i = 0; i < this.indent; i++) { this.output += "  "; }
+        this.output += "<" + name;
+        if (attrs != null) {
+        }
+        this.output += ">\n";
+        this.indent++;
+    }
+
+    public void text(string t) {
+        for (int i = 0; i < this.indent; i++) { this.output += "  "; }
+        this.output += t + "\n";
+    }
+
+    public void end() {
+        this.indent--;
+    }
+
+    public string build() { return this.output; }
+}
+
+public document parse(string raw) {
+    document doc = new document();
+    node root = new node();
+    root.name = "root";
+    doc.root = root;
+
+    int i = 0;
+    int len = raw.length();
+    node current = root;
+    node[] stack;
+    stack.push(current);
+
+    while (i < len) {
+        if (raw[i] == '<') {
+            if (i + 1 < len && raw[i + 1] == '/') {
+                int end = raw.indexOf(">", i);
+                if (end < 0) { break; }
+                stack.pop();
+                if (stack.length() > 0) { current = stack[stack.length() - 1]; }
+                i = end + 1;
+            } else if (i + 1 < len && raw[i + 1] == '?') {
+                int end = raw.indexOf("?>", i);
+                if (end < 0) { break; }
+                i = end + 2;
+            } else if (i + 1 < len && raw[i + 1] == '!') {
+                int end = raw.indexOf(">", i);
+                if (end < 0) { break; }
+                i = end + 1;
+            } else {
+                int end = raw.indexOf(">", i);
+                if (end < 0) { break; }
+                string tag = raw.substr(i + 1, end - i - 1);
+                int space = tag.indexOf(" ");
+                string name = tag;
+                if (space >= 0) { name = tag.substr(0, space); }
+                node n = new node();
+                n.name = name;
+                if (current != null) {
+                    current.childNodes.push(n);
+                }
+                if (tag[tag.length() - 1] != '/') {
+                    stack.push(n);
+                    current = n;
+                }
+                i = end + 1;
+            }
+        } else {
+            int next = raw.indexOf("<", i);
+            if (next < 0) { next = len; }
+            string t = raw.substr(i, next - i);
+            if (current != null && t.trim().length() > 0) {
+                current.text = t.trim();
+            }
+            i = next;
+        }
+    }
+
+    return doc;
+}
+
+public string beautify(string raw, int indent) { return raw; }

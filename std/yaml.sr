@@ -1,0 +1,220 @@
+mod export yaml;
+
+class YamlParser {
+    private prop string src;
+    private prop int pos;
+    private prop int line;
+
+    construct (string src) {
+        this.src = src;
+        this.pos = 0;
+        this.line = 1;
+    }
+
+    private void skipBlank() {
+        while (this.pos < this.src.length) {
+            char c = this.src[this.pos];
+            if (c == ' ' || c == '\t') { this.pos += 1; }
+            elif (c == '\n') { this.pos += 1; this.line += 1; }
+            elif (c == '\r') { this.pos += 1; }
+            else { break; }
+        }
+    }
+
+    private void skipLine() {
+        while (this.pos < this.src.length) {
+            char c = this.src[this.pos];
+            if (c == '\n') { this.pos += 1; this.line += 1; break; }
+            if (c == '\r') { this.pos += 1; break; }
+            this.pos += 1;
+        }
+    }
+
+    private char? peek() {
+        if (this.pos >= this.src.length) { return null; }
+        return this.src[this.pos];
+    }
+
+    private string readWhile(bool fn(char)) {
+        string r = "";
+        while (this.pos < this.src.length) {
+            char c = this.src[this.pos];
+            if (fn(c)) { r += c; this.pos += 1; }
+            else { break; }
+        }
+        return r;
+    }
+
+    private int countIndent() {
+        int n = 0;
+        int p = this.pos;
+        while (p < this.src.length) {
+            char c = this.src[p];
+            if (c == ' ') { n += 1; p += 1; }
+            elif (c == '\t') { n += 1; p += 1; }
+            else { break; }
+        }
+        return n;
+    }
+
+    private object parseValue(int indent) {
+        this.skipBlank();
+        if (this.pos >= this.src.length) { return null; }
+        char c = this.src[this.pos];
+        if (c == '#') { this.skipLine(); return this.parseValue(indent); }
+        if (c == '-') { return this.parseSequence(indent); }
+        if (c == '\n') { this.pos += 1; return this.parseValue(indent); }
+        return this.parseMappingOrScalar(indent);
+    }
+
+    private dict<string, object> parseMappingOrScalar(int indent) {
+        dict<string, object> map = {};
+        string? key = null;
+        while (true) {
+            this.skipBlank();
+            if (this.pos >= this.src.length) { break; }
+            char c = this.src[this.pos];
+            if (c == '\n') { this.pos += 1; continue; }
+            if (c == '#') { this.skipLine(); continue; }
+            int curIndent = this.countIndent();
+            if (curIndent < indent) { break; }
+            if (curIndent > indent) {
+                if (key != null) {
+                    map[key] = this.parseValue(curIndent);
+                    key = null;
+                }
+                continue;
+            }
+            string line = this.readLine();
+            int ci = line.indexOf(":");
+            if (ci >= 0) {
+                key = line.substr(0, ci).trim();
+                string rest = line.substr(ci + 1).trim();
+                if (rest.length() > 0) {
+                    map[key] = this.inferScalar(rest);
+                    key = null;
+                }
+            }
+        }
+        return map;
+    }
+
+    private object[] parseSequence(int indent) {
+        object[] seq = [];
+        while (true) {
+            this.skipBlank();
+            if (this.pos >= this.src.length) { break; }
+            int curIndent = this.countIndent();
+            if (curIndent < indent) { break; }
+            if (this.src[this.pos] != '-') { break; }
+            this.pos += 1;
+            this.skipBlank();
+            string rest = this.readLine().trim();
+            if (rest.length() > 0) {
+                seq.add(this.inferScalar(rest));
+            } else {
+                seq.add(this.parseValue(curIndent + 2));
+            }
+        }
+        return seq;
+    }
+
+    private string readLine() {
+        string r = "";
+        while (this.pos < this.src.length) {
+            char c = this.src[this.pos];
+            if (c == '\n') { this.pos += 1; this.line += 1; break; }
+            if (c == '\r') { this.pos += 1; break; }
+            r += c; this.pos += 1;
+        }
+        return r;
+    }
+
+    private object inferScalar(string s) {
+        if (s == "null" || s == "~") { return null; }
+        if (s == "true" || s == "True" || s == "TRUE") { return true; }
+        if (s == "false" || s == "False" || s == "FALSE") { return false; }
+        if (s.length() >= 2 && ((s[0] == '"' && s[s.length() - 1] == '"') || (s[0] == '\'' && s[s.length() - 1] == '\''))) {
+            return s.substr(1, s.length() - 2);
+        }
+        bool isNum = true;
+        int dots = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s[i];
+            if (c == '.') { dots += 1; }
+            elif (!c.isDigit() && c != '-' && c != '+') { isNum = false; break; }
+        }
+        if (isNum && s.length() > 0) {
+            if (dots > 0) { return float64(s); }
+            return int(s);
+        }
+        return s;
+    }
+}
+
+class YamlSerializer {
+    construct () {}
+
+    public string serialize(object val) {
+        return this.serializeVal(val, 0);
+    }
+
+    private string serializeVal(object val, int indent) {
+        string pad = "";
+        for (int i = 0; i < indent; i++) { pad += " "; }
+        if (val == null) { return pad + "null\n"; }
+        if (val is bool) {
+            if (val as bool) { return pad + "true\n"; }
+            return pad + "false\n";
+        }
+        if (val is int || val is float64 || val is float) { return pad + val.toString() + "\n"; }
+        if (val is string) {
+            string s = val as string;
+            if (s.length() > 0 && s[0] == ' ') { return pad + "'" + s + "'\n"; }
+            return pad + s + "\n";
+        }
+        if (val is dict<string, object>) {
+            dict<string, object> d = val as dict<string, object>;
+            string r = "";
+            string[] keys = [];
+            foreach (string k in d.keys()) { keys.add(k); }
+            for (int i = 0; i < keys.length; i++) {
+                if (indent > 0) { r += pad; }
+                r += keys[i] + ": ";
+                object v = d[keys[i]];
+                if (v is dict<string, object>) {
+                    r += "\n" + this.serializeVal(v, indent + 2);
+                } else {
+                    r += this.serializeVal(v, indent + 2).trim() + "\n";
+                }
+            }
+            return r;
+        }
+        if (val is object[]) {
+            object[] arr = val as object[];
+            string r = "";
+            for (int i = 0; i < arr.length; i++) {
+                r += pad + "- " + this.serializeVal(arr[i], indent + 2).trim() + "\n";
+            }
+            return r;
+        }
+        return pad + val.toString() + "\n";
+    }
+}
+
+public object parse(string yamlStr) {
+    YamlParser p = new YamlParser(yamlStr);
+    return p.parseValue(0);
+}
+
+public void load(string filepath, object obj) {
+    import fs;
+    string content = readString(filepath);
+    YamlParser p = new YamlParser(content);
+    obj = p.parseValue(0);
+}
+
+public string stringify(object val) {
+    YamlSerializer s = new YamlSerializer();
+    return s.serialize(val);
+}

@@ -1,0 +1,260 @@
+mod export html;
+
+class HtmlDocument {
+    public prop string tagName;
+    public prop dict<string, string> attrs;
+    public prop HtmlDocument[] children;
+    public prop string textContent;
+    public prop HtmlDocument parent;
+
+    construct (string tag) {
+        this.tagName = tag;
+        this.attrs = {};
+        this.children = [];
+        this.textContent = "";
+    }
+
+    public HtmlDocument? querySelector(string selector) {
+        if (selector.length() == 0) { return null; }
+        char first = selector[0];
+        if (first == '#') {
+            string id = selector.substr(1);
+            return this.findById(id);
+        }
+        if (first == '.') {
+            string cls = selector.substr(1);
+            return this.findClass(cls);
+        }
+        return this.findByTag(selector);
+    }
+
+    private HtmlDocument? findById(string id) {
+        if (this.attrs.contains("id") && this.attrs["id"] == id) { return this; }
+        foreach (HtmlDocument child in this.children) {
+            HtmlDocument? found = child.findById(id);
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+
+    private HtmlDocument? findByTag(string tag) {
+        if (this.tagName == tag) { return this; }
+        foreach (HtmlDocument child in this.children) {
+            HtmlDocument? found = child.findByTag(tag);
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+
+    private HtmlDocument? findClass(string cls) {
+        if (this.attrs.contains("class")) {
+            string[] classes = this.attrs["class"].split(" ");
+            foreach (string c in classes) {
+                if (c == cls) { return this; }
+            }
+        }
+        foreach (HtmlDocument child in this.children) {
+            HtmlDocument? found = child.findClass(cls);
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+}
+
+class HtmlParser {
+    private prop string src;
+    private prop int pos;
+
+    construct (string source) {
+        this.src = source;
+        this.pos = 0;
+    }
+
+    private void skipWs() {
+        while (this.pos < this.src.length) {
+            char c = this.src[this.pos];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { this.pos += 1; }
+            else { break; }
+        }
+    }
+
+    private char? peek() {
+        if (this.pos >= this.src.length) { return null; }
+        return this.src[this.pos];
+    }
+
+    private char advance() {
+        char c = this.src[this.pos];
+        this.pos += 1;
+        return c;
+    }
+
+    private bool matchString(string s) {
+        if (this.src.substr(this.pos, s.length()) == s) { this.pos += s.length(); return true; }
+        return false;
+    }
+
+    public HtmlDocument parse() {
+        this.skipWs();
+        return this.parseElement();
+    }
+
+    private HtmlDocument parseElement() {
+        this.skipWs();
+        if (this.peek() != '<') {
+            string text = "";
+            while (this.pos < this.src.length && this.peek() != '<') {
+                text += this.advance();
+            }
+            HtmlDocument tn = new HtmlDocument("#text");
+            tn.textContent = text.trim();
+            return tn;
+        }
+        this.advance();
+        bool isClose = false;
+        if (this.peek() == '/') {
+            isClose = true;
+            this.advance();
+        }
+        if (this.peek() == '!' ) {
+            if (this.matchString("!--")) {
+                while (this.pos < this.src.length && !this.matchString("-->")) { this.advance(); }
+                return null;
+            }
+            if (this.matchString("!DOCTYPE")) {
+                while (this.pos < this.src.length && this.peek() != '>') { this.advance(); }
+                if (this.peek() == '>') { this.advance(); }
+                return null;
+            }
+        }
+        if (this.peek() == '?') {
+            while (this.pos < this.src.length && this.peek() != '>') { this.advance(); }
+            if (this.peek() == '>') { this.advance(); }
+            return null;
+        }
+        string tagName = "";
+        while (this.pos < this.src.length) {
+            char c = this.peek();
+            if (c == '>' || c == '/' || c == ' ' || c == '\t' || c == '\n') { break; }
+            tagName += this.advance();
+        }
+        if (isClose) {
+            while (this.pos < this.src.length && this.peek() != '>') { this.advance(); }
+            if (this.peek() == '>') { this.advance(); }
+            return null;
+        }
+        HtmlDocument el = new HtmlDocument(tagName);
+        this.skipWs();
+        while (this.pos < this.src.length) {
+            char c = this.peek();
+            if (c == '>' || c == '/') { break; }
+            string attrName = "";
+            while (this.pos < this.src.length) {
+                c = this.peek();
+                if (c == '=' || c == '>' || c == '/' || c == ' ' || c == '\t' || c == '\n') { break; }
+                attrName += this.advance();
+            }
+            this.skipWs();
+            if (this.peek() == '=') {
+                this.advance();
+                this.skipWs();
+                string val = "";
+                if (this.peek() == '"') {
+                    this.advance();
+                    while (this.pos < this.src.length && this.peek() != '"') { val += this.advance(); }
+                    if (this.peek() == '"') { this.advance(); }
+                } elif (this.peek() == '\'') {
+                    this.advance();
+                    while (this.pos < this.src.length && this.peek() != '\'') { val += this.advance(); }
+                    if (this.peek() == '\'') { this.advance(); }
+                } else {
+                    while (this.pos < this.src.length) {
+                        c = this.peek();
+                        if (c == '>' || c == '/' || c == ' ' || c == '\t') { break; }
+                        val += this.advance();
+                    }
+                }
+                el.attrs[attrName] = val;
+            } else if (attrName.length() > 0) {
+                el.attrs[attrName] = "";
+            }
+            this.skipWs();
+        }
+        bool selfClose = false;
+        if (this.peek() == '/') {
+            selfClose = true;
+            this.advance();
+        }
+        if (this.peek() == '>') { this.advance(); }
+        if (selfClose) { return el; }
+        string[] voidTags = ["br", "hr", "img", "input", "meta", "link", "area", "base", "col", "embed", "source", "track", "wbr"];
+        foreach (string vt in voidTags) {
+            if (tagName == vt) { return el; }
+        }
+        while (this.pos < this.src.length) {
+            this.skipWs();
+            if (this.peek() == '<' && this.pos + 1 < this.src.length && this.src[this.pos + 1] == '/') {
+                string closeTag = "</" + tagName + ">";
+                if (this.src.substr(this.pos, closeTag.length()).toLower() == closeTag.toLower()) {
+                    this.pos += closeTag.length();
+                    break;
+                }
+            }
+            HtmlDocument? child = this.parseElement();
+            if (child != null) {
+                child.parent = el;
+                el.children.add(child);
+            }
+            this.skipWs();
+            if (this.pos >= this.src.length) { break; }
+        }
+        el.textContent = this.collectText(el);
+        return el;
+    }
+
+    private string collectText(HtmlDocument el) {
+        string s = "";
+        foreach (HtmlDocument child in el.children) {
+            if (child.tagName == "#text") { s += child.textContent + " "; }
+            else { s += this.collectText(child) + " "; }
+        }
+        return s.trim();
+    }
+}
+
+public HtmlDocument parse(string htmlStr) {
+    HtmlParser p = new HtmlParser(htmlStr);
+    return p.parse();
+}
+
+public string beautify(string htmlStr) {
+    HtmlDocument doc = parse(htmlStr);
+    return formatHtml(doc, 0);
+}
+
+private string formatHtml(HtmlDocument el, int depth) {
+    string pad = "";
+    for (int i = 0; i < depth; i++) { pad += "  "; }
+    if (el.tagName == "#text") { return pad + el.textContent + "\n"; }
+    string r = pad + "<" + el.tagName;
+    string[] keys = [];
+    foreach (string k in el.attrs.keys()) { keys.add(k); }
+    for (int i = 0; i < keys.length; i++) {
+        string v = el.attrs[keys[i]];
+        if (v.length() > 0) { r += " " + keys[i] + "=\"" + v + "\""; }
+        else { r += " " + keys[i]; }
+    }
+    if (el.children.length == 0 && el.textContent.length() == 0) {
+        r += " />\n";
+        return r;
+    }
+    r += ">\n";
+    if (el.textContent.length() > 0 && el.children.length == 0) {
+        r += pad + "  " + el.textContent + "\n";
+    }
+    foreach (HtmlDocument child in el.children) {
+        r += formatHtml(child, depth + 1);
+    }
+    r += pad + "</" + el.tagName + ">\n";
+    return r;
+}

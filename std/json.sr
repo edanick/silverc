@@ -1,0 +1,250 @@
+mod export json;
+
+class JsonParser {
+    private prop string src;
+    private prop int pos;
+
+    construct (string src) {
+        this.src = src;
+        this.pos = 0;
+    }
+
+    private void skip() {
+        while (this.pos < this.src.length) {
+            char c = this.src[this.pos];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                this.pos += 1;
+            } else { break; }
+        }
+    }
+
+    private char? peek() {
+        this.skip();
+        if (this.pos >= this.src.length) { return null; }
+        return this.src[this.pos];
+    }
+
+    private char advance() {
+        char c = this.src[this.pos];
+        this.pos += 1;
+        return c;
+    }
+
+    private object parseValue() {
+        char? c = this.peek();
+        if (c == null) { return null; }
+        if (c == '{') { return this.parseObject(); }
+        if (c == '[') { return this.parseArray(); }
+        if (c == '"') { return this.parseString(); }
+        if (c == 't' || c == 'f') { return this.parseBool(); }
+        if (c == 'n') { this.expect("null"); return null; }
+        return this.parseNumber();
+    }
+
+    private dict<string, object> parseObject() {
+        dict<string, object> obj = {};
+        this.advance();
+        if (this.peek() == '}') { this.advance(); return obj; }
+        while (true) {
+            this.skip();
+            string key = this.parseString();
+            this.skip();
+            this.expect(":");
+            this.skip();
+            object val = this.parseValue();
+            obj[key] = val;
+            this.skip();
+            if (this.peek() == '}') { this.advance(); break; }
+            if (this.peek() == ',') { this.advance(); }
+        }
+        return obj;
+    }
+
+    private object[] parseArray() {
+        object[] arr = [];
+        this.advance();
+        if (this.peek() == ']') { this.advance(); return arr; }
+        while (true) {
+            arr.add(this.parseValue());
+            this.skip();
+            if (this.peek() == ']') { this.advance(); break; }
+            if (this.peek() == ',') { this.advance(); }
+        }
+        return arr;
+    }
+
+    private string parseString() {
+        string s = "";
+        if (this.peek() == '"') { this.advance(); }
+        while (this.pos < this.src.length) {
+            char c = this.advance();
+            if (c == '"') { break; }
+            if (c == '\\') {
+                char n = this.advance();
+                if (n == 'n') { s += "\n"; }
+                elif (n == 't') { s += "\t"; }
+                elif (n == 'r') { s += "\r"; }
+                elif (n == '\\') { s += "\\"; }
+                elif (n == '"') { s += "\""; }
+                elif (n == '/') { s += "/"; }
+                elif (n == 'u') {
+                    string hex = "";
+                    for (int i = 0; i < 4; i++) { hex += this.advance(); }
+                    s += char(int(hex, 16));
+                }
+                else { s += n; }
+            } else { s += c; }
+        }
+        return s;
+    }
+
+    private float64 parseNumber() {
+        string s = "";
+        if (this.peek() == '-') { s += this.advance(); }
+        while (this.pos < this.src.length) {
+            char c = this.src[this.pos];
+            if (c.isDigit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
+                if ((c == '+' || c == '-') && s.length() > 0 && s[s.length() - 1] != 'e' && s[s.length() - 1] != 'E') { break; }
+                s += this.advance();
+            } else { break; }
+        }
+        return float64(s);
+    }
+
+    private bool parseBool() {
+        if (this.src.substr(this.pos, 4) == "true") { this.pos += 4; return true; }
+        this.pos += 5;
+        return false;
+    }
+
+    private void expect(string s) {
+        if (this.src.substr(this.pos, s.length()) == s) {
+            this.pos += s.length();
+        }
+    }
+}
+
+class JsonSerializer {
+    private prop int indentLevel;
+
+    construct () { this.indentLevel = 0; }
+
+    private string indentStr(int indent) {
+        string s = "";
+        for (int i = 0; i < this.indentLevel * indent; i++) { s += " "; }
+        return s;
+    }
+
+    public string stringify(object val, int indent) {
+        return this.serialize(val, indent, false);
+    }
+
+    public string stringifyMulti(object val, int indent, bool multiline) {
+        return this.serialize(val, indent, multiline);
+    }
+
+    private string serialize(object val, int indent, bool multi) {
+        if (val == null) { return "null"; }
+        if (val is bool) {
+            if (val as bool) { return "true"; }
+            return "false";
+        }
+        if (val is int || val is float64 || val is float) { return val.toString(); }
+        if (val is string) { return "\"" + this.escape(val as string) + "\""; }
+        if (val is dict<string, object>) {
+            return this.serializeDict(val as dict<string, object>, indent, multi);
+        }
+        if (val is object[]) {
+            return this.serializeArray(val as object[], indent, multi);
+        }
+        return val.toString();
+    }
+
+    private string escape(string s) {
+        string r = "";
+        foreach (char c in s) {
+            if (c == '"') { r += "\\\""; }
+            elif (c == '\\') { r += "\\\\"; }
+            elif (c == '\n') { r += "\\n"; }
+            elif (c == '\t') { r += "\\t"; }
+            elif (c == '\r') { r += "\\r"; }
+            else { r += c; }
+        }
+        return r;
+    }
+
+    private string serializeDict(dict<string, object> d, int indent, bool multi) {
+        string[] keys = [];
+        foreach (string k in d.keys()) { keys.add(k); }
+        if (keys.length == 0) { return "{}"; }
+        if (!multi) {
+            string r = "{";
+            for (int i = 0; i < keys.length; i++) {
+                if (i > 0) { r += ", "; }
+                r += "\"" + keys[i] + "\": " + this.serialize(d[keys[i]], indent, false);
+            }
+            r += "}";
+            return r;
+        }
+        this.indentLevel += 1;
+        string r = "{\n";
+        for (int i = 0; i < keys.length; i++) {
+            if (i > 0) { r += ",\n"; }
+            r += this.indentStr(indent) + "\"" + keys[i] + "\": " + this.serialize(d[keys[i]], indent, true);
+        }
+        r += "\n";
+        this.indentLevel -= 1;
+        r += this.indentStr(indent) + "}";
+        return r;
+    }
+
+    private string serializeArray(object[] arr, int indent, bool multi) {
+        if (arr.length == 0) { return "[]"; }
+        if (!multi) {
+            string r = "[";
+            for (int i = 0; i < arr.length; i++) {
+                if (i > 0) { r += ", "; }
+                r += this.serialize(arr[i], indent, false);
+            }
+            r += "]";
+            return r;
+        }
+        this.indentLevel += 1;
+        string r = "[\n";
+        for (int i = 0; i < arr.length; i++) {
+            if (i > 0) { r += ",\n"; }
+            r += this.indentStr(indent) + this.serialize(arr[i], indent, true);
+        }
+        r += "\n";
+        this.indentLevel -= 1;
+        r += this.indentStr(indent) + "]";
+        return r;
+    }
+}
+
+public object parse(string jsonStr) {
+    JsonParser p = new JsonParser(jsonStr);
+    return p.parseValue();
+}
+
+public void load(string filepath, object obj) {
+    import fs;
+    string content = readString(filepath);
+    JsonParser p = new JsonParser(content);
+    obj = p.parseValue();
+}
+
+public string stringify(object val, int indent) {
+    JsonSerializer s = new JsonSerializer();
+    return s.stringify(val, indent);
+}
+
+public string stringify(object val, int indent, bool multiline) {
+    JsonSerializer s = new JsonSerializer();
+    return s.stringifyMulti(val, indent, multiline);
+}
+
+public string beautify(string jsonStr) {
+    object parsed = parse(jsonStr);
+    return stringify(parsed, 2, true);
+}

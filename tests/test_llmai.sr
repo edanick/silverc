@@ -1,0 +1,67 @@
+import * from llmai;
+
+// The API key lives in the user's code, not in the language or library.
+// Read it from the LLM_API_KEY environment variable when present, otherwise
+// fall back to the inline key below. Replace INLINE_API_KEY with your own
+// key before running a real completion.
+const string INLINE_API_KEY = "sk-HQiWye7oABbFjwMKaLjrnERipPBpHCZBKc6WniV0wGiAW996";
+
+void main() {
+    string url = "https://api.hcnsec.cn/v1/chat/completions";
+
+    // 1) Environment-variable path: env.get(name) / fs.getenv(name)
+    string key = env.get("LLM_API_KEY");
+    string keySource = "env(LLM_API_KEY)";
+    // 2) Inline-string fallback
+    if (key.length == 0) {
+        key = INLINE_API_KEY;
+        keySource = "inline constant";
+    }
+    printline("API key source: " + keySource);
+    if (key.length == 0) {
+        printline("FAILED: no API key available. Set LLM_API_KEY or fill INLINE_API_KEY.");
+        exit(1);
+    }
+    printline("API key length: ");
+    printline(key.length);
+
+    LLMClient client = new LLMClient(url, key, Compatibility.OpenAI);
+    client.headers.set("X-Client", "silver");
+
+    printline("LLM compatibility: OpenAI");
+    if (client.headers.has("Content-Type")) {
+        printline("Content-Type: " + client.headers.get("Content-Type"));
+    } else {
+        printline("FAILED: missing Content-Type header");
+        exit(1);
+    }
+    if (client.headers.has("Authorization")) {
+        printline("Authorization header: present");
+        printline("Authorization value length: ");
+        printline(client.headers.get("Authorization").length);
+    } else {
+        printline("FAILED: missing Authorization header");
+        exit(1);
+    }
+    printline("LLM headers:");
+    printline(client.headers.serialize());
+
+    // The body is an object; LLMClient serializes it internally.
+    ChatCompletionRequest request = new ChatCompletionRequest("auto");
+    request.addMessage("user", "Say hello in one sentence.");
+    printline("Serialized body: " + request.serialize());
+
+    // Live completion: client.chat.completions.create(body) -> raw JSON,
+    // and the typed response is filled in for request.response.choices.
+    printline("Calling " + url + " ...");
+    string raw = client.chat.completions.create(request);
+    printline("Raw response: " + raw);
+    string content = request.response.choices[0].message.content;
+    printline("LLM response: " + content);
+    if (content.length > 0) {
+        printline("OK: got a response from the LLM API");
+        exit(0);
+    }
+    printline("FAILED: empty or unexpected response from the LLM API");
+    exit(1);
+}
