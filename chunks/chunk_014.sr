@@ -1,0 +1,100 @@
+
+    public bool typeNameEq(string bare, string typed) {
+        // Class-name comparison that tolerates a nullable suffix: a receiver
+        // typed `Node?` resolves to the same class layout as `Node`.
+        if (this.strEq(bare, typed)) { return true; }
+        if (typed.length == bare.length + 1 && typed[typed.length - 1] == '?') {
+            for (int i = 0; i < bare.length; i++) {
+                if (typed[i] != bare[i]) { return false; }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    public bool isDictType(string t) {
+        if (t.length >= 4) {
+            if (t[0] == 'd' && t[1] == 'i' && t[2] == 'c' && t[3] == 't') { return true; }
+        }
+        return false;
+    }
+
+    public string dictValueType(string t) {
+        int len = t.length;
+        int i = 5;
+        int depth = 1;
+        bool inVal = false;
+        string result = "";
+        while (i < len) {
+            if (t[i] == '<') { depth = depth + 1; }
+            elif (t[i] == '>') {
+                depth = depth - 1;
+                if (depth == 0) { return result; }
+            } elif (t[i] == ',' && depth == 1) {
+                inVal = true;
+            } elif (inVal) {
+                result = result + t[i];
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    public string inferReceiverType(Node expr) {
+        if (expr.kind == 6) {
+            if (this.strEq(expr.name, "this")) { return this.currentClassName; }
+            return this.getLocalType(expr.name);
+        }
+        return this.inferExprType(expr);
+    }
+
+    public int findFieldOffset(string className, string fieldName) {
+        int start = -1;
+        int cnt = 0;
+        for (int i = 0; i < this.classNames.length; i++) {
+            if (this.typeNameEq(this.classNames[i], className)) {
+                start = this.classFieldStarts[i];
+                cnt = this.classFieldCounts[i];
+            }
+        }
+        if (start < 0) { return -1; }
+        for (int i = 0; i < cnt; i++) {
+            if (this.strEq(this.classFieldNames[start + i], fieldName)) {
+                return this.classFieldOffsets[start + i];
+            }
+        }
+        return -1;
+    }
+
+    public string findFieldType(string className, string fieldName) {
+        int start = -1;
+        int cnt = 0;
+        for (int i = 0; i < this.classNames.length; i++) {
+            if (this.typeNameEq(this.classNames[i], className)) {
+                start = this.classFieldStarts[i];
+                cnt = this.classFieldCounts[i];
+            }
+        }
+        if (start < 0) { return ""; }
+        for (int i = 0; i < cnt; i++) {
+            if (this.strEq(this.classFieldNames[start + i], fieldName)) {
+                return this.classFieldTypes[start + i];
+            }
+        }
+        return "";
+    }
+
+    public string getLocalType(string name) {
+        for (int i = this.localNames.length - 1; i >= 0; i = i - 1) {
+            if (this.strEq(this.localNames[i], name)) {
+                if (i < this.localTypes.length) {
+                    return this.localTypes[i];
+                }
+                return "";
+            }
+        }
+        for (int i = 0; i < this.globalNames.length; i++) {
+            if (this.strEq(this.globalNames[i], name)) {
+                if (i < this.globalTypes.length) {
+                    return this.globalTypes[i];
+                }

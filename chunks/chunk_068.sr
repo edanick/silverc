@@ -1,0 +1,100 @@
+            this.asm.movRI64(0, 1);
+            this.asm.bindLabel(ed);
+        }
+    }
+
+    public void genCompoundAssign(Node bin, int op) {
+        Node lhs = bin.child(0);
+        Node rhs = bin.child(1);
+        if (lhs.kind == 6) {
+            int off = this.findLocal(lhs.name);
+            int gi = this.findGlobal(lhs.name);
+            if (op == 14) {
+                string lt = this.getLocalType(lhs.name);
+                if (this.strEq(lt, "string")) {
+                    this.genStringConcat(bin);
+                    if (off != 0) { this.asm.movMBaseR(5, 0, off); }
+                    elif (gi >= 0) { this.genGlobalStore(gi); }
+                    else { this.asm.movMBaseR(5, 0, 0); }
+                    return;
+                }
+            }
+            if (off != 0) { this.asm.movRMBase(0, 5, off); }
+            elif (gi >= 0) { this.genGlobalLoad(gi); }
+            else { this.asm.movRMBase(0, 5, 0); }
+            this.asm.pushR64(0);
+            this.genExpr(rhs);
+            this.asm.movRR64(1, 0);
+            this.asm.popR64(0);
+            if (op == 14) { this.asm.addRR64(0, 1); }
+            elif (op == 15) { this.asm.subRR64(0, 1); }
+            elif (op == 16) { this.asm.mulRR64(1); }
+            elif (op == 17) { this.emitDivisorCheck(); this.asm.cqo(); this.asm.idivR64(1); }
+            if (off != 0) { this.asm.movMBaseR(5, 0, off); }
+            elif (gi >= 0) { this.genGlobalStore(gi); }
+            else { this.asm.movMBaseR(5, 0, 0); }
+            return;
+        }
+        if (lhs.kind == 24 && lhs.childCount() >= 2) {
+            Node arrNode = lhs.child(0);
+            Node idxNode = lhs.child(1);
+            bool arrIsByte = false;
+            if (arrNode.kind == 6) {
+                arrIsByte = this.isByteElemType(this.getLocalType(arrNode.name));
+            } elif (arrNode.kind == 13) {
+                Node arrObj = arrNode.child(0);
+                if (arrObj.kind == 6 && this.strEq(arrObj.name, "this")) {
+                    // Stable classification for self-hosted stages: resolve the
+                    // field type from the class table instead of the recursive
+                    // inferExprType path.
+                    arrIsByte = this.isByteElemType(this.findFieldType(this.currentClassName, arrNode.name));
+                } else {
+                    arrIsByte = this.isByteElemType(this.inferExprType(arrNode));
+                }
+            }
+            if (arrNode.kind == 6) {
+                int arrOff = this.findLocal(arrNode.name);
+                this.genExpr(idxNode);
+                this.asm.pushR64(0);
+                this.asm.movRMBase(11, 5, arrOff);
+                this.asm.popR64(0);
+                if (!arrIsByte) { this.asm.shlR64Imm(0, 3); }
+                this.asm.addRR64(11, 0);
+                if (arrIsByte) {
+                    this.asm.movzxByteMBase(0, 11, 0);
+                } else {
+                    this.asm.movRMBase(0, 11, 0);
+                }
+                this.asm.pushR64(0);
+                this.genExpr(rhs);
+                this.asm.movRR64(1, 0);
+                this.asm.popR64(0);
+                if (op == 14) { this.asm.addRR64(0, 1); }
+                elif (op == 15) { this.asm.subRR64(0, 1); }
+                elif (op == 16) { this.asm.mulRR64(1); }
+                if (arrIsByte) {
+                    this.asm.movMBaseByteR(11, 0, 0);
+                } else {
+                    this.asm.movMBaseR(11, 0, 0);
+                }
+                return;
+            } else {
+                this.genExpr(arrNode);
+                this.asm.pushR64(0);
+                this.genExpr(idxNode);
+                if (!arrIsByte) { this.asm.shlR64Imm(0, 3); }
+                this.asm.movRR64(11, 0);
+                this.asm.popR64(0);
+                this.asm.addRR64(0, 11);
+                this.asm.pushR64(0);
+                if (arrIsByte) {
+                    this.asm.movzxByteMBase(0, 0, 0);
+                } else {
+                    this.asm.movRMBase(0, 0, 0);
+                }
+                this.asm.pushR64(0);
+                this.genExpr(rhs);
+                this.asm.movRR64(1, 0);
+                this.asm.popR64(0);
+                if (op == 14) { this.asm.addRR64(0, 1); }
+                elif (op == 15) { this.asm.subRR64(0, 1); }

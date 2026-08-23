@@ -1,0 +1,100 @@
+                int thisOff = this.findLocal("this");
+                int fieldOff = this.findFieldOffset(this.currentClassName, arrNode.name);
+                string fieldType = this.findFieldType(this.currentClassName, arrNode.name);
+                if (fieldOff >= 0) {
+                    this.asm.movRMBase(0, 5, thisOff);
+                    this.asm.movRMBase(0, 0, fieldOff);
+                    this.asm.pushR64(0);
+                    this.genExpr(idxNode);
+                    if (!this.strEq(fieldType, "string")) {
+                        this.asm.shlR64Imm(0, 3);
+                    }
+                    this.asm.movRR64(11, 0);
+                    this.asm.popR64(0);
+                    this.asm.addRR64(0, 11);
+                    if (this.strEq(fieldType, "string")) {
+                        this.asm.movzxByteMBase(0, 0, 0);
+                    } else {
+                        this.asm.movRMBase(0, 0, 0);
+                    }
+                    return;
+                }
+            }
+            if (arrObj.kind == 6) {
+                // obj.field[index] where obj is a local variable whose class
+                // declares field as a string array.  Resolve the owner type
+                // through the local type table so string elements are read as
+                // characters (byte loads) instead of raw pointers.
+                string ownerType = this.getLocalType(arrObj.name);
+                int fieldOff = this.findFieldOffset(ownerType, arrNode.name);
+                string fieldType = this.findFieldType(ownerType, arrNode.name);
+                if (fieldOff >= 0) {
+                    this.asm.movRMBase(0, 5, this.findLocal(arrObj.name));
+                    this.asm.movRMBase(0, 0, fieldOff);
+                    this.asm.pushR64(0);
+                    this.genExpr(idxNode);
+                    if (!this.strEq(fieldType, "string")) {
+                        this.asm.shlR64Imm(0, 3);
+                    }
+                    this.asm.movRR64(11, 0);
+                    this.asm.popR64(0);
+                    this.asm.addRR64(0, 11);
+                    if (this.strEq(fieldType, "string")) {
+                        this.asm.movzxByteMBase(0, 0, 0);
+                    } else {
+                        this.asm.movRMBase(0, 0, 0);
+                    }
+                    return;
+                }
+            }
+        }
+        int isString = 0;
+        if (arrNode.kind == 6) {
+            if (this.isByteElemType(this.getLocalType(arrNode.name))) { isString = 1; }
+        } elif (arrNode.kind == 13) {
+            if (this.isByteElemType(this.inferExprType(arrNode))) { isString = 1; }
+        } elif (arrNode.kind == 24) {
+            // Nested index (m[i][j]): the inner expression's inferred type is
+            // the row element type, so byte-backed rows (char[][], string[]
+            // vs. byte elements) are classified the same way as a member
+            // access row.  Without this, char[][] reads used full-width loads.
+            if (this.isByteElemType(this.inferExprType(arrNode))) { isString = 1; }
+        }
+        if (arrNode.kind == 6 && this.findLocal(arrNode.name) != 0) {
+            int arrOff = this.findLocal(arrNode.name);
+            this.asm.movRMBase(0, 5, arrOff);
+            this.asm.pushR64(0);
+            this.genExpr(idxNode);
+            this.asm.movRR64(1, 0);
+            this.asm.popR64(0);
+            if (isString == 0) {
+                this.emitIndexBoundsCheck();
+                this.asm.shlR64Imm(1, 3);
+                this.asm.addRR64(0, 1);
+                this.asm.movRMBase(0, 0, 0);
+            } else {
+                this.asm.addRR64(0, 1);
+                this.asm.movzxByteMBase(0, 0, 0);
+            }
+        } else {
+            this.genExpr(arrNode);
+            this.asm.pushR64(0);
+            this.genExpr(idxNode);
+            this.asm.movRR64(1, 0);
+            this.asm.popR64(0);
+            if (isString == 0) {
+                this.emitIndexBoundsCheck();
+                this.asm.shlR64Imm(1, 3);
+                this.asm.addRR64(0, 1);
+                this.asm.movRMBase(0, 0, 0);
+            } else {
+                this.asm.addRR64(0, 1);
+                this.asm.movzxByteMBase(0, 0, 0);
+            }
+        }
+    }
+
+    public void genSlice(Node expr) {
+        // Slice expr: [0]=base, [1]=start, [2]=end (end-exclusive).
+        // Strings copy bytes into a fresh NUL-terminated buffer; arrays copy
+        // elements (8 bytes each, or 1 byte for byte[]/char[]) into a new

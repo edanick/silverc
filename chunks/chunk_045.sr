@@ -1,0 +1,100 @@
+        this.asm.addRI32(1, 1);
+        this.asm.movMBaseR(0, 1, -8);
+        this.asm.movRI64(0, 0);
+        this.asm.bindLabel(eL);
+    }
+
+    public void genDictContains(Node call) {
+        Node dictNode = call.child(0);
+        Node keyNode = call.child(1);
+        this.genExpr(dictNode);
+        int dBase = this.allocLocal("__dc_base");
+        this.asm.movMBaseR(5, 0, dBase);
+        this.genExpr(keyNode);
+        int dKey = this.allocLocal("__dc_key");
+        this.asm.movMBaseR(5, 0, dKey);
+        int dI = this.allocLocal("__dc_i");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, dI);
+        int lL = this.newLabel();
+        int fL = this.newLabel();
+        int nL = this.newLabel();
+        int eL = this.newLabel();
+        int iter = this.newLabel();
+        this.asm.bindLabel(lL);
+        this.asm.movRMBase(0, 5, dI);
+        this.asm.movRMBase(1, 5, dBase);
+        this.asm.movRMBase(1, 1, -8);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(nL);
+        this.asm.movRMBase(0, 5, dI);
+        this.asm.shlR64Imm(0, 1);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.movRR64(11, 0);
+        this.asm.movRMBase(0, 5, dBase);
+        this.asm.addRR64(0, 11);
+        this.asm.movRMBase(1, 0, 0);
+        this.asm.cmpRI32(1, 0);
+        this.asm.jeLabel(iter);
+        this.asm.movRR64(1, 1);
+        this.asm.movRMBase(2, 5, dKey);
+        this.addImportPatch("ucrtbase.dll", "strcmp");
+        int sCmp3 = 0xDEADBEEFCAFEBADD;
+        this.asm.emitImm64(0, sCmp3);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(fL);
+        this.asm.bindLabel(iter);
+        this.asm.movRMBase(0, 5, dI);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, dI);
+        this.asm.jmpLabel(lL);
+        this.asm.bindLabel(fL);
+        this.asm.movRI64(0, 1);
+        this.asm.jmpLabel(eL);
+        this.asm.bindLabel(nL);
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(eL);
+    }
+
+    public void genValueFactoryCall(Node call) {
+        // Value.makeXxx(...) builtin tagged-union factory: allocate a 112-byte
+        // zeroed block, set the tag and payload at the fixed Value offsets.
+        string m = call.name;
+        this.asm.emitImm64(1, 112);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        int sV0 = 0xDEADBEEFCAFEBAB0;
+        this.asm.emitImm64(0, sV0);
+        this.asm.movRMBase(11, 0, 0);
+        this.asm.xorRR64(0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(11);
+        this.asm.emitCallTeardown();
+        int vP = this.allocLocal("__val_ptr");
+        this.asm.movMBaseR(5, 0, vP);
+        for (int zi = 0; zi < 14; zi++) {
+            this.asm.movRMBase(0, 5, vP);
+            this.asm.movRI64(1, 0);
+            this.asm.movMBaseR(0, 1, zi * 8);
+        }
+        int[] vArgs = [];
+        // child(0) is the `Value` receiver; arguments start at child(1).
+        for (int ai = 1; ai < call.childCount(); ai++) {
+            this.genExpr(call.child(ai));
+            int t = this.allocLocal("__val_arg");
+            this.asm.movMBaseR(5, 0, t);
+            vArgs.add(t);
+        }
+        int tag = 0;
+        int fOff = 8;
+        if (this.strEq(m, "makeInt")) { tag = 1; fOff = 8; }
+        elif (this.strEq(m, "makeFloat")) { tag = 2; fOff = 16; }
+        elif (this.strEq(m, "makeBool")) { tag = 3; fOff = 24; }
+        elif (this.strEq(m, "makeString")) { tag = 4; fOff = 32; }
+        elif (this.strEq(m, "makeChar")) { tag = 5; fOff = 40; }
+        elif (this.strEq(m, "makeArray")) { tag = 6; fOff = 48; }
+        elif (this.strEq(m, "makeTuple")) { tag = 7; fOff = 48; }
+        elif (this.strEq(m, "makeObject")) { tag = 8; fOff = 56; }

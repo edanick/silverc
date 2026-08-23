@@ -1,0 +1,100 @@
+                    if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
+                        return "bool";
+                    }
+                }
+                if (this.strEq(cname, "reverse")) {
+                    if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
+                        return recvType;
+                    }
+                }
+                if ((this.strEq(cname, "pad") || this.strEq(cname, "padLeft") || this.strEq(cname, "padRight") || this.strEq(cname, "slugify")) && this.strEq(recvType, "string")) {
+
+                    return "string";
+                }
+            }
+            string cls = recvType;
+            if (expr.isMember && expr.childCount() > 0 && this.strEq(cls, "")) {
+                Node recv = expr.child(0);
+                cls = this.inferExprType(recv);
+            }
+            for (int i = 0; i < this.funcNames.length; i++) {
+                if (this.strEq(this.funcNames[i], cname) && this.typeNameEq(this.funcClasses[i], cls)) {
+                    return this.funcRetTypes[i];
+                }
+            }
+            for (int i = 0; i < this.funcNames.length; i++) {
+                if (this.strEq(this.funcNames[i], cname)) {
+                    return this.funcRetTypes[i];
+                }
+            }
+            if (this.strEq(cname, "readString") || this.strEq(cname, "readFile") || this.strEq(cname, "input") || this.strEq(cname, "readLine")) { return "string"; }
+            if (this.strEq(cname, "strlen") || this.strEq(cname, "len")) { return "int"; }
+            if (this.strEq(cname, "getenv")) { return "string"; }
+            if (this.strEq(cname, "getExt") || this.strEq(cname, "getExtension")) { return "string"; }
+            if (this.strEq(cname, "cargs")) { return "string[]"; }
+            if (this.strEq(cname, "findFieldType")) { return "string"; }
+            if (this.strEq(cname, "findFieldOffset")) { return "int"; }
+            return "";
+        }
+        if (expr.kind == 7) {
+            if (expr.op == 1) {
+                string lt = this.inferExprType(expr.child(0));
+                string rt = this.inferExprType(expr.child(1));
+                if (this.strEq(lt, "string") || this.strEq(rt, "string")) {
+                    return "string";
+                }
+                return "int";
+            }
+            // Comparisons (==, !=, <, <=, >, >=, &&, ||) yield bool; every
+            // other arithmetic/bitwise op yields int. Without these cases,
+            // (a + b).toString() failed to be recognized as a builtin member
+            // call and was lowered as a user call instead.
+            if (expr.op >= 5 && expr.op <= 12) {
+                return "bool";
+            }
+            return "int";
+        }
+        return "";
+    }
+
+    public string inferMemberAccessType(Node expr) {
+        Node obj = expr.child(0);
+        string fieldName = expr.name;
+        // os.name / os.version / os.build → string
+        if (obj.kind == 6 && this.strEq(obj.name, "os")) { return "string"; }
+        string objType = this.inferExprType(obj);
+        string fieldType = this.findFieldType(objType, fieldName);
+        return fieldType;
+    }
+
+    public int findFieldOffsetInAllClasses(string fieldName) {
+        for (int i = 0; i < this.classFieldNames.length; i++) {
+            if (this.strEq(this.classFieldNames[i], fieldName)) {
+                int off = this.classFieldOffsets[i];
+                int unique = 1;
+                for (int j = 0; j < this.classFieldNames.length; j++) {
+                    if (j != i && this.strEq(this.classFieldNames[j], fieldName)) {
+                        unique = 0;
+                    }
+                }
+                if (unique == 1) {
+                    return off;
+                }
+            }
+        }
+        return -1;
+    }
+
+    public void genArrayIndex(Node idx) {
+        Node arrNode = idx.child(0);
+        Node idxNode = idx.child(1);
+        if (this.isDictType(this.inferReceiverType(arrNode))) {
+            this.genDictIndexGet(idx);
+            return;
+        }
+        // Lower this.field[index] directly.  Going through the generic
+        // member-expression path evaluates a field receiver across a nested
+        // index expression and is not stable in later self-hosted stages.
+        if (arrNode.kind == 13) {
+            Node arrObj = arrNode.child(0);
+            if (arrObj.kind == 6 && this.strEq(arrObj.name, "this")) {

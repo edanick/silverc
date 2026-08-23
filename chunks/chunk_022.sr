@@ -1,0 +1,100 @@
+    this.emitFunctionBody(func);
+}    public void emitUtf8ConsoleSetup() {
+        // Silver strings and file contents are UTF-8 bytes. Configure the
+        // Windows console so printf/WriteFile displays those bytes correctly.
+        this.asm.movRI64(1, 65001);
+        this.asm.emitCallSetup(0);
+        this.addImportPatch("kernel32.dll", "SetConsoleOutputCP");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+    }
+
+    public void emitFunctionBody(Node func) {
+
+        int isMethod = 0;
+        if (!this.strEq(this.currentClassName, "")) {
+            isMethod = 1;
+        }
+        string savedClass = this.currentClassName;
+        int retLbl = this.newLabel();
+        int exitLbl = this.newLabel();
+        this.currentReturnLabel = retLbl;
+        this.currentIsMain = this.strEq(func.name, "main") && this.strEq(this.currentClassName, "");
+        // Reserve member-call argument slots before emitting the function
+        // prologue.  Calls can nest while generating expressions; keeping a
+        // fixed pool avoids changing stackSize after RSP has been reserved.
+        this.funcCallArgTemps = [];
+        this.funcCallArgCount = 0;
+        this.scratchBaseOffset = -8 * (this.localOffsets.length + 1);
+        for (int si = 0; si < 64; si = si + 1) {
+            int scratchOff = this.allocLocal("__call_scratch");
+            this.funcCallArgTemps.add(scratchOff);
+        }
+        if (func.childCount() > 1) {
+            Node body = func.child(1);
+            this.allocLocals(body);
+            this.stackSize = ((this.stackSize + 15) / 16) * 16;
+            int initialStackSize = this.stackSize;
+            int subRspPatchPos = -1;
+            // RBP is the stable frame anchor. Align the working stack before
+            // reserving locals so every generated function enters calls with
+            // the Win64 16-byte stack invariant, even when its caller's RSP
+            // was not aligned. The epilogue restores RSP from RBP because an
+            // AND operation cannot be undone by adding stackSize.
+            this.asm.andRImm(4, -16);
+            this.asm.emitU8(0x48);
+            this.asm.emitU8(0x81);
+            this.asm.emitU8(0xEC);
+            this.asm.emitU32(this.stackSize);
+            subRspPatchPos = this.asm.buf.length - 4;
+            if (isMethod == 1) {
+                int thisOff = this.findLocal("this");
+                this.asm.movMBaseR(5, 1, thisOff);
+                int[] paramRegsMb = [2, 8, 9];
+                if (func.childCount() > 0) {
+                    Node params = func.child(0);
+                    for (int i = 0; i < params.childCount(); i++) {
+                        int poff = this.findLocal(params.child(i).name);
+                        if (poff != 0) {
+                            if (i < 3) {
+                                this.asm.movMBaseR(5, paramRegsMb[i], poff);
+                            } else {
+                                // Method ABI: `this` is RCX, declared params
+                                // use RDX/R8/R9, and params 4+ come from the
+                                // caller's stack. After push rbp and the local
+                                // frame, the first stack argument is at
+                                // [RBP+48]: return address (8), saved frame
+                                // pointer (8), shadow space (32).
+                                this.asm.movRMBase(0, 5, 48 + (i - 3) * 8);
+                                this.asm.movMBaseR(5, 0, poff);
+                            }
+                        }
+                    }
+                }
+            } else {
+                int[] paramRegsFb = [1, 2, 8, 9];
+                if (func.childCount() > 0) {
+                    Node params = func.child(0);
+                    for (int i = 0; i < params.childCount(); i++) {
+                        int poff = this.findLocal(params.child(i).name);
+                        if (poff != 0) {
+                            if (i < 4) {
+                                this.asm.movMBaseR(5, paramRegsFb[i], poff);
+                            } else {
+                                // Free-function ABI: params 1-4 use RCX/RDX/
+                                // R8/R9; params 5+ come from the caller's
+                                // stack at [RBP+48], [RBP+56], ... (return
+                                // address 8 + saved frame pointer 8 + shadow
+                                // space 32).
+                                this.asm.movRMBase(0, 5, 48 + (i - 4) * 8);
+                                this.asm.movMBaseR(5, 0, poff);
+                            }
+                        }
+                    }
+                }
+            }
+            if (this.currentIsMain) {
+                this.emitUtf8ConsoleSetup();
+            }

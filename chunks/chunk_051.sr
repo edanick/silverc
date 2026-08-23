@@ -1,0 +1,100 @@
+            if (targetOff >= 0) {
+                int callPos = this.asm.buf.length;
+                int rel32 = targetOff - (callPos + 5);
+                this.asm.callRel32(rel32);
+            } else {
+                this.asm.callRel32(0);
+                this.forwardCalls.add(this.asm.buf.length - 4);
+                this.forwardCallNames.add(name);
+                this.forwardCallClasses.add(lookupClass);
+            }
+            this.asm.emitCallTeardown();
+            this.emitExcCheck();
+            return;
+        }
+        // These helpers have an out-parameter internally and therefore cannot
+        // use the ordinary four-register external-call path. Handle them
+        // before argument marshalling so they pass a real POINT pointer.
+        if (this.strEq(name, "GetCursorX")) {
+            this.genCursorXCall();
+            this.emitExcCheck();
+            return;
+        } elif (this.strEq(name, "GetCursorY")) {
+            this.genCursorYCall();
+            this.emitExcCheck();
+            return;
+        }
+        int extArgCount = call.childCount() - argStart;
+        int extStack = 0;
+        if (extArgCount > 4) { extStack = (extArgCount - 4) * 8; }
+        this.asm.emitCallSetup(extStack);
+        int[] argRegs2 = [1, 2, 8, 9];
+        int nargs2 = extArgCount;
+        if (nargs2 > 4) { nargs2 = 4; }
+        // Spill every argument to the shadow space / stack slots before
+        // loading the argument registers (nested calls clobber volatile regs).
+        for (int i = 0; i < extArgCount; i++) {
+            this.genExpr(call.child(i + argStart));
+            if (i < 4) {
+                this.asm.movMBaseR(4, 0, i * 8);
+            } else {
+                // Win64: args 5+ go at [rsp+32], [rsp+40], ... (same layout as
+                // internal function calls above). Storing instead of pushing keeps
+                // the argument order correct (pushing reversed the order).
+                this.asm.movMBaseR(4, 0, 32 + (i - 4) * 8);
+            }
+        }
+        for (int i = 0; i < nargs2; i++) {
+            this.asm.movRMBase(argRegs2[i], 4, i * 8);
+        }
+        bool isWin32 = false;
+        string win32Dll = "";
+        if (this.strEq(name, "FindFirstFileA") || this.strEq(name, "FindNextFileA") || this.strEq(name, "FindClose") || this.strEq(name, "DeleteFileA") || this.strEq(name, "MoveFileA") || this.strEq(name, "GetFileAttributesA") || this.strEq(name, "CreateDirectoryA") || this.strEq(name, "RemoveDirectoryA") || this.strEq(name, "SetCurrentDirectoryA") || this.strEq(name, "CreateProcessA") || this.strEq(name, "WaitForSingleObject") || this.strEq(name, "GetStdHandle") || this.strEq(name, "SetConsoleTextAttribute") || this.strEq(name, "GetConsoleScreenBufferInfo") || this.strEq(name, "SetConsoleCursorPosition") || this.strEq(name, "GetModuleHandleA") || this.strEq(name, "LoadLibraryA") || this.strEq(name, "GetProcAddress") || this.strEq(name, "Sleep") || this.strEq(name, "GetTickCount") || this.strEq(name, "GetLastError") || this.strEq(name, "GetCurrentDirectoryA") || this.strEq(name, "WriteConsoleA") || this.strEq(name, "ReadConsoleA") || this.strEq(name, "GetConsoleMode") || this.strEq(name, "SetConsoleMode") || this.strEq(name, "CreatePipe") || this.strEq(name, "GetExitCodeProcess") || this.strEq(name, "CreateFileA") || this.strEq(name, "GetFileSize") || this.strEq(name, "ReadFile") || this.strEq(name, "WriteFile") || this.strEq(name, "CloseHandle") || this.strEq(name, "GetFileAttributesW") || this.strEq(name, "SetFilePointer") || this.strEq(name, "GetCurrentProcessId") || this.strEq(name, "GetCurrentProcess") || this.strEq(name, "GetCurrentThreadId") || this.strEq(name, "GetCurrentThread") || this.strEq(name, "GetEnvironmentVariableA") || this.strEq(name, "GetEnvironmentVariableW") || this.strEq(name, "SetEnvironmentVariableA") || this.strEq(name, "SetEnvironmentVariableW") || this.strEq(name, "ExpandEnvironmentStringsA") || this.strEq(name, "GetEnvironmentStringsA") || this.strEq(name, "FreeEnvironmentStringsA") || this.strEq(name, "GetTempPathA") || this.strEq(name, "GetComputerNameA") || this.strEq(name, "GetUserNameA") || this.strEq(name, "CopyFileA") || this.strEq(name, "SetFileAttributesA") || this.strEq(name, "GetFullPathNameA") || this.strEq(name, "GetModuleFileNameA") || this.strEq(name, "QueryPerformanceCounter") || this.strEq(name, "QueryPerformanceFrequency") || this.strEq(name, "GetTickCount64") || this.strEq(name, "TerminateProcess") || this.strEq(name, "OpenProcess") || this.strEq(name, "GetProcessId") || this.strEq(name, "FlushFileBuffers") || this.strEq(name, "GetFileSizeEx") || this.strEq(name, "CreateProcessW") || this.strEq(name, "CreateProcess") || this.strEq(name, "GetVersionExA") || this.strEq(name, "GetSystemDirectoryA") || this.strEq(name, "GetWindowsDirectoryA") || this.strEq(name, "GetLocalTime") || this.strEq(name, "GetSystemTime") || this.strEq(name, "OutputDebugStringA") || this.strEq(name, "IsDebuggerPresent") || this.strEq(name, "GetCommandLineA") || this.strEq(name, "GlobalAlloc") || this.strEq(name, "GlobalFree") || this.strEq(name, "VirtualAlloc") || this.strEq(name, "VirtualFree") || this.strEq(name, "HeapFree") || this.strEq(name, "GetProcessHeap") || this.strEq(name, "lstrlenA") || this.strEq(name, "lstrcpyA") || this.strEq(name, "lstrcatA") || this.strEq(name, "lstrcmpA") || this.strEq(name, "SetThreadPriority") || this.strEq(name, "QueryFullProcessImageNameA")) {
+            isWin32 = true;
+            win32Dll = "kernel32.dll";
+        } elif (this.strEq(name, "memcpy") || this.strEq(name, "memset") || this.strEq(name, "memmove") || this.strEq(name, "memcmp") || this.strEq(name, "strlen") || this.strEq(name, "strcmp") || this.strEq(name, "strchr") || this.strEq(name, "strstr") || this.strEq(name, "strrchr") || this.strEq(name, "strcpy") || this.strEq(name, "strcat") || this.strEq(name, "strncmp") || this.strEq(name, "strncat") || this.strEq(name, "strncpy") || this.strEq(name, "strtok") || this.strEq(name, "strpbrk") || this.strEq(name, "strspn") || this.strEq(name, "strcspn") || this.strEq(name, "atoi") || this.strEq(name, "atol") || this.strEq(name, "atoll") || this.strEq(name, "strtol") || this.strEq(name, "strtoll") || this.strEq(name, "malloc") || this.strEq(name, "free") || this.strEq(name, "realloc") || this.strEq(name, "calloc") || this.strEq(name, "printf") || this.strEq(name, "fprintf") || this.strEq(name, "sprintf") || this.strEq(name, "sscanf") || this.strEq(name, "fopen") || this.strEq(name, "fclose") || this.strEq(name, "fread") || this.strEq(name, "fwrite") || this.strEq(name, "fflush") || this.strEq(name, "fgets") || this.strEq(name, "fputs") || this.strEq(name, "fseek") || this.strEq(name, "ftell") || this.strEq(name, "system") || this.strEq(name, "getenv") || this.strEq(name, "putenv") || this.strEq(name, "time") || this.strEq(name, "rand") || this.strEq(name, "srand") || this.strEq(name, "abs") || this.strEq(name, "labs") || this.strEq(name, "toupper") || this.strEq(name, "tolower") || this.strEq(name, "isalpha") || this.strEq(name, "isdigit") || this.strEq(name, "isspace") || this.strEq(name, "isprint") || this.strEq(name, "isalnum") || this.strEq(name, "isxdigit") || this.strEq(name, "isupper") || this.strEq(name, "islower")) {
+            isWin32 = true;
+            win32Dll = "msvcrt.dll";
+        } elif (this.strEq(name, "socket") || this.strEq(name, "bind") || this.strEq(name, "listen") || this.strEq(name, "accept") || this.strEq(name, "recv") || this.strEq(name, "send") || this.strEq(name, "closesocket") || this.strEq(name, "setsockopt") || this.strEq(name, "WSAStartup") || this.strEq(name, "WSACleanup") || this.strEq(name, "htons") || this.strEq(name, "inet_addr") || this.strEq(name, "getaddrinfo") || this.strEq(name, "freeaddrinfo") || this.strEq(name, "ioctlsocket") || this.strEq(name, "select") || this.strEq(name, "connect") || this.strEq(name, "shutdown") || this.strEq(name, "WSAGetLastError")) {
+            isWin32 = true;
+            win32Dll = "ws2_32.dll";
+        } elif (this.strEq(name, "InternetOpenA") || this.strEq(name, "InternetConnectA") || this.strEq(name, "InternetOpenUrlA") || this.strEq(name, "InternetReadFile") || this.strEq(name, "InternetReadFileExA") || this.strEq(name, "InternetCloseHandle") || this.strEq(name, "HttpSendRequestA") || this.strEq(name, "HttpSendRequestExA") || this.strEq(name, "InternetQueryDataAvailable") || this.strEq(name, "InternetSetOptionA") || this.strEq(name, "InternetQueryOptionA") || this.strEq(name, "HttpQueryInfoA") || this.strEq(name, "InternetWriteFile") || this.strEq(name, "InternetGetConnectedState") || this.strEq(name, "InternetCrackUrlA") || this.strEq(name, "InternetCanonicalizeUrlA") || this.strEq(name, "InternetSetStatusCallback")) {
+            isWin32 = true;
+            win32Dll = "wininet.dll";
+        } elif (this.strEq(name, "ShellExecuteA") || this.strEq(name, "ShellExecuteW") || this.strEq(name, "ShellExecuteExA") || this.strEq(name, "ShellExecuteExW")) {
+            isWin32 = true;
+            win32Dll = "shell32.dll";
+        } elif (this.strEq(name, "WinHttpOpen") || this.strEq(name, "WinHttpConnect") || this.strEq(name, "WinHttpOpenRequest") || this.strEq(name, "WinHttpSendRequest") || this.strEq(name, "WinHttpReceiveResponse") || this.strEq(name, "WinHttpReadData") || this.strEq(name, "WinHttpCloseHandle") || this.strEq(name, "WinHttpQueryHeaders") || this.strEq(name, "WinHttpSetOption")) {
+            isWin32 = true;
+            win32Dll = "winhttp.dll";
+        } elif (this.strEq(name, "keybd_event") || this.strEq(name, "VkKeyScanA") || this.strEq(name, "GetKeyState") || this.strEq(name, "GetAsyncKeyState") || this.strEq(name, "GetKeyboardState") || this.strEq(name, "SetKeyboardState") || this.strEq(name, "MapVirtualKeyA") || this.strEq(name, "SendInput")) {
+            // Win32 keyboard - user32.dll (DOCS/229, mirrors silverc-rs
+            // keyboard.rs + the user32 dispatcher added later).
+            isWin32 = true;
+            win32Dll = "user32.dll";
+        } elif (this.strEq(name, "mouse_event") || this.strEq(name, "GetCursorPos") || this.strEq(name, "GetCursorX") || this.strEq(name, "GetCursorY") || this.strEq(name, "SetCursorPos") || this.strEq(name, "SetCursor") || this.strEq(name, "ClipCursor") || this.strEq(name, "GetClipCursor") || this.strEq(name, "GetDoubleClickTime") || this.strEq(name, "SetDoubleClickTime") || this.strEq(name, "GetForegroundWindow") || this.strEq(name, "GetWindowTextA") || this.strEq(name, "GetWindowThreadProcessId")) {
+            // Win32 mouse / cursor - same user32.dll but a distinct elif so
+            // the keyboard importer above cannot silently absorb a typo, and
+            // so mouse-specific extensions (SetCursor, ClipCursor) can be
+            // added without touching the keyboard list.
+            isWin32 = true;
+            win32Dll = "user32.dll";
+        } elif (this.strEq(name, "RegisterHotKey") || this.strEq(name, "UnregisterHotKey") || this.strEq(name, "MessageBeep") || this.strEq(name, "RegisterRawInputDevices") || this.strEq(name, "GetRawInputData") || this.strEq(name, "GetRawInputDeviceList")) {
+            // Hotkeys + raw input on user32.dll. Kept separate from the
+            // keyboard / mouse sections so future raw-input work can land in
+            // its own block.
+            isWin32 = true;
+            win32Dll = "user32.dll";
+        }
+        // kernel32 exports CreateProcessA/CreateProcessW, never bare
+        // CreateProcess (that spelling exists only as a C macro).  Map it to
+        // the ANSI import so source like std/process.sr links and runs.
+        string importName = name;
+        if (this.strEq(name, "CreateProcess")) { importName = "CreateProcessA"; }
+        if (isWin32) {
+            this.addImportPatch(win32Dll, importName);
+            this.asm.emitImm64(0, 0);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.callR64(0);
+        } else {
+            this.asm.callRel32(0);

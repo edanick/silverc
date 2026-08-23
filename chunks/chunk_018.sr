@@ -1,0 +1,100 @@
+                uniqueDlls.add(this.importDlls[i]);
+                groupSizes.add(0);
+                gIdx = uniqueDlls.length - 1;
+            }
+            groupSizes[gIdx] = groupSizes[gIdx] + 1;
+            importGroupIdx.add(gIdx);
+        }
+        int[] posInGroup = [];
+        for (int i = 0; i < this.importDlls.length; i++) {
+            posInGroup.add(0);
+        }
+        int[] runningCount = [];
+        for (int g = 0; g < uniqueDlls.length; g++) {
+            runningCount.add(0);
+        }
+        for (int i = 0; i < this.importDlls.length; i++) {
+            int g = importGroupIdx[i];
+            posInGroup[i] = runningCount[g];
+            runningCount[g] = runningCount[g] + 1;
+        }
+        int[] groupStart = [];
+        int runningOff = 0;
+        for (int g = 0; g < uniqueDlls.length; g++) {
+            groupStart.add(runningOff);
+            runningOff = runningOff + groupSizes[g] * 8 + 8;
+        }
+        int descBytes = (numGroups + 1) * 20;
+        for (int i = 0; i < this.importDlls.length; i++) {
+            int g = importGroupIdx[i];
+            iatAddrs[i] = descBytes + iltTotal + groupStart[g] + posInGroup[i] * 8;
+        }
+        return iatAddrs;
+    }
+
+    public void patchImportRefs(int[] code, int[] iatAddrs, int rdataRva) {
+        for (int i = 0; i < this.importPatchOffsets.length; i++) {
+            int patchPos = this.importPatchOffsets[i];
+            int funcIdx = this.importPatchFuncIndices[i];
+            int iatOff = iatAddrs[funcIdx];
+            int64 addr = 0x140000000 + rdataRva + iatOff;
+            code[patchPos] = addr & 0xFF;
+            code[patchPos + 1] = (addr >> 8) & 0xFF;
+            code[patchPos + 2] = (addr >> 16) & 0xFF;
+            code[patchPos + 3] = (addr >> 24) & 0xFF;
+            code[patchPos + 4] = (addr >> 32) & 0xFF;
+            code[patchPos + 5] = (addr >> 40) & 0xFF;
+            code[patchPos + 6] = (addr >> 48) & 0xFF;
+            code[patchPos + 7] = (addr >> 56) & 0xFF;
+        }
+    }
+
+    public void patchStringRefs(int[] code, int stringsStart, int rdataRva) {
+        for (int i = 0; i < this.stringPatchOffsets.length; i++) {
+            int patchPos = this.stringPatchOffsets[i];
+int strIdx = this.stringPatchIndices[i];
+        StrEntry se2 = this.strings[strIdx];
+        int dataOff = se2.dataOffset;
+            int64 addr = 0x140000000 + rdataRva + stringsStart + dataOff;
+            code[patchPos] = addr & 0xFF;
+            code[patchPos + 1] = (addr >> 8) & 0xFF;
+            code[patchPos + 2] = (addr >> 16) & 0xFF;
+            code[patchPos + 3] = (addr >> 24) & 0xFF;
+            code[patchPos + 4] = (addr >> 32) & 0xFF;
+            code[patchPos + 5] = (addr >> 40) & 0xFF;
+            code[patchPos + 6] = (addr >> 48) & 0xFF;
+            code[patchPos + 7] = (addr >> 56) & 0xFF;
+        }
+    }
+
+    public void genProgram(Node[] program) {
+        this.collectClassLayouts(program);
+        for (int i = 0; i < program.length; i++) {
+            Node pi = program[i];
+            if (pi.kind == 104) {
+                this.constNames.add(pi.name);
+                if (pi.childCount() > 0 && pi.child(0).kind == 0) {
+                    this.constValues.add(pi.child(0).intVal);
+                    this.constStringValues.add("");
+                    this.constIsString.add(0);
+                } elif (pi.childCount() > 0 && pi.child(0).kind == 2) {
+                    this.constValues.add(0);
+                    this.constStringValues.add(pi.child(0).strVal);
+                    this.constIsString.add(1);
+                } else {
+                    this.constValues.add(0);
+                    this.constStringValues.add("");
+                    this.constIsString.add(0);
+                }
+            }
+            if (pi.kind == 105) {
+                this.enumNames.add(pi.name);
+                for (int j = 0; j < pi.childCount(); j++) {
+                    Node member = pi.child(j);
+                    string fullName = pi.name + "." + member.name;
+                    this.constNames.add(fullName);
+                    this.constValues.add(member.intVal);
+                    this.constStringValues.add("");
+                    this.constIsString.add(0);
+                }
+            }

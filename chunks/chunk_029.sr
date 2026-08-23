@@ -1,0 +1,100 @@
+                if (expr.op == 1) {
+                    int t = this.newLabel();
+                    int e = this.newLabel();
+                    this.asm.cmpRI32(0, 0);
+                    this.asm.jeLabel(t);
+                    this.asm.movRI64(0, 0);
+                    this.asm.jmpLabel(e);
+                    this.asm.bindLabel(t);
+                    this.asm.movRI64(0, 1);
+                    this.asm.bindLabel(e);
+                } elif (expr.op == 0) {
+                    this.asm.negR64(0);
+                }
+            }
+        } elif (kind == 24) {
+            this.genArrayIndex(expr);
+        } elif (kind == 13) {
+            this.genMemberAccess(expr);
+        } elif (kind == 65) {
+            int elseLbl = this.newLabel();
+            int endLbl = this.newLabel();
+            this.genExpr(expr.child(0));
+            this.asm.cmpRI32(0, 0);
+            this.asm.jeLabel(elseLbl);
+            this.genExpr(expr.child(1));
+            this.asm.jmpLabel(endLbl);
+            this.asm.bindLabel(elseLbl);
+            this.genExpr(expr.child(2));
+            this.asm.bindLabel(endLbl);
+        } elif (kind == 67) {
+            this.genSlice(expr);
+        }
+    }
+
+    public void genMemberAccess(Node expr) {
+        Node obj = expr.child(0);
+        string fieldName = expr.name;
+        if (obj.kind == 6) {
+            for (int ei = 0; ei < this.enumNames.length; ei++) {
+                if (this.strEq(this.enumNames[ei], obj.name)) {
+                    string fullName = obj.name + "." + fieldName;
+                    for (int ci = 0; ci < this.constNames.length; ci++) {
+                        if (this.strEq(this.constNames[ci], fullName)) {
+                            this.asm.emitImm64(0, this.constValues[ci]);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        // os.name / os.version / os.build - builtin OS detection fields
+        if (obj.kind == 6 && this.strEq(obj.name, "console") && this.strEq(fieldName, "title")) {
+            // The self-hosted backend uses the documented empty fallback for
+            // title reads on hosts where a native title query is unavailable.
+            this.emitLlmaiStringLiteral("");
+            return;
+        }
+        if (obj.kind == 6 && this.strEq(obj.name, "os")) {
+            if (this.strEq(fieldName, "name")) {
+                this.emitLlmaiStringLiteral("windows");
+                return;
+            }
+            if (this.strEq(fieldName, "version")) {
+                this.genOsVersionCall();
+                return;
+            }
+            if (this.strEq(fieldName, "build")) {
+                this.genOsBuildCall();
+                return;
+            }
+        }
+        if (this.strEq(fieldName, "length")) {
+            string objType = this.inferExprType(obj);
+            if (this.strEq(objType, "string")) {
+                // Use the same aligned imported strlen path as the explicit
+                // strlen() builtin.  Keeping this out of the hand-written
+                // byte loop avoids a stage-sensitive movzx lowering issue in
+                // d2 while preserving the string length semantics.
+                this.genExpr(obj);
+                this.asm.movRR64(1, 0);
+                this.addImportPatch("ucrtbase.dll", "strlen");
+                int sLen = 0xDEADBEEFCAFEBAD1;
+                this.asm.emitImm64(0, sLen);
+                this.asm.movRMBase(0, 0, 0);
+                this.asm.emitCallSetup(0);
+                this.asm.callR64(0);
+                this.asm.emitCallTeardown();
+                return;
+            }
+            this.genExpr(obj);
+            this.asm.movRMBase(0, 0, -8);
+            return;
+        }
+        if (obj.kind == 6 && this.strEq(obj.name, "this")) {
+            int thisOff = this.findLocal("this");
+            int fieldOff = this.findFieldOffset(this.currentClassName, fieldName);
+            if (fieldOff < 0) { return; }
+            this.asm.movRMBase(0, 5, thisOff);
+            this.asm.movRMBase(0, 0, fieldOff);
+            return;

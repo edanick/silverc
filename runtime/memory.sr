@@ -1,0 +1,243 @@
+mod export memory;
+
+public const int SM_OK = 0;
+public const int SM_ERR_NULL = 1;
+public const int SM_ERR_MAGIC = 2;
+public const int SM_ERR_VERSION = 3;
+public const int SM_ERR_HEADER_SIZE = 4;
+public const int SM_ERR_FLAGS = 5;
+public const int SM_ERR_KIND = 6;
+public const int SM_ERR_CODEC = 7;
+public const int SM_ERR_RESERVED = 8;
+public const int SM_ERR_ID = 9;
+public const int SM_ERR_SIZE = 10;
+public const int SM_ERR_INDEX = 11;
+public const int SM_ERR_BOUNDS = 12;
+public const int SM_ERR_NAME_HASH = 13;
+public const int SM_ERR_CHECKSUM = 14;
+
+public const int SM_HEADER_SIZE = 96;
+public const int SM_FORMAT_VERSION = 1;
+public const int SM_INDEX_RECORD_SIZE = 32;
+public const int SM_DEFAULT_CHUNK_SIZE = 65536;
+public const int SM_MAX_CHUNK_SIZE = 67108864;
+public const int SM_INDEX_OFFSET_REQUIRED = 96;
+public const int SM_HEADER_CHECKSUM_OFFSET = 80;
+public const int SM_NAME_HASH_OFFSET = 84;
+
+public const int SM_FLAG_COMPRESSED = 0x0001;
+public const int SM_FLAG_READ_ONLY = 0x0002;
+public const int SM_FLAG_TEMPORARY = 0x0004;
+public const int SM_FLAG_HAS_INDEX = 0x0008;
+public const int SM_FLAG_CHUNK_CHECKSUMS = 0x0010;
+public const int SM_FLAG_DELETE_ON_EXIT = 0x0020;
+public const int SM_FLAG_SALTED_NAME = 0x0040;
+public const int SM_FLAG_REQUIRED = 0x001c;
+public const int SM_FLAG_UNKNOWN_MASK = 0xff80;
+
+public const int SM_KIND_STRING = 1;
+public const int SM_KIND_ARRAY = 2;
+public const int SM_KIND_DICT = 3;
+public const int SM_KIND_BYTES = 4;
+public const int SM_KIND_OTHER_BUFFER = 5;
+
+public const int SM_CODEC_NONE = 0;
+
+class SmHeader {
+    public int format_version;
+    public int header_size;
+    public int flags;
+    public int kind;
+    public int codec;
+    public int64 page_id;
+    public int64 owner_id;
+    public int64 generation;
+    public int64 logical_size;
+    public int64 payload_size;
+    public int chunk_size;
+    public int chunk_count;
+    public int64 index_offset;
+    public int64 index_size;
+    public int payload_checksum;
+    public int64 name_hash;
+}
+
+public int64 smFnv1_64(string data) {
+    int64 hash = 14695981039346656037;
+    for (int i = 0; i < data.length; i = i + 1) {
+        hash = hash * 1099511628211;
+        hash = hash ^ data[i];
+    }
+    return hash;
+}
+
+int crc32cBytes(byte[] data) {
+    int crc = 0xffffffff;
+    for (int i = 0; i < data.length; i = i + 1) {
+        crc = crc ^ data[i];
+        for (int bit = 0; bit < 8; bit = bit + 1) {
+            int mask = -(crc & 1);
+            crc = ((crc >> 1) & 0x7fffffff) ^ (0x82f63b78 & mask);
+        }
+    }
+    return (crc ^ 0xffffffff) & 0xffffffff;
+}
+
+public int smCrc32c(string data) {
+    int crc = 0xffffffff;
+    for (int i = 0; i < data.length; i = i + 1) {
+        crc = crc ^ data[i];
+        for (int bit = 0; bit < 8; bit = bit + 1) {
+            int mask = -(crc & 1);
+            crc = ((crc >> 1) & 0x7fffffff) ^ (0x82f63b78 & mask);
+        }
+    }
+    return (crc ^ 0xffffffff) & 0xffffffff;
+}
+
+bool uint64Gt(int64 a, int64 b) {
+    if (a >= 0 && b >= 0) { return a > b; }
+    if (a < 0 && b < 0) { return a > b; }
+    if (a < 0) { return true; }
+    return false;
+}
+
+int smGetU16(byte[] p, int off) {
+    return p[off] | (p[off + 1] << 8);
+}
+
+int smGetU32(byte[] p, int off) {
+    return p[off] | (p[off + 1] << 8) | (p[off + 2] << 16) | (p[off + 3] << 24);
+}
+
+int64 smGetU64(byte[] p, int off) {
+    int64 v = 0;
+    for (int i = 0; i < 8; i = i + 1) {
+        v = v | (((int64)p[off + i]) << (i * 8));
+    }
+    return v;
+}
+
+void smPutU16(byte[] p, int off, int v) {
+    p[off] = v & 0xff;
+    p[off + 1] = (v >> 8) & 0xff;
+}
+
+void smPutU32(byte[] p, int off, int v) {
+    p[off] = v & 0xff;
+    p[off + 1] = (v >> 8) & 0xff;
+    p[off + 2] = (v >> 16) & 0xff;
+    p[off + 3] = (v >> 24) & 0xff;
+}
+
+void smPutU64(byte[] p, int off, int64 v) {
+    for (int i = 0; i < 8; i = i + 1) {
+        p[off + i] = (v >> (i * 8)) & 0xff;
+    }
+}
+
+public int smHeaderValidate(SmHeader h, int64 fileSize, int checkFileSize, int64 expectedNameHash, int checkNameHash) {
+    if (h.format_version != SM_FORMAT_VERSION) { return SM_ERR_VERSION; }
+    if (h.header_size != SM_HEADER_SIZE) { return SM_ERR_HEADER_SIZE; }
+    if ((h.flags & SM_FLAG_UNKNOWN_MASK) != 0 || (h.flags & SM_FLAG_REQUIRED) != SM_FLAG_REQUIRED) {
+        return SM_ERR_FLAGS;
+    }
+    if (h.kind < SM_KIND_STRING || h.kind > SM_KIND_OTHER_BUFFER) { return SM_ERR_KIND; }
+    if (h.codec != SM_CODEC_NONE || (h.flags & SM_FLAG_COMPRESSED) != 0) { return SM_ERR_CODEC; }
+    if (h.page_id == 0 || h.owner_id == 0 || h.generation == 0) { return SM_ERR_ID; }
+    if (h.chunk_size == 0 || h.chunk_size > SM_MAX_CHUNK_SIZE) { return SM_ERR_SIZE; }
+    int64 expectedCount = h.logical_size / (int64)h.chunk_size;
+    if (h.logical_size % (int64)h.chunk_size != 0) { expectedCount = expectedCount + 1; }
+    if (expectedCount > 4294967295) { return SM_ERR_INDEX; }
+    if ((int)expectedCount != h.chunk_count) { return SM_ERR_INDEX; }
+    if (h.index_offset != SM_INDEX_OFFSET_REQUIRED) { return SM_ERR_INDEX; }
+    int64 expectedIndexSize = expectedCount * (int64)SM_INDEX_RECORD_SIZE;
+    if (h.index_size != expectedIndexSize) { return SM_ERR_INDEX; }
+    if (uint64Gt(h.index_offset, 0xffffffffffffffff - h.index_size)) { return SM_ERR_INDEX; }
+    int64 dataOffset = h.index_offset + h.index_size;
+    if (h.payload_size != h.logical_size) { return SM_ERR_SIZE; }
+    if (checkNameHash != 0 && h.name_hash != expectedNameHash) { return SM_ERR_NAME_HASH; }
+    if (checkFileSize != 0) {
+        if (uint64Gt(dataOffset, 0xffffffffffffffff - h.payload_size)) { return SM_ERR_BOUNDS; }
+        if (dataOffset + h.payload_size != fileSize) { return SM_ERR_BOUNDS; }
+    }
+    return SM_OK;
+}
+
+public byte[] smHeaderEncode(SmHeader h) {
+    int result = smHeaderValidate(h, 0, 0, 0, 0);
+    if (result != SM_OK) { return new byte[0]; }
+    byte[] out = new byte[96];
+    for (int i = 0; i < 96; i = i + 1) { out[i] = 0; }
+    out[0] = 83;
+    out[1] = 77;
+    smPutU16(out, 2, h.format_version);
+    smPutU16(out, 4, h.header_size);
+    smPutU16(out, 6, h.flags);
+    out[8] = h.kind;
+    out[9] = h.codec;
+    smPutU64(out, 12, h.page_id);
+    smPutU64(out, 20, h.owner_id);
+    smPutU64(out, 28, h.generation);
+    smPutU64(out, 36, h.logical_size);
+    smPutU64(out, 44, h.payload_size);
+    smPutU32(out, 52, h.chunk_size);
+    smPutU32(out, 56, h.chunk_count);
+    smPutU64(out, 60, h.index_offset);
+    smPutU64(out, 68, h.index_size);
+    smPutU32(out, 76, h.payload_checksum);
+    smPutU64(out, SM_NAME_HASH_OFFSET, h.name_hash);
+    smPutU32(out, SM_HEADER_CHECKSUM_OFFSET, crc32cBytes(out));
+    return out;
+}
+
+public int smHeaderDecode(byte[] in, SmHeader h) {
+    if (in.length != 96) { return SM_ERR_NULL; }
+    if (in[0] != 83 || in[1] != 77) { return SM_ERR_MAGIC; }
+    if (smGetU16(in, 10) != 0 || smGetU32(in, 92) != 0) { return SM_ERR_RESERVED; }
+    byte[] work = new byte[96];
+    for (int i = 0; i < 96; i = i + 1) { work[i] = in[i]; }
+    int storedChecksum = smGetU32(work, 80);
+    work[80] = 0;
+    work[81] = 0;
+    work[82] = 0;
+    work[83] = 0;
+    int calcChecksum = crc32cBytes(work);
+    if (storedChecksum != calcChecksum) { return SM_ERR_CHECKSUM; }
+    h.format_version = smGetU16(in, 2);
+    h.header_size = smGetU16(in, 4);
+    h.flags = smGetU16(in, 6);
+    h.kind = in[8];
+    h.codec = in[9];
+    h.page_id = smGetU64(in, 12);
+    h.owner_id = smGetU64(in, 20);
+    h.generation = smGetU64(in, 28);
+    h.logical_size = smGetU64(in, 36);
+    h.payload_size = smGetU64(in, 44);
+    h.chunk_size = smGetU32(in, 52);
+    h.chunk_count = smGetU32(in, 56);
+    h.index_offset = smGetU64(in, 60);
+    h.index_size = smGetU64(in, 68);
+    h.payload_checksum = smGetU32(in, 76);
+    h.name_hash = smGetU64(in, 84);
+    return smHeaderValidate(h, 0, 0, 0, 0);
+}
+
+public string smResultString(int result) {
+    if (result == SM_OK) { return "ok"; }
+    if (result == SM_ERR_NULL) { return "null argument"; }
+    if (result == SM_ERR_MAGIC) { return "invalid magic"; }
+    if (result == SM_ERR_VERSION) { return "unsupported format version"; }
+    if (result == SM_ERR_HEADER_SIZE) { return "invalid header size"; }
+    if (result == SM_ERR_FLAGS) { return "invalid flags"; }
+    if (result == SM_ERR_KIND) { return "invalid page kind"; }
+    if (result == SM_ERR_CODEC) { return "unsupported codec"; }
+    if (result == SM_ERR_RESERVED) { return "reserved field is nonzero"; }
+    if (result == SM_ERR_ID) { return "invalid page identity"; }
+    if (result == SM_ERR_SIZE) { return "invalid page size"; }
+    if (result == SM_ERR_INDEX) { return "invalid chunk index"; }
+    if (result == SM_ERR_BOUNDS) { return "file bounds mismatch"; }
+    if (result == SM_ERR_NAME_HASH) { return "name hash mismatch"; }
+    if (result == SM_ERR_CHECKSUM) { return "checksum mismatch"; }
+    return "unknown Silver Memory error";
+}

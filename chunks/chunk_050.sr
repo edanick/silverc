@@ -1,0 +1,100 @@
+        // (SessionStore.get would otherwise shadow json_runtime.get).
+        bool isModuleCall = false;
+        if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6) {
+            string recvType = this.inferExprType(call.child(0));
+            bool recvIsClass = false;
+            for (int ci = 0; ci < this.classNames.length; ci++) {
+                if (this.typeNameEq(this.classNames[ci], recvType)) { recvIsClass = true; }
+            }
+            // Any receiver that is not a class instance and not `this` names a
+            // module: the call must resolve to the GLOBAL function (e.g.
+            // json_runtime.get, fs.read). An unknown identifier has recvType
+            // "" which is exactly the module case. Class methods of the
+            // current class must NOT shadow global functions here.
+            if (!recvIsClass && !this.strEq(recvType, "this")) {
+                isModuleCall = true;
+            }
+        }
+        int funcIdx = -1;
+        for (int i = 0; i < this.funcNames.length; i++) {
+            if (!isModuleCall && this.strEq(this.funcNames[i], name) && this.strEq(this.funcClasses[i], this.currentClassName)) {
+                funcIdx = i;
+            }
+        }
+        if (funcIdx < 0) {
+            for (int i = 0; i < this.funcNames.length; i++) {
+                if (this.strEq(this.funcNames[i], name) && this.strEq(this.funcClasses[i], "")) {
+                    funcIdx = i;
+                }
+            }
+        }
+        if (funcIdx < 0) {
+            for (int i = 0; i < this.funcNames.length; i++) {
+                if (this.strEq(this.funcNames[i], name)) {
+                    funcIdx = i;
+                }
+            }
+        }
+        string lookupClass = "";
+        if (funcIdx >= 0) {
+            lookupClass = this.funcClasses[funcIdx];
+        }
+        // Module-qualified global call (e.g. json_runtime.parse(raw)) parses as
+        // a member call whose child(0) is the module identifier. When the
+        // resolved function is a plain global function (no owning class), drop
+        // that receiver so it isn't evaluated as argument 0.
+        int argStart = 0;
+        if (isModuleCall || (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.strEq(lookupClass, ""))) {
+            argStart = 1;
+        }
+        if (funcIdx >= 0 && funcIdx < this.funcOffsets.length) {
+            int targetOff = this.funcOffsets[funcIdx];
+            int[] argRegs = [1, 2, 8, 9];
+            int explicitArgs = call.childCount() - argStart;
+            int totalArgs = explicitArgs;
+            if (funcIdx < this.funcParamCounts.length) {
+                int paramCount = this.funcParamCounts[funcIdx];
+                int paramStart = this.funcParamStarts[funcIdx];
+                while (totalArgs < paramCount && totalArgs + paramStart < this.funcParamHasDefaults.length && this.funcParamHasDefaults[totalArgs + paramStart] == 1) {
+                    totalArgs = totalArgs + 1;
+                }
+            }
+            // A bare call to a static method (e.g. stringMethod(...) inside
+            // BuiltinMethods) still uses the method ABI: RCX is the unused
+            // `this` slot and the declared parameters follow in RDX/R8/R9.
+            // Without the bias the arguments shift one register and corrupt
+            // string/object parameters.
+            bool staticMethodCall = !this.strEq(lookupClass, "");
+            int slotBias = 0;
+            if (staticMethodCall) { slotBias = 1; }
+            int slotTotal = totalArgs + slotBias;
+            int extraStack = 0;
+            if (slotTotal > 4) { extraStack = (slotTotal - 4) * 8; }
+            this.asm.emitCallSetup(extraStack);
+            if (staticMethodCall) {
+                this.asm.xorRR64(0, 0);
+                this.asm.movMBaseR(4, 0, 0);
+            }
+            // Evaluate every argument into RAX and spill it to the shadow
+            // space / stack-arg slots BEFORE loading the argument registers.
+            // Spilling first is required: a nested call in a later argument
+            // would otherwise clobber the volatile argument registers
+            // (rcx/rdx/r8/r9) already holding earlier arguments.
+            for (int i = 0; i < totalArgs; i++) {
+                if (i < explicitArgs) {
+                    this.genExpr(call.child(i + argStart));
+                } elif (funcIdx < this.funcParamStarts.length && this.funcParamStarts[funcIdx] + i < this.funcParamDefaults.length) {
+                    this.genExpr(this.funcParamDefaults[this.funcParamStarts[funcIdx] + i]);
+                } else {
+                    this.asm.xorRR64(0, 0);
+                }
+                int slot = i + slotBias;
+                if (slot < 4) {
+                    this.asm.movMBaseR(4, 0, slot * 8);
+                } else {
+                    this.asm.movMBaseR(4, 0, 32 + (slot - 4) * 8);
+                }
+            }
+            for (int i = 0; i < slotTotal && i < 4; i++) {
+                this.asm.movRMBase(argRegs[i], 4, i * 8);
+            }

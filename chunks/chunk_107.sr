@@ -1,0 +1,100 @@
+    }    private Node? parseItem() {
+        if (this.check(35)) { this.advance(); if (this.check(59)) { this.advance(); } this.advance(); this.expect(106); return null; }
+		if (this.check(36)) { return this.parseImport(); }
+        if (this.check(40)) { return this.parseConst(); }
+        if (this.check(32)) { return this.parseDef(); }
+        if (this.check(29)) { return this.parseStruct(); }
+        if (this.check(30)) { return this.parseClass(); }
+        if (this.check(31)) { return this.parseEnum(); }
+        // Top-level statements (e.g. `printline(42);`) are legal: a source
+        // without a function is compiled as if the statements were the body
+        // of an implicit `void main()`.  Functions are recognized by their
+        // `Type name (` shape (including array returns like `string[] name (`
+        // and optional public/private/static prefixes); anything else is
+        // parsed as a statement.
+        if (this.pos + 1 < this.tokens.length) {
+            int typePos = this.pos;
+            Token t0 = this.tokens[this.pos];
+            if ((t0.kind == 44 || t0.kind == 45 || t0.kind == 46) && this.pos + 1 < this.tokens.length) {
+                typePos = this.pos + 1;
+                t0 = this.tokens[typePos];
+            }
+            bool typeStart = t0.kind == 17 || t0.kind == 18 || t0.kind == 19 || t0.kind == 20 || t0.kind == 22 || t0.kind == 23 || t0.kind == 25 || t0.kind == 26 || t0.kind == 27 || t0.kind == 28 || t0.kind == 7;
+            if (typeStart) {
+                int scan = typePos + 1;
+                if (this.tokens[scan].kind == 120) {
+                    scan = scan + 1;
+                    while (scan < this.tokens.length && this.tokens[scan].kind != 121) { scan = scan + 1; }
+                    scan = scan + 1;
+                }
+                while (scan + 1 < this.tokens.length && this.tokens[scan].kind == 104 && this.tokens[scan + 1].kind == 105) { scan = scan + 2; }
+                if (this.tokens[scan].kind == 123) { scan = scan + 1; }
+                if (scan + 1 < this.tokens.length && this.tokens[scan].kind == 7 && this.tokens[scan + 1].kind == 100) {
+                    return this.parseFunction();
+                }
+                return this.parseStmt();
+            }
+            return this.parseStmt();
+        }
+        return this.parseFunction();
+    }
+
+    private Node parseImport() {
+        Node node = new Node();
+        node.kind = 105;
+        this.expect(36);
+        node.name = this.advance().text;
+        if (this.check(37)) {
+            this.advance();
+            this.advance();
+        }
+        this.expect(106);
+        return node;
+    }
+
+    private Node parseConst() {
+        Node node = new Node();
+        node.kind = 104;
+        this.expect(40);
+        // Support both `const int NAME = 3;` and C-style `const NAME = "x";`.
+        // If the token after `const` is a primitive type keyword, consume it;
+        // otherwise the name comes directly (type is inferred from the
+        // initializer).  Identifiers (kind 7) are always treated as the name.
+        if (this.check(17) || this.check(18) || this.check(19) || this.check(20) || this.check(22) || this.check(23) || this.check(25) || this.check(26) || this.check(27) || this.check(28)) {
+            node.typeHint = this.advance().text;
+        } else {
+            node.typeHint = "";
+        }
+        node.name = this.advance().text;
+        this.expect(110);
+        node.children.add(this.parseExpr(0));
+        this.expect(106);
+        return node;
+    }
+
+    private Node parseDef() {
+        Node node = new Node();
+        this.expect(32);
+        node.name = this.advance().text;
+        if (this.check(110)) {
+            node.kind = 103;
+            this.advance();
+            this.expect(31);
+            this.expect(102);
+            while (!this.check(103) && !this.check(0)) {
+                node.children.add(this.parsePattern());
+                if (this.check(107)) { this.advance(); }
+            }
+            this.expect(103);
+            this.expect(106);
+        } else {
+            node.kind = 110;
+            this.expect(106);
+        }
+        return node;
+    }
+
+    private Node parseStruct() {
+        Node node = new Node();
+        node.kind = 101;
+        this.expect(29);

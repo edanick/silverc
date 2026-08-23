@@ -1,0 +1,100 @@
+
+        this.asm.emitCallSetup(0);
+        this.asm.movRR64(1, 0);
+        this.asm.xorRR64(2, 2);
+        this.asm.movRMBase(8, 5, sizeOff);
+        this.asm.addRI32(8, 1);
+        this.addImportPatch("kernel32.dll", "HeapAlloc");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+
+        int bufOff = this.allocLocal("__rs_buf");
+        this.asm.movMBaseR(5, 0, bufOff);
+
+        int breadOff = this.allocLocal("__rs_bread");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, breadOff);
+
+        this.asm.emitCallSetup(8);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(4, 0, 32);
+        this.asm.movRMBase(1, 5, hfileOff);
+        this.asm.movRMBase(2, 5, bufOff);
+        this.asm.movRMBase(8, 5, sizeOff);
+        this.asm.leaRBase(9, 5, breadOff);
+        this.addImportPatch("kernel32.dll", "ReadFile");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+
+        // HeapAlloc reserves size + 1 bytes; terminate the source buffer so
+        // string.length and the lexer never read past the bytes returned by
+        // ReadFile.  This is essential when the next byte is non-zero in a
+        // reused heap block, and keeps every bootstrap stage deterministic.
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.movRMBase(1, 5, breadOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movRI64(1, 0);
+        this.asm.movMBaseByteR(0, 1, 0);
+
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, hfileOff);
+        this.addImportPatch("kernel32.dll", "CloseHandle");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.bindLabel(rsDone);
+    }
+
+    // input() builtin: reads a line from stdin via GetStdHandle + ReadFile.
+    // Modeled after genReadStringCall but uses the stdin handle instead of
+    // CreateFileA, and a fixed-size (4096-byte) heap buffer.
+    public void genInputCall(Node call) {
+        // GetStdHandle(-10) -> stdin handle
+        this.asm.emitCallSetup(0);
+        this.asm.movRI64(1, -10);
+        this.addImportPatch("kernel32.dll", "GetStdHandle");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+
+        int hstdinOff = this.allocLocal("__in_hstdin");
+        this.asm.movMBaseR(5, 0, hstdinOff);
+
+        // Allocate a 4096-byte heap buffer
+        int bufSize = 4096;
+        int sizeOff = this.allocLocal("__in_size");
+        this.asm.movRI64(0, bufSize);
+        this.asm.movMBaseR(5, 0, sizeOff);
+
+        this.asm.emitCallSetup(0);
+        this.addImportPatch("kernel32.dll", "GetProcessHeap");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+
+        this.asm.emitCallSetup(0);
+        this.asm.movRR64(1, 0);
+        this.asm.xorRR64(2, 2);
+        this.asm.movRMBase(8, 5, sizeOff);
+        this.addImportPatch("kernel32.dll", "HeapAlloc");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+
+        int bufOff = this.allocLocal("__in_buf");
+        this.asm.movMBaseR(5, 0, bufOff);
+
+        int breadOff = this.allocLocal("__in_bread");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, breadOff);
+

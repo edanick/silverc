@@ -1,0 +1,100 @@
+        int notFound = this.asm.createLabel();
+        int done = this.asm.createLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(notFound);
+
+        // buf = HeapAlloc(GetProcessHeap(), 0, size)
+        this.asm.emitCallSetup(0);
+        this.addImportPatch("kernel32.dll", "GetProcessHeap");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.emitCallSetup(0);
+        this.asm.movRR64(1, 0);
+        this.asm.xorRR64(2, 2);
+        this.asm.movRMBase(8, 5, sizeOff);
+        this.addImportPatch("kernel32.dll", "HeapAlloc");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int bufOff = this.allocLocal("__env_buf");
+        this.asm.movMBaseR(5, 0, bufOff);
+
+        // GetEnvironmentVariableA(key, buf, size) writes the value + NUL
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, keyOff);
+        this.asm.movRMBase(2, 5, bufOff);
+        this.asm.movRMBase(8, 5, sizeOff);
+        this.addImportPatch("kernel32.dll", "GetEnvironmentVariableA");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.jmpLabel(done);
+        this.asm.bindLabel(notFound);
+        this.emitLlmaiStringLiteral("");
+        this.asm.bindLabel(done);
+    }
+
+    // RAX = 1 when the string at strOff starts with `prefix`, else 0.
+    public void emitPrefixCheck(int strOff, string prefix, int prefixLen) {
+        this.emitLlmaiStringLiteral(prefix);
+        int preOff = this.allocLocal("__url_pre");
+        this.asm.movMBaseR(5, 0, preOff);
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, strOff);
+        this.asm.movRMBase(2, 5, preOff);
+        this.asm.movRI64(8, prefixLen);
+        this.addImportPatch("ucrtbase.dll", "strncmp");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int pNo = this.newLabel();
+        int pDone = this.newLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jneLabel(pNo);
+        this.asm.movRI64(0, 1);
+        this.asm.jmpLabel(pDone);
+        this.asm.bindLabel(pNo);
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(pDone);
+    }
+
+    public void genUrlCall(Node call) {
+        string name = call.name;
+        if (call.childCount() < 2) { this.asm.xorRR64(0, 0); return; }
+        this.genExpr(call.child(1));
+        int urlOff = this.allocLocal("__url_s");
+        this.asm.movMBaseR(5, 0, urlOff);
+        if (this.strEq(name, "isUrl")) {
+            this.emitPrefixCheck(urlOff, "http://", 7);
+            int uYes = this.newLabel();
+            int uDone = this.newLabel();
+            this.asm.cmpRI32(0, 1);
+            this.asm.jeLabel(uYes);
+            this.emitPrefixCheck(urlOff, "https://", 8);
+            this.asm.cmpRI32(0, 1);
+            this.asm.jeLabel(uYes);
+            this.asm.xorRR64(0, 0);
+            this.asm.jmpLabel(uDone);
+            this.asm.bindLabel(uYes);
+            this.asm.movRI64(0, 1);
+            this.asm.bindLabel(uDone);
+        } elif (this.strEq(name, "isFtp")) {
+            // ftp:// but not ftps://
+            this.emitPrefixCheck(urlOff, "ftps://", 7);
+            int fNo = this.newLabel();
+            int fDone = this.newLabel();
+            this.asm.cmpRI32(0, 1);
+            this.asm.jeLabel(fNo);
+            this.emitPrefixCheck(urlOff, "ftp://", 6);
+            this.asm.cmpRI32(0, 1);
+            this.asm.jneLabel(fNo);
+            this.asm.movRI64(0, 1);
+            this.asm.jmpLabel(fDone);
+            this.asm.bindLabel(fNo);

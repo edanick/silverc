@@ -1,0 +1,100 @@
+        this.asm.movRMBase(1, 5, hreOff);
+        this.addImportPatch("wininet.dll", "InternetCloseHandle");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, hcoOff);
+        this.addImportPatch("wininet.dll", "InternetCloseHandle");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, hinOff);
+        this.addImportPatch("wininet.dll", "InternetCloseHandle");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(0, 5, resOff);
+        this.asm.jmpLabel(doneLbl);
+
+        // ---- failure paths: close what was opened, return empty string ----
+        this.asm.bindLabel(failSend);
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, hreOff);
+        this.addImportPatch("wininet.dll", "InternetCloseHandle");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.bindLabel(failReq);
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, hcoOff);
+        this.addImportPatch("wininet.dll", "InternetCloseHandle");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.bindLabel(failConn);
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, hinOff);
+        this.addImportPatch("wininet.dll", "InternetCloseHandle");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.bindLabel(failInet);
+        this.emitLlmaiEmptyString();
+
+        this.asm.bindLabel(doneLbl);
+    }
+
+    public void genWriteBytesCall(Node call) {
+        // The path/data arguments sit at child(1)/child(2) for member calls
+        // (file.writeString(p, d) where child(0) is the receiver) but at
+        // child(0)/child(1) for the global writeString(p, d) builtin.  Using
+        // the wrong slots silently skipped the write and left the file
+        // uncreated (the old guard also rejected the 2-child global form).
+        int pathIdx = 0;
+        int dataIdx = 1;
+        if (call.isMember) { pathIdx = 1; dataIdx = 2; }
+        if (call.childCount() <= dataIdx) { return; }
+        this.genExpr(call.child(pathIdx));
+        int pathOff = this.allocLocal("__wb_path");
+        this.asm.movMBaseR(5, 0, pathOff);
+
+        this.genExpr(call.child(dataIdx));
+        int dataOff = this.allocLocal("__wb_data");
+        this.asm.movMBaseR(5, 0, dataOff);
+
+        string dataType = this.inferExprType(call.child(dataIdx));
+        int isString = 0;
+        if (this.strEq(dataType, "string")) { isString = 1; }
+
+        int sizeOff = this.allocLocal("__wb_size");
+        int bufOff = dataOff;
+        if (isString == 1) {
+            this.asm.emitCallSetup(0);
+            this.asm.movRMBase(1, 5, dataOff);
+            this.addImportPatch("kernel32.dll", "lstrlenA");
+            this.asm.emitImm64(0, 0);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movMBaseR(5, 0, sizeOff);
+        } else {
+            // int[] points at element zero; its length is stored at -8.
+            // Compact the low byte of each eight-byte element in place. The
+            // array allocation has enough capacity for this prefix, so this
+            // avoids a second heap allocation and keeps the bootstrap ABI
+            // identical across compiler generations.
+            this.asm.movRMBase(10, 5, dataOff);
+            this.asm.movRMBase(0, 10, -8);
+            this.asm.movMBaseR(5, 0, sizeOff);
+
+            int iOff = this.allocLocal("__wb_i");
+            this.asm.movRI64(0, 0);
+            this.asm.movMBaseR(5, 0, iOff);

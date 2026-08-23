@@ -1,0 +1,100 @@
+
+    public void genProgram2(Node[] program) {
+        for (int i = 0; i < program.length; i++) {
+            Node item = program[i];
+            if (item.kind == 100) {
+                this.emitFunction(item);
+            }
+        }
+    }
+
+    public void genStmt(Node stmt) {
+        if (stmt.kind == 61) {
+            if (stmt.childCount() > 0) {
+                this.genExpr(stmt.child(0));
+            }
+    } elif (stmt.kind == 50) {
+        int off = this.findLocal(stmt.name);            if (stmt.childCount() > 0) {
+                if (this.strEq(stmt.typeHint, "byte[]") && stmt.child(0).kind == 19) {
+                    this.genByteArrayLiteral(stmt.child(0));
+                } else {
+                    this.genExpr(stmt.child(0));
+                }
+                if (off != 0) {
+                this.asm.movMBaseR(5, 0, off);
+            }
+        } else {
+            // Uninitialized locals start zeroed; array-typed locals start as
+            // an empty array so that later .add() never touches garbage.
+            string localTy = this.getLocalType(stmt.name);
+            bool isArrTy = false;
+            if (localTy.length >= 2) {
+                if (localTy[localTy.length - 2] == '[' && localTy[localTy.length - 1] == ']') {
+                    isArrTy = true;
+                }
+            }
+            if (off != 0) {
+                if (isArrTy) {
+                    Node arrInit = new Node(); arrInit.kind = 19;
+                    this.genExpr(arrInit);
+                    this.asm.movMBaseR(5, 0, off);
+                } else {
+                    this.asm.xorRR64(0, 0);
+                    this.asm.movMBaseR(5, 0, off);
+                }
+            }
+        }        } elif (stmt.kind == 51) {
+            if (stmt.childCount() > 0) {
+                this.genExpr(stmt.child(0));
+            } else {
+                this.asm.xorRR64(0, 0);
+            }
+            this.emitReturnJump();
+        } elif (stmt.kind == 68) {
+            this.genExpr(stmt.child(0));
+            int evIdx = this.findGlobal("__exc_value");
+            this.genGlobalStore(evIdx);
+            this.asm.movRI64(0, 1);
+            int eaIdx = this.findGlobal("__exc_active");
+            this.genGlobalStore(eaIdx);
+            this.emitExceptionJump();
+        } elif (stmt.kind == 59) {
+            bool hasCatch = !this.strEq(stmt.name, "");
+            bool hasFinally = stmt.hasFinally;
+            int catchLbl = this.newLabel();
+            int afterLbl = this.newLabel();
+            int finallyLbl = this.newLabel();
+            int retVal = 0;
+            int retFlag = 0;
+            int prevHandler = this.currentExcHandler;
+            int prevCatch = this.currentCatch;
+            int prevFinally = this.currentFinally;
+            int prevRetVal = this.currentFinallyRetVal;
+            int prevRetFlag = this.currentFinallyRetFlag;
+            if (hasFinally) {
+                retVal = this.allocLocal("__finally_ret_val");
+                retFlag = this.allocLocal("__finally_ret_flag");
+                this.asm.xorRR64(0, 0);
+                this.asm.movMBaseR(5, 0, retFlag);
+                this.currentFinallyRetVal = retVal;
+                this.currentFinallyRetFlag = retFlag;
+                this.currentFinally = finallyLbl;
+            } else {
+                this.currentFinally = -1;
+                this.currentFinallyRetVal = 0;
+                this.currentFinallyRetFlag = 0;
+            }
+            this.currentExcHandler = prevHandler;
+            if (hasCatch) {
+                this.currentCatch = catchLbl;
+            } else {
+                this.currentCatch = -1;
+            }
+            this.genBlock(stmt.child(0));
+            if (hasFinally) {
+                this.asm.jmpLabel(finallyLbl);
+            } else {
+                this.asm.jmpLabel(afterLbl);
+            }
+            if (hasCatch) {
+                this.asm.bindLabel(catchLbl);

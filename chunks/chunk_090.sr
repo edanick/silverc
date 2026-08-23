@@ -1,0 +1,100 @@
+        this.asm.movMBaseByteR(0, 1, 0);
+
+        // ---- InternetOpenA(NULL, 0, NULL, NULL, 0) ----
+        this.asm.emitCallSetup(8);
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(4, 0, 32);
+        this.asm.xorRR64(1, 1);
+        this.asm.xorRR64(2, 2);
+        this.asm.xorRR64(8, 8);
+        this.asm.xorRR64(9, 9);
+        this.addImportPatch("wininet.dll", "InternetOpenA");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, hinOff);
+
+        int failInet = this.newLabel();
+        int failConn = this.newLabel();
+        int failReq = this.newLabel();
+        int failSend = this.newLabel();
+        int readLoop = this.newLabel();
+        int readDone = this.newLabel();
+        int doneLbl = this.newLabel();
+
+        this.asm.movRMBase(0, 5, hinOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(failInet);
+
+        // ---- InternetConnectA(hin, host, port, NULL, NULL, HTTP(3), 0, 0) ----
+        this.asm.emitCallSetup(32);
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(4, 0, 32);
+        this.asm.movRI64(0, 3);
+        this.asm.movMBaseR(4, 0, 40);
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(4, 0, 48);
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(4, 0, 56);
+        this.asm.movRMBase(1, 5, hinOff);
+        this.asm.movRMBase(2, 5, hbufOff);
+        this.asm.movRMBase(8, 5, portOff);
+        this.asm.xorRR64(9, 9);
+        this.addImportPatch("wininet.dll", "InternetConnectA");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, hcoOff);
+
+        this.asm.movRMBase(0, 5, hcoOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(failConn);
+
+        // ---- HttpOpenRequestA(hco, "POST", path, NULL, NULL, NULL, FLAGS, 0) ----
+        this.emitLlmaiStringLiteral("POST");
+        this.asm.movMBaseR(5, 0, tmpOff);
+        this.asm.emitCallSetup(32);
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(4, 0, 32);
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(4, 0, 40);
+        this.asm.movRI64(0, 0x84800200);
+        this.asm.movMBaseR(4, 0, 48);
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(4, 0, 56);
+        this.asm.movRMBase(1, 5, hcoOff);
+        this.asm.movRMBase(2, 5, tmpOff);
+        this.asm.movRMBase(8, 5, pathOff);
+        this.asm.xorRR64(9, 9);
+        this.addImportPatch("wininet.dll", "HttpOpenRequestA");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, hreOff);
+
+        this.asm.movRMBase(0, 5, hreOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(failReq);
+
+        // ---- strlen(body) ----
+        this.asm.movRMBase(1, 5, bodyOff);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, tmpOff);
+
+        // ---- HttpSendRequestA(hre, headers, -1, body, strlen(body)) ----
+        this.asm.emitCallSetup(8);
+        this.asm.movRMBase(0, 5, tmpOff);
+        this.asm.movMBaseR(4, 0, 32);
+        this.asm.movRMBase(1, 5, hreOff);
+        this.asm.movRMBase(2, 5, hdrOff);
+        this.asm.movRI64(8, 0xFFFFFFFF);
+        this.asm.movRMBase(9, 5, bodyOff);
+        this.addImportPatch("wininet.dll", "HttpSendRequestA");

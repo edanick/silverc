@@ -1,0 +1,100 @@
+        this.pos += 1;
+        if (c == '\n') {
+            this.line += 1;
+            this.col = 1;
+        } else {
+            this.col += 1;
+        }
+        return c;
+    }
+
+    private void skipWhitespace() {
+        while (this.pos < this.srcLen) {
+            // Compare the byte value as an int.  A local char comparison in
+            // this hot path was miscompiled by the second self-hosted stage,
+            // causing it to consume the first non-whitespace source byte.
+            int cCode = this.src[this.pos];
+            if (cCode == 32 || cCode == 9 || cCode == 10 || cCode == 13) {
+                this.advance();
+            } else {
+                break;
+            }
+        }
+    }
+
+    private void skipLineComment() {
+        while (this.pos < this.srcLen) {
+            char c = this.src[this.pos];
+            if (c == '\n') { break; }
+            this.advance();
+        }
+    }
+
+    private bool skipBlockComment() {
+        int depth = 1;
+        while (this.pos < this.srcLen && depth > 0) {
+            char c = this.src[this.pos];
+            if (c == '/' && this.peekNext() == '*') {
+                depth += 1;
+                this.advance();
+                this.advance();
+            } else if (c == '*' && this.peekNext() == '/') {
+                depth -= 1;
+                this.advance();
+                this.advance();
+            } else {
+                this.advance();
+            }
+        }
+        return depth == 0;
+    }
+
+    public Token[] tokenize() {
+        Token[] tokens = [];
+        while (true) {
+            this.skipWhitespace();
+            if (this.pos >= this.srcLen) {
+                tokens.add(new Token(0, "", this.line, this.col));
+                break;
+            }
+        Token? tok = this.nextToken();
+        if (tok != null) {
+            tokens.add(tok);
+        }
+        }
+        return tokens;
+    }
+
+    private Token? nextToken() {
+        while (this.pos < this.srcLen) {
+        char c = this.src[this.pos];
+        this.lastChar = c;
+        int ln = this.line;
+        int cl = this.col;
+
+        if (c == '/' && this.peekNext() != null) {
+            char next = this.peekNext();
+            if (next == '/') { this.advance(); this.skipLineComment(); return null; }
+            if (next == '*') { this.advance(); this.advance(); this.skipBlockComment(); return null; }
+        }
+
+        if (c == '"') { this.advance(); return this.readStringToken(); }
+        if (c == '\'') { this.advance(); return this.readChar(); }
+        if ((c >= '0' && c <= '9')) { this.currentCode = c; return this.readNumber(); }
+        if (isAlpha(c) || c == '_') { this.currentCode = c; return this.readIdent(); }
+
+        this.advance();
+
+        if (c == '(') { return new Token(100, "(", ln, cl); }
+        if (c == ')') { return new Token(101, ")", ln, cl); }
+        if (c == '{') { return new Token(102, "{", ln, cl); }
+        if (c == '}') { return new Token(103, "}", ln, cl); }
+        if (c == '[') { return new Token(104, "[", ln, cl); }
+        if (c == ']') { return new Token(105, "]", ln, cl); }
+        if (c == ';') { return new Token(106, ";", ln, cl); }
+        if (c == ',') { return new Token(107, ",", ln, cl); }
+        if (c == '.') {
+            if (this.peek() == '.' && this.peekNext() != null && this.peekNext() == '.') {
+                this.advance(); this.advance();
+                return new Token(147, "...", ln, cl);
+            }

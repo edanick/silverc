@@ -1,0 +1,516 @@
+mod export lexer;
+
+import * from token;
+
+class Lexer {
+    private prop string src;
+    private prop int pos;
+    private prop int line;
+    private prop int col;
+    private prop char lastChar;
+    // Keep the dispatch character in the receiver instead of passing it as a
+    // method argument.  This avoids the self-hosted ABI path that can corrupt
+    // the first scalar argument after one bootstrap boundary.
+    private prop int currentCode;
+    // Cached source length.  `string.length` lowers to strlen() (O(n)), so
+    // reading it inside every `while (pos < src.length)` loop re-scans the
+    // entire source per iteration (O(n^2)).  Cache it once in the constructor.
+    private prop int srcLen;
+
+    construct (string source) {
+        this.src = source;
+        this.srcLen = source.length;
+        this.pos = 0;
+        this.line = 1;
+        this.col = 1;
+        this.lastChar = ' ';
+        this.currentCode = 0;
+    }
+
+    private bool strEq(string a, string b) {
+        if (a.length != b.length) { return false; }
+        for (int i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    private char? peek() {
+        if (this.pos < this.srcLen) {
+            char c = this.src[this.pos];
+            return c;
+        }
+        return null;
+    }
+
+    private char? peekNext() {
+        if (this.pos + 1 < this.srcLen) {
+            char c2 = this.src[this.pos + 1];
+            return c2;
+        }
+        return null;
+    }
+
+    private char? advance() {
+        if (this.pos >= this.srcLen) { return null; }
+        char c = this.src[this.pos];
+        this.pos += 1;
+        if (c == '\n') {
+            this.line += 1;
+            this.col = 1;
+        } else {
+            this.col += 1;
+        }
+        return c;
+    }
+
+    private void skipWhitespace() {
+        while (this.pos < this.srcLen) {
+            // Compare the byte value as an int.  A local char comparison in
+            // this hot path was miscompiled by the second self-hosted stage,
+            // causing it to consume the first non-whitespace source byte.
+            int cCode = this.src[this.pos];
+            if (cCode == 32 || cCode == 9 || cCode == 10 || cCode == 13) {
+                this.advance();
+            } else {
+                break;
+            }
+        }
+    }
+
+    private void skipLineComment() {
+        while (this.pos < this.srcLen) {
+            char c = this.src[this.pos];
+            if (c == '\n') { break; }
+            this.advance();
+        }
+    }
+
+    private bool skipBlockComment() {
+        int depth = 1;
+        while (this.pos < this.srcLen && depth > 0) {
+            char c = this.src[this.pos];
+            if (c == '/' && this.peekNext() == '*') {
+                depth += 1;
+                this.advance();
+                this.advance();
+            } else if (c == '*' && this.peekNext() == '/') {
+                depth -= 1;
+                this.advance();
+                this.advance();
+            } else {
+                this.advance();
+            }
+        }
+        return depth == 0;
+    }
+
+    public Token[] tokenize() {
+        Token[] tokens = [];
+        while (true) {
+            this.skipWhitespace();
+            if (this.pos >= this.srcLen) {
+                tokens.add(new Token(0, "", this.line, this.col));
+                break;
+            }
+        Token? tok = this.nextToken();
+        if (tok != null) {
+            tokens.add(tok);
+        }
+        }
+        return tokens;
+    }
+
+    private Token? nextToken() {
+        while (this.pos < this.srcLen) {
+        char c = this.src[this.pos];
+        this.lastChar = c;
+        int ln = this.line;
+        int cl = this.col;
+
+        if (c == '/' && this.peekNext() != null) {
+            char next = this.peekNext();
+            if (next == '/') { this.advance(); this.skipLineComment(); return null; }
+            if (next == '*') { this.advance(); this.advance(); this.skipBlockComment(); return null; }
+        }
+
+        if (c == '"') { this.advance(); return this.readStringToken(); }
+        if (c == '\'') { this.advance(); return this.readChar(); }
+        if ((c >= '0' && c <= '9')) { this.currentCode = c; return this.readNumber(); }
+        if (isAlpha(c) || c == '_') { this.currentCode = c; return this.readIdent(); }
+
+        this.advance();
+
+        if (c == '(') { return new Token(100, "(", ln, cl); }
+        if (c == ')') { return new Token(101, ")", ln, cl); }
+        if (c == '{') { return new Token(102, "{", ln, cl); }
+        if (c == '}') { return new Token(103, "}", ln, cl); }
+        if (c == '[') { return new Token(104, "[", ln, cl); }
+        if (c == ']') { return new Token(105, "]", ln, cl); }
+        if (c == ';') { return new Token(106, ";", ln, cl); }
+        if (c == ',') { return new Token(107, ",", ln, cl); }
+        if (c == '.') {
+            if (this.peek() == '.' && this.peekNext() != null && this.peekNext() == '.') {
+                this.advance(); this.advance();
+                return new Token(147, "...", ln, cl);
+            }
+            if (this.peek() == '.') { this.advance(); return new Token(144, "..", ln, cl); }
+            return new Token(108, ".", ln, cl);
+        }
+        if (c == ':') { return new Token(109, ":", ln, cl); }
+        if (c == '+') {
+            if (this.peek() == '+') { this.advance(); return new Token(142, "++", ln, cl); }
+            if (this.peek() == '=') { this.advance(); return new Token(130, "+=", ln, cl); }
+            return new Token(111, "+", ln, cl);
+        }
+        if (c == '-') {
+            if (this.peek() == '-') { this.advance(); return new Token(143, "--", ln, cl); }
+            if (this.peek() == '=') { this.advance(); return new Token(131, "-=", ln, cl); }
+            if (this.peek() == '>') { this.advance(); return new Token(145, "->", ln, cl); }
+            return new Token(112, "-", ln, cl);
+        }
+        if (c == '*') {
+            if (this.peek() == '=') { this.advance(); return new Token(132, "*=", ln, cl); }
+            return new Token(113, "*", ln, cl);
+        }
+        if (c == '/') {
+            if (this.peek() == '=') { this.advance(); return new Token(133, "/=", ln, cl); }
+            return new Token(114, "/", ln, cl);
+        }
+        if (c == '%') { return new Token(115, "%", ln, cl); }
+        if (c == '&') {
+            if (this.peek() == '&') { this.advance(); return new Token(138, "&&", ln, cl); }
+            return new Token(116, "&", ln, cl);
+        }
+        if (c == '|') {
+            if (this.peek() == '|') { this.advance(); return new Token(139, "||", ln, cl); }
+            return new Token(117, "|", ln, cl);
+        }
+        if (c == '<') {
+            if (this.peek() == '<') { this.advance(); return new Token(140, "<<", ln, cl); }
+            if (this.peek() == '=') { this.advance(); return new Token(136, "<=", ln, cl); }
+            return new Token(120, "<", ln, cl);
+        }
+        if (c == '>') {
+            if (this.peek() == '>') { this.advance(); return new Token(141, ">>", ln, cl); }
+            if (this.peek() == '=') { this.advance(); return new Token(137, ">=", ln, cl); }
+            return new Token(121, ">", ln, cl);
+        }
+        if (c == '=') {
+            if (this.peek() == '=') { this.advance(); return new Token(134, "==", ln, cl); }
+            if (this.peek() == '>') { this.advance(); return new Token(146, "=>", ln, cl); }
+            return new Token(110, "=", ln, cl);
+        }
+        if (c == '!') {
+            if (this.peek() == '=') { this.advance(); return new Token(135, "!=", ln, cl); }
+            return new Token(122, "!", ln, cl);
+        }
+        if (c == '~') { return new Token(119, "~", ln, cl); }
+        if (c == '^') { return new Token(118, "^", ln, cl); }
+        if (c == '?') {
+            if (this.peek() == '?') { this.advance(); return new Token(148, "??", ln, cl); }
+            return new Token(123, "?", ln, cl);
+        }
+        if (c == '#') { return new Token(125, "#", ln, cl); }
+        if (c == '$') { return new Token(149, "$", ln, cl); }
+        if (c == '@') { return new Token(156, "@", ln, cl); }
+
+        }
+        return null;
+    }
+
+    private Token readStringToken() {
+        int ln = this.line; int cl = this.col;
+        string s = "";
+        while (this.pos < this.srcLen) {
+            char ch = this.src[this.pos]; this.advance();
+            if (ch == '"') { break; }
+            if (ch == '\\') {
+                if (this.pos < this.srcLen) {
+                    char esc = this.src[this.pos]; this.advance();
+                    if (esc == 'n') { s = s + "\n"; }
+                    else if (esc == 't') { s = s + "\t"; }
+                    else if (esc == '0') { s = s + "\0"; }
+                    else if (esc == 'r') { s = s + "\r"; }
+                    else if (esc == '\\') { s = s + "\\"; }
+                    else if (esc == '\"') { s = s + "\""; }
+                    else if (esc == 'x') {
+                        // Hex escape \xHH: decode 1-2 hex digits into a raw
+                        // byte (ANSI codes like \x1B are the primary use).
+                        int hv = 0;
+                        int nd = 0;
+                        while (nd < 2 && this.pos < this.srcLen) {
+                            char hc = this.src[this.pos];
+                            int dv = -1;
+                            if (hc >= '0' && hc <= '9') { dv = hc - '0'; }
+                            elif (hc >= 'a' && hc <= 'f') { dv = hc - 'a' + 10; }
+                            elif (hc >= 'A' && hc <= 'F') { dv = hc - 'A' + 10; }
+                            if (dv < 0) { break; }
+                            this.advance();
+                            hv = hv * 16 + dv;
+                            nd = nd + 1;
+                        }
+                        if (nd > 0) {
+                            char xc = hv;
+                            s = s + charToString(xc);
+                        } else {
+                            s = s + "\\x";
+                        }
+                    }
+                    else { s = s + "\\" + esc; }
+                }
+            } else {
+                s = s + charToString(ch);
+            }
+        }
+        Token tok = new Token(3, s, ln, cl);
+        tok.strVal = s;
+        return tok;
+    }
+
+    private Token readChar() {
+        int ln = this.line; int cl = this.col;
+        char ch = ' ';
+        if (this.pos < this.srcLen) {
+            ch = this.src[this.pos]; this.advance();
+            if (ch == '\\' && this.pos < this.srcLen) {
+                char esc = this.src[this.pos]; this.advance();
+                if (esc == 'n') { ch = '\n'; }
+                else if (esc == 't') { ch = '\t'; }
+                else if (esc == '0') { ch = '\0'; }
+                else if (esc == 'r') { ch = '\r'; }
+                else if (esc == '\\') { ch = '\\'; }
+                else if (esc == '\'') { ch = '\''; }
+                else if (esc == 'x') {
+                    // Hex escape \xHH (e.g. '\x1B').
+                    int hv = 0;
+                    int nd = 0;
+                    while (nd < 2 && this.pos < this.srcLen) {
+                        char hc = this.src[this.pos];
+                        int dv = -1;
+                        if (hc >= '0' && hc <= '9') { dv = hc - '0'; }
+                        elif (hc >= 'a' && hc <= 'f') { dv = hc - 'a' + 10; }
+                        elif (hc >= 'A' && hc <= 'F') { dv = hc - 'A' + 10; }
+                        if (dv < 0) { break; }
+                        this.advance();
+                        hv = hv * 16 + dv;
+                        nd = nd + 1;
+                    }
+                    if (nd > 0) { ch = hv; } else { ch = esc; }
+                }
+                else { ch = esc; }
+            } elif (ch == '\r' && this.pos < this.srcLen && this.src[this.pos] == '\n') {
+                // A literal CRLF inside the quotes (CRLF-saved sources) means
+                // the char is the newline: the Rust frontend normalizes
+                // CRLF to LF before lexing, so a real newline between the
+                // quotes must read as newline here.
+                this.advance();
+                ch = '\n';
+            }
+        }
+        if (this.pos < this.srcLen && this.src[this.pos] == '\'') {
+            this.advance();
+        }
+        string charText = "";
+        charText = charText + ch;
+        Token tok = new Token(4, charText, ln, cl);
+        tok.charVal = ch;
+        return tok;
+    }
+
+    private Token readNumber() {
+        int ln = this.line; int cl = this.col;
+        int firstCode = this.currentCode;
+        this.advance();
+        string s = "";
+        if (firstCode == 48) { s = s + "0"; }
+        elif (firstCode == 49) { s = s + "1"; }
+        elif (firstCode == 50) { s = s + "2"; }
+        elif (firstCode == 51) { s = s + "3"; }
+        elif (firstCode == 52) { s = s + "4"; }
+        elif (firstCode == 53) { s = s + "5"; }
+        elif (firstCode == 54) { s = s + "6"; }
+        elif (firstCode == 55) { s = s + "7"; }
+        elif (firstCode == 56) { s = s + "8"; }
+        elif (firstCode == 57) { s = s + "9"; }
+        bool isFloat = false;
+        int base = 10;
+        if (firstCode == 48 && this.pos < this.srcLen) {
+            char next = this.src[this.pos];
+            if (next == 'x' || next == 'X') {
+                this.advance();
+                base = 16;
+                s = "";
+            }
+        }
+        while (this.pos < this.srcLen) {
+            char ch = this.src[this.pos];
+            if ((ch >= '0' && ch <= '9') || ch == '_') {
+                s = s + ch; this.advance();
+            } elif (base == 16 && ((ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F'))) {
+                s = s + ch; this.advance();
+            } elif (ch == '.' && !isFloat) {
+                if (this.peek() == '.') { break; }
+                isFloat = true; s = s + "."; this.advance();
+            } elif (ch == 'e' || ch == 'E') {
+                isFloat = true; s = s + ch; this.advance();
+if (this.pos < this.srcLen) {
+                char sign = this.src[this.pos];
+                if (sign == '+' || sign == '-') {
+                    s = s + sign; this.advance();
+                }
+            }
+            } else { break; }
+        }
+        Token tok = new Token(1, s, ln, cl);
+        if (isFloat) {
+            tok.intVal = 0;
+        } else {
+            // Parse the digit string manually.  The toInt64 / toInt64FromBase
+            // builtin methods are not dispatched by every backend, so compute
+            // the value directly with arithmetic that all stages support.
+            int64 val = 0;
+            for (int i = 0; i < s.length; i++) {
+                char ch = s[i];
+                int d = -1;
+                if (ch >= '0' && ch <= '9') { d = ch - '0'; }
+                elif (base == 16 && ch >= 'a' && ch <= 'f') { d = ch - 'a' + 10; }
+                elif (base == 16 && ch >= 'A' && ch <= 'F') { d = ch - 'A' + 10; }
+                if (d >= 0) { val = val * base + d; }
+            }
+            tok.intVal = val;
+        }
+        return tok;
+    }
+
+    private Token readIdent() {
+        int ln = this.line; int cl = this.col;
+        int firstCode = this.currentCode;
+        this.advance();
+        string s = "";
+        if (firstCode == 97) { s = s + "a"; }
+        elif (firstCode == 98) { s = s + "b"; }
+        elif (firstCode == 99) { s = s + "c"; }
+        elif (firstCode == 100) { s = s + "d"; }
+        elif (firstCode == 101) { s = s + "e"; }
+        elif (firstCode == 102) { s = s + "f"; }
+        elif (firstCode == 103) { s = s + "g"; }
+        elif (firstCode == 104) { s = s + "h"; }
+        elif (firstCode == 105) { s = s + "i"; }
+        elif (firstCode == 106) { s = s + "j"; }
+        elif (firstCode == 107) { s = s + "k"; }
+        elif (firstCode == 108) { s = s + "l"; }
+        elif (firstCode == 109) { s = s + "m"; }
+        elif (firstCode == 110) { s = s + "n"; }
+        elif (firstCode == 111) { s = s + "o"; }
+        elif (firstCode == 112) { s = s + "p"; }
+        elif (firstCode == 113) { s = s + "q"; }
+        elif (firstCode == 114) { s = s + "r"; }
+        elif (firstCode == 115) { s = s + "s"; }
+        elif (firstCode == 116) { s = s + "t"; }
+        elif (firstCode == 117) { s = s + "u"; }
+        elif (firstCode == 118) { s = s + "v"; }
+        elif (firstCode == 119) { s = s + "w"; }
+        elif (firstCode == 120) { s = s + "x"; }
+        elif (firstCode == 121) { s = s + "y"; }
+        elif (firstCode == 122) { s = s + "z"; }
+        elif (firstCode == 65) { s = s + "A"; }
+        elif (firstCode == 66) { s = s + "B"; }
+        elif (firstCode == 67) { s = s + "C"; }
+        elif (firstCode == 68) { s = s + "D"; }
+        elif (firstCode == 69) { s = s + "E"; }
+        elif (firstCode == 70) { s = s + "F"; }
+        elif (firstCode == 71) { s = s + "G"; }
+        elif (firstCode == 72) { s = s + "H"; }
+        elif (firstCode == 73) { s = s + "I"; }
+        elif (firstCode == 74) { s = s + "J"; }
+        elif (firstCode == 75) { s = s + "K"; }
+        elif (firstCode == 76) { s = s + "L"; }
+        elif (firstCode == 77) { s = s + "M"; }
+        elif (firstCode == 78) { s = s + "N"; }
+        elif (firstCode == 79) { s = s + "O"; }
+        elif (firstCode == 80) { s = s + "P"; }
+        elif (firstCode == 81) { s = s + "Q"; }
+        elif (firstCode == 82) { s = s + "R"; }
+        elif (firstCode == 83) { s = s + "S"; }
+        elif (firstCode == 84) { s = s + "T"; }
+        elif (firstCode == 85) { s = s + "U"; }
+        elif (firstCode == 86) { s = s + "V"; }
+        elif (firstCode == 87) { s = s + "W"; }
+        elif (firstCode == 88) { s = s + "X"; }
+        elif (firstCode == 89) { s = s + "Y"; }
+        elif (firstCode == 90) { s = s + "Z"; }
+        elif (firstCode == 95) { s = s + "_"; }
+        while (this.pos < this.srcLen) {
+            char ch = this.src[this.pos];
+            if (isAlphaNum(ch) || ch == '_') {
+                s = s + ch; this.advance();
+            } else { break; }
+        }
+        int kind = this.keywordKind(s);
+        Token tok = new Token(kind, s, ln, cl);
+        if (kind == 7) { tok.strVal = s; }
+        return tok;
+    }
+
+    private int keywordKind(string s) {
+        if (this.strEq(s, "if")) { return 10; }
+        if (this.strEq(s, "else")) { return 11; }
+        if (this.strEq(s, "while")) { return 12; }
+        if (this.strEq(s, "for")) { return 13; }
+        if (this.strEq(s, "foreach")) { return 14; }
+        if (this.strEq(s, "return")) { return 15; }
+        if (this.strEq(s, "match")) { return 16; }
+        if (this.strEq(s, "void")) { return 17; }
+        if (this.strEq(s, "int")) { return 18; }
+        if (this.strEq(s, "int32")) { return 19; }
+        if (this.strEq(s, "int64")) { return 20; }
+        if (this.strEq(s, "float")) { return 22; }
+        if (this.strEq(s, "float64")) { return 23; }
+        if (this.strEq(s, "bool")) { return 25; }
+        if (this.strEq(s, "char")) { return 26; }
+        if (this.strEq(s, "string")) { return 27; }
+        if (this.strEq(s, "var")) { return 28; }
+        if (this.strEq(s, "struct")) { return 29; }
+        if (this.strEq(s, "class")) { return 30; }
+        if (this.strEq(s, "enum")) { return 31; }
+        if (this.strEq(s, "def")) { return 32; }
+        if (this.strEq(s, "new")) { return 39; }
+        if (this.strEq(s, "const")) { return 40; }
+        if (this.strEq(s, "true")) { return 5; }
+        if (this.strEq(s, "false")) { return 5; }
+        if (this.strEq(s, "null")) { return 6; }
+        if (this.strEq(s, "import")) { return 36; }
+        if (this.strEq(s, "from")) { return 37; }
+        if (this.strEq(s, "as")) { return 38; }
+        if (this.strEq(s, "mod")) { return 35; }
+        if (this.strEq(s, "mut")) { return 50; }
+        if (this.strEq(s, "public")) { return 44; }
+        if (this.strEq(s, "private")) { return 45; }
+        if (this.strEq(s, "static")) { return 46; }
+        if (this.strEq(s, "prop")) { return 47; }
+        if (this.strEq(s, "construct")) { return 48; }
+        if (this.strEq(s, "unset")) { return 49; }
+        if (this.strEq(s, "local")) { return 150; }
+        if (this.strEq(s, "alias")) { return 151; }
+        if (this.strEq(s, "fixed")) { return 152; }
+        if (this.strEq(s, "live")) { return 153; }
+        if (this.strEq(s, "once")) { return 154; }
+        if (this.strEq(s, "shared")) { return 155; }
+        if (this.strEq(s, "try")) { return 52; }
+        if (this.strEq(s, "catch")) { return 53; }
+        if (this.strEq(s, "finally")) { return 65; }
+        if (this.strEq(s, "throw")) { return 64; }
+        if (this.strEq(s, "found")) { return 33; }
+        if (this.strEq(s, "collect")) { return 34; }
+        if (this.strEq(s, "ref")) { return 51; }
+        if (this.strEq(s, "in")) { return 54; }
+        if (this.strEq(s, "to")) { return 55; }
+        if (this.strEq(s, "elif")) { return 56; }
+        if (this.strEq(s, "break")) { return 57; }
+        if (this.strEq(s, "continue")) { return 58; }
+        if (this.strEq(s, "export")) { return 59; }
+        if (this.strEq(s, "extends")) { return 60; }
+        return 7;
+    }
+}

@@ -1,0 +1,100 @@
+    }
+
+    public void writeLe32(int[] buf, int offset, int val) {
+        buf[offset] = val & 0xFF;
+        buf[offset + 1] = (val >> 8) & 0xFF;
+        buf[offset + 2] = (val >> 16) & 0xFF;
+        buf[offset + 3] = (val >> 24) & 0xFF;
+    }
+
+    public void writeLe64(int[] buf, int offset, int64 val) {
+        buf[offset] = val & 0xFF;
+        buf[offset + 1] = (val >> 8) & 0xFF;
+        buf[offset + 2] = (val >> 16) & 0xFF;
+        buf[offset + 3] = (val >> 24) & 0xFF;
+        buf[offset + 4] = (val >> 32) & 0xFF;
+        buf[offset + 5] = (val >> 40) & 0xFF;
+        buf[offset + 6] = (val >> 48) & 0xFF;
+        buf[offset + 7] = (val >> 56) & 0xFF;
+    }
+
+    private void rsrcWriteUtf16Pad(int[] buf, string s) {
+        for (int i = 0; i < s.length; i++) {
+            int ch = s[i];
+            buf.add(ch & 0xFF);
+            buf.add((ch >> 8) & 0xFF);
+        }
+        buf.add(0);
+        buf.add(0);
+    }
+
+    private string rsrcFixVer(string v) {
+        int dots = 0;
+        for (int i = 0; i < v.length; i++) {
+            if (v[i] == '.') { dots = dots + 1; }
+        }
+        for (int i = 0; dots < 3; dots++) {
+            v = v + ".0";
+        }
+        return v;
+    }
+
+    private int[] buildVERSIONINFO(string[] keys, string[] values) {
+        int kc = keys.length;
+
+        int strBlockSize = 6 + 4 * kc;
+        int strTableNameBytes = 18;
+        int strSize = 24 + 6 + strBlockSize + strTableNameBytes;
+        for (int i = 0; i < kc; i++) {
+            strSize = strSize + (keys[i].length + 1) * 2;
+            strSize = strSize + (values[i].length + 1) * 2;
+        }
+        int pad = strSize % 4;
+        if (pad != 0) { strSize = strSize + (4 - pad); }
+
+        int viLen = 52 + 6 + 6 + 52 + strSize;
+
+        int[] s = [];
+        for (int i = 0; i < viLen; i++) { s.add(0); }
+
+        s[0] = 'V'; s[1] = 'S'; s[2] = '_'; s[3] = 'V'; s[4] = 'E'; s[5] = 'R'; s[6] = 'S'; s[7] = 'I';
+        s[8] = 'O'; s[9] = 'N'; s[10] = '_'; s[11] = 'I'; s[12] = 'N'; s[13] = 'F'; s[14] = 'O';
+
+        this.writeLe32(s, 8, 52);
+        this.writeLe32(s, 12, viLen);
+
+        this.writeLe32(s, 52, 0xFEEF04BD);
+        this.writeLe32(s, 54, 34 + 6 + strSize);
+
+        s.add('S'); s.add(0); s.add('t'); s.add(0); s.add('r'); s.add(0); s.add('i'); s.add(0);
+        s.add('n'); s.add(0); s.add('g'); s.add(0); s.add('F'); s.add(0); s.add('i'); s.add(0);
+        s.add('l'); s.add(0); s.add('e'); s.add(0); s.add('I'); s.add(0); s.add('n'); s.add(0);
+        s.add('f'); s.add(0); s.add('o'); s.add(0); s.add(0); s.add(0);
+
+        this.writeLe32(s, 86 + 4, 28 + strBlockSize + strTableNameBytes);
+
+        s.add('V'); s.add(0); s.add('a'); s.add(0); s.add('r'); s.add(0);
+        s.add('F'); s.add(0); s.add('i'); s.add(0); s.add('l'); s.add(0);
+        s.add('e'); s.add(0); s.add('I'); s.add(0); s.add('n'); s.add(0);
+        s.add('f'); s.add(0); s.add('o'); s.add(0); s.add(0); s.add(0);
+        this.writeLe32(s, 120, 4);
+
+        s.add(0x09); s.add(0x04); s.add(0xB0); s.add(0x04);
+
+        int strBlockOff = s.length;
+        s.add(0); s.add(0); s.add(0); s.add(0); s.add(0); s.add(0);
+        this.writeLe32(s, strBlockOff, strBlockSize + strTableNameBytes);
+
+        for (int i = 0; i < kc; i++) {
+            int keyLen = (keys[i].length + 1) * 2;
+            int valLen = (values[i].length + 1) * 2;
+            // Reserve the two DWORD fields before writing them. Writing at
+            // s.length without extending the array corrupts the self-hosted
+            // native compiler when project version metadata is enabled.
+            int pos = s.length;
+            s.add(0); s.add(0); s.add(0); s.add(0);
+            this.writeLe32(s, pos, keyLen);
+            this.writeLe32(s, pos + 2, strBlockSize + strTableNameBytes + pos - strBlockOff);
+        }
+        for (int i = 0; i < kc; i++) {
+            int valLen = (values[i].length + 1) * 2;

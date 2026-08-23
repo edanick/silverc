@@ -1,5 +1,68 @@
 mod export cli;
 
+// Whole-word string equality for command-line arguments. The self-hosted
+// stage-2 backend represents strings as pointers, so `a == b` compares
+// pointers rather than contents. This helper walks the characters and is
+// correct on both backends (mirrors string.cliArgEq; kept here so the cli
+// module is self-contained when callers only need arg parsing).
+public bool eq(string a, string b) {
+    if (a.length != b.length) { return false; }
+    for (int i = 0; i < a.length; i = i + 1) {
+        if (a[i] != b[i]) { return false; }
+    }
+    return true;
+}
+
+// Returns true if `arg` matches any of the listed option spellings.
+// Useful for accepting short and long forms together, e.g.
+// cli.isFlag(arg, ["-h", "--help", "/?"]).
+public bool isFlag(string arg, string[] names) {
+    for (int i = 0; i < names.length; i = i + 1) {
+        if (eq(arg, names[i])) { return true; }
+    }
+    return false;
+}
+
+// Returns true if `arg` looks like an option (begins with '-' or '/').
+// Used to distinguish positional arguments from options while scanning.
+public bool isOption(string arg) {
+    if (arg.length == 0) { return false; }
+    char c = arg[0];
+    return c == '-' || c == '/';
+}
+
+// Returns true if `arg` begins with `prefix`. Useful for combined short
+// options like `-vh`.
+public bool hasPrefix(string arg, string prefix) {
+    if (arg.length < prefix.length) { return false; }
+    for (int i = 0; i < prefix.length; i = i + 1) {
+        if (arg[i] != prefix[i]) { return false; }
+    }
+    return true;
+}
+
+// Returns the value following `args[idx]` for a value-taking option, or
+// the empty string when no value is present or the next item is itself
+// an option. Pair this with the caller's index increment to consume the
+// value when it is non-empty.
+public string valueAfter(string[] args, int idx) {
+    int next = idx + 1;
+    if (next >= args.length) { return ""; }
+    string nxt = args[next];
+    if (isOption(nxt)) { return ""; }
+    return nxt;
+}
+
+// Returns the array of positional (non-option) arguments from `args`.
+// Useful for collecting input/output file operands after a flag scan.
+public string[] positional(string[] args) {
+    string[] result = [];
+    for (int i = 0; i < args.length; i = i + 1) {
+        if (!isOption(args[i])) { result.add(args[i]); }
+    }
+    return result;
+}
+
 public string[] args() << cargs;
 
 public string programName() {

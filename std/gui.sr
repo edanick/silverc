@@ -1,113 +1,94 @@
+import * from win32.kernel32;
+import * from win32.user32;
+
 mod export gui;
 
-class Color {
-    public int r;
-    public int g;
-    public int b;
-    public int a;
+// DOCS/248 -- Window GUI (self-hosted backend).
+//
+// The `Window` class creates a native Win32 window through user32.dll:
+// CreateWindowExA / ShowWindow / UpdateWindow / SetWindowTextA /
+// DestroyWindow, centered on the primary display via GetSystemMetrics.
+//
+//     Window w = new Window("main", "Silver App", 400, 400);
+//     w.show();
+//     w.setTitle("Updated title");
+//     w.close();
+//
+// `handle` is the opaque native HWND (0 when the window has not been created
+// or has been closed).
 
-    construct() { this.r = 0; this.g = 0; this.b = 0; this.a = 255; }
-    construct(int r, int g, int b) {
-        this.r = r; this.g = g; this.b = b; this.a = 255;
+class Window {
+    private string name;
+    private string title;
+    private int width;
+    private int height;
+    private int handle;
+    private bool visible;
+    private string icon;
+
+    construct(string name, string title, int width, int height) {
+        this.name = name;
+        this.title = title;
+        this.width = width;
+        this.height = height;
+        this.handle = 0;
+        this.visible = false;
+        this.icon = "";
+
+        int hinst = GetModuleHandleA(0);
+        int x = (GetSystemMetrics(0) - width) / 2;
+        int y = (GetSystemMetrics(1) - height) / 2;
+        if (x < 0) { x = 0; }
+        if (y < 0) { y = 0; }
+        // WS_OVERLAPPEDWINDOW = 0x00CF0000, with the pre-registered "STATIC"
+        // class so we do not need RegisterClassExA + a WndProc for a simple
+        // window.
+        this.handle = CreateWindowExA(0, "STATIC", title, 0x00CF0000, x, y, width, height, 0, 0, hinst, 0);
     }
 
-    public static Color White = new Color(255, 255, 255);
-    public static Color Black = new Color(0, 0, 0);
-}
+    public string getName() { return this.name; }
+    public string getTitle() { return this.title; }
+    public int getWidth() { return this.width; }
+    public int getHeight() { return this.height; }
+    public int getHandle() { return this.handle; }
+    public bool isVisible() { return this.visible; }
 
-class buttonStyle {
-    public Color backgroundColor;
-    public Color hoverColor;
-    public Color pressedColor;
-    public Color textColor;
-    public int borderRadius;
-    public Color borderColor;
-    public int borderWidth;
-    public int fontSize;
-}
-
-class checkboxStyle {
-    public Color checkColor;
-    public Color uncheckedBorderColor;
-    public Color textColor;
-    public int fontSize;
-    public int checkmarkSize;
-}
-
-class imageStyle {
-    public int borderRadius;
-    public Color borderColor;
-    public int borderWidth;
-}
-
-class labelStyle {
-    public int fontSize;
-    public Color textColor;
-    public bool bold;
-}
-
-class canvas {
-    public void clear(Color c) { }
-    public void fillRoundedRect(int x, int y, int w, int h, int r, Color c) { }
-    public void drawText(string text, int x, int y, Color c, int size, string weight) { }
-}
-
-class button {
-    private string text;
-
-    construct(string text) { this.text = text; }
-    public void setPosition(int x, int y) { }
-    public void setSize(int w, int h) { }
-    public void setStyle(buttonStyle s) { }
-    public void onClick(void callback()) { }
-}
-
-class checkbox {
-    private string label;
-
-    construct(string label) { this.label = label; }
-    public void setPosition(int x, int y) { }
-    public void setSize(int w, int h) { }
-    public void setStyle(checkboxStyle s) { }
-    public void onChange(void callback(bool state)) { }
-}
-
-class image {
-    construct(string path) { }
-    public void setPosition(int x, int y) { }
-    public void setSize(int w, int h) { }
-    public void setStyle(imageStyle s) { }
-}
-
-class label {
-    private string text;
-
-    construct(string text) { this.text = text; }
-    public void setPosition(int x, int y) { }
-    public void setStyle(labelStyle s) { }
-}
-
-class window {
-    public void setBackground(Color c) { }
-    public void onDraw(void callback(canvas)) { }
-    public void add(button b) { }
-    public void add(checkbox c) { }
-    public void add(image i) { }
-    public void add(label l) { }
-    public void show() { }
-
-    construct(application app, string title, int w, int h) {
-        HWND hwnd = CreateWindowEx(0, "STATIC", title, 0x10000000, 0, 0, w, h, null, null, null, null);
-        ShowWindow(hwnd, 1);
+    public void setTitle(string t) {
+        this.title = t;
+        if (this.handle != 0) { SetWindowTextA(this.handle, t); }
     }
-}
 
-class application {
-    public void run() {
-        MSG msg;
-        while (GetMessage(&msg, null, 0, 0)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+    // Load a custom .ico asset and attach it as the window icon via
+    // user32!LoadImageA (LR_LOADFROMFILE) + SendMessageA(WM_SETICON).
+    public void setIcon(string path) {
+        this.icon = path;
+        if (this.handle != 0) {
+            int hicon = LoadImageA(0, path, 1, 0, 0, 0x50);
+            if (hicon != 0) {
+                SendMessageA(this.handle, 0x80, 1, hicon); // ICON_BIG
+                SendMessageA(this.handle, 0x80, 0, hicon); // ICON_SMALL
+            }
         }
+    }
+
+    public string getIcon() { return this.icon; }
+
+    public void show() {
+        if (this.handle != 0) {
+            ShowWindow(this.handle, 5);   // SW_SHOW
+            UpdateWindow(this.handle);
+        }
+        this.visible = true;
+    }
+
+    public void hide() {
+        if (this.handle != 0) { ShowWindow(this.handle, 0); } // SW_HIDE
+        this.visible = false;
+    }
+
+    public void close() {
+        if (this.handle != 0) { DestroyWindow(this.handle); }
+        this.handle = 0;
+        this.visible = false;
     }
 }

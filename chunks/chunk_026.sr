@@ -1,0 +1,100 @@
+                    this.genExpr(init);
+                }
+            }
+            int startLbl = this.newLabel();
+            int endLbl = this.newLabel();
+            int contLbl = this.newLabel();
+            this.loopStartStack.add(startLbl);
+            this.loopEndStack.add(endLbl);
+            this.loopContinueStack.add(contLbl);
+            this.asm.bindLabel(startLbl);
+            if (stmt.childCount() > 1) {
+                this.genExpr(stmt.child(1));
+            }
+            this.asm.cmpRI32(0, 0);
+            this.asm.jeLabel(endLbl);
+            if (stmt.childCount() > 3) {
+                Node body = stmt.child(3);
+                if (body.kind == 16) {
+                    this.genBlock(body);
+                } else {
+                    this.genStmt(body);
+                }
+            }
+            this.asm.bindLabel(contLbl);
+            if (stmt.childCount() > 2) {
+                this.genExpr(stmt.child(2));
+            }
+            this.asm.jmpLabel(startLbl);
+            this.asm.bindLabel(endLbl);
+            this.popLoopStart();
+            this.popLoopEnd();
+            this.popLoopContinue();
+        } elif (stmt.kind == 62) {
+            if (this.loopEndStack.length > 0) {
+                int endLbl = this.loopEndStack[this.loopEndStack.length - 1];
+                this.asm.jmpLabel(endLbl);
+            }
+        } elif (stmt.kind == 63) {
+            if (this.loopContinueStack.length > 0) {
+                int contLbl = this.loopContinueStack[this.loopContinueStack.length - 1];
+                this.asm.jmpLabel(contLbl);
+            }
+        } elif (stmt.kind == 64) {
+            int startLbl = this.newLabel();
+            int endLbl = this.newLabel();
+            int contLbl = this.newLabel();
+            this.loopStartStack.add(startLbl);
+            this.loopEndStack.add(endLbl);
+            this.loopContinueStack.add(contLbl);
+            if (stmt.childCount() > 1) {
+                this.genExpr(stmt.child(1));
+                int arrOff = this.allocLocal("__foreach_arr");
+                this.asm.movMBaseR(5, 0, arrOff);
+                this.asm.movRMBase(0, 0, -8);
+                int lenOff = this.allocLocal("__foreach_len");
+                this.asm.movMBaseR(5, 0, lenOff);
+                int idxOff = this.allocLocal("__foreach_idx");
+                this.asm.movRI64(0, 0);
+                this.asm.movMBaseR(5, 0, idxOff);
+                int vOff = this.findLocal(stmt.child(0).name);
+                this.asm.bindLabel(startLbl);
+                this.asm.movRMBase(0, 5, idxOff);
+                this.asm.movRMBase(1, 5, lenOff);
+                this.asm.cmpRR64(0, 1);
+                this.asm.jgeLabel(endLbl);
+                this.asm.movRMBase(0, 5, arrOff);
+                this.asm.movRMBase(1, 5, idxOff);
+                this.asm.shlR64Imm(1, 3);
+                this.asm.addRR64(0, 1);
+                this.asm.movRMBase(0, 0, 0);
+                this.asm.movMBaseR(5, 0, vOff);
+                if (stmt.childCount() > 2) {
+                    Node body = stmt.child(2);
+                    if (body.kind == 16) {
+                        this.genBlock(body);
+                    } elif (body.kind == 61) {
+                        this.genStmt(body);
+                    }
+                }
+                this.asm.bindLabel(contLbl);
+                this.asm.movRMBase(0, 5, idxOff);
+                this.asm.addRI32(0, 1);
+                this.asm.movMBaseR(5, 0, idxOff);
+                this.asm.jmpLabel(startLbl);
+                this.asm.bindLabel(endLbl);
+            }
+            this.popLoopStart();
+            this.popLoopEnd();
+            this.popLoopContinue();
+        }
+    }
+
+    public void popLoopStart() {
+        int[] ns = [];
+        for (int i = 0; i < this.loopStartStack.length - 1; i++) {
+            ns.add(this.loopStartStack[i]);
+        }
+        this.loopStartStack = ns;
+    }
+

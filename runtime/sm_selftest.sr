@@ -1,0 +1,93 @@
+import * from memory;
+
+void check(bool ok) {
+    if (!ok) {
+        printline("SM SELFTEST FAIL");
+        exit(1);
+    }
+}
+
+void checkHeader(SmHeader a, SmHeader b) {
+    check(a.format_version == b.format_version);
+    check(a.header_size == b.header_size);
+    check(a.flags == b.flags);
+    check(a.kind == b.kind);
+    check(a.codec == b.codec);
+    check(a.page_id == b.page_id);
+    check(a.owner_id == b.owner_id);
+    check(a.generation == b.generation);
+    check(a.logical_size == b.logical_size);
+    check(a.payload_size == b.payload_size);
+    check(a.chunk_size == b.chunk_size);
+    check(a.chunk_count == b.chunk_count);
+    check(a.index_offset == b.index_offset);
+    check(a.index_size == b.index_size);
+    check(a.payload_checksum == b.payload_checksum);
+    check(a.name_hash == b.name_hash);
+}
+
+void main() {
+    check(smFnv1_64("a") == 0xaf63bd4c8601b7be);
+    check(smFnv1_64("silver-memory/example") == 0x9bca43930f28837d);
+    int expectedCrc = 0xe3069283;
+    check(smCrc32c("123456789") == expectedCrc);
+
+    int64 logicalSize = 131072;
+    int64 fileSize = (int64)96 + (int64)64 + logicalSize;
+    SmHeader source = new SmHeader();
+    source.format_version = SM_FORMAT_VERSION;
+    source.header_size = SM_HEADER_SIZE;
+    source.flags = SM_FLAG_REQUIRED | SM_FLAG_DELETE_ON_EXIT;
+    source.kind = SM_KIND_BYTES;
+    source.codec = SM_CODEC_NONE;
+    source.page_id = 7;
+    source.owner_id = 11;
+    source.generation = 1;
+    source.logical_size = logicalSize;
+    source.payload_size = logicalSize;
+    source.chunk_size = SM_DEFAULT_CHUNK_SIZE;
+    source.chunk_count = 2;
+    source.index_offset = SM_HEADER_SIZE;
+    source.index_size = 64;
+    source.payload_checksum = 0x12345678;
+    source.name_hash = smFnv1_64("silver-memory/example");
+
+    check(smHeaderValidate(source, fileSize, 1, source.name_hash, 1) == SM_OK);
+    byte[] encoded = smHeaderEncode(source);
+    check(encoded.length == SM_HEADER_SIZE);
+    check(encoded[0] == 83 && encoded[1] == 77);
+    check(encoded[80] == 0xc9 && encoded[81] == 0x15 && encoded[82] == 0x2c && encoded[83] == 0xd2);
+    SmHeader decoded = new SmHeader();
+    int dd = smHeaderDecode(encoded, decoded);
+    check(dd == SM_OK);
+    checkHeader(source, decoded);
+    check(smHeaderValidate(decoded, fileSize, 1, source.name_hash, 1) == SM_OK);
+    int bd = smHeaderValidate(decoded, fileSize + 1, 1, source.name_hash, 1);
+    check(bd == SM_ERR_BOUNDS);
+    int nh = smHeaderValidate(decoded, fileSize, 1, source.name_hash ^ 1, 1);
+    check(nh == SM_ERR_NAME_HASH);
+
+    source.flags = SM_FLAG_REQUIRED | 0x0080;
+    check(smHeaderEncode(source).length == 0);
+    check(smHeaderValidate(source, 0, 0, 0, 0) == SM_ERR_FLAGS);
+    source.flags = SM_FLAG_REQUIRED;
+
+    source.chunk_count = 1;
+    check(smHeaderValidate(source, 0, 0, 0, 0) == SM_ERR_INDEX);
+    source.chunk_count = 2;
+    source.logical_size = 0xffffffffffffffff;
+    check(smHeaderValidate(source, 0, 0, 0, 0) == SM_ERR_INDEX);
+    source.logical_size = logicalSize;
+
+    encoded = smHeaderEncode(source);
+    check(encoded.length == SM_HEADER_SIZE);
+    encoded[10] = 1;
+    check(smHeaderDecode(encoded, decoded) == SM_ERR_RESERVED);
+    encoded = smHeaderEncode(source);
+    encoded[12] = encoded[12] ^ 1;
+    check(smHeaderDecode(encoded, decoded) == SM_ERR_CHECKSUM);
+
+    check(smResultString(SM_ERR_VERSION) == "unsupported format version");
+    check(smResultString(SM_OK) == "ok");
+    printline("SM SELFTEST OK");
+}

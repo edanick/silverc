@@ -1,0 +1,100 @@
+            }
+            this.asm.movRMBase(0, 5, dictOff);
+            this.asm.addRI32(0, 16);
+        } elif (kind == 19) {
+            int count = expr.childCount();
+            int capacity = 8;
+            if (count > 8) { capacity = count; }
+            int allocSize = (capacity + 2) * 8;
+            this.asm.emitImm64(1, allocSize);
+            this.addImportPatch("msvcrt.dll", "malloc");
+            int s4 = 0xDEADBEEFCAFEBAB0;
+            this.asm.emitImm64(0, s4);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            int arrOff = this.allocLocal("__arr_lit");
+            this.asm.movMBaseR(5, 0, arrOff);
+            this.asm.movRMBase(0, 5, arrOff);
+            this.asm.emitImm64(1, capacity);
+            this.asm.movMBaseR(0, 1, 0);
+            this.asm.movRMBase(0, 5, arrOff);
+            this.asm.emitImm64(1, count);
+            this.asm.movMBaseR(0, 1, 8);
+            for (int i = 0; i < count; i++) {
+                this.genExpr(expr.child(i));
+                this.asm.movRMBase(1, 5, arrOff);
+                this.asm.movMBaseR(1, 0, 16 + i * 8);
+            }
+            this.asm.movRMBase(0, 5, arrOff);
+            this.asm.addRI32(0, 16);    } elif (kind == 6) {
+        bool isConst = false;
+        int constVal = 0;
+        string constString = "";
+        int constIdx = 0;
+        for (int ci = 0; ci < this.constNames.length; ci++) {
+            if (this.strEq(this.constNames[ci], expr.name)) {
+                constVal = this.constValues[ci];
+                if (ci < this.constStringValues.length) {
+                    constString = this.constStringValues[ci];
+                }
+                constIdx = ci;
+                isConst = true;
+                break;
+            }
+        }
+        if (isConst) {
+            if (constIdx < this.constIsString.length && this.constIsString[constIdx] == 1) {
+                int strIdx = this.addString(constString);
+                int sp = this.asm.buf.length;
+                this.asm.emitImm64(0, 0);
+                this.stringPatchOffsets.add(sp + 2);
+                this.stringPatchIndices.add(strIdx);
+            } else {
+                this.asm.emitImm64(0, constVal);
+            }
+        } else if (this.strEq(expr.name, "cargs")) {
+            this.genCargsCall(expr);
+        } elif (this.strEq(expr.name, "getCommandLine")) {
+            this.genGetCommandLineCall(expr);
+        } else {
+            int off = this.findLocal(expr.name);
+            if (off != 0) {
+                this.asm.movRMBase(0, 5, off);
+            } else {
+                int gi = this.findGlobal(expr.name);
+                if (gi >= 0) {
+                    this.genGlobalLoad(gi);
+                } else {
+                    this.asm.movRMBase(0, 5, 0);
+                }
+            }
+        }
+        } elif (kind == 9 || kind == 10) {
+            this.genCall(expr);
+        } elif (kind == 23) {
+            if (expr.childCount() > 0) {
+                this.genExpr(expr.child(0));
+            }
+        } elif (kind == 7) {
+            this.genBinary(expr);
+        } elif (kind == 8) {
+            if (expr.op == 3) {
+                // Address-of operator (&x): compute the address of the operand.
+                // For a simple local variable, emit LEA [rbp+off] instead of
+                // loading the value (the old code evaluated the child, leaving
+                // the *value* in RAX, so &x passed the value to the callee).
+                if (expr.childCount() > 0) {
+                    Node addrChild = expr.child(0);
+                    if (addrChild.kind == 6) {
+                        int off = this.findLocal(addrChild.name);
+                        this.asm.leaRBase(0, 5, off);
+                    } else {
+                        this.genExpr(addrChild);
+                    }
+                }
+            } else {
+                if (expr.childCount() > 0) {
+                    this.genExpr(expr.child(0));
+                }

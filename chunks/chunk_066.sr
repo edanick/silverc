@@ -1,0 +1,100 @@
+            } elif (i <= explicitArgs) {
+                this.genExpr(call.child(i));
+            } elif (funcIdx >= 0 && funcIdx < this.funcParamStarts.length) {
+                int defaultIndex = this.funcParamStarts[funcIdx] + i - 1;
+                if (defaultIndex < this.funcParamDefaults.length) {
+                    this.genExpr(this.funcParamDefaults[defaultIndex]);
+                } else {
+                    this.asm.xorRR64(0, 0);
+                }
+            } else {
+                this.asm.xorRR64(0, 0);
+            }
+            int argOff = this.scratchBaseOffset - (8 * (scratchBase + i));
+            this.asm.movMBaseR(5, 0, argOff);
+        }
+
+        int extraStack = 0;
+        if (totalArgs > 4) {
+            extraStack = (totalArgs - 4) * 8;
+        }
+        this.asm.emitCallSetup(extraStack);
+        // Methods use RCX for `this`, then RDX/R8/R9 for declared parameters.
+        // Further parameters are placed after Win64 shadow space at [RSP+32].
+        int[] argRegs = [1, 2, 8, 9];
+        int regArgs = totalArgs;
+        if (regArgs > 4) { regArgs = 4; }
+        for (int i = 0; i < regArgs; i++) {
+            int argOff = this.scratchBaseOffset - (8 * (scratchBase + i));
+            this.asm.movRMBase(argRegs[i], 5, argOff);
+        }
+        for (int i = 4; i < totalArgs; i++) {
+            int argOff = this.scratchBaseOffset - (8 * (scratchBase + i));
+            this.asm.movRMBase(0, 5, argOff);
+            this.asm.movMBaseR(4, 0, 32 + (i - 4) * 8);
+        }
+
+        if (funcIdx >= 0 && funcIdx < this.funcOffsets.length) {
+            int targetOff = this.funcOffsets[funcIdx];
+            if (targetOff >= 0) {
+                int callPos = this.asm.buf.length;
+                int rel32 = targetOff - (callPos + 5);
+                this.asm.callRel32(rel32);
+            } else {
+                this.asm.callRel32(0);
+                this.forwardCalls.add(this.asm.buf.length - 4);
+                this.forwardCallNames.add(name);
+                this.forwardCallClasses.add(lookupClass);
+            }
+        } else {
+            this.asm.callRel32(0);
+            this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallNames.add(name);
+            this.forwardCallClasses.add(lookupClass);
+        }
+        this.asm.emitCallTeardown();
+        this.funcCallArgCount = scratchBase;
+    }
+
+    public void genBinary(Node bin) {
+        if (bin.childCount() < 2) { return; }
+        int op = bin.op;
+        if (op == 25) {
+            this.genExpr(bin.child(0));
+            this.asm.pushR64(0);
+            int fallback = this.newLabel();
+            int done = this.newLabel();
+            this.asm.cmpRI32(0, 0);
+            this.asm.jeLabel(fallback);
+            this.asm.popR64(0);
+            this.asm.jmpLabel(done);
+            this.asm.bindLabel(fallback);
+            this.asm.popR64(1);
+            this.genExpr(bin.child(1));
+            this.asm.bindLabel(done);
+            return;
+        }
+        if (op == 20) {
+            this.genAssign(bin);
+            return;
+        }
+        if (op >= 14 && op <= 17) {
+            this.genCompoundAssign(bin, op);
+            return;
+        }
+        if (op == 1) {
+            string lt = this.inferExprType(bin.child(0));
+            string rt = this.inferExprType(bin.child(1));
+            // Only a real string operand makes `+` string concatenation.
+            // A char operand alone (`'a' + 1`, `'a' + 'b'`) is integer
+            // arithmetic on the code point; treating char as string there
+            // silently produced garbage from the string-concat path.
+            if (this.strEq(lt, "string") || this.strEq(rt, "string")) {
+                this.genStringConcat(bin);
+                return;
+            }
+        }
+        // Strings are pointers, so pointer comparison is not value equality.
+        // Lower string equality through strcmp while leaving numeric/char
+        // comparisons on the ordinary integer path below.
+        if (op == 5 || op == 6) {

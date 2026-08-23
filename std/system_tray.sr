@@ -1,0 +1,110 @@
+mod export system_tray;
+
+// DOCS/249 -- System Tray Icon.
+//
+// The `TrayIcon` class wraps shell32!Shell_NotifyIconA (NIM_ADD / NIM_MODIFY /
+// NIM_DELETE).  silverc-rs emits the real Win32 sequence for the
+// trayAdd/traySetTooltip/trayDelete/trayRemove bridge functions; the
+// self-hosted backend links them as no-ops so this class runs anywhere.
+//
+//     TrayIcon tray = new TrayIcon("silver-app", "assets/app.ico");
+//     tray.setTooltip("Silver App");
+//     tray.show();
+//     ...
+//     tray.dispose();
+//
+// `handle` is the opaque native HWND of the hidden helper window (0 once the
+// icon has been disposed, or when the current backend is a no-op).
+
+class TrayMenuItem {
+    private string title;
+    private string id;
+
+    construct(string title, string id) {
+        this.title = title;
+        this.id = id;
+    }
+
+    public string getTitle() { return this.title; }
+    public string getId() { return this.id; }
+}
+
+class TrayIcon {
+    private string name;
+    private string icon;
+    private string tooltip;
+    private int handle;
+    private bool shown;
+    private TrayMenuItem[] menu;
+
+    construct(string name, string icon) {
+        this.name = name;
+        this.icon = icon;
+        this.tooltip = name;
+        this.handle = trayAdd(name, icon);
+        this.shown = true;
+        this.menu = [];
+    }
+
+    public string getName() { return this.name; }
+    public string getIcon() { return this.icon; }
+    public string getTooltip() { return this.tooltip; }
+    public int getHandle() { return this.handle; }
+    public bool isShown() { return this.shown; }
+
+    public void setTooltip(string t) {
+        this.tooltip = t;
+        if (this.shown && this.handle != 0) { traySetTooltip(this.handle, t); }
+    }
+
+    public void show() {
+        if (!this.shown) {
+            this.handle = trayAdd(this.tooltip, this.icon);
+            this.shown = true;
+        }
+    }
+
+    public void hide() {
+        if (this.shown && this.handle != 0) { trayDelete(this.handle); }
+        this.shown = false;
+    }
+
+    public void dispose() {
+        if (this.handle != 0) { trayRemove(this.handle); }
+        this.handle = 0;
+        this.shown = false;
+    }
+
+    // Register the context-menu items with the native tray window.  The
+    // titles are joined with '\n' and stored in a native buffer; the tray
+    // WndProc renders them as a popup menu on right-click.  (This backend's
+    // tray bridge is a no-op, so the call is harmless and the items are
+    // retained for the getMenu/pollMenu API surface.)
+    public void setMenu(TrayMenuItem[] items) {
+        this.menu = items;
+        string titles = "";
+        for (int i = 0; i < items.length; i = i + 1) {
+            if (i > 0) { titles = titles + "\n"; }
+            titles = titles + items[i].getTitle();
+        }
+        if (this.handle != 0) { traySetMenu(this.handle, titles); }
+    }
+
+    public TrayMenuItem[] getMenu() { return this.menu; }
+
+    // Pump the message queue until a tray event or WM_QUIT.  No-op here.
+    public void run() { trayRunLoop(); }
+
+    // Number of left-clicks since the last poll (resets the counter).
+    public int pollClick() { return trayPollClick(); }
+
+    // The `id` of the last selected menu item ("" when none / dismissed).
+    public string pollMenu() {
+        int cmd = trayPollMenu();
+        if (cmd >= 1 && cmd <= this.menu.length) {
+            TrayMenuItem item = this.menu[cmd - 1];
+            return item.getId();
+        }
+        return "";
+    }
+}

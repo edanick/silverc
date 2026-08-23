@@ -1,0 +1,1399 @@
+mod export parser;
+
+import * from token;
+import * from node;
+import * from lexer;
+
+class Parser {
+    private prop Token[] tokens;
+    private prop int pos;
+    // Inside a `[...]` index, a top-level `..` (token 144) starts a slice
+    // rather than a binary range expression.
+    private bool rangeIsSliceBoundary;
+
+    construct (Token[] toks) {
+        this.tokens = toks;
+        this.pos = 0;
+        this.rangeIsSliceBoundary = false;
+    }
+
+    private bool strEq(string a, string b) {
+        if (a.length != b.length) { return false; }
+        for (int i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    private void pppp() {
+        Node n = new Node();
+        n.kind = 64;
+        this.expect(14);
+        this.expect(100);
+        Node v = new Node();
+        v.kind = 50;
+        string vt = this.advance().text;
+        if (this.check(120)) {
+            while (!this.check(121) && !this.check(106) && !this.check(103)) {
+                vt = vt + this.advance().text;
+            }
+            if (this.check(121)) { vt = vt + ">"; this.advance(); }
+        }
+        if (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } vt = vt + "[]"; }
+        if (this.check(123)) { this.advance(); vt = vt + "?"; }
+        v.typeHint = vt;
+        v.name = this.advance().text;
+        n.children.add(v);
+        this.expect(54);
+        n.children.add(this.parseExpr(0));
+        this.expect(101);
+        n.children.add(this.parseBlock());
+        return n;
+    }
+
+    private Token peek() {
+        if (this.pos < this.tokens.length) {
+            return this.tokens[this.pos];
+        }
+        return this.tokens[this.tokens.length - 1];
+    }
+
+    private Token advance() {
+        // Guard against running past the EOF sentinel (e.g. an unterminated
+        // paren/brace/bracket at end of file): reading tokens[this.pos] beyond
+        // the array would be an out-of-bounds access.
+        if (this.pos >= this.tokens.length) {
+            Token eof = this.tokens[this.tokens.length - 1];
+            printline("Parse error at line " + eof.line.toString() + ", column " + eof.col.toString() + ": unexpected end of file");
+            exit(1);
+            return eof;
+        }
+        Token t = this.tokens[this.pos];
+        this.pos = this.pos + 1;
+        return t;
+    }
+
+    private bool check(int kind) {
+        Token t = this.peek();
+        return t.kind == kind;
+    }
+
+    private Token expect(int kind) {
+        if (this.check(kind)) {
+            return this.advance();
+        }
+        Token tok = this.peek();
+        printline("Parse error at line " + tok.line.toString() + ", column " + tok.col.toString() + ": expected " + this.kindName(kind) + " but found " + this.tokenText(tok));
+        exit(1);
+        return this.peek();
+    }
+
+    private string kindName(int kind) {
+        if (kind == 0) { return "end of file"; }
+        if (kind == 1) { return "number"; }
+        if (kind == 3) { return "string"; }
+        if (kind == 4) { return "character"; }
+        if (kind == 5) { return "boolean"; }
+        if (kind == 6) { return "null"; }
+        if (kind == 7) { return "identifier"; }
+        if (kind == 10) { return "if"; }
+        if (kind == 11) { return "else"; }
+        if (kind == 12) { return "while"; }
+        if (kind == 13) { return "for"; }
+        if (kind == 14) { return "foreach"; }
+        if (kind == 15) { return "return"; }
+        if (kind == 16) { return "match"; }
+        if (kind == 17) { return "void"; }
+        if (kind == 18) { return "int"; }
+        if (kind == 19) { return "int32"; }
+        if (kind == 20) { return "int64"; }
+        if (kind == 22) { return "float"; }
+        if (kind == 23) { return "float64"; }
+        if (kind == 25) { return "bool"; }
+        if (kind == 26) { return "char"; }
+        if (kind == 27) { return "string"; }
+        if (kind == 28) { return "var"; }
+        if (kind == 29) { return "struct"; }
+        if (kind == 30) { return "class"; }
+        if (kind == 31) { return "enum"; }
+        if (kind == 32) { return "def"; }
+        if (kind == 33) { return "found"; }
+        if (kind == 34) { return "collect"; }
+        if (kind == 35) { return "mod"; }
+        if (kind == 36) { return "import"; }
+        if (kind == 37) { return "from"; }
+        if (kind == 38) { return "as"; }
+        if (kind == 39) { return "new"; }
+        if (kind == 40) { return "const"; }
+        if (kind == 44) { return "public"; }
+        if (kind == 45) { return "private"; }
+        if (kind == 46) { return "static"; }
+        if (kind == 47) { return "prop"; }
+        if (kind == 48) { return "construct"; }
+        if (kind == 49) { return "unset"; }
+        if (kind == 50) { return "mut"; }
+        if (kind == 51) { return "ref"; }
+        if (kind == 52) { return "try"; }
+        if (kind == 53) { return "catch"; }
+        if (kind == 54) { return "in"; }
+        if (kind == 55) { return "to"; }
+        if (kind == 56) { return "elif"; }
+        if (kind == 57) { return "break"; }
+        if (kind == 58) { return "continue"; }
+        if (kind == 59) { return "export"; }
+        if (kind == 60) { return "extends"; }
+        if (kind == 64) { return "throw"; }
+        if (kind == 100) { return "("; }
+        if (kind == 101) { return ")"; }
+        if (kind == 102) { return "{"; }
+        if (kind == 103) { return "}"; }
+        if (kind == 104) { return "["; }
+        if (kind == 105) { return "]"; }
+        if (kind == 106) { return ";"; }
+        if (kind == 107) { return ","; }
+        if (kind == 108) { return "."; }
+        if (kind == 109) { return ":"; }
+        if (kind == 110) { return "="; }
+        if (kind == 111) { return "+"; }
+        if (kind == 112) { return "-"; }
+        if (kind == 113) { return "*"; }
+        if (kind == 114) { return "/"; }
+        if (kind == 115) { return "%"; }
+        if (kind == 116) { return "&"; }
+        if (kind == 117) { return "|"; }
+        if (kind == 118) { return "^"; }
+        if (kind == 119) { return "~"; }
+        if (kind == 120) { return "<"; }
+        if (kind == 121) { return ">"; }
+        if (kind == 122) { return "!"; }
+        if (kind == 123) { return "?"; }
+        if (kind == 125) { return "#"; }
+        if (kind == 130) { return "+="; }
+        if (kind == 131) { return "-="; }
+        if (kind == 132) { return "*="; }
+        if (kind == 133) { return "/="; }
+        if (kind == 134) { return "=="; }
+        if (kind == 135) { return "!="; }
+        if (kind == 136) { return "<="; }
+        if (kind == 137) { return ">="; }
+        if (kind == 138) { return "&&"; }
+        if (kind == 139) { return "||"; }
+        if (kind == 140) { return "<<"; }
+        if (kind == 141) { return ">>"; }
+        if (kind == 142) { return "++"; }
+        if (kind == 143) { return "--"; }
+        if (kind == 144) { return ".."; }
+        if (kind == 145) { return "->"; }
+        if (kind == 146) { return "=>"; }
+        if (kind == 147) { return "..."; }
+        if (kind == 148) { return "??"; }
+        if (kind == 149) { return "$"; }
+        if (kind == 150) { return "local"; }
+        if (kind == 151) { return "alias"; }
+        if (kind == 152) { return "fixed"; }
+        if (kind == 153) { return "live"; }
+        if (kind == 154) { return "once"; }
+        if (kind == 155) { return "shared"; }
+        if (kind == 156) { return "@"; }
+        return "token(" + kind.toString() + ")";
+    }
+
+    private string tokenText(Token t) {
+        if (t.kind == 0) { return "end of file"; }
+        if (t.kind == 3) { return "\"" + t.text + "\""; }
+        if (t.kind == 4) { return "'" + t.text + "'"; }
+        return t.text;
+    }
+
+    public Node[] parseProgram() {
+        Node[] items = [];
+        Node mainBody = new Node();
+        mainBody.kind = 16;
+        bool mainSeen = false;
+        while (!this.check(0)) {
+            int posBefore = this.pos;
+            Node? item = this.parseItem();
+            if (item != null) {
+                if (item.kind == 100 && this.strEq(item.name, "main")) {
+                    mainSeen = true;
+                }
+                if (item.kind == 61 || item.kind == 50 || item.kind == 73 || item.kind == 16 || item.kind == 53 || item.kind == 54 || item.kind == 55 || item.kind == 59 || item.kind == 68) {
+                    mainBody.children.add(item);
+                } else {
+                    items.add(item);
+                }
+            }
+            if (this.pos == posBefore) {
+                break;
+            }
+        }
+        if (mainBody.children.length > 0 && !mainSeen) {
+            Node main = new Node();
+            main.kind = 100;
+            main.name = "main";
+            main.typeHint = "void";
+            Node params = new Node();
+            main.children.add(params);
+            main.children.add(mainBody);
+            items.add(main);
+        }
+        if (mainSeen) {
+            // Top-level variable declarations become real globals when a main
+            // function exists: keep them in the program list so codegen can
+            // allocate writable slots and run their initializers before main().
+            for (int gi = 0; gi < mainBody.children.length; gi++) {
+                if (mainBody.children[gi].kind == 50) {
+                    items.add(mainBody.children[gi]);
+                }
+            }
+        }
+        return items;
+    }    private Node? parseItem() {
+        if (this.check(35)) { this.advance(); if (this.check(59)) { this.advance(); } this.advance(); this.expect(106); return null; }
+		if (this.check(36)) { return this.parseImport(); }
+        if (this.check(40)) { return this.parseConst(); }
+        if (this.check(32)) { return this.parseDef(); }
+        if (this.check(34)) { return this.parseCollect(); }
+        if (this.check(29)) { return this.parseStruct(); }
+        if (this.check(30)) { return this.parseClass(); }
+        if (this.check(31)) { return this.parseEnum(); }
+        // Top-level statements (e.g. `printline(42);`) are legal: a source
+        // without a function is compiled as if the statements were the body
+        // of an implicit `void main()`.  Functions are recognized by their
+        // `Type name (` shape (including array returns like `string[] name (`
+        // and optional public/private/static prefixes); anything else is
+        // parsed as a statement.
+        if (this.pos + 1 < this.tokens.length) {
+            int typePos = this.pos;
+            Token t0 = this.tokens[this.pos];
+            if ((t0.kind == 44 || t0.kind == 45 || t0.kind == 46) && this.pos + 1 < this.tokens.length) {
+                typePos = this.pos + 1;
+                t0 = this.tokens[typePos];
+            }
+            bool typeStart = t0.kind == 17 || t0.kind == 18 || t0.kind == 19 || t0.kind == 20 || t0.kind == 22 || t0.kind == 23 || t0.kind == 25 || t0.kind == 26 || t0.kind == 27 || t0.kind == 28 || t0.kind == 7 || t0.kind == 150 || t0.kind == 151 || t0.kind == 152 || t0.kind == 153 || t0.kind == 154 || t0.kind == 155;
+            if (typeStart) {
+                int scan = typePos + 1;
+                if (this.tokens[scan].kind == 120) {
+                    scan = scan + 1;
+                    while (scan < this.tokens.length && this.tokens[scan].kind != 121) { scan = scan + 1; }
+                    scan = scan + 1;
+                }
+                while (scan + 1 < this.tokens.length && this.tokens[scan].kind == 104 && this.tokens[scan + 1].kind == 105) { scan = scan + 2; }
+                if (scan < this.tokens.length && this.tokens[scan].kind == 123) { scan = scan + 1; }
+                if (scan + 1 < this.tokens.length && this.tokens[scan].kind == 7 && this.tokens[scan + 1].kind == 100) {
+                    return this.parseFunction();
+                }
+                return this.parseStmt();
+            }
+            return this.parseStmt();
+        }
+        return this.parseFunction();
+    }
+
+    private Node parseImport() {
+        Node node = new Node();
+        node.kind = 105;
+        this.expect(36);
+        if (this.check(113)) {
+            this.advance();
+            node.isStatic = true;
+        } elif (this.check(102)) {
+            this.advance();
+            node.name = this.advance().text;
+            while (this.check(107)) {
+                this.advance();
+                Node extra = new Node();
+                extra.name = this.advance().text;
+                node.children.add(extra);
+            }
+            this.expect(103);
+        } else {
+            node.name = this.advance().text;
+            while (this.check(107)) {
+                this.advance();
+                Node extra = new Node();
+                extra.name = this.advance().text;
+                node.children.add(extra);
+            }
+        }
+        if (this.check(37)) {
+            this.advance();
+            string src = this.advance().text;
+            while (this.check(108)) {
+                this.advance();
+                src = src + "." + this.advance().text;
+            }
+            node.typeHint = src;
+        }
+        this.expect(106);
+        return node;
+    }
+
+    private Node parseConst() {
+        Node node = new Node();
+        node.kind = 104;
+        this.expect(40);
+        // Support both `const int NAME = 3;` and C-style `const NAME = "x";`.
+        // If the token after `const` is a primitive type keyword, consume it;
+        // otherwise the name comes directly (type is inferred from the
+        // initializer).  Identifiers (kind 7) are always treated as the name.
+        if (this.check(17) || this.check(18) || this.check(19) || this.check(20) || this.check(22) || this.check(23) || this.check(25) || this.check(26) || this.check(27) || this.check(28)) {
+            node.typeHint = this.advance().text;
+        } else {
+            node.typeHint = "";
+        }
+        node.name = this.advance().text;
+        if (this.check(110)) {
+            this.advance();
+            node.children.add(this.parseExpr(0));
+        }
+        this.expect(106);
+        return node;
+    }
+
+    private Node parseDef() {
+        Node node = new Node();
+        this.expect(32);
+        node.name = this.advance().text;
+        if (this.check(110)) {
+            node.kind = 103;
+            this.advance();
+            this.expect(31);
+            this.expect(102);
+            while (!this.check(103) && !this.check(0)) {
+                node.children.add(this.parsePattern());
+                if (this.check(107)) { this.advance(); }
+            }
+            this.expect(103);
+            this.expect(106);
+        } else {
+            node.kind = 110;
+            this.expect(106);
+        }
+        return node;
+    }
+
+    private Node parseCollect() {
+        Node node = new Node();
+        node.kind = 102;
+        this.expect(34);
+        node.name = this.advance().text;
+        this.expect(110);
+        this.expect(100);
+        int fieldIndex = 0;
+        while (!this.check(101) && !this.check(0)) {
+            Node field = new Node();
+            field.kind = 50;
+            field.typeHint = this.advance().text;
+            field.name = fieldIndex.toString();
+            node.children.add(field);
+            fieldIndex = fieldIndex + 1;
+            if (this.check(107)) { this.advance(); }
+        }
+        this.expect(101);
+        this.expect(106);
+        return node;
+    }
+
+    private Node parseStruct() {
+        Node node = new Node();
+        node.kind = 101;
+        this.expect(29);
+        node.name = this.advance().text;
+        this.expect(102);
+        while (!this.check(103) && !this.check(0)) {
+            Node field = new Node();
+            field.typeHint = this.advance().text;
+            string fn = this.advance().text;
+            field.name = fn;
+            field.kind = 0;
+            node.children.add(field);
+            this.expect(106);
+        }
+        this.expect(103);
+        return node;
+    }
+
+    private Node parseClass() {
+        Node node = new Node();
+        node.kind = 102;
+        this.expect(30);
+        node.name = this.advance().text;
+        if (this.check(109) || this.check(60)) {
+            this.advance();
+            node.parentClass = this.advance().text;
+        }
+        this.expect(102);
+        while (!this.check(103) && !this.check(0)) {
+            Node member = this.parseClassMember();
+            if (member != null) { node.children.add(member); }
+        }
+        this.expect(103);
+        return node;
+    }
+
+    private Node? parseEnum() {
+        this.expect(31);
+        Node node = new Node();
+        node.kind = 105;
+        node.name = this.advance().text;
+        this.expect(102);
+        int value = 0;
+        while (!this.check(103) && !this.check(0)) {
+            Node member = new Node();
+            member.kind = 106;
+            member.name = this.advance().text;
+            member.intVal = value;
+            node.children.add(member);
+            value = value + 1;
+            if (this.check(107)) { this.advance(); }
+        }
+        this.expect(103);
+        return node;
+    }
+
+    private Node? parseClassMember() {
+        if (this.check(44) || this.check(45)) { this.advance(); }
+        if (this.check(46)) { this.advance(); }
+        if (this.check(48)) {
+            Node ctor = new Node();
+            ctor.kind = 100;
+            ctor.name = "construct";
+            this.advance();
+            this.expect(100);
+            Node params = new Node();
+            while (!this.check(101) && !this.check(0)) {
+                Node param = new Node();
+                string cpt = this.advance().text;
+                if (this.check(120)) {
+                    while (!this.check(121) && !this.check(106) && !this.check(103)) {
+                        cpt = cpt + this.advance().text;
+                    }
+                    if (this.check(121)) { cpt = cpt + ">"; this.advance(); }
+                }
+                if (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } cpt = cpt + "[]"; }
+                if (this.check(123)) { this.advance(); cpt = cpt + "?"; }
+                param.typeHint = cpt;
+                param.name = this.advance().text;
+                if (this.check(110)) {
+                    this.advance();
+                    param.children.add(this.parseExpr(0));
+                }
+                params.children.add(param);
+                if (this.check(107)) { this.advance(); }
+            }
+            this.expect(101);
+            ctor.children.add(params);
+            ctor.children.add(this.parseBlock());
+            return ctor;
+        }
+        if (this.check(47)) {
+            this.advance();
+            Node field = new Node();
+            field.kind = 50;
+            string ft = this.advance().text;
+            if (this.check(120)) {
+                while (!this.check(121) && !this.check(106) && !this.check(103)) {
+                    ft = ft + this.advance().text;
+                }
+                if (this.check(121)) { ft = ft + ">"; this.advance(); }
+            }
+            if (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } ft = ft + "[]"; }
+            if (this.check(123)) { this.advance(); ft = ft + "?"; }
+            field.typeHint = ft;
+            field.name = this.advance().text;
+            this.expect(106);
+            return field;
+        }
+        if (this.check(28) || this.check(18) || this.check(19) || this.check(20) || this.check(25) || this.check(27) || this.check(22) || this.check(23) || this.check(26) || this.check(7)) {
+            int savedPos = this.pos;
+            string ft = this.advance().text;
+            if (this.check(120)) {
+                while (!this.check(121) && !this.check(106) && !this.check(103)) {
+                    ft = ft + this.advance().text;
+                }
+                if (this.check(121)) { ft = ft + ">"; this.advance(); }
+            }
+            if (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } ft = ft + "[]"; }
+            if (this.check(123)) { this.advance(); ft = ft + "?"; }
+            if (this.check(7) && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 106) {
+                Node field = new Node();
+                field.kind = 50;
+                field.typeHint = ft;
+                field.name = this.advance().text;
+                this.expect(106);
+                return field;
+            }
+            // Legacy class sources (cd_test_classes.sr) omit the trailing
+            // semicolon on fields.  Accept `Type name` followed by another
+            // type/field or the closing brace as a field declaration.
+            if (this.check(7) && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind != 100 && this.tokens[this.pos + 1].kind != 101 && this.tokens[this.pos + 1].kind != 102) {
+                Node field = new Node();
+                field.kind = 50;
+                field.typeHint = ft;
+                field.name = this.advance().text;
+                if (this.check(106)) { this.advance(); }
+                return field;
+            }
+            this.pos = savedPos;
+        }
+        return this.parseFunction();
+    }
+
+    private Node parseFunction() {
+        Node node = new Node();
+        node.kind = 100;
+        if (this.check(44) || this.check(45) || this.check(46)) { this.advance(); }
+        string retType = this.advance().text;
+        if (this.check(120)) {
+            while (!this.check(121) && !this.check(106) && !this.check(103)) {
+                retType = retType + this.advance().text;
+            }
+            if (this.check(121)) { retType = retType + ">"; this.advance(); }
+        }
+        if (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } retType = retType + "[]"; }
+        if (this.check(123)) { this.advance(); retType = retType + "?"; }
+        node.typeHint = retType;
+        node.name = this.advance().text;
+        this.expect(100);
+        Node params = new Node();
+        while (!this.check(101) && !this.check(0)) {
+            Node param = new Node();
+            string pt = this.advance().text;
+            if (this.check(120)) {
+                while (!this.check(121) && !this.check(106) && !this.check(103)) {
+                    pt = pt + this.advance().text;
+                }
+                if (this.check(121)) { pt = pt + ">"; this.advance(); }
+            }
+            if (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } pt = pt + "[]"; }
+            if (this.check(123)) { this.advance(); pt = pt + "?"; }
+            param.typeHint = pt;
+            param.name = this.advance().text;
+            if (this.check(110)) {
+                this.advance();
+                param.children.add(this.parseExpr(0));
+            }
+            params.children.add(param);
+            if (this.check(107)) { this.advance(); }
+        }
+        this.expect(101);
+        node.children.add(params);
+        if (this.check(145)) {
+            this.advance();
+            string ret = this.advance().text;
+            if (this.check(120)) {
+                while (!this.check(121) && !this.check(106) && !this.check(103)) {
+                    ret = ret + this.advance().text;
+                }
+                if (this.check(121)) { ret = ret + ">"; this.advance(); }
+            }
+            if (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } ret = ret + "[]"; }
+            if (this.check(123)) { this.advance(); ret = ret + "?"; }
+            node.typeHint = ret;
+        }
+        if (this.check(140)) {
+            this.advance();
+            node.children.add(this.parseExpr(0));
+        } else {
+            node.children.add(this.parseBlock());
+        }
+        return node;
+    }
+
+    private Node parseBlock() {
+        Node block = new Node();
+        block.kind = 16;
+        this.expect(102);
+        while (!this.check(103) && !this.check(0)) {
+            block.children.add(this.parseStmt());
+        }
+        this.expect(103);
+        return block;
+    }
+
+    // Accepts either a brace block or a single brace-less statement
+    // (JS-style `if (x) return 1;` one-liners).
+    private Node parseBlockOrStmt() {
+        if (this.check(102)) {
+            return this.parseBlock();
+        }
+        return this.parseStmt();
+    }
+
+    private Node parseStmt() {
+        if ((this.check(18) || this.check(19) || this.check(20) || this.check(22) || this.check(23) || this.check(25) || this.check(26) || this.check(27)) && this.pos + 3 < this.tokens.length && this.tokens[this.pos + 1].kind == 7 && this.tokens[this.pos + 2].kind == 104) {
+            return this.parseFixedVarDecl();
+        }
+        if (this.check(7) && this.strEq(this.peek().text, "tuple") && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 120) {
+            int tupleSaved = this.pos;
+            this.advance();
+            this.advance();
+            while (!this.check(121) && !this.check(0)) { this.advance(); }
+            this.expect(121);
+            if (this.check(7)) {
+                this.pos = tupleSaved;
+                return this.parseVarDecl();
+            }
+            this.expect(100);
+            Node destr = new Node(); destr.kind = 71;
+            while (!this.check(101) && !this.check(0)) {
+                destr.children.add(this.makeNameNode(this.advance().text));
+                if (this.check(107)) { this.advance(); }
+            }
+            this.expect(101);
+            this.expect(110);
+            destr.children.add(this.parseExpr(0));
+            this.expect(106);
+            return destr;
+        }
+        if (this.check(7) && this.pos + 1 < this.tokens.length) {
+            Token next = this.tokens[this.pos + 1];
+            if (next.kind == 7) {
+                return this.parseVarDecl();
+            }
+if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.pos + 2].kind == 105) {
+                return this.parseVarDecl();
+            }
+            if (next.kind == 123 && this.pos + 2 < this.tokens.length && this.tokens[this.pos + 2].kind == 7) {
+                return this.parseVarDecl();
+            }
+            if (next.kind == 120) {
+                return this.parseVarDecl();
+            }
+        }
+        if (this.check(15)) {
+            Node n = new Node(); n.kind = 51;
+            this.advance();
+            if (!this.check(106)) { n.children.add(this.parseExpr(0)); }
+            this.expect(106);
+            return n;
+        }
+        if (this.check(141)) {
+            Node n = new Node(); n.kind = 52;
+            this.advance();
+            n.children.add(this.parseExpr(0));
+            this.expect(106);
+            return n;
+        }
+        if (this.check(10)) { return this.parseIf(); }
+        if (this.check(12)) { return this.parseWhile(); }
+        if (this.check(13)) { return this.parseFor(); }
+        if (this.check(14)) { return this.pppp(); }
+        if (this.check(57)) { Node n = new Node(); n.kind = 62; this.advance(); this.expect(106); return n; }
+        if (this.check(58)) { Node n = new Node(); n.kind = 63; this.advance(); this.expect(106); return n; }
+        if (this.check(150)) {
+            this.advance();
+            return this.parseVarDecl();
+        }
+        if (this.check(152)) {
+            this.advance();
+            Node n = this.parseTypeNameInit();
+            n.isFixed = true;
+            return n;
+        }
+        if (this.check(153)) {
+            this.advance();
+            Node n = this.parseTypeNameInit();
+            n.isLive = true;
+            return n;
+        }
+        if (this.check(154)) {
+            this.advance();
+            Node n = this.parseTypeNameInit();
+            n.isOnce = true;
+            return n;
+        }
+        if (this.check(155)) {
+            this.advance();
+            Node n = this.parseTypeNameInit();
+            n.isShared = true;
+            return n;
+        }
+        if (this.check(151)) {
+            this.advance();
+            Node n = new Node(); n.kind = 73; n.isAlias = true;
+            string aliasType = this.advance().text;
+            if (this.check(120)) {
+                while (!this.check(121) && !this.check(106) && !this.check(103)) {
+                    this.advance();
+                }
+                this.expect(121);
+            }
+            while (this.check(104)) {
+                this.advance();
+                this.expect(105);
+                aliasType = aliasType + "[]";
+            }
+            if (this.check(123)) { this.advance(); aliasType = aliasType + "?"; }
+            n.typeHint = aliasType;
+            n.name = this.advance().text;
+            n.children.add(this.makeNameNode(n.name));
+            if (this.check(110)) {
+                this.advance();
+                n.children.add(this.parseExpr(0));
+            }
+            this.expect(106);
+            return n;
+        }
+        if (this.check(49)) {
+            Node n = new Node(); n.kind = 60;
+            this.advance();
+            n.name = this.advance().text;
+            this.expect(106);
+            return n;
+        }
+        if (this.check(52)) { return this.parseTryCatch(); }
+        if (this.check(64)) { return this.parseThrow(); }
+        if (this.check(28) || this.check(18) || this.check(19) || this.check(20) || this.check(25) || this.check(27) || this.check(22) || this.check(23) || this.check(26)) {
+            return this.parseVarDecl();
+        }
+        Node exprStmt = new Node(); exprStmt.kind = 61;
+        exprStmt.children.add(this.parseExpr(0));
+        // A trailing semicolon is optional for the final statement (top-level
+        // scripts and legacy tests such as test_42.sr omit it).
+        if (this.check(106)) { this.advance(); }
+        return exprStmt;
+    }
+
+    private Node parseFixedVarDecl() {
+        Node n = new Node(); n.kind = 50;
+        string typeName = this.advance().text;
+        n.name = this.advance().text;
+        this.expect(104);
+        Node sizeExpr = this.parseExpr(0);
+        this.expect(105);
+        n.typeHint = typeName + "[]";
+        Node arr = new Node(); arr.kind = 19; arr.op = 1;
+        if (sizeExpr.kind == 0) { arr.intVal = sizeExpr.intVal; }
+        n.children.add(arr);
+        this.expect(106);
+        return n;
+    }
+
+    private Node makeNameNode(string name) {
+        Node n = new Node(); n.kind = 6; n.name = name; return n;
+    }
+
+    private Node parseVarDecl() {
+        string typeName = this.advance().text;
+        if (this.check(38)) {
+            Node n = new Node(); n.kind = 111;
+            n.typeHint = typeName;
+            this.advance();
+            n.name = this.advance().text;
+            this.expect(106);
+            return n;
+        }
+        this.pos = this.pos - 1;
+        return this.parseTypeNameInit();
+    }
+
+    private Node parseTypeNameInit() {
+        Node n = new Node(); n.kind = 50;
+        string typeName = this.advance().text;
+        if (this.check(120)) {
+            bool isTupleType = this.strEq(typeName, "tuple");
+            while (!this.check(121) && !this.check(106) && !this.check(103)) {
+                this.advance();
+            }
+            this.expect(121);
+            if (isTupleType) { typeName = "tuple"; }
+        }
+        while (this.check(104)) {
+            this.advance();
+            this.expect(105);
+            typeName = typeName + "[]";
+        }
+        if (this.check(123)) { this.advance(); typeName = typeName + "?"; }
+        n.typeHint = typeName;
+        if (this.check(50)) { this.advance(); n.isMut = true; }
+        n.name = this.advance().text;
+        if (this.check(110)) {
+            this.advance();
+            n.children.add(this.parseExpr(0));
+        } elif (this.check(140)) {
+            this.advance();
+            Node rhs = this.parseExpr(0);
+            Node moveBin = new Node(); moveBin.kind = 7; moveBin.op = 28;
+            moveBin.children.add(this.makeNameNode(n.name));
+            moveBin.children.add(rhs);
+            n.children.add(moveBin);
+        }
+        this.expect(106);
+        return n;
+    }
+
+    private Node parseIf() {
+        Node n = new Node(); n.kind = 53;
+        if (this.check(56)) {
+            this.advance();
+        } else {
+            this.expect(10);
+        }
+        this.expect(100);
+        n.children.add(this.parseExpr(0));
+        this.expect(101);
+        n.children.add(this.parseBlockOrStmt());
+        if (this.check(11)) {
+            this.advance();
+            if (this.check(10)) {
+                n.children.add(this.parseIf());
+            } elif (this.check(56)) {
+                n.children.add(this.parseIf());
+            } else {
+                n.children.add(this.parseBlockOrStmt());
+            }
+        } elif (this.check(56)) {
+            n.children.add(this.parseIf());
+        }
+        return n;
+    }
+
+    private Node parseWhile() {
+        Node n = new Node(); n.kind = 54;
+        this.expect(12);
+        this.expect(100);
+        n.children.add(this.parseExpr(0));
+        this.expect(101);
+        n.children.add(this.parseBlockOrStmt());
+        return n;
+    }
+
+    private Node parseTryCatch() {
+        Node n = new Node(); n.kind = 59;
+        this.expect(52);
+        n.children.add(this.parseBlock());
+        if (this.check(53)) {
+            this.advance();
+            this.expect(100);
+            string catchType = this.advance().text;
+            if (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } catchType = catchType + "[]"; }
+            if (this.check(123)) { this.advance(); catchType = catchType + "?"; }
+            n.name = this.advance().text;
+            n.typeHint = catchType;
+            this.expect(101);
+            n.children.add(this.parseBlock());
+        } else {
+            Node empty = new Node(); empty.kind = 16;
+            n.children.add(empty);
+        }
+        if (this.check(65)) {
+            this.advance();
+            n.hasFinally = true;
+            n.children.add(this.parseBlock());
+        }
+        return n;
+    }
+
+    private Node parseThrow() {
+        Node n = new Node(); n.kind = 68;
+        this.advance();
+        n.children.add(this.parseExpr(0));
+        this.expect(106);
+        return n;
+    }
+
+    private Node parseFor() {
+        Node n = new Node();
+        this.expect(13);
+        this.expect(100);
+        // Range-style for loop: `for (type name as start to end) { body }`.
+        // Look ahead for the `type name as` pattern; if present, desugar it
+        // into the C-style for node (kind 55) that codegen already handles.
+        int savedPos = this.pos;
+        bool isRange = false;
+        string rangeType = "";
+        string rangeVar = "";
+        if (this.check(28) || this.check(18) || this.check(19) || this.check(20) || this.check(7)) {
+            rangeType = this.advance().text;
+            if (this.check(7)) {
+                rangeVar = this.advance().text;
+                if (this.check(38)) {
+                    isRange = true;
+                }
+            }
+        }
+        if (isRange) {
+            this.advance();
+            Node startExpr = this.parseExpr(0);
+            this.expect(55);
+            Node endExpr = this.parseExpr(0);
+            this.expect(101);
+            Node body = this.parseBlockOrStmt();
+            n.kind = 55;
+            // init: type name = start
+            Node init = new Node();
+            init.kind = 50;
+            init.typeHint = rangeType;
+            init.name = rangeVar;
+            init.children.add(startExpr);
+            n.children.add(init);
+            // cond: name < end
+            Node cond = new Node();
+            cond.kind = 7;
+            cond.op = 7;
+            Node lhs = new Node();
+            lhs.kind = 6;
+            lhs.name = rangeVar;
+            cond.children.add(lhs);
+            cond.children.add(endExpr);
+            n.children.add(cond);
+            // update: name = name + 1
+            Node upd = new Node();
+            upd.kind = 7;
+            upd.op = 20;
+            Node uLhs = new Node();
+            uLhs.kind = 6;
+            uLhs.name = rangeVar;
+            Node add = new Node();
+            add.kind = 7;
+            add.op = 1;
+            Node aLhs = new Node();
+            aLhs.kind = 6;
+            aLhs.name = rangeVar;
+            Node one = new Node();
+            one.kind = 0;
+            one.intVal = 1;
+            add.children.add(aLhs);
+            add.children.add(one);
+            upd.children.add(uLhs);
+            upd.children.add(add);
+            n.children.add(upd);
+            n.children.add(body);
+            return n;
+        }
+        this.pos = savedPos;
+        if (this.check(28) || this.check(18) || this.check(19) || this.check(20)) {
+            n.kind = 55;
+            n.children.add(this.parseVarDecl());
+        } else {
+            n.kind = 55;
+            n.children.add(this.parseStmt());
+        }
+        n.children.add(this.parseExpr(0));
+        this.expect(106);
+        n.children.add(this.parseExpr(0));
+        this.expect(101);
+        n.children.add(this.parseBlockOrStmt());
+        return n;
+    }
+
+    private Node parseExpr(int minPrec) {
+        Node lhs = this.parsePrefix();
+        while (true) {
+            if (this.check(100) && lhs.kind == 6) {
+                Node call = new Node(); call.kind = 10;
+                call.name = lhs.name;
+                this.advance();
+                while (!this.check(101) && !this.check(0)) {
+                    call.children.add(this.parseExpr(0));
+                    if (this.check(107)) { this.advance(); }
+                }
+                this.expect(101);
+                lhs = call;
+                continue;
+            }
+            if (this.check(104)) {
+                Node idx = new Node(); idx.kind = 24;
+                idx.children.add(lhs);
+                this.advance();
+                // Inside the brackets, `..` is a slice boundary rather than a
+                // binary range operator, so the index expression stops there.
+                bool oldBoundary = this.rangeIsSliceBoundary;
+                this.rangeIsSliceBoundary = true;
+                idx.children.add(this.parseExpr(0));
+                bool isSlice = this.check(109) || this.check(144);
+                // Slice syntax: arr[a:b] (colon) or arr[a..b] (range) -> kind 67.
+                if (isSlice) {
+                    this.advance();
+                    idx.kind = 67;
+                    if (this.check(105)) {
+                        // Open-ended slice [a:]: the end bound is the base's
+                        // length, resolved in genSlice (sentinel intVal -1).
+                        Node openEnd = new Node(); openEnd.kind = 0; openEnd.intVal = -1;
+                        idx.children.add(openEnd);
+                    } else {
+                        idx.children.add(this.parseExpr(0));
+                    }
+                }
+                this.rangeIsSliceBoundary = oldBoundary;
+                this.expect(105);
+                lhs = idx;
+                continue;
+            }
+            if (this.check(108)) {
+                this.advance();
+                Token name = this.advance();
+                if (this.check(100)) {
+                    Node call = new Node(); call.kind = 10;
+                    call.name = name.text;
+                    call.isMember = true;
+                    call.children.add(lhs);
+                    this.advance();
+                    while (!this.check(101) && !this.check(0)) {
+                        call.children.add(this.parseExpr(0));
+                        if (this.check(107)) { this.advance(); }
+                    }
+                    this.expect(101);
+                    lhs = call;
+                } else {
+                    Node member = new Node(); member.kind = 13;
+                    member.name = name.text;
+                    member.children.add(lhs);
+                    lhs = member;
+                }
+                continue;
+            }
+            if (this.check(142)) {
+                this.advance();
+                Node add = new Node(); add.kind = 7; add.op = 1;
+                Node one = new Node(); one.kind = 0; one.intVal = 1;
+                add.children.add(lhs);
+                add.children.add(one);
+                Node assign = new Node(); assign.kind = 7; assign.op = 20;
+                assign.children.add(lhs);
+                assign.children.add(add);
+                lhs = assign;
+                continue;
+            }
+            if (this.check(143)) {
+                this.advance();
+                Node sub = new Node(); sub.kind = 7; sub.op = 2;
+                Node one = new Node(); one.kind = 0; one.intVal = 1;
+                sub.children.add(lhs);
+                sub.children.add(one);
+                Node assign = new Node(); assign.kind = 7; assign.op = 20;
+                assign.children.add(lhs);
+                assign.children.add(sub);
+                lhs = assign;
+                continue;
+            }
+            if (this.check(148) && minPrec <= 1) {
+                this.advance();
+                Node coalesce = new Node(); coalesce.kind = 7; coalesce.op = 25;
+                coalesce.children.add(lhs);
+                coalesce.children.add(this.parseExpr(2));
+                lhs = coalesce;
+                continue;
+            }
+            if (this.check(123) && minPrec <= 1) {
+                this.advance();
+                Node thenExpr = this.parseExpr(0);
+                this.expect(109);
+                Node elseExpr = this.parseExpr(0);
+                Node tern = new Node(); tern.kind = 65;
+                tern.children.add(lhs);
+                tern.children.add(thenExpr);
+                tern.children.add(elseExpr);
+                lhs = tern;
+                continue;
+            }
+            if (this.check(144) && this.rangeIsSliceBoundary) {
+                // `..` inside a `[...]` index starts a slice, so it is not an
+                // infix operator there; stop and let the index handler see it.
+                break;
+            }
+            int prec = this.getPrec(this.peek().kind);
+            if (prec < minPrec) { break; }
+            int nextMin = prec + 1;
+            int op = this.peek().kind;
+            this.advance();
+            Node rhs = this.parseExpr(nextMin);
+            Node bin = new Node(); bin.kind = 7;
+            bin.op = this.tokenToOp(op);
+            bin.children.add(lhs);
+            bin.children.add(rhs);
+            lhs = bin;
+        }
+        return lhs;
+    }
+
+    private int tokenToOp(int kind) {
+        if (kind == 111) { return 1; }
+        if (kind == 112) { return 2; }
+        if (kind == 113) { return 3; }
+        if (kind == 114) { return 4; }
+        if (kind == 115) { return 13; }
+        if (kind == 134) { return 5; }
+        if (kind == 135) { return 6; }
+        if (kind == 120) { return 7; }
+        if (kind == 136) { return 8; }
+        if (kind == 121) { return 9; }
+        if (kind == 137) { return 10; }
+        if (kind == 138) { return 11; }
+        if (kind == 139) { return 12; }
+        if (kind == 110) { return 20; }
+        if (kind == 130) { return 14; }
+        if (kind == 131) { return 15; }
+        if (kind == 132) { return 16; }
+        if (kind == 133) { return 17; }
+        if (kind == 140) { return 18; }
+        if (kind == 141) { return 19; }
+        if (kind == 144) { return 27; }
+        if (kind == 147) { return 26; }
+        if (kind == 148) { return 25; }
+        if (kind == 116) { return 22; }
+        if (kind == 117) { return 23; }
+        if (kind == 118) { return 24; }
+        return 0;
+    }
+
+    private int getPrec(int kind) {
+        if (kind == 110 || kind == 130 || kind == 131 || kind == 132 || kind == 133 || kind == 148) { return 1; }
+        if (kind == 139) { return 2; }
+        if (kind == 138) { return 3; }
+        if (kind == 135 || kind == 134) { return 4; }
+        if (kind == 120 || kind == 136 || kind == 121 || kind == 137) { return 5; }
+        if (kind == 117) { return 6; }
+        if (kind == 116) { return 7; }
+        if (kind == 118) { return 7; }
+        if (kind == 140 || kind == 141) { return 8; }
+        if (kind == 111 || kind == 112) { return 9; }
+        if (kind == 113 || kind == 114 || kind == 115) { return 10; }
+        if (kind == 147) { return 4; }
+        if (kind == 144) { return 11; }
+        return -1;
+    }
+
+    private Node parsePrefix() {
+        Token t = this.advance();
+        Node n = new Node();
+        n.line = t.line; n.col = t.col;
+        int kind = t.kind;
+
+        if (kind == 1) { n.kind = 0; n.intVal = t.intVal; return n; }
+        if (kind == 2) { n.kind = 1; n.floatVal = t.floatVal; return n; }
+        if (kind == 3) { n.kind = 2; n.strVal = t.strVal; return n; }
+        if (kind == 4) { n.kind = 3; n.charVal = t.charVal; return n; }
+        if (kind == 5) {
+            n.kind = 4;
+            n.boolVal = this.strEq(t.text, "true");
+            return n;
+        }
+        if (kind == 6) { n.kind = 5; return n; }
+        if (kind == 7) { n.kind = 6; n.name = t.text; return n; }        if (kind == 39) {
+            Node ctor = new Node();
+            ctor.kind = 10;
+            ctor.name = this.advance().text;
+            if (this.check(104)) {
+                // new T[n]: native array allocation.  A zero/omitted size
+                // produces an empty array; a positive constant size produces
+                // that many zeroed slots.
+                this.advance();
+                Node sizeExpr = this.parseExpr(0);
+                this.expect(105);
+                Node arr = new Node(); arr.kind = 19;
+                if (sizeExpr.kind == 0) {
+                    arr.op = 1;
+                    arr.intVal = sizeExpr.intVal;
+                }
+                if (sizeExpr.kind == 0 && sizeExpr.intVal > 0 && sizeExpr.intVal <= 256) {
+                    for (int zi = 0; zi < sizeExpr.intVal; zi++) {
+                        Node zero = new Node(); zero.kind = 0; zero.intVal = 0;
+                        arr.children.add(zero);
+                    }
+                }
+                return arr;
+            }
+            this.expect(100);
+            while (!this.check(101) && !this.check(0)) {
+                ctor.children.add(this.parseExpr(0));
+                if (this.check(107)) { this.advance(); }
+            }
+            this.expect(101);
+            return ctor;
+        }
+
+        if (kind == 16) {
+            // `match (subject) { pattern => expr; ... }` is an expression: the
+            // value of the matched arm is the match's value.
+            Node m = new Node(); m.kind = 20;
+            if (this.check(100)) {
+                this.advance();
+                m.children.add(this.parseExpr(0));
+                this.expect(101);
+            } else {
+                m.children.add(this.parseExpr(0));
+            }
+            this.expect(102);
+            while (!this.check(103) && !this.check(0)) {
+                Node arm = new Node(); arm.kind = 21;
+                arm.children.add(this.parsePattern());
+                this.expect(146);
+                arm.children.add(this.parseExpr(0));
+                this.expect(106);
+                m.children.add(arm);
+            }
+            this.expect(103);
+            return m;
+        }
+
+        if (kind == 100) {
+            // C-style casts used by legacy/runtime modules, e.g. `(int) c`.
+            // Integer and character values share the native scalar
+            // representation, so the self-hosted backend can lower these
+            // casts as the operand itself.  Detect the cast before ordinary
+            // parenthesized/tuple expressions; the required closing `)` makes
+            // the forms unambiguous.
+            int castSaved = this.pos;
+            bool castType = this.check(17) || this.check(18) || this.check(19) || this.check(20) || this.check(22) || this.check(23) || this.check(25) || this.check(26) || this.check(27) || this.check(28) || this.check(7);
+            if (castType) {
+                this.advance();
+                if (this.check(101)) {
+                    this.advance();
+                    return this.parseExpr(10);
+                }
+            }
+            this.pos = castSaved;
+            Node first = this.parseExpr(0);
+            if (this.check(107)) {
+                n.kind = 70;
+                n.children.add(first);
+                while (this.check(107)) {
+                    this.advance();
+                    n.children.add(this.parseExpr(0));
+                }
+                this.expect(101);
+                return n;
+            }
+            n.kind = 23; n.children.add(first); this.expect(101); return n;
+        }
+        if (kind == 102) {
+            if (this.check(103)) {
+                n.kind = 66;
+                this.advance();
+                return n;
+            }
+            // Braced string/int key pairs are dictionary literals; other
+            // braced expressions retain the historical array-compatible form.
+            if (this.check(3) || this.check(1) || this.check(7)) {
+                int saved = this.pos;
+                Node firstKey = this.parseExpr(0);
+                if (this.check(109)) {
+                    n.kind = 66;
+                    this.advance();
+                    Node pair = new Node(); pair.kind = 18;
+                    pair.children.add(firstKey);
+                    pair.children.add(this.parseExpr(0));
+                    n.children.add(pair);
+                    while (this.check(107)) {
+                        this.advance();
+                        Node key = this.parseExpr(0);
+                        this.expect(109);
+                        Node nextPair = new Node(); nextPair.kind = 18;
+                        nextPair.children.add(key);
+                        nextPair.children.add(this.parseExpr(0));
+                        n.children.add(nextPair);
+                    }
+                    this.expect(103);
+                    return n;
+                }
+                this.pos = saved;
+            }
+            n.kind = 19;
+            while (!this.check(103) && !this.check(0)) {
+                n.children.add(this.parseExpr(0));
+                if (this.check(107)) { this.advance(); }
+            }
+            this.expect(103);
+            return n;
+        }
+
+        if (kind == 104) {
+            n.kind = 19;
+            while (!this.check(105) && !this.check(0)) {
+                n.children.add(this.parseExpr(0));
+                if (this.check(107)) { this.advance(); }
+            }
+            this.expect(105);
+            return n;
+        }
+
+        if (kind == 112) { n.kind = 8; n.op = 0; n.children.add(this.parseExpr(10)); return n; }
+        if (kind == 122) { n.kind = 8; n.op = 1; n.children.add(this.parseExpr(10)); return n; }
+        if (kind == 116) { n.kind = 8; n.op = 3; n.children.add(this.parseExpr(10)); return n; }
+        if (kind == 156) {
+            Node a = new Node(); a.kind = 72;
+            a.children.add(this.parseExpr(10));
+            return a;
+        }
+        if (kind == 149) {
+            if (this.check(3)) {
+                Token st = this.advance();
+                Node ip = this.parseInterpString(st.strVal);
+                ip.line = t.line; ip.col = t.col;
+                return ip;
+            }
+            Node bad = new Node(); bad.kind = 6; bad.name = "$";
+            return bad;
+        }
+
+        Node ident = new Node(); ident.kind = 6; ident.name = t.text;
+        return ident;
+    }
+
+    private Node parseInterpString(string s) {
+        Node n = new Node();
+        n.kind = 69;
+        n.name = "interp";
+        string text = "";
+        int i = 0;
+        while (i < s.length) {
+            if (s[i] == '{') {
+                if (text.length > 0) {
+                    Node tn = new Node(); tn.kind = 2; tn.strVal = text;
+                    n.children.add(tn);
+                    text = "";
+                }
+                int depth = 1;
+                i = i + 1;
+                string exprSrc = "";
+                while (i < s.length && depth > 0) {
+                    if (s[i] == '{') { depth = depth + 1; }
+                    elif (s[i] == '}') {
+                        depth = depth - 1;
+                        if (depth == 0) { break; }
+                    }
+                    exprSrc = exprSrc + charToString(s[i]);
+                    i = i + 1;
+                }
+                if (depth == 0) {
+                    Lexer lx = new Lexer(exprSrc);
+                    Token[] toks = lx.tokenize();
+                    Parser pp = new Parser(toks);
+                    Node en = pp.parseExpr(0);
+                    n.children.add(en);
+                }
+                i = i + 1;
+            } else {
+                text = text + charToString(s[i]);
+                i = i + 1;
+            }
+        }
+        if (text.length > 0) {
+            Node tn = new Node(); tn.kind = 2; tn.strVal = text;
+            n.children.add(tn);
+        }
+        return n;
+    }
+
+    private Node parsePattern() {
+        Node n = new Node();
+        Token t = this.advance();
+        if (t.kind == 126) { n.name = "_"; return n; }
+        if (t.kind == 1) { n.kind = 0; n.intVal = t.intVal; return n; }
+        if (t.kind == 7) {
+            n.name = t.text;
+            if (this.check(108)) {
+                // Enum variant pattern `Enum.Variant` (kind 13): the codegen
+                // compares the subject against the enum's constant value.
+                this.advance();
+                n.kind = 13;
+                n.name = t.text + "." + this.advance().text;
+            }
+            return n;
+        }
+        return n;
+    }
+}

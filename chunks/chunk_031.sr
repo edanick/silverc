@@ -1,0 +1,100 @@
+        if (expr.kind == 6) {
+            if (this.strEq(expr.name, "this")) { return this.currentClassName; }
+            for (int ci = 0; ci < this.constNames.length; ci++) {
+                if (this.strEq(this.constNames[ci], expr.name)) {
+                    if (ci < this.constIsString.length && this.constIsString[ci] == 1) {
+                        return "string";
+                    }
+                    return "int";
+                }
+            }
+            return this.getLocalType(expr.name);
+        }
+        if (expr.kind == 13) {
+            if (this.strEq(expr.name, "length")) { return "int"; }
+            return this.inferMemberAccessType(expr);
+        }
+        if (expr.kind == 24) {
+            Node arrNode = expr.child(0);
+            string arrType = this.inferExprType(arrNode);
+            if (this.isDictType(arrType)) { return this.dictValueType(arrType); }
+            if (this.strEq(arrType, "string")) { return "char"; }
+            return this.arrayElementType(arrType);
+        }
+        if (expr.kind == 9) {
+            return expr.name;
+        }
+        if (expr.kind == 10) {
+            string cname = expr.name;
+            // `new X(...)` parses as a non-member call whose name is the
+            // class, and genCall lowers it to genNewCall. Infer the constructed
+            // type so `new X(...).field` (and .method()) can resolve the field
+            // on the result instead of leaving it as an unknown type.
+            if (!expr.isMember) {
+                for (int ci = 0; ci < this.classNames.length; ci++) {
+                    if (this.strEq(this.classNames[ci], cname)) {
+                        return cname;
+                    }
+                }
+            }
+            string recvType = "";
+            if (expr.isMember && expr.childCount() > 0) {
+                recvType = this.inferExprType(expr.child(0));
+                // env.get / env.getenv / env.getEnv return the environment
+                // value as a string.  Without this, `env.get(k) == "v"`
+                // inferred an unknown type and lowered to pointer comparison
+                // instead of strcmp, so the comparison was always false.
+                if (this.strEq(expr.child(0).name, "env") && (this.strEq(cname, "get") || this.strEq(cname, "getenv") || this.strEq(cname, "getEnv"))) {
+                    return "string";
+                }
+                if (this.strEq(expr.child(0).name, "url") && (this.strEq(cname, "isUrl") || this.strEq(cname, "isFtp") || this.strEq(cname, "isFtps"))) {
+                    return "bool";
+                }
+                if ((this.strEq(expr.child(0).name, "fs") || this.strEq(expr.child(0).name, "file") || this.strEq(expr.child(0).name, "folder")) && (this.strEq(cname, "isDir") || this.strEq(cname, "isFile") || this.strEq(cname, "isDriveRoot") || this.strEq(cname, "exists"))) {
+                    return "bool";
+                }
+                if ((this.strEq(expr.child(0).name, "fs") || this.strEq(expr.child(0).name, "file") || this.strEq(expr.child(0).name, "folder")) && this.strEq(cname, "getSize")) {
+                    return "int64";
+                }
+                if ((this.strEq(expr.child(0).name, "fs") || this.strEq(expr.child(0).name, "folder")) && (this.strEq(cname, "getEntries") || this.strEq(cname, "entries") || this.strEq(cname, "list") || this.strEq(cname, "getFiles") || this.strEq(cname, "files") || this.strEq(cname, "getFolders") || this.strEq(cname, "folders"))) {
+                    return "string[]";
+                }
+                if (this.strEq(cname, "toInt64") || this.strEq(cname, "toInt") || this.strEq(cname, "toNumber")) { return "int64"; }
+                if (this.strEq(cname, "toString") && (this.strEq(recvType, "string") || this.strEq(recvType, "char") || this.strEq(recvType, "int") || this.strEq(recvType, "int64") || this.strEq(recvType, "bool"))) {
+                    return "string";
+                }
+                if ((this.strEq(cname, "trim") || this.strEq(cname, "trimEnd") || this.strEq(cname, "trimStart") || this.strEq(cname, "trimLeft") || this.strEq(cname, "trimRight")) && this.strEq(recvType, "string")) {
+                    return "string";
+                }
+                if (this.strEq(cname, "startsWith") && this.strEq(recvType, "string")) {
+                    return "bool";
+                }
+                if ((this.strEq(cname, "split") || this.strEq(cname, "lines")) && this.strEq(recvType, "string")) {
+                    return "string[]";
+                }
+                if (this.strEq(cname, "isWhiteSpace") && this.strEq(recvType, "char")) {
+                    return "bool";
+                }
+                if (this.strEq(cname, "contains") && this.strEq(recvType, "string")) {
+                    return "bool";
+                }
+                if ((this.strEq(cname, "indexOf") || this.strEq(cname, "find")) && this.strEq(recvType, "string")) {
+                    return "int";
+                }
+                if ((this.strEq(cname, "toLower") || this.strEq(cname, "lower")) && this.strEq(recvType, "string")) {
+                    return "string";
+                }
+                if ((this.strEq(cname, "toUpper") || this.strEq(cname, "upper")) && this.strEq(recvType, "string")) {
+                    return "string";
+                }
+                if ((this.strEq(cname, "substr") || this.strEq(cname, "substring")) && this.strEq(recvType, "string")) {
+                    return "string";
+                }
+                if (this.strEq(cname, "length") && this.strEq(recvType, "string")) {
+                    return "int";
+                }
+                if (this.strEq(cname, "endsWith") && this.strEq(recvType, "string")) {
+                    return "bool";
+                }
+                if (this.strEq(cname, "replace") && this.strEq(recvType, "string")) { return "string"; }
+                if (this.strEq(cname, "any") || this.strEq(cname, "all")) {

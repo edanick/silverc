@@ -1,0 +1,204 @@
+import * from win32.msvcrt;
+import * from win32.user32;
+
+// ---------------------------------------------------------------------------
+// mouse - Win32 mouse input for the self-hosted Silver compiler.
+//
+// Companion to silverc/std/keyboard.sr. compiler_driver.sr accepts the
+// Win32 identifiers `mouse_event`, `SetCursorPos`, `GetCursorPos` (and
+// clipboard / hotkey cousins) as free functions, all routed through
+// `user32.dll` (the user32 mouse / cursor elif in compiler_driver.sr, line
+// ~4627). This file provides the documented high-level API: click/tap,
+// press/hold/release on each button, scroll, cursor position read/write
+// through a tracked local. Reading the current cursor position uses the
+// compiler's native GetCursorX/GetCursorY wrappers, which allocate and pass
+// a valid Win32 POINT internally; SetCursorPos is invoked directly because
+// it takes ints by value.
+// ---------------------------------------------------------------------------
+
+mod export mouse;
+
+const int MOUSEEVENTF_LEFTDOWN  = 0x0002;
+const int MOUSEEVENTF_LEFTUP    = 0x0004;
+const int MOUSEEVENTF_RIGHTDOWN = 0x0008;
+const int MOUSEEVENTF_RIGHTUP   = 0x0010;
+const int MOUSEEVENTF_MIDDLEDOWN = 0x0020;
+const int MOUSEEVENTF_MIDDLEUP  = 0x0040;
+const int MOUSEEVENTF_WHEEL     = 0x0800;
+
+const int VK_LBUTTON = 0x01;
+const int VK_RBUTTON = 0x02;
+const int VK_MBUTTON = 0x04;
+
+const int MouseButtons_LEFT   = 1;
+const int MouseButtons_RIGHT  = 2;
+const int MouseButtons_MIDDLE = 4;
+
+const int ScrollDirections_UP   = 1;
+const int ScrollDirections_DOWN = 0;
+
+class Position {
+    public int x;
+    public int y;
+
+    construct (int xv, int yv) {
+        this.x = xv;
+        this.y = yv;
+    }
+}
+
+class MouseButton {
+    public int type;
+    construct (int t) { this.type = t; }
+}
+
+class ScrollDirection {
+    public int type;
+    construct (int t) { this.type = t; }
+}
+
+class Cursor {
+    private int xPos;
+    private int yPos;
+
+    construct () {
+        this.xPos = 0;
+        this.yPos = 0;
+    }
+
+    public int getX() { return GetCursorX(); }
+    public int getY() { return GetCursorY(); }
+    public void setX(int v) { this.xPos = v; }
+    public void setY(int v) { this.yPos = v; }
+
+    public Position getPosition() {
+        return Position(this.xPos, this.yPos);
+    }
+
+    public void setPosition(int newX, int newY) {
+        this.xPos = newX;
+        this.yPos = newY;
+        SetCursorPos(newX, newY);
+    }
+}
+
+int mouseDownFlag(int button) {
+    if (button == MouseButtons_RIGHT) { return MOUSEEVENTF_RIGHTDOWN; }
+    if (button == MouseButtons_MIDDLE) { return MOUSEEVENTF_MIDDLEDOWN; }
+    return MOUSEEVENTF_LEFTDOWN;
+}
+
+int mouseUpFlag(int button) {
+    if (button == MouseButtons_RIGHT) { return MOUSEEVENTF_RIGHTUP; }
+    if (button == MouseButtons_MIDDLE) { return MOUSEEVENTF_MIDDLEUP; }
+    return MOUSEEVENTF_LEFTUP;
+}
+
+class mouse {
+    public Cursor cursor;
+
+    construct () {
+        this.cursor = new Cursor();
+    }
+
+    // Active simulation. Win32 expects `mevent(0x0002 | button, 0, 0, 0, 0)`
+    // for left/down. The 0x0002 flag is shared with right-down at bit 3, so
+    // we OR with the constant MouseButtons value to pick a direction.
+    public void press(int button) {
+        mouse_event(mouseDownFlag(button), 0, 0, 0, 0);
+    }
+
+    public void hold(int button) {
+        this.press(button);
+    }
+
+    public void release(int button) {
+        mouse_event(mouseUpFlag(button), 0, 0, 0, 0);
+    }
+
+    public void click(int button) {
+        this.press(button);
+        this.release(button);
+    }
+
+    public void tap(int button) {
+        this.click(button);
+    }
+
+    // scroll(int amount) - positive scrolls down, negative up. The Win32
+    // wheel delta unit is WHEEL_DELTA (120) per "click"; we forward raw
+    // amounts so user code can pick its own scale (e.g. `mouse.scroll(400)`
+    // in the docs is several clicks).
+    public void scroll(int amount) {
+        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, amount, 0);
+    }
+
+    // scroll(int amount, ScrollDirection direction)
+    // The optional `direction` overrides the sign of `amount`. UP = up,
+    // DOWN = down. Per the docs, this avoids needing math.abs on the
+    // caller side.
+    public void scroll(int amount, ScrollDirection direction) {
+        int delta = amount;
+        if (direction.type == ScrollDirections_UP) {
+            if (delta > 0) { delta = -delta; }
+        } else {
+            if (delta < 0) { delta = -delta; }
+        }
+        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0);
+    }
+
+    // Read live cursor X / Y from Win32. The compiler recognises
+    // `mouse.cursorX()` / `mouse.cursorY()` and emits the GetCursorPos
+    // call directly (compiler_driver.sr's genCursorXCall / genCursorYCall).
+    // We still need Silver-level wrappers so the demo source can call
+    // them as `instance.cursorX()` / `instance.cursorY()` too.
+    public int cursorX() { return GetCursorX(); }
+    public int cursorY() { return GetCursorY(); }
+    public int getCursorX() { return GetCursorX(); }
+    public int getCursorY() { return GetCursorY(); }
+}
+
+mouse instance = new mouse();
+
+// Stand-alone positional helpers. The docs show the user accessing
+// `mouse.cursor.x`, `mouse.cursor.y`, and writing tuples/arrays to
+// `mouse.cursor.position`. Lets a script update position without going
+// through the mouse instance's setPosition().
+//
+// `mouse.cursorX()` / `mouse.cursorY()` are dispatched to user32
+// GetCursorPos by compiler_driver.sr's genCursorXCall / genCursorYCall
+// (which allocate a 16-byte POINT struct on the stack, call GetCursorPos,
+// and sign-extend the int32 coordinate into RAX). The free
+// `getCursorX()` / `getCursorY()` are the same implementation in the
+// silverc-rs and silveri layers; here they re-export the module-level
+// methods so the free and prefixed spellings behave identically.
+int getCursorX() {
+    return GetCursorX();
+}
+
+int getCursorY() {
+    return GetCursorY();
+}
+
+void setCursorX(int v) {
+    instance.cursor.setX(v);
+}
+
+void setCursorY(int v) {
+    instance.cursor.setY(v);
+}
+
+// True if the button code (MouseButtons.LEFT/RIGHT/MIDDLE) is currently
+// pressed. Implemented via GetKeyState on the per-button virtual key.
+bool isMouseDown(int buttonCode) {
+    if (buttonCode == MouseButtons_LEFT) {
+        return (GetKeyState(VK_LBUTTON) & 0x8000) != 0;
+    }
+    if (buttonCode == MouseButtons_RIGHT) {
+        return (GetKeyState(VK_RBUTTON) & 0x8000) != 0;
+    }
+    if (buttonCode == MouseButtons_MIDDLE) {
+        return (GetKeyState(VK_MBUTTON) & 0x8000) != 0;
+    }
+    return false;
+}

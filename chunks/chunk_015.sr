@@ -1,0 +1,100 @@
+                return "";
+            }
+        }
+        return "";
+    }
+
+    public void setLocalType(string name, string typeName) {
+        for (int i = this.localNames.length - 1; i >= 0; i = i - 1) {
+            if (this.strEq(this.localNames[i], name)) {
+                while (this.localTypes.length <= i) {
+                    this.localTypes.add("");
+                }
+                this.localTypes[i] = typeName;
+                return;
+            }
+        }
+    }
+
+    public string arrayElementType(string arrType) {
+        // Element type of a declared array type.  Type names are built as
+        // `base + "[]"*n` (see parseVarDecl), so the element type of `T[]` is
+        // `T` and the element type of `T[][]` is `T[]`.  Strip exactly ONE
+        // trailing `[]` pair; the old scan stopped at the FIRST pair, which
+        // collapsed `string[][]` to `string` and made `m[1][0]` infer as a
+        // character (byte load) instead of a string pointer.
+        if (arrType.length >= 2) {
+            int len = arrType.length;
+            if (arrType[len - 2] == '[' && arrType[len - 1] == ']') {
+                string result = "";
+                for (int i = 0; i < len - 2; i = i + 1) {
+                    result = result + arrType[i];
+                }
+                return result;
+            }
+        }
+        return arrType;
+    }
+
+    public int newLabel() {
+        int id = this.asm.labelPositions.length;
+        this.asm.labelPositions.add(-1);
+        return id;
+    }
+
+    public int addString(string s) {
+        for (int i = 0; i < this.strings.length; i++) {
+            StrEntry se = this.strings[i];
+            if (this.strEq(se.text, s)) {
+                return i;
+            }
+        }
+        int off = this.stringData.length;
+        for (int i = 0; i < s.length; i++) {
+            int ch = s[i];
+            this.stringData.add(ch);
+        }
+        this.stringData.add(0);
+        StrEntry e;
+        e = new StrEntry(s);
+        e.dataOffset = off;
+        this.strings.add(e);
+        return this.strings.length - 1;
+    }
+
+    public int[] getStringData() {
+        return this.stringData;
+    }
+
+    public int findImport(string dll, string name) {
+        for (int i = 0; i < this.importDlls.length; i++) {
+            if (this.strEq(this.importDlls[i], dll) && this.strEq(this.importFuncs[i], name)) {
+                return i;
+            }
+        }
+        this.importDlls.add(dll);
+        this.importFuncs.add(name);
+        return this.importDlls.length - 1;
+    }
+
+    public int addImportPatch(string dll, string name) {
+        int idx = this.findImport(dll, name);
+        this.importPatchOffsets.add(this.asm.buf.length + 2);
+        this.importPatchDllIndices.add(-1);
+        this.importPatchFuncIndices.add(idx);
+        return idx;
+    }
+
+    public bool strEq(string a, string b) {
+        if (a.length != b.length) { return false; }
+        for (int i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    public int findLocal(string name) {
+        // Search from the most recent local backward. The flat local table has
+        // no lexical scopes and codegen appends temporaries as it goes, so a
+        // name can legitimately appear several times (e.g. every
+        // `catch (Exception e)` declares `e`). The most recent declaration is

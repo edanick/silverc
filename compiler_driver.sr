@@ -1025,6 +1025,12 @@ class MiniCg {
     public prop int[] importPatchFuncIndices;
     public prop string[] importDlls;
     public prop string[] importFuncs;
+    // DOCS/213 -- win32 module grants. win32Dlls lists DLLs opened in full
+    // via `import * from win32.<mod>;` / `import <mod> from win32;`.
+    // win32Grants lists single exports as "dll|name" entries granted via
+    // `import Name from win32.<mod>;`.
+    public prop string[] win32Dlls;
+    public prop string[] win32Grants;
     public prop int[] loopStartStack;
     public prop int[] loopEndStack;
     public prop int[] loopContinueStack;
@@ -1094,6 +1100,8 @@ class MiniCg {
         this.importPatchFuncIndices = [];
         this.importDlls = [];
         this.importFuncs = [];
+        this.win32Dlls = [];
+        this.win32Grants = [];
         this.loopStartStack = [];
         this.loopEndStack = [];
         this.loopContinueStack = [];
@@ -1408,6 +1416,141 @@ class MiniCg {
         return true;
     }
 
+    // ------------------------------------------------------------------
+    // DOCS/213 -- win32 module system. Win32 API functions are no longer
+    // auto-imported globals: a source must open the owning DLL with an
+    // `import ... from win32[.<module>];` statement before calling its
+    // exports as free functions.
+    // ------------------------------------------------------------------
+
+    // Map a win32 module name (the part after "win32.") to its DLL.
+    public string win32ModuleDll(string module) {
+        if (this.strEq(module, "kernel32")) { return "kernel32.dll"; }
+        if (this.strEq(module, "ws2_32")) { return "ws2_32.dll"; }
+        if (this.strEq(module, "winhttp")) { return "winhttp.dll"; }
+        if (this.strEq(module, "wininet")) { return "wininet.dll"; }
+        if (this.strEq(module, "shell32")) { return "shell32.dll"; }
+        if (this.strEq(module, "msvcrt")) { return "msvcrt.dll"; }
+        if (this.strEq(module, "user32")) { return "user32.dll"; }
+        if (this.strEq(module, "registry") || this.strEq(module, "advapi32")) { return "advapi32.dll"; }
+        if (this.strEq(module, "version")) { return "version.dll"; }
+        return "";
+    }
+
+    // The export table of a supported DLL as a space-separated name list.
+    public string win32ExportTable(string dll) {
+        if (this.strEq(dll, "kernel32.dll")) { return "CreateFileA ReadFile WriteFile CloseHandle GetFileSize GetFileSizeEx SetFilePointer FlushFileBuffers DeleteFileA MoveFileA CopyFileA GetFileAttributesA SetFileAttributesA CreateDirectoryA RemoveDirectoryA SetCurrentDirectoryA GetCurrentDirectoryA GetFullPathNameA FindFirstFileA FindNextFileA FindClose GetStdHandle SetConsoleTextAttribute GetConsoleScreenBufferInfo SetConsoleCursorPosition GetConsoleMode SetConsoleMode ReadConsoleA WriteConsoleA GetModuleHandleA GetModuleFileNameA LoadLibraryA GetProcAddress Sleep GetTickCount GetTickCount64 GetLastError CreateProcessA CreateProcessW WaitForSingleObject GetExitCodeProcess TerminateProcess OpenProcess GetProcessId CreatePipe GetProcessHeap HeapFree GlobalAlloc GlobalFree VirtualAlloc VirtualFree GetCurrentProcessId GetCurrentProcess GetCurrentThreadId GetCurrentThread GetEnvironmentVariableA GetEnvironmentVariableW SetEnvironmentVariableA SetEnvironmentVariableW ExpandEnvironmentStringsA GetEnvironmentStringsA FreeEnvironmentStringsA GetTempPathA GetComputerNameA GetUserNameA QueryPerformanceCounter QueryPerformanceFrequency GetVersionExA GetSystemDirectoryA GetWindowsDirectoryA GetLocalTime GetSystemTime OutputDebugStringA IsDebuggerPresent GetCommandLineA SetThreadPriority lstrlenA lstrcpyA lstrcatA lstrcmpA"; }
+        if (this.strEq(dll, "ws2_32.dll")) { return "WSAStartup WSACleanup socket bind listen accept recv send shutdown closesocket connect select setsockopt ioctlsocket htons inet_addr getaddrinfo freeaddrinfo WSAGetLastError"; }
+        if (this.strEq(dll, "winhttp.dll")) { return "WinHttpOpen WinHttpConnect WinHttpOpenRequest WinHttpSendRequest WinHttpReceiveResponse WinHttpQueryHeaders WinHttpQueryDataAvailable WinHttpReadData WinHttpCloseHandle WinHttpSetOption"; }
+        if (this.strEq(dll, "wininet.dll")) { return "InternetOpenA InternetConnectA InternetOpenUrlA InternetReadFile InternetReadFileExA InternetCloseHandle HttpSendRequestA HttpSendRequestExA InternetQueryDataAvailable InternetSetOptionA InternetQueryOptionA HttpQueryInfoA InternetWriteFile InternetGetConnectedState InternetCrackUrlA InternetCanonicalizeUrlA InternetSetStatusCallback"; }
+        if (this.strEq(dll, "shell32.dll")) { return "ShellExecuteA ShellExecuteW ShellExecuteExA ShellExecuteExW"; }
+        if (this.strEq(dll, "msvcrt.dll")) { return "memcpy memset memmove memcmp strlen strcmp strchr strstr strrchr strcpy strcat strncmp strncat strncpy strtok strpbrk strspn strcspn atoi atol strtol malloc free realloc calloc printf fprintf sprintf sscanf fopen fclose fread fwrite fflush fgets fputs fseek ftell system getenv putenv time rand srand abs labs toupper tolower isalpha isdigit isspace isprint isalnum isxdigit isupper islower"; }
+        if (this.strEq(dll, "user32.dll")) { return "keybd_event VkKeyScanA GetKeyState GetAsyncKeyState GetKeyboardState SetKeyboardState MapVirtualKeyA SendInput mouse_event GetCursorPos SetCursorPos ClipCursor GetClipCursor GetDoubleClickTime SetDoubleClickTime GetForegroundWindow GetWindowTextA GetWindowThreadProcessId RegisterHotKey UnregisterHotKey MessageBeep RegisterRawInputDevices GetRawInputData GetRawInputDeviceList RegisterClassExA CreateWindowExA ShowWindow UpdateWindow SetWindowTextA DestroyWindow GetMessageA TranslateMessage DispatchMessageA DefWindowProcA PostQuitMessage GetSystemMetrics LoadIconA LoadCursorA LoadImageA SendMessageA"; }
+        if (this.strEq(dll, "advapi32.dll")) { return "RegOpenKeyExA RegCreateKeyExA RegQueryValueExA RegSetValueExA RegDeleteValueA RegDeleteKeyA RegEnumKeyExA RegEnumValueA RegQueryInfoKeyA RegCloseKey"; }
+        if (this.strEq(dll, "version.dll")) { return "GetFileVersionInfoSizeA GetFileVersionInfoA VerQueryValueA"; }
+        return "";
+    }
+
+    public bool win32TableHas(string dll, string fn) {
+        string table = this.win32ExportTable(dll);
+        int i = 0;
+        while (i < table.length) {
+            while (i < table.length && table[i] == ' ') { i = i + 1; }
+            int start = i;
+            while (i < table.length && table[i] != ' ') { i = i + 1; }
+            if (i > start && this.strEq(fn, projectSlice(table, start, i))) { return true; }
+        }
+        return false;
+    }
+
+    public void win32AddDll(string dll) {
+        if (dll.length == 0) { return; }
+        for (int i = 0; i < this.win32Dlls.length; i++) {
+            if (this.strEq(this.win32Dlls[i], dll)) { return; }
+        }
+        this.win32Dlls.add(dll);
+    }
+
+    public void win32AddGrant(string dll, string fn) {
+        if (dll.length == 0 || fn.length == 0) { return; }
+        string grant = dll + "|" + fn;
+        for (int i = 0; i < this.win32Grants.length; i++) {
+            if (this.strEq(this.win32Grants[i], grant)) { return; }
+        }
+        this.win32Grants.add(grant);
+    }
+
+    // True when `fn` may be called as a free function targeting `dll`.
+    public bool win32Allowed(string dll, string fn) {
+        for (int i = 0; i < this.win32Dlls.length; i++) {
+            if (this.strEq(this.win32Dlls[i], dll)) {
+                if (this.win32TableHas(dll, fn)) { return true; }
+            }
+        }
+        string grant = dll + "|" + fn;
+        for (int i = 0; i < this.win32Grants.length; i++) {
+            if (this.strEq(this.win32Grants[i], grant)) { return true; }
+        }
+        return false;
+    }
+
+    // Inverse of win32ModuleDll: first module alias for a DLL.
+    public string win32ModuleOf(string dll) {
+        if (this.strEq(dll, "kernel32.dll")) { return "kernel32"; }
+        if (this.strEq(dll, "ws2_32.dll")) { return "ws2_32"; }
+        if (this.strEq(dll, "winhttp.dll")) { return "winhttp"; }
+        if (this.strEq(dll, "wininet.dll")) { return "wininet"; }
+        if (this.strEq(dll, "shell32.dll")) { return "shell32"; }
+        if (this.strEq(dll, "msvcrt.dll")) { return "msvcrt"; }
+        if (this.strEq(dll, "user32.dll")) { return "user32"; }
+        if (this.strEq(dll, "advapi32.dll")) { return "registry"; }
+        if (this.strEq(dll, "version.dll")) { return "version"; }
+        return dll;
+    }
+
+    // Register one parsed import statement (node.kind == 105 with
+    // typeHint/isStatic set by the parser).
+    public void registerWin32Import(Node node) {
+        string source = node.typeHint;
+        bool all = node.isStatic;
+        if (!this.strEq(source, "win32") && source.length > 6) {
+            string prefix = projectSlice(source, 0, 6);
+            if (!this.strEq(prefix, "win32.")) { return; }
+        } elif (!this.strEq(source, "win32")) {
+            return;
+        }
+        if (this.strEq(source, "win32")) {
+            if (all) {
+                this.win32AddDll(this.win32ModuleDll("kernel32"));
+                this.win32AddDll(this.win32ModuleDll("ws2_32"));
+                this.win32AddDll(this.win32ModuleDll("winhttp"));
+                this.win32AddDll(this.win32ModuleDll("wininet"));
+                this.win32AddDll(this.win32ModuleDll("shell32"));
+                this.win32AddDll(this.win32ModuleDll("msvcrt"));
+                this.win32AddDll(this.win32ModuleDll("user32"));
+                this.win32AddDll(this.win32ModuleDll("registry"));
+                this.win32AddDll(this.win32ModuleDll("version"));
+                return;
+            }
+            this.win32AddDll(this.win32ModuleDll(node.name));
+            for (int j = 0; j < node.childCount(); j++) {
+                this.win32AddDll(this.win32ModuleDll(node.child(j).name));
+            }
+            return;
+        }
+        string module = projectSlice(source, 6, source.length);
+        string dll = this.win32ModuleDll(module);
+        if (dll.length == 0) { return; }
+        if (all) {
+            this.win32AddDll(dll);
+            return;
+        }
+        this.win32AddGrant(dll, node.name);
+        for (int j = 0; j < node.childCount(); j++) {
+            this.win32AddGrant(dll, node.child(j).name);
+        }
+    }
+
     public int findLocal(string name) {
         for (int i = 0; i < this.localNames.length; i++) {
             if (this.strEq(this.localNames[i], name)) {
@@ -1601,7 +1744,12 @@ int strIdx = this.stringPatchIndices[i];
                     this.constIsString.add(0);
                 }
             }
-            if (pi.kind == 105) {
+            if (pi.kind == 105 && (pi.typeHint.length > 0 || pi.isStatic)) {
+                // DOCS/213 -- import statement (win32 module grants or a
+                // no-op source-module marker). Registered, not treated as an
+                // enum.
+                this.registerWin32Import(pi);
+            } elif (pi.kind == 105) {
                 this.enumNames.add(pi.name);
                 for (int j = 0; j < pi.childCount(); j++) {
                     Node member = pi.child(j);
@@ -4158,6 +4306,11 @@ public void genNewCall(Node call) {
         string importName = name;
         if (this.strEq(name, "CreateProcess")) { importName = "CreateProcessA"; }
         if (isWin32) {
+            if (!this.win32Allowed(win32Dll, importName)) {
+                // DOCS/213 -- the owning win32 module was not imported.
+                printline("Error: Win32 function '" + name + "' used without importing its module (add: import * from win32." + this.win32ModuleOf(win32Dll) + ";)");
+                exit(1);
+            }
             this.addImportPatch(win32Dll, importName);
             this.asm.emitImm64(0, 0);
             this.asm.movRMBase(0, 0, 0);
@@ -8598,13 +8751,47 @@ class Parser {
     }
 
     private Node parseImport() {
+        // DOCS/213 -- import grammar:
+        //   `import * from win32.kernel32;`        every export of one DLL
+        //   `import kernel32 from win32;`          one native module
+        //   `import { a, b } from win32;`          several native modules
+        //   `import ReadFile from win32.kernel32;` a single export
+        //   `import ast;` / `import * from mod;`   source modules (unchanged)
+        // Node layout: name = first name, children = extra names,
+        // typeHint = source module after `from`, isStatic = star form.
         Node node = new Node();
         node.kind = 105;
         this.expect(36);
-        node.name = this.advance().text;
+        if (this.check(113)) {
+            this.advance();
+            node.isStatic = true;
+        } elif (this.check(102)) {
+            this.advance();
+            node.name = this.advance().text;
+            while (this.check(107)) {
+                this.advance();
+                Node extra = new Node();
+                extra.name = this.advance().text;
+                node.children.add(extra);
+            }
+            this.expect(103);
+        } else {
+            node.name = this.advance().text;
+            while (this.check(107)) {
+                this.advance();
+                Node extra = new Node();
+                extra.name = this.advance().text;
+                node.children.add(extra);
+            }
+        }
         if (this.check(37)) {
             this.advance();
-            this.advance();
+            string src = this.advance().text;
+            while (this.check(108)) {
+                this.advance();
+                src = src + "." + this.advance().text;
+            }
+            node.typeHint = src;
         }
         this.expect(106);
         return node;

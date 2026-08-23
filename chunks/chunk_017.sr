@@ -1,0 +1,100 @@
+
+    public void emitIndexBoundsCheck() {
+        // RAX = array pointer, RCX = index (unscaled). Throws
+        // IndexOutOfRangeException when index < 0 or index >= [RAX - 8]
+        // (the array length stored immediately before the element data).
+        int oob = this.newLabel();
+        int ok = this.newLabel();
+        this.asm.cmpRI32(1, 0);
+        this.asm.jlLabel(oob);
+        this.asm.movRMBase(2, 0, -8);
+        this.asm.cmpRR64(1, 2);
+        this.asm.jgeLabel(oob);
+        this.asm.jmpLabel(ok);
+        this.asm.bindLabel(oob);
+        this.emitThrowException("index out of range");
+        this.asm.bindLabel(ok);
+    }
+
+    public void emitExcCheck() {
+        // After a user-function call, branch to the nearest handler (or unwind
+        // via the return label) when the exception flag is set. Uses RCX as
+        // scratch so RAX (the call's return value) is preserved on the
+        // non-exceptional path.
+        int eaIdx = this.findGlobal("__exc_active");
+        int ok = this.newLabel();
+        int sp = this.asm.buf.length;
+        this.asm.emitImm64(1, 0);
+        this.globalPatchOffsets.add(sp + 2);
+        this.globalPatchIndices.add(eaIdx);
+        this.asm.movRMBase(1, 1, 0);
+        this.asm.cmpRI32(1, 0);
+        this.asm.jeLabel(ok);
+        this.emitExceptionJump();
+        this.asm.bindLabel(ok);
+    }
+
+    public void patchGlobalRefs(int[] code, int globalsStart, int rdataRva) {
+        for (int i = 0; i < this.globalPatchOffsets.length; i++) {
+            int patchPos = this.globalPatchOffsets[i];
+            int gi = this.globalPatchIndices[i];
+            int64 addr = 0x140000000 + rdataRva + globalsStart + this.globalOffsets[gi];
+            code[patchPos] = addr & 0xFF;
+            code[patchPos + 1] = (addr >> 8) & 0xFF;
+            code[patchPos + 2] = (addr >> 16) & 0xFF;
+            code[patchPos + 3] = (addr >> 24) & 0xFF;
+            code[patchPos + 4] = (addr >> 32) & 0xFF;
+            code[patchPos + 5] = (addr >> 40) & 0xFF;
+            code[patchPos + 6] = (addr >> 48) & 0xFF;
+            code[patchPos + 7] = (addr >> 56) & 0xFF;
+        }
+    }
+
+    public int allocLocal(string name) {
+        this.stackSize += 8;
+        int off = -8 * (this.localOffsets.length + 1);
+        this.localOffsets.add(off);
+        this.localNames.add(name);
+        this.localTypes.add("");
+        return off;
+    }
+
+    public void emitPrologue() {
+        this.asm.pushR64(5);
+        this.asm.movRR64(5, 4);
+        this.asm.subRI32(4, 32);
+        this.asm.pushR64(15);
+        this.asm.pushR64(13);
+        this.asm.pushR64(12);
+        this.asm.movRR64(15, 4);
+    }
+
+    public void emitEpilogue() {
+        this.asm.popR64(12);
+        this.asm.popR64(13);
+        this.asm.popR64(15);
+        this.asm.addRI32(4, this.stackSize);
+        this.asm.popR64(5);
+        this.asm.ret();
+    }
+
+    public int[] computeIatAddresses(int[] layout) {
+        int stringsStart = layout[0];
+        int numGroups = layout[1];
+        int iltTotal = layout[2];
+        int[] iatAddrs = [];
+        for (int i = 0; i < this.importDlls.length; i++) {
+            iatAddrs.add(0);
+        }
+        string[] uniqueDlls = [];
+        int[] groupSizes = [];
+        int[] importGroupIdx = [];
+        for (int i = 0; i < this.importDlls.length; i++) {
+            int gIdx = -1;
+            for (int j = 0; j < uniqueDlls.length; j++) {
+                if (this.strEq(uniqueDlls[j], this.importDlls[i])) {
+                    gIdx = j;
+                    break;
+                }
+            }
+            if (gIdx < 0) {

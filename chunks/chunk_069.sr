@@ -1,0 +1,100 @@
+                elif (op == 16) { this.asm.mulRR64(1); }
+                this.asm.popR64(11);
+                if (arrIsByte) {
+                    this.asm.movMBaseByteR(11, 0, 0);
+                } else {
+                    this.asm.movMBaseR(11, 0, 0);
+                }
+                return;
+            }
+        }
+        if (lhs.kind == 13 && lhs.childCount() >= 1) {
+            Node obj = lhs.child(0);
+            string fieldName = lhs.name;
+            if (obj.kind == 6 && this.strEq(obj.name, "this")) {
+                int thisOff = this.findLocal("this");
+                int fieldOff = this.findFieldOffset(this.currentClassName, fieldName);
+                if (fieldOff < 0) { this.genExpr(rhs); return; }
+                this.asm.movRMBase(0, 5, thisOff);
+                this.asm.movRMBase(0, 0, fieldOff);
+                this.asm.pushR64(0);
+                this.genExpr(rhs);
+                this.asm.movRR64(1, 0);
+                this.asm.popR64(0);
+                if (op == 14) { this.asm.addRR64(0, 1); }
+                elif (op == 15) { this.asm.subRR64(0, 1); }
+                elif (op == 16) { this.asm.mulRR64(1); }
+                elif (op == 17) { this.emitDivisorCheck(); this.asm.cqo(); this.asm.idivR64(1); }
+                this.asm.movRMBase(10, 5, thisOff);
+                this.asm.addRI32(10, fieldOff);
+                this.asm.movMBaseR(10, 0, 0);
+                return;
+            }
+            if (obj.kind == 13) {
+                // Nested member chain compound assign (e.g. this.inner.x += 1)
+                string ownerType = this.inferMemberAccessType(obj);
+                int fieldOff = this.findFieldOffset(ownerType, fieldName);
+                if (fieldOff < 0) {
+                    fieldOff = this.findFieldOffsetInAllClasses(fieldName);
+                }
+                if (fieldOff >= 0) {
+                    this.genExpr(obj);
+                    this.asm.pushR64(0);
+                    this.genExpr(lhs);
+                    this.asm.pushR64(0);
+                    this.genExpr(rhs);
+                    this.asm.movRR64(1, 0);
+                    this.asm.popR64(0);
+                    if (op == 14) { this.asm.addRR64(0, 1); }
+                    elif (op == 15) { this.asm.subRR64(0, 1); }
+                    elif (op == 16) { this.asm.mulRR64(1); }
+                    elif (op == 17) { this.emitDivisorCheck(); this.asm.cqo(); this.asm.idivR64(1); }
+                    this.asm.popR64(11);
+                    this.asm.addRI32(11, fieldOff);
+                    this.asm.movMBaseR(11, 0, 0);
+                } else {
+                    this.genExpr(rhs);
+                }
+                return;
+            }
+        }
+        this.genExpr(rhs);
+    }
+
+    public void genAssign(Node bin) {
+        Node lhs = bin.child(0);
+        Node rhs = bin.child(1);
+        if (lhs.kind == 13 && lhs.childCount() >= 1) {
+            Node titleObj = lhs.child(0);
+            if (titleObj.kind == 6 && this.strEq(titleObj.name, "console") && this.strEq(lhs.name, "title")) {
+                Node titleCall = new Node();
+                titleCall.kind = 10;
+                titleCall.name = "setTitle";
+                titleCall.children = [rhs];
+                this.genCall(titleCall);
+                return;
+            }
+        }
+        if (lhs.kind == 6) {
+            int off = this.findLocal(lhs.name);
+            int gi = this.findGlobal(lhs.name);
+            this.genExpr(rhs);
+            if (off != 0) {
+                this.asm.movMBaseR(5, 0, off);
+            } elif (gi >= 0) {
+                this.genGlobalStore(gi);
+            } else {
+                this.asm.movMBaseR(5, 0, 0);
+            }
+            return;
+        }
+        if (lhs.kind == 13 && lhs.childCount() >= 1) {
+            Node obj = lhs.child(0);
+            string fieldName = lhs.name;
+            if (obj.kind == 6 && this.strEq(obj.name, "this")) {
+                int thisOff = this.findLocal("this");
+                int fieldOff = this.findFieldOffset(this.currentClassName, fieldName);
+                if (fieldOff < 0) {
+                    this.genExpr(rhs);
+                    return;
+                }

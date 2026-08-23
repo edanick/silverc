@@ -1,0 +1,100 @@
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(done);
+
+        // Source index = len - 1 - i.
+        this.asm.movRMBase(0, 5, lenOff);
+        this.asm.subRI32(0, 1);
+        this.asm.movRMBase(1, 5, iOff);
+        this.asm.subRR64(0, 1);
+        if (!byteElements) { this.asm.shlR64Imm(0, 3); }
+        this.asm.movRR64(11, 0);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.addRR64(0, 11);
+        if (byteElements) {
+            this.asm.movzxByteMBase(0, 0, 0);
+        } else {
+            this.asm.movRMBase(0, 0, 0);
+        }
+        this.asm.pushR64(0);
+        this.asm.movRMBase(0, 5, outOff);
+        this.asm.addRI32(0, 16);
+        this.asm.movRMBase(1, 5, iOff);
+        if (!byteElements) { this.asm.shlR64Imm(1, 3); }
+        this.asm.addRR64(0, 1);
+        this.asm.popR64(1);
+        if (byteElements) {
+            this.asm.movMBaseByteR(0, 1, 0);
+        } else {
+            this.asm.movMBaseR(0, 1, 0);
+        }
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(loop);
+        this.asm.bindLabel(done);
+        this.asm.movRMBase(0, 5, outOff);
+        this.asm.addRI32(0, 16);
+    }
+
+    public void genArrayLast(Node call) {
+        Node arrNode = call.child(0);
+        this.genExpr(arrNode);
+        int arrOff = this.allocLocal("__arr_last_arr");
+        int lenOff = this.allocLocal("__arr_last_len");
+        this.asm.movMBaseR(5, 0, arrOff);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+        int empty = this.newLabel();
+        int done = this.newLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jleLabel(empty);
+        this.asm.subRI32(0, 1);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(0, 1, 0);
+        this.asm.jmpLabel(done);
+        this.asm.bindLabel(empty);
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(done);
+    }
+
+    public void genArrayUnique(Node call) {
+        Node arrNode = call.child(0);
+        string arrType = this.inferExprType(arrNode);
+        string elemType = this.arrayElementType(arrType);
+        bool stringElements = this.strEq(elemType, "string");
+        int arrOff = this.allocLocal("__arr_unique_arr");
+        int lenOff = this.allocLocal("__arr_unique_len");
+        int outOff = this.allocLocal("__arr_unique_out");
+        int outLenOff = this.allocLocal("__arr_unique_out_len");
+        int iOff = this.allocLocal("__arr_unique_i");
+        int jOff = this.allocLocal("__arr_unique_j");
+        int candidateOff = this.allocLocal("__arr_unique_candidate");
+
+        this.genExpr(arrNode);
+        this.asm.movMBaseR(5, 0, arrOff);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+
+        // Allocate [capacity, length] plus one qword per source element.
+        this.asm.movRMBase(0, 5, lenOff);
+        this.asm.addRI32(0, 2);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.movRR64(1, 0);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, outOff);
+        this.asm.movRMBase(0, 5, lenOff);
+        this.asm.movMBaseR(0, 0, 0);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, outLenOff);
+        this.asm.movRMBase(0, 5, outOff);
+        this.asm.movMBaseR(0, 0, 8);

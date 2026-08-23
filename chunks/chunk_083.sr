@@ -1,0 +1,100 @@
+        // memcpy(buf, fd+44, nlen); buf[nlen] = 0
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, bufOff);
+        this.asm.movRMBase(2, 5, fdOff);
+        this.asm.addRI32(2, 44);
+        this.asm.movRMBase(8, 5, nlenOff);
+        this.addImportPatch("ucrtbase.dll", "memcpy");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.movRMBase(1, 5, nlenOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movRI64(1, 0);
+        this.asm.movMBaseByteR(0, 1, 0);
+
+        // arr[16 + widx*8] = buf
+        this.asm.movRMBase(0, 5, widxOff);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.addRI32(0, 16);
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.movMBaseR(1, 0, 0);
+
+        this.asm.movRMBase(0, 5, widxOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, widxOff);
+
+        this.asm.bindLabel(p2Skip);
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, hOff);
+        this.asm.movRMBase(2, 5, fdOff);
+        this.addImportPatch("kernel32.dll", "FindNextFileA");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jneLabel(p2Loop);
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, hOff);
+        this.addImportPatch("kernel32.dll", "FindClose");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.addRI32(0, 16);
+        int feDone = this.newLabel();
+        this.asm.jmpLabel(feDone);
+        this.asm.bindLabel(noFiles);
+        this.emitEmptyStringArray();
+        this.asm.bindLabel(feDone);
+    }
+
+    // Branch to `skip` when the entry described by findData at fdOff should be
+    // excluded: "." / ".." pseudo-entries, or entries failing `filter`.
+    public void emitEntryTest(int fdOff, int filter, int skip) {
+        this.asm.movRMBase(0, 5, fdOff);
+        this.asm.addRI32(0, 44);
+        int checkFilter = this.newLabel();
+        this.asm.movzxByteMBase(1, 0, 0);
+        this.asm.cmpRI32(1, 46);
+        this.asm.jneLabel(checkFilter);
+        this.asm.movzxByteMBase(1, 0, 1);
+        this.asm.cmpRI32(1, 0);
+        this.asm.jeLabel(skip);
+        this.asm.cmpRI32(1, 46);
+        this.asm.jneLabel(checkFilter);
+        this.asm.movzxByteMBase(1, 0, 2);
+        this.asm.cmpRI32(1, 0);
+        this.asm.jeLabel(skip);
+        this.asm.bindLabel(checkFilter);
+        if (filter == 1) {
+            // files: skip directories (attribute 0x10 set)
+            this.asm.movRMBase(0, 5, fdOff);
+            this.asm.movRMBase(1, 0, 0);
+            this.asm.andRImm(1, 0x10);
+            this.asm.cmpRI32(1, 0);
+            this.asm.jneLabel(skip);
+        } elif (filter == 2) {
+            // folders: skip files (attribute 0x10 not set)
+            this.asm.movRMBase(0, 5, fdOff);
+            this.asm.movRMBase(1, 0, 0);
+            this.asm.andRImm(1, 0x10);
+            this.asm.cmpRI32(1, 0);
+            this.asm.jeLabel(skip);
+        }
+    }
+
+    public void emitEmptyStringArray() {
+        this.asm.movRI64(1, 80);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);

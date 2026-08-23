@@ -1,0 +1,100 @@
+        this.asm.movMBaseR(5, 0, hOff);
+        int fszBad = this.newLabel();
+        int fszDone = this.newLabel();
+        this.asm.movRI64(1, 0xFFFFFFFFFFFFFFFF);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jeLabel(fszBad);
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, hOff);
+        this.asm.xorRR64(2, 2);
+        this.addImportPatch("kernel32.dll", "GetFileSize");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int sizeOff = this.allocLocal("__fsz_size");
+        this.asm.movMBaseR(5, 0, sizeOff);
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, hOff);
+        this.addImportPatch("kernel32.dll", "CloseHandle");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(0, 5, sizeOff);
+        this.asm.jmpLabel(fszDone);
+        this.asm.bindLabel(fszBad);
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(fszDone);
+    }
+
+    public void genFolderSizeCall(Node call) {
+        // Folder size is a recursive sum; the self-hosted backend returns the
+        // OS-reported directory entry size (0 for an empty/most directories)
+        // via GetFileSize on a backup-semantics handle is unreliable, so a
+        // conservative 0 is returned here. See silverc-rs for the recursive
+        // implementation used by the bootstrap compiler.
+        this.asm.xorRR64(0, 0);
+    }
+
+    public void genIsDirCall(Node call) {
+        int pathIdx = 1;
+        if (call.childCount() <= pathIdx) { this.asm.xorRR64(0, 0); return; }
+        this.genExpr(call.child(pathIdx));
+        this.asm.emitCallSetup(0);
+        this.asm.movRR64(1, 0);
+        this.addImportPatch("kernel32.dll", "GetFileAttributesA");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int idNo = this.newLabel();
+        int idDone = this.newLabel();
+        this.asm.movRI64(1, 0xFFFFFFFF);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jeLabel(idNo);            this.asm.andRImm(0, 0x10);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(idNo);
+        this.asm.movRI64(0, 1);
+        this.asm.jmpLabel(idDone);
+        this.asm.bindLabel(idNo);
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(idDone);
+    }
+
+    public void genIsFileCall(Node call) {
+        int pathIdx = 1;
+        if (call.childCount() <= pathIdx) { this.asm.xorRR64(0, 0); return; }
+        this.genExpr(call.child(pathIdx));
+        this.asm.emitCallSetup(0);
+        this.asm.movRR64(1, 0);
+        this.addImportPatch("kernel32.dll", "GetFileAttributesA");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int ifNo = this.newLabel();
+        int ifDone = this.newLabel();
+        this.asm.movRI64(1, 0xFFFFFFFF);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jeLabel(ifNo);            this.asm.andRImm(0, 0x10);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jneLabel(ifNo);
+        this.asm.movRI64(0, 1);
+        this.asm.jmpLabel(ifDone);
+        this.asm.bindLabel(ifNo);
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(ifDone);
+    }
+
+    public void genIsDriveRootCall(Node call) {
+        int pathIdx = 1;
+        if (call.childCount() <= pathIdx) { this.asm.xorRR64(0, 0); return; }
+        this.genExpr(call.child(pathIdx));
+        int pathOff = this.allocLocal("__dr_path");
+        this.asm.movMBaseR(5, 0, pathOff);
+        int drNo = this.newLabel();
+        int drYes = this.newLabel();
+        int drDone = this.newLabel();
+        this.asm.movRMBase(0, 5, pathOff);
+        this.asm.movzxByteMBase(1, 0, 0);

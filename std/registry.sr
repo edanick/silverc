@@ -1,0 +1,168 @@
+mod export registry;
+
+// DOCS/250 -- Windows Registry (`registry` / `win.registry`).
+//
+// The `RegistryKey` class wraps a native HKEY (stored in `handle`) and routes
+// every operation through the bare `reg*` bridge functions emitted by the
+// compiler (silverc-rs/src/stdlib/registry.rs).  A `RegistryHive` selects the
+// root key; a `RegistryAccess` selects the requested permission mask.
+//
+//     RegistryKey k = new RegistryKey(
+//         RegistryHive.CURRENT_USER, "Software\\Silver\\MyApp",
+//         RegistryAccess.READ_WRITE, true);
+//     k.setString("InstallPath", "C:\\Apps\\MyApp");
+//     string installPath = k.getString("InstallPath", "");
+//     k.close();
+//
+// The native `registry.*` module also exposes one-shot full-path helpers
+// (registry.readString/writeString/readInt/writeInt/.../deleteKey) that take a
+// hive + a `key\...\value` path and open/read/write/close in a single call.
+
+def RegistryHive = enum {
+    CLASSES_ROOT,
+    CURRENT_USER,
+    LOCAL_MACHINE,
+    USERS,
+    CURRENT_CONFIG
+};
+
+def RegistryAccess = enum {
+    READ,
+    WRITE,
+    READ_WRITE,
+    QUERY_VALUE,
+    SET_VALUE,
+    ENUMERATE_SUB_KEYS,
+    CREATE_SUB_KEY,
+    DELETE,
+    VIEW_32,
+    VIEW_64
+};
+
+def RegistryValueKind = enum {
+    NONE,
+    STRING,
+    EXPAND_STRING,
+    BINARY,
+    DWORD,
+    QWORD,
+    STRING_ARRAY,
+    LINK
+};
+
+class RegistryKey {
+    private int handle;
+    private int hive;
+    private string path;
+    private int access;
+
+    // `create = false` opens an existing key (handle 0 when missing);
+    // `create = true` creates it (and any missing parents) via RegCreateKeyEx.
+    construct(int hive, string path, int access, bool create = false) {
+        this.hive = hive;
+        this.path = path;
+        this.access = access;
+        if (create) {
+            this.handle = regCreate(hive, path, access);
+        } else {
+            this.handle = regOpen(hive, path, access);
+        }
+    }
+
+    public int getHandle() { return this.handle; }
+    public int getHive() { return this.hive; }
+    public string getPath() { return this.path; }
+    public int getAccess() { return this.access; }
+    public bool isOpen() { return this.handle != 0; }
+    public bool exists() { return this.handle != 0; }
+
+    // ---- typed values -----------------------------------------------------
+    public string getString(string name, string defaultValue) {
+        return regGetString(this.handle, name, defaultValue);
+    }
+    public void setString(string name, string value) {
+        regSetString(this.handle, name, value);
+    }
+
+    public int getInt(string name, int defaultValue) {
+        return regGetInt(this.handle, name, defaultValue);
+    }
+    public void setInt(string name, int value) {
+        regSetInt(this.handle, name, value);
+    }
+
+    public int getInt64(string name, int defaultValue) {
+        return regGetInt64(this.handle, name, defaultValue);
+    }
+    public void setInt64(string name, int value) {
+        regSetInt64(this.handle, name, value);
+    }
+
+    public bool getBool(string name, bool defaultValue) {
+        if (defaultValue) { return regGetInt(this.handle, name, 1) != 0; }
+        return regGetInt(this.handle, name, 0) != 0;
+    }
+    public void setBool(string name, bool value) {
+        if (value) { regSetInt(this.handle, name, 1); }
+        else { regSetInt(this.handle, name, 0); }
+    }
+
+    // ---- child-key traversal ---------------------------------------------
+    // Open a child key relative to this key (inherit access).  Chaining works
+    // to any depth without rebuilding the full path by hand.
+    public RegistryKey GetKey(string name) {
+        return new RegistryKey(this.hive, this.path + "\\" + name, this.access, false);
+    }
+
+    // Explicit access mode for a child (Silver methods are not overloadable,
+    // so this spelling carries the access argument).
+    public RegistryKey GetKeyAccess(string name, int access) {
+        return new RegistryKey(this.hive, this.path + "\\" + name, access, false);
+    }
+
+    public RegistryKey getKey(string name) { return this.GetKey(name); }
+
+    // Create (or open) a child key relative to this key.
+    public RegistryKey addKey(string name, int access) {
+        return new RegistryKey(this.hive, this.path + "\\" + name, access, true);
+    }
+
+    // ---- enumeration + metadata ------------------------------------------
+    public int getSubKeyCount() { return regSubKeyCount(this.handle); }
+    public int getValueCount() { return regValueCount(this.handle); }
+
+    public string[] subKeyNames() {
+        string[] r = [];
+        int n = regSubKeyCount(this.handle);
+        for (int i = 0; i < n; i = i + 1) {
+            r.add(regEnumSubKeyName(this.handle, i));
+        }
+        return r;
+    }
+
+    public string[] valueNames() {
+        string[] r = [];
+        int n = regValueCount(this.handle);
+        for (int i = 0; i < n; i = i + 1) {
+            r.add(regEnumValueName(this.handle, i));
+        }
+        return r;
+    }
+
+    public bool hasValue(string name) { return regValueExists(this.handle, name) != 0; }
+
+    // ---- deletion ---------------------------------------------------------
+    public void deleteValue(string name) { regDeleteValue(this.handle, name); }
+
+    // Delete an immediate child key (non-recursive).
+    public void deleteKey(string name) { regDeleteKey(this.handle, name); }
+
+    // ---- lifecycle --------------------------------------------------------
+    public void close() {
+        if (this.handle != 0) { regClose(this.handle); }
+        this.handle = 0;
+    }
+
+    // Windows flushes registry writes automatically; kept for API parity.
+    public void flush() { }
+}

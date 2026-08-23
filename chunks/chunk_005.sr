@@ -1,0 +1,100 @@
+        this.emitU8(v >> 8);
+    }
+
+    public void emitU32(int v) {
+        this.emitU8(v);
+        this.emitU8(v >> 8);
+        this.emitU8(v >> 16);
+        this.emitU8(v >> 24);
+    }
+
+    public void emitU64(int64 v) {
+        this.emitU32(v & 0xFFFFFFFF);
+        this.emitU32((v >> 32) & 0xFFFFFFFF);
+    }
+
+    public void emitBytes(int[] data) {
+        for (int i = 0; i < data.length; i++) {
+            this.emitU8(data[i]);
+        }
+    }
+
+    public int[] getBytes() {
+        this.resolveRelocs();
+        return this.buf;
+    }
+
+    public void emitImm64(int reg, int64 imm) {
+        this.buf.add(0x48);
+        this.buf.add(0xB8 + (reg & 7));
+        for (int b = 0; b < 8; b++) {
+            this.buf.add((imm >> (b * 8)) & 0xFF);
+        }
+    }
+
+    public void pushR64(int r) {
+        int opcode = 0x50 + (r & 7);
+        if (r > 7) { this.emitU8(0x41); }
+        this.emitU8(opcode);
+    }
+
+    public void popR64(int r) {
+        if (r > 7) { this.emitU8(0x41); }
+        this.emitU8(0x58 + (r & 7));
+    }
+
+    public void movRR64(int dst, int src) {
+        int rFlag = 0;
+        int sFlag = 0;
+        if (src > 7) { rFlag = 1; }
+        if (dst > 7) { sFlag = 1; }
+        this.emitU8(0x48 | (rFlag << 2) | sFlag);
+        this.emitU8(0x89);
+        this.emitU8(0xC0 | ((src & 7) << 3) | (dst & 7));
+    }
+
+    public void movRI64(int dst, int64 imm) {
+        int dFlag = 0;
+        if (dst > 7) { dFlag = 1; }
+        this.emitU8(0x48 | dFlag);
+        this.emitU8(0xB8 + (dst & 7));
+        int lo = imm & 0xFFFFFFFF;
+        this.emitU8(lo);
+        this.emitU8(lo >> 8);
+        this.emitU8(lo >> 16);
+        this.emitU8(lo >> 24);
+        int hi = (imm >> 32) & 0xFFFFFFFF;
+        this.emitU8(hi);
+        this.emitU8(hi >> 8);
+        this.emitU8(hi >> 16);
+        this.emitU8(hi >> 24);
+    }
+
+    public void movRMBase(int r, int base, int disp) {
+        int rex = 0x48;
+        if (r > 7) { rex = rex | 0x04; }
+        if (base > 7) { rex = rex | 0x01; }
+        this.emitU8(rex);
+        this.emitU8(0x8B);
+        if (base == 5 || base == 13) {
+            this.emitU8(0x85 | ((r & 7) << 3) | (base & 7));
+            this.emitU32(disp);
+        } elif (base == 4 || base == 12) {
+            if (disp >= -128 && disp <= 127) {
+                this.emitU8(0x44 | ((r & 7) << 3));
+                this.emitU8(0x24);
+                this.emitU8(disp & 0xFF);
+            } else {
+                this.emitU8(0x84 | ((r & 7) << 3));
+                this.emitU8(0x24);
+                this.emitU32(disp);
+            }
+        } else {
+            if (disp == 0 && base != 5 && base != 13) {
+                this.emitU8(((r & 7) << 3) | (base & 7));
+            } elif (disp >= -128 && disp <= 127) {
+                this.emitU8(0x40 | ((r & 7) << 3) | (base & 7));
+                this.emitU8(disp & 0xFF);
+            } else {
+                this.emitU8(0x80 | ((r & 7) << 3) | (base & 7));
+                this.emitU32(disp);

@@ -1,0 +1,100 @@
+                // binary range operator, so the index expression stops there.
+                bool oldBoundary = this.rangeIsSliceBoundary;
+                this.rangeIsSliceBoundary = true;
+                idx.children.add(this.parseExpr(0));
+                bool isSlice = this.check(109) || this.check(144);
+                // Slice syntax: arr[a:b] (colon) or arr[a..b] (range) -> kind 67.
+                if (isSlice) {
+                    this.advance();
+                    idx.kind = 67;
+                    if (this.check(105)) {
+                        // Open-ended slice [a:]: the end bound is the base's
+                        // length, resolved in genSlice (sentinel intVal -1).
+                        Node openEnd = new Node(); openEnd.kind = 0; openEnd.intVal = -1;
+                        idx.children.add(openEnd);
+                    } else {
+                        idx.children.add(this.parseExpr(0));
+                    }
+                }
+                this.rangeIsSliceBoundary = oldBoundary;
+                this.expect(105);
+                lhs = idx;
+                continue;
+            }
+            if (this.check(108)) {
+                this.advance();
+                Token name = this.advance();
+                if (this.check(100)) {
+                    Node call = new Node(); call.kind = 10;
+                    call.name = name.text;
+                    call.isMember = true;
+                    call.children.add(lhs);
+                    this.advance();
+                    while (!this.check(101) && !this.check(0)) {
+                        call.children.add(this.parseExpr(0));
+                        if (this.check(107)) { this.advance(); }
+                    }
+                    this.expect(101);
+                    lhs = call;
+                } else {
+                    Node member = new Node(); member.kind = 13;
+                    member.name = name.text;
+                    member.children.add(lhs);
+                    lhs = member;
+                }
+                continue;
+            }
+            if (this.check(142)) {
+                this.advance();
+                Node add = new Node(); add.kind = 7; add.op = 1;
+                Node one = new Node(); one.kind = 0; one.intVal = 1;
+                add.children.add(lhs);
+                add.children.add(one);
+                Node assign = new Node(); assign.kind = 7; assign.op = 20;
+                assign.children.add(lhs);
+                assign.children.add(add);
+                lhs = assign;
+                continue;
+            }
+            if (this.check(143)) {
+                this.advance();
+                Node sub = new Node(); sub.kind = 7; sub.op = 2;
+                Node one = new Node(); one.kind = 0; one.intVal = 1;
+                sub.children.add(lhs);
+                sub.children.add(one);
+                Node assign = new Node(); assign.kind = 7; assign.op = 20;
+                assign.children.add(lhs);
+                assign.children.add(sub);
+                lhs = assign;
+                continue;
+            }
+            if (this.check(148) && minPrec <= 1) {
+                this.advance();
+                Node coalesce = new Node(); coalesce.kind = 7; coalesce.op = 25;
+                coalesce.children.add(lhs);
+                coalesce.children.add(this.parseExpr(2));
+                lhs = coalesce;
+                continue;
+            }
+            if (this.check(123) && minPrec <= 1) {
+                this.advance();
+                Node thenExpr = this.parseExpr(0);
+                this.expect(109);
+                Node elseExpr = this.parseExpr(0);
+                Node tern = new Node(); tern.kind = 65;
+                tern.children.add(lhs);
+                tern.children.add(thenExpr);
+                tern.children.add(elseExpr);
+                lhs = tern;
+                continue;
+            }
+            if (this.check(144) && this.rangeIsSliceBoundary) {
+                // `..` inside a `[...]` index starts a slice, so it is not an
+                // infix operator there; stop and let the index handler see it.
+                break;
+            }
+            int prec = this.getPrec(this.peek().kind);
+            if (prec < minPrec) { break; }
+            int nextMin = prec + 1;
+            int op = this.peek().kind;
+            this.advance();

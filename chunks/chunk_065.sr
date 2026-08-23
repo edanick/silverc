@@ -1,0 +1,100 @@
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, outOff);
+
+        // copy src[start..end] to out
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        int cpLoop = this.newLabel();
+        int cpDone = this.newLabel();
+        this.asm.bindLabel(cpLoop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(cpDone);
+        this.asm.movRMBase(1, 5, srcOff);
+        this.asm.movRMBase(0, 5, startOff);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRR64(1, 0);
+        this.asm.movzxByteMBase(2, 1, 0);
+        this.asm.movRMBase(1, 5, outOff);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRR64(1, 0);
+        this.asm.movMBaseByteR(1, 2, 0);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(cpLoop);
+        this.asm.bindLabel(cpDone);
+
+        // out[newLen] = 0
+        this.asm.movRMBase(0, 5, outOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.addRR64(0, 1);
+        this.asm.xorRR64(2, 2);
+        this.asm.movMBaseByteR(0, 2, 0);
+        this.asm.movRMBase(0, 5, outOff);
+    }
+
+    public void genMemberCall(Node call) {
+        string name = call.name;
+        Node recv = call.child(0);
+        string recvClass = this.inferExprType(recv);
+        // A bare class-name receiver (e.g. BuiltinMethods.callMethod(...)) has
+        // no local type, so inferExprType returns "". Resolve it to the class
+        // name itself: otherwise the exact-class search below fails and the
+        // any-class fallback can bind an overloaded method name (e.g.
+        // callMethod exists on both Evaluator and BuiltinMethods) to the wrong
+        // function, corrupting every argument at the call site.
+        if (recv.kind == 6) {
+            for (int ci = 0; ci < this.classNames.length; ci++) {
+                if (this.strEq(this.classNames[ci], recv.name)) { recvClass = recv.name; }
+            }
+        }
+        int funcIdx = -1;
+        for (int i = 0; i < this.funcNames.length; i++) {
+            if (this.strEq(this.funcNames[i], name) && this.typeNameEq(this.funcClasses[i], recvClass)) {
+                funcIdx = i;
+            }
+        }
+        if (funcIdx < 0) {
+            for (int i = 0; i < this.funcNames.length; i++) {
+                if (this.strEq(this.funcNames[i], name)) {
+                    funcIdx = i;
+                }
+            }
+        }
+        string lookupClass = "";
+        if (funcIdx >= 0) {
+            lookupClass = this.funcClasses[funcIdx];
+        }
+
+        // Use slots reserved before the function prologue.  The old
+        // per-call allocLocal and stack-spill variants either changed the
+        // frame after prologue emission or depended on a volatile register
+        // surviving nested generated calls.
+        // Member-call child(0) is the receiver, not a declared method
+        // parameter.  The receiver uses the method ABI's RCX slot; declared
+        // parameters begin at child(1) and use RDX/R8/R9/stack.
+        int explicitArgs = call.childCount() - 1;
+        if (explicitArgs < 0) { explicitArgs = 0; }
+        int totalUserArgs = explicitArgs;
+        if (funcIdx >= 0 && funcIdx < this.funcParamCounts.length) {
+            int paramCount = this.funcParamCounts[funcIdx];
+            int paramStart = this.funcParamStarts[funcIdx];
+            while (totalUserArgs < paramCount && totalUserArgs + paramStart < this.funcParamHasDefaults.length && this.funcParamHasDefaults[totalUserArgs + paramStart] == 1) {
+                totalUserArgs = totalUserArgs + 1;
+            }
+        }
+        int totalArgs = totalUserArgs + 1;
+        int scratchBase = this.funcCallArgCount;
+
+        if (scratchBase + totalArgs > 64) {
+            printline("too many nested call arguments");
+            exit(1);
+            return;
+        }
+        this.funcCallArgCount = this.funcCallArgCount + totalArgs;
+        for (int i = 0; i < totalArgs; i++) {
+            if (i == 0) {
+                this.genExpr(call.child(0));

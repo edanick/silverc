@@ -1,0 +1,100 @@
+        int extraStack = 0;
+        if (nargs > 3) { extraStack = (nargs - 3) * 8; }
+        this.asm.emitCallSetup(extraStack);
+        this.asm.movRMBase(0, 5, tmpOff);
+        this.asm.movMBaseR(4, 0, 0);
+        for (int i = 0; i < nargs; i++) {
+            this.asm.movRMBase(0, 5, argTemps[i]);
+            if (i < 3) {
+                this.asm.movMBaseR(4, 0, 8 + i * 8);
+            } else {
+                this.asm.movMBaseR(4, 0, 32 + (i - 3) * 8);
+            }
+        }
+        this.asm.movRMBase(1, 5, tmpOff);
+        for (int i = 0; i < nargs && i < 3; i++) {
+            this.asm.movRMBase(argRegs[i + 1], 5, argTemps[i]);
+        }
+        if (this.funcOffsets[ctorIdx] >= 0) {
+            int targetOff = this.funcOffsets[ctorIdx];
+            int callPos = this.asm.buf.length;
+            int rel32 = targetOff - (callPos + 5);
+            this.asm.callRel32(rel32);
+        } else {
+            this.asm.callRel32(0);
+            this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallNames.add("construct");
+            this.forwardCallClasses.add(this.funcClasses[ctorIdx]);
+        }
+        this.asm.emitCallTeardown();
+    }
+    this.asm.movRMBase(0, 5, tmpOff);
+}
+
+    public void genSuperCall(Node call) {
+        // super(arg0, arg1, ...) - call parent class constructor with `this`.
+        // Only valid inside a class constructor.
+        if (!this.strEq(this.currentFunctionName, "construct")) { return; }
+
+        // Find parent class of the current class.
+        string parentClass = "";
+        for (int i = 0; i < this.classNames.length; i++) {
+            if (this.strEq(this.classNames[i], this.currentClassName)) {
+                parentClass = this.classParentClasses[i];
+            }
+        }
+        if (this.strEq(parentClass, "")) { return; }
+
+        // Find parent's construct function.
+        int ctorIdx = -1;
+        for (int i = 0; i < this.funcNames.length; i++) {
+            if (this.strEq(this.funcNames[i], "construct") && this.strEq(this.funcClasses[i], parentClass)) {
+                ctorIdx = i;
+            }
+        }
+        if (ctorIdx < 0 || ctorIdx >= this.funcOffsets.length) { return; }
+
+        // Evaluate super() arguments into temporary stack slots.
+        int nargs = call.childCount();
+        int[] argTemps = [];
+        for (int i = 0; i < nargs; i++) {
+            this.genExpr(call.child(i));
+            int t = this.allocLocal("__sa");
+            this.asm.movMBaseR(5, 0, t);
+            argTemps.add(t);
+        }
+
+        // Set up the call: R1 = this, R2..R9 = args 0-2, stack = rest.
+        int[] argRegs = [1, 2, 8, 9];
+        int extraStack = 0;
+        if (nargs > 3) { extraStack = (nargs - 3) * 8; }
+        this.asm.emitCallSetup(extraStack);
+        // Load `this` directly from its local slot into R1.
+        this.asm.movRMBase(1, 5, this.findLocal("this"));   // R1 = this
+        for (int i = 0; i < nargs; i++) {
+            if (i < 3) {
+                this.asm.movRMBase(argRegs[i + 1], 5, argTemps[i]);
+            } else {
+                this.asm.movRMBase(0, 5, argTemps[i]);
+                this.asm.movMBaseR(4, 0, 32 + (i - 3) * 8);
+            }
+        }
+
+        // Call the parent constructor.
+        int targetOff = this.funcOffsets[ctorIdx];
+        if (targetOff >= 0) {
+            int callPos = this.asm.buf.length;
+            int rel32 = targetOff - (callPos + 5);
+            this.asm.callRel32(rel32);
+        } else {
+            this.asm.callRel32(0);
+            this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallNames.add("construct");
+            this.forwardCallClasses.add(parentClass);
+        }
+        this.asm.emitCallTeardown();
+    }
+
+    public int asmOperand(Node expr) {
+        if (expr.kind == 0) { return expr.intVal; }
+        if (expr.kind == 6) { return this.findLocal(expr.name); }

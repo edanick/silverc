@@ -1,0 +1,100 @@
+            int toStrOff = this.allocLocal("__toint_str");
+            this.asm.movMBaseR(5, 0, toStrOff);
+            int toEndOff = this.allocLocal("__toint_end");
+            this.asm.movRR64(1, 0);
+            this.asm.leaRBase(2, 5, toEndOff);
+            this.asm.movRI64(8, 10);
+            this.addImportPatch("ucrtbase.dll", "strtoll");
+            int sToI = 0xDEADBEEFCAFEBAD3;
+            this.asm.emitImm64(0, sToI);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            int toOk = this.newLabel();
+            this.asm.movRMBase(1, 5, toEndOff);
+            this.asm.movRMBase(2, 5, toStrOff);
+            this.asm.cmpRR64(1, 2);
+            this.asm.jneLabel(toOk);
+            this.emitThrowException("invalid number format");
+            this.asm.bindLabel(toOk);
+            return;
+        }
+        if (this.strEq(name, "trim") || this.strEq(name, "trimEnd") || this.strEq(name, "trimRight") || this.strEq(name, "trimStart") || this.strEq(name, "trimLeft")) {
+            int tMode = 0;
+            if (this.strEq(name, "trim")) { tMode = 2; }
+            elif (this.strEq(name, "trimStart") || this.strEq(name, "trimLeft")) { tMode = 1; }
+            if (call.childCount() >= 2) {
+                this.genTrimCore(recv, call.child(1), 1, tMode);
+            } else {
+                this.genTrimCore(recv, call.child(0), 0, tMode);
+            }
+            return;
+        }
+        if (this.strEq(name, "startsWith")) {
+            if (call.childCount() < 2) { this.asm.xorRR64(0, 0); return; }
+            int swRecv = this.allocLocal("__starts_recv");
+            int swPrefix = this.allocLocal("__starts_prefix");
+            int swRecvLen = this.allocLocal("__starts_recv_len");
+            int swPrefixLen = this.allocLocal("__starts_prefix_len");
+            int swI = this.allocLocal("__starts_i");
+            this.genExpr(recv);
+            this.asm.movMBaseR(5, 0, swRecv);
+            this.genExpr(call.child(1));
+            this.asm.movMBaseR(5, 0, swPrefix);
+
+            this.asm.movRMBase(1, 5, swRecv);
+            this.addImportPatch("ucrtbase.dll", "strlen");
+            int sSwLen1 = 0xDEADBEEFCAFEBAD9;
+            this.asm.emitImm64(0, sSwLen1);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movMBaseR(5, 0, swRecvLen);
+
+            this.asm.movRMBase(1, 5, swPrefix);
+            this.addImportPatch("ucrtbase.dll", "strlen");
+            int sSwLen2 = 0xDEADBEEFCAFEBADA;
+            this.asm.emitImm64(0, sSwLen2);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movMBaseR(5, 0, swPrefixLen);
+
+            int swFalse = this.newLabel();
+            int swLoop = this.newLabel();
+            int swTrue = this.newLabel();
+            int swDone = this.newLabel();
+            this.asm.movRMBase(0, 5, swPrefixLen);
+            this.asm.movRMBase(1, 5, swRecvLen);
+            this.asm.cmpRR64(0, 1);
+            this.asm.jgLabel(swFalse);
+            this.asm.xorRR64(0, 0);
+            this.asm.movMBaseR(5, 0, swI);
+            this.asm.bindLabel(swLoop);
+            this.asm.movRMBase(0, 5, swI);
+            this.asm.movRMBase(1, 5, swPrefixLen);
+            this.asm.cmpRR64(0, 1);
+            this.asm.jgeLabel(swTrue);
+            this.asm.movRMBase(11, 5, swI);
+            this.asm.movRMBase(0, 5, swRecv);
+            this.asm.addRR64(0, 11);
+            this.asm.movzxByteMBase(0, 0, 0);
+            this.asm.movRR64(1, 0);
+            this.asm.movRMBase(0, 5, swPrefix);
+            this.asm.addRR64(0, 11);
+            this.asm.movzxByteMBase(0, 0, 0);
+            this.asm.cmpRR64(0, 1);
+            this.asm.jneLabel(swFalse);
+            this.asm.movRMBase(0, 5, swI);
+            this.asm.addRI32(0, 1);
+            this.asm.movMBaseR(5, 0, swI);
+            this.asm.jmpLabel(swLoop);
+            this.asm.bindLabel(swTrue);
+            this.asm.movRI64(0, 1);
+            this.asm.jmpLabel(swDone);
+            this.asm.bindLabel(swFalse);
+            this.asm.xorRR64(0, 0);
+            this.asm.bindLabel(swDone);

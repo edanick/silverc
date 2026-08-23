@@ -1,0 +1,100 @@
+        int[] hintNames = [];
+        for (int i = 0; i < numImports; i++) {
+            hintNames.add(0);
+            hintNames.add(0);
+            string nm = this.imports[i].name;
+            for (int c = 0; c < nm.length; c++) {
+                hintNames.add(nm[c]);
+            }
+            hintNames.add(0);
+        }
+        for (int g = 0; g < numGroups; g++) {
+            string dll = uniqueDlls[g];
+            for (int c = 0; c < dll.length; c++) {
+                hintNames.add(dll[c]);
+            }
+            hintNames.add(0);
+        }
+
+        int namesStart = descBytes + iltTotal + iatTotal;
+        int stringsStart = namesStart + hintNames.length;
+        int importDataSize = stringsStart + stringData.length + this.globalAreaSize;
+
+        int[] rsrcData = [];
+        if (false) {
+            // Version-resource emission remains disabled for the self-hosted
+            // backend because its array argument ABI corrupts the resource
+            // builder. PE generation and executable output remain enabled.
+            int[] viBlob = this.buildVERSIONINFO(versionKeys, versionValues);
+            int viPad = viBlob.length % 4;
+            if (viPad != 0) {
+                for (int i = 0; i < 4 - viPad; i++) { viBlob.add(0); }
+            }
+            int resHdrLen = 16 + 8 + 16 + 8 + 16 + 8 + 16;
+            for (int i = 0; i < resHdrLen; i++) { rsrcData.add(0); }
+            int viOff = resHdrLen;
+            rsrcData[12] = 0; rsrcData[13] = 0; rsrcData[14] = 1; rsrcData[15] = 0;
+            this.writeLe32(rsrcData, 16, 16);
+            this.writeLe32(rsrcData, 20, 0x80000000 | 24);
+            rsrcData[36] = 0; rsrcData[37] = 0; rsrcData[38] = 1; rsrcData[39] = 0;
+            this.writeLe32(rsrcData, 40, 1);
+            this.writeLe32(rsrcData, 44, 0x80000000 | 48);
+            rsrcData[60] = 0; rsrcData[61] = 0; rsrcData[62] = 1; rsrcData[63] = 0;
+            this.writeLe32(rsrcData, 64, 0x409);
+            this.writeLe32(rsrcData, 68, 72);
+            this.writeLe32(rsrcData, 72, viOff);
+            this.writeLe32(rsrcData, 76, viBlob.length);
+            for (int i = 0; i < viBlob.length; i++) { rsrcData.add(viBlob[i]); }
+        }
+
+        int FILE_ALIGN = 0x200;
+        int SECT_ALIGN = 0x1000;
+        int numSections = 2;
+        if (rsrcData.length > 0) { numSections = 3; }
+        int headersRawSize = 64 + 4 + 20 + 240 + numSections * 40;
+        int headersSize = this.padToAlign(headersRawSize, FILE_ALIGN);
+
+        int textRva = SECT_ALIGN;
+        int textVirt = this.padToAlign(this.code.length, SECT_ALIGN);
+        int textRaw = this.padToAlign(this.code.length, FILE_ALIGN);
+        int textFileOff = headersSize;
+
+        int rdataRva = textRva + textVirt;
+        int importVirt = this.padToAlign(importDataSize, SECT_ALIGN);
+        int importRaw = this.padToAlign(importDataSize, FILE_ALIGN);
+        int rdataFileOff = textFileOff + textRaw;
+
+        int rsrcRva = rdataRva + importVirt;
+        int rsrcVirt = 0;
+        int rsrcRaw = 0;
+        int rsrcFileOff = 0;
+        if (rsrcData.length > 0) {
+            rsrcVirt = this.padToAlign(rsrcData.length, SECT_ALIGN);
+            rsrcRaw = this.padToAlign(rsrcData.length, FILE_ALIGN);
+            rsrcFileOff = rdataFileOff + importRaw;
+        }
+
+        int iatSectionStart = descBytes + iltTotal;
+        int[] groupIatStart = [];
+        int runOff = 0;
+        for (int g = 0; g < numGroups; g++) {
+            groupIatStart.add(descBytes + iltTotal + runOff);
+            runOff += iltSizes[g];
+        }
+        int firstIatRva = rdataRva + groupIatStart[0];
+        int iatSize = iatTotal;
+
+        int imageSize = this.padToAlign(rdataRva + importVirt + rsrcVirt, SECT_ALIGN);
+        int totalSize = rdataFileOff + importRaw;
+        if (rsrcData.length > 0) { totalSize = rsrcFileOff + rsrcRaw; }
+        int[] pe = [];
+        for (int i = 0; i < totalSize; i++) {
+            pe.add(0);
+        }
+
+        pe[0] = 0x4D; pe[1] = 0x5A;
+        this.writeLe32(pe, 0x3C, 64);
+
+        int p = 64;
+        pe[p] = 0x50; pe[p+1] = 0x45; pe[p+2] = 0; pe[p+3] = 0;
+        p += 4;

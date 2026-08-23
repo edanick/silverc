@@ -1,0 +1,100 @@
+        elif (this.strEq(m, "makeFunc")) { tag = 9; fOff = 72; }
+        elif (this.strEq(m, "makeBuiltin")) { tag = 10; fOff = 72; }
+        elif (this.strEq(m, "makeClassInst")) { tag = 12; fOff = 56; }
+        elif (this.strEq(m, "makeEnumVal")) { tag = 13; fOff = 64; }
+        elif (this.strEq(m, "makeDict")) { tag = 15; fOff = 56; }
+        this.asm.movRMBase(0, 5, vP);
+        this.asm.movRI64(1, tag);
+        this.asm.movMBaseR(0, 1, 0);
+        if (vArgs.length > 0) {
+            this.asm.movRMBase(0, 5, vP);
+            this.asm.movRMBase(1, 5, vArgs[0]);
+            this.asm.movMBaseR(0, 1, fOff);
+        }
+        if (this.strEq(m, "makeEnumVal")) {
+            if (vArgs.length > 1) {
+                this.asm.movRMBase(0, 5, vP);
+                this.asm.movRMBase(1, 5, vArgs[1]);
+                this.asm.movMBaseR(0, 1, 32);
+            }
+        }
+        // makeObject / makeClassInst carry a second argument: the type name
+        // stored at the typeName offset (64).
+        if (this.strEq(m, "makeObject") || this.strEq(m, "makeClassInst")) {
+            if (vArgs.length > 1) {
+                this.asm.movRMBase(0, 5, vP);
+                this.asm.movRMBase(1, 5, vArgs[1]);
+                this.asm.movMBaseR(0, 1, 64);
+            }
+        }
+        // strVal = "" so printing or concatenating a value that never received
+        // a string payload cannot dereference a null pointer. makeString and
+        // makeEnumVal already store their string payload at the strVal offset
+        // (32), so skip the default there to avoid overwriting it.
+        if (!this.strEq(m, "makeString") && !this.strEq(m, "makeEnumVal")) {
+            this.asm.movRMBase(0, 5, vP);
+            this.asm.pushR64(0);
+            Node es = new Node(); es.kind = 2; es.strVal = "";
+            this.genExpr(es);
+            this.asm.movRR64(1, 0);
+            this.asm.popR64(0);
+            this.asm.movMBaseR(0, 1, 32);
+        }
+        this.asm.movRMBase(0, 5, vP);
+    }
+
+    public string parentClassName(string className) {
+        for (int i = 0; i < this.classNames.length; i++) {
+            if (this.strEq(this.classNames[i], className)) {
+                return this.classParentClasses[i];
+            }
+        }
+        return "";
+    }
+
+    public int findConstructor(string className, int nargs) {
+        int ctorIdx = -1;
+        // Exact-arity match first: `new Env()` must select the no-arg
+        // constructor, not a later overload (e.g. Env(Env? parent)) whose
+        // garbage argument would leave fields non-null and recurse forever.
+        for (int i = 0; i < this.funcNames.length; i++) {
+            if (this.strEq(this.funcNames[i], "construct") && this.strEq(this.funcClasses[i], className)) {
+                if (i < this.funcParamCounts.length && this.funcParamCounts[i] == nargs) {
+                    ctorIdx = i;
+                }
+            }
+        }
+        // Fall back to a constructor whose trailing parameters all have defaults.
+        if (ctorIdx < 0) {
+            for (int i = 0; i < this.funcNames.length; i++) {
+                if (this.strEq(this.funcNames[i], "construct") && this.strEq(this.funcClasses[i], className)) {
+                    int pc = (i < this.funcParamCounts.length) ? this.funcParamCounts[i] : 0;
+                    int ps = (i < this.funcParamStarts.length) ? this.funcParamStarts[i] : 0;
+                    bool allDefault = true;
+                    for (int di = nargs; di < pc; di++) {
+                        if (ps + di >= this.funcParamHasDefaults.length || this.funcParamHasDefaults[ps + di] != 1) {
+                            allDefault = false;
+                        }
+                    }
+                    if (allDefault) { ctorIdx = i; }
+                }
+            }
+        }
+        // Last-resort fallback: any constructor of the class.
+        if (ctorIdx < 0) {
+            for (int i = 0; i < this.funcNames.length; i++) {
+                if (this.strEq(this.funcNames[i], "construct") && this.strEq(this.funcClasses[i], className)) {
+                    ctorIdx = i;
+                }
+            }
+        }
+        return ctorIdx;
+    }
+
+public void genNewCall(Node call) {
+    int size = 16;
+    for (int i = 0; i < this.classNames.length; i++) {
+        if (this.strEq(this.classNames[i], call.name)) {
+            int cnt = this.classFieldCounts[i];
+            size = cnt * 8;
+            if (size < 16) { size = 16; }

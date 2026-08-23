@@ -1,0 +1,578 @@
+mod export mini_pe;
+
+class PeImport {
+    public prop string dll;
+    public prop string name;
+
+    construct (string dll, string name) {
+        this.dll = dll;
+        this.name = name;
+    }
+}
+class PeDllGroup {
+    public prop string dll;
+    public prop int count;
+
+    construct (string dll) {
+        this.dll = dll;
+        this.count = 0;
+    }
+}
+class MiniPe {
+    public int[] code;
+    public int entryRva;
+    public int globalAreaSize;
+    public PeImport[] imports;
+    public int[] relocOffsets;
+    public int[] extraData;
+    public string[] viKeys;
+    public string[] viValues;
+    // PE optional-header subsystem (DOCS/253): 3 = console (default),
+    // 2 = Windows GUI (no attached console, used by `type: app` / `service`).
+    public int subsystem;
+
+    construct () {
+        this.code = [];
+        this.entryRva = 0;
+        this.globalAreaSize = 0;
+        this.imports = [];
+        this.relocOffsets = [];
+        this.extraData = [];
+        this.viKeys = [];
+        this.viValues = [];
+        this.subsystem = 3;
+    }
+
+    public void addSectionData(int[] data) {
+        this.extraData = data;
+    }
+
+    public void setVersionInfo(string[] keys, string[] values) {
+        this.viKeys = keys;
+        this.viValues = values;
+    }
+
+    public void writeFile(string path) {
+        int[] peBytes = this.build(this.code, this.extraData, []);
+        file.writeBytes(path, peBytes);
+    }
+
+    public void addImport(string dll, string name) {
+        this.imports.add(new PeImport(dll, name));
+    }
+
+    private bool strEq(string a, string b) {
+        if (a.length != b.length) { return false; }
+        for (int i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    public int computeRdataRva() {
+        int FILE_ALIGN = 0x200;
+        int SECT_ALIGN = 0x1000;
+        int textRva = SECT_ALIGN;
+        int textVirt = this.padToAlign(this.code.length, SECT_ALIGN);
+        return textRva + textVirt;
+    }
+
+    public int[] computeLayout(int stringDataLen) {
+        PeDllGroup[] groups = [];
+        int[] groupMap = [];
+        for (int i = 0; i < this.imports.length; i++) {
+            string impDll = this.imports[i].dll;
+            int gIdx = -1;
+            for (int j = 0; j < groups.length; j++) {
+                string gDll = groups[j].dll;
+                if (this.strEq(gDll, impDll)) {
+                    gIdx = j;
+                    break;
+                }
+            }
+            if (gIdx < 0) {
+                groups.add(new PeDllGroup(impDll));
+                gIdx = groups.length - 1;
+            }
+            PeDllGroup grp = groups[gIdx];
+            grp.count = grp.count + 1;
+            groupMap.add(gIdx);
+        }
+        int numGroups = groups.length;
+        int descBytes = (numGroups + 1) * 20;
+        int iltTotal = 0;
+        for (int g = 0; g < numGroups; g++) {
+            int cnt = groups[g].count;
+            iltTotal += (cnt + 1) * 8;
+        }
+        int iatTotal = iltTotal;
+        int namesStart = descBytes + iltTotal + iatTotal;
+        int hintNamesLen = 0;
+        for (int i = 0; i < this.imports.length; i++) {
+            string nm = this.imports[i].name;
+            hintNamesLen += 2 + nm.length + 1;
+        }
+        for (int g = 0; g < numGroups; g++) {
+            string gDll2 = groups[g].dll;
+            hintNamesLen += gDll2.length + 1;
+        }
+        int stringsStart = namesStart + hintNamesLen;
+        int[] layout = [];
+        layout.add(stringsStart);
+        layout.add(numGroups);
+        layout.add(iltTotal);
+        return layout;
+    }
+
+    public int padToAlign(int offset, int align) {
+        int m = offset % align;
+        if (m != 0) {
+            return offset + (align - m);
+        }
+        return offset;
+    }
+
+    public void writeLe32(int[] buf, int offset, int val) {
+        buf[offset] = val & 0xFF;
+        buf[offset + 1] = (val >> 8) & 0xFF;
+        buf[offset + 2] = (val >> 16) & 0xFF;
+        buf[offset + 3] = (val >> 24) & 0xFF;
+    }
+
+    public void writeLe64(int[] buf, int offset, int64 val) {
+        buf[offset] = val & 0xFF;
+        buf[offset + 1] = (val >> 8) & 0xFF;
+        buf[offset + 2] = (val >> 16) & 0xFF;
+        buf[offset + 3] = (val >> 24) & 0xFF;
+        buf[offset + 4] = (val >> 32) & 0xFF;
+        buf[offset + 5] = (val >> 40) & 0xFF;
+        buf[offset + 6] = (val >> 48) & 0xFF;
+        buf[offset + 7] = (val >> 56) & 0xFF;
+    }
+
+    private void rsrcWriteUtf16Pad(int[] buf, string s) {
+        for (int i = 0; i < s.length; i++) {
+            int ch = s[i];
+            buf.add(ch & 0xFF);
+            buf.add((ch >> 8) & 0xFF);
+        }
+        buf.add(0);
+        buf.add(0);
+    }
+
+    private string rsrcFixVer(string v) {
+        int dots = 0;
+        for (int i = 0; i < v.length; i++) {
+            if (v[i] == '.') { dots = dots + 1; }
+        }
+        for (int i = 0; dots < 3; dots++) {
+            v = v + ".0";
+        }
+        return v;
+    }
+
+    private int[] buildVERSIONINFO(string[] keys, string[] values) {
+        int kc = keys.length;
+
+        int strBlockSize = 6 + 4 * kc;
+        int strTableNameBytes = 18;
+        int strSize = 24 + 6 + strBlockSize + strTableNameBytes;
+        for (int i = 0; i < kc; i++) {
+            strSize = strSize + (keys[i].length + 1) * 2;
+            strSize = strSize + (values[i].length + 1) * 2;
+        }
+        int pad = strSize % 4;
+        if (pad != 0) { strSize = strSize + (4 - pad); }
+
+        int viLen = 52 + 6 + 6 + 52 + strSize;
+
+        int[] s = [];
+        for (int i = 0; i < viLen; i++) { s.add(0); }
+
+        s[0] = 'V'; s[1] = 'S'; s[2] = '_'; s[3] = 'V'; s[4] = 'E'; s[5] = 'R'; s[6] = 'S'; s[7] = 'I';
+        s[8] = 'O'; s[9] = 'N'; s[10] = '_'; s[11] = 'I'; s[12] = 'N'; s[13] = 'F'; s[14] = 'O';
+
+        this.writeLe32(s, 8, 52);
+        this.writeLe32(s, 12, viLen);
+
+        this.writeLe32(s, 52, 0xFEEF04BD);
+        this.writeLe32(s, 54, 34 + 6 + strSize);
+
+        s.add('S'); s.add(0); s.add('t'); s.add(0); s.add('r'); s.add(0); s.add('i'); s.add(0);
+        s.add('n'); s.add(0); s.add('g'); s.add(0); s.add('F'); s.add(0); s.add('i'); s.add(0);
+        s.add('l'); s.add(0); s.add('e'); s.add(0); s.add('I'); s.add(0); s.add('n'); s.add(0);
+        s.add('f'); s.add(0); s.add('o'); s.add(0); s.add(0); s.add(0);
+
+        this.writeLe32(s, 86 + 4, 28 + strBlockSize + strTableNameBytes);
+
+        s.add('V'); s.add(0); s.add('a'); s.add(0); s.add('r'); s.add(0);
+        s.add('F'); s.add(0); s.add('i'); s.add(0); s.add('l'); s.add(0);
+        s.add('e'); s.add(0); s.add('I'); s.add(0); s.add('n'); s.add(0);
+        s.add('f'); s.add(0); s.add('o'); s.add(0); s.add(0); s.add(0);
+        this.writeLe32(s, 120, 4);
+
+        s.add(0x09); s.add(0x04); s.add(0xB0); s.add(0x04);
+
+        int strBlockOff = s.length;
+        s.add(0); s.add(0); s.add(0); s.add(0); s.add(0); s.add(0);
+        this.writeLe32(s, strBlockOff, strBlockSize + strTableNameBytes);
+
+        for (int i = 0; i < kc; i++) {
+            int keyLen = (keys[i].length + 1) * 2;
+            int valLen = (values[i].length + 1) * 2;
+            // Reserve the two DWORD fields before writing them. Writing at
+            // s.length without extending the array corrupts the self-hosted
+            // native compiler when project version metadata is enabled.
+            int pos = s.length;
+            s.add(0); s.add(0); s.add(0); s.add(0);
+            this.writeLe32(s, pos, keyLen);
+            this.writeLe32(s, pos + 2, strBlockSize + strTableNameBytes + pos - strBlockOff);
+        }
+        for (int i = 0; i < kc; i++) {
+            int valLen = (values[i].length + 1) * 2;
+            int pos = s.length;
+            s.add(0); s.add(0); s.add(0); s.add(0);
+            this.writeLe32(s, pos, valLen);
+            this.writeLe32(s, pos + 2, strBlockSize + strTableNameBytes + pos - strBlockOff);
+        }
+
+        s.add('0'); s.add(0); s.add('4'); s.add(0); s.add('0'); s.add(0); s.add('9'); s.add(0);
+        s.add('0'); s.add(0); s.add('4'); s.add(0); s.add('B'); s.add(0); s.add('0'); s.add(0);
+        s.add(0); s.add(0);
+
+        for (int i = 0; i < kc; i++) {
+            this.rsrcWriteUtf16Pad(s, keys[i]);
+        }
+        for (int i = 0; i < kc; i++) {
+            string vv = values[i];
+            if (this.strEq(keys[i], "FileVersion") || this.strEq(keys[i], "ProductVersion")) {
+                vv = this.rsrcFixVer(vv);
+            }
+            this.rsrcWriteUtf16Pad(s, vv);
+        }
+
+        int tailPad = s.length % 4;
+        if (tailPad != 0) {
+            for (int i = 0; i < 4 - tailPad; i++) { s.add(0); }
+        }
+
+        this.writeLe32(s, 2, s.length);
+
+        return s;
+    }
+
+public int[] build(int[] codeIn, int[] stringData, string[] versionData) {
+        this.code = codeIn;
+        string[] versionKeys = [];
+        string[] versionValues = [];
+        for (int vi = 0; vi + 1 < versionData.length; vi += 2) {
+            versionKeys.add(versionData[vi]);
+            versionValues.add(versionData[vi + 1]);
+        }
+
+        int numImports = this.imports.length;
+        string[] uniqueDlls = [];
+        int[] groupSizes = [];
+        int[] importGroupIdx = [];
+        for (int i = 0; i < numImports; i++) {
+            string impDll = this.imports[i].dll;
+            int gIdx = -1;
+            for (int j = 0; j < uniqueDlls.length; j++) {
+                if (this.strEq(uniqueDlls[j], impDll)) {
+                    gIdx = j;
+                    break;
+                }
+            }
+            if (gIdx < 0) {
+                uniqueDlls.add(impDll);
+                groupSizes.add(0);
+                gIdx = uniqueDlls.length - 1;
+            }
+            groupSizes[gIdx] = groupSizes[gIdx] + 1;
+            importGroupIdx.add(gIdx);
+        }
+        int numGroups = uniqueDlls.length;
+        int[] posInGroup = [];
+        int[] runningCount = [];
+        for (int g = 0; g < numGroups; g++) {
+            runningCount.add(0);
+        }
+        for (int i = 0; i < numImports; i++) {
+            posInGroup.add(0);
+        }
+        for (int i = 0; i < numImports; i++) {
+            int g = importGroupIdx[i];
+            posInGroup[i] = runningCount[g];
+            runningCount[g] = runningCount[g] + 1;
+        }
+
+        int descBytes = (numGroups + 1) * 20;
+        int iltTotal = 0;
+        int[] iltSizes = [];
+        for (int g = 0; g < numGroups; g++) {
+            int sz = (groupSizes[g] + 1) * 8;
+            iltSizes.add(sz);
+            iltTotal += sz;
+        }
+        int iatTotal = iltTotal;
+
+        int[] hintNameOffsets = [];
+        int off = 0;
+        for (int i = 0; i < numImports; i++) {
+            string nm = this.imports[i].name;
+            hintNameOffsets.add(off);
+            off += 2 + nm.length + 1;
+        }
+        int[] dllNameOffsets = [];
+        for (int g = 0; g < numGroups; g++) {
+            string dll = uniqueDlls[g];
+            dllNameOffsets.add(off);
+            off += dll.length + 1;
+        }
+
+        int[] hintNames = [];
+        for (int i = 0; i < numImports; i++) {
+            hintNames.add(0);
+            hintNames.add(0);
+            string nm = this.imports[i].name;
+            for (int c = 0; c < nm.length; c++) {
+                hintNames.add(nm[c]);
+            }
+            hintNames.add(0);
+        }
+        for (int g = 0; g < numGroups; g++) {
+            string dll = uniqueDlls[g];
+            for (int c = 0; c < dll.length; c++) {
+                hintNames.add(dll[c]);
+            }
+            hintNames.add(0);
+        }
+
+        int namesStart = descBytes + iltTotal + iatTotal;
+        int stringsStart = namesStart + hintNames.length;
+        int importDataSize = stringsStart + stringData.length + this.globalAreaSize;
+
+        int[] rsrcData = [];
+        if (false) {
+            // Version-resource emission remains disabled for the self-hosted
+            // backend because its array argument ABI corrupts the resource
+            // builder. PE generation and executable output remain enabled.
+            int[] viBlob = this.buildVERSIONINFO(versionKeys, versionValues);
+            int viPad = viBlob.length % 4;
+            if (viPad != 0) {
+                for (int i = 0; i < 4 - viPad; i++) { viBlob.add(0); }
+            }
+            int resHdrLen = 16 + 8 + 16 + 8 + 16 + 8 + 16;
+            for (int i = 0; i < resHdrLen; i++) { rsrcData.add(0); }
+            int viOff = resHdrLen;
+            rsrcData[12] = 0; rsrcData[13] = 0; rsrcData[14] = 1; rsrcData[15] = 0;
+            this.writeLe32(rsrcData, 16, 16);
+            this.writeLe32(rsrcData, 20, 0x80000000 | 24);
+            rsrcData[36] = 0; rsrcData[37] = 0; rsrcData[38] = 1; rsrcData[39] = 0;
+            this.writeLe32(rsrcData, 40, 1);
+            this.writeLe32(rsrcData, 44, 0x80000000 | 48);
+            rsrcData[60] = 0; rsrcData[61] = 0; rsrcData[62] = 1; rsrcData[63] = 0;
+            this.writeLe32(rsrcData, 64, 0x409);
+            this.writeLe32(rsrcData, 68, 72);
+            this.writeLe32(rsrcData, 72, viOff);
+            this.writeLe32(rsrcData, 76, viBlob.length);
+            for (int i = 0; i < viBlob.length; i++) { rsrcData.add(viBlob[i]); }
+        }
+
+        int FILE_ALIGN = 0x200;
+        int SECT_ALIGN = 0x1000;
+        int numSections = 2;
+        if (rsrcData.length > 0) { numSections = 3; }
+        int headersRawSize = 64 + 4 + 20 + 240 + numSections * 40;
+        int headersSize = this.padToAlign(headersRawSize, FILE_ALIGN);
+
+        int textRva = SECT_ALIGN;
+        int textVirt = this.padToAlign(this.code.length, SECT_ALIGN);
+        int textRaw = this.padToAlign(this.code.length, FILE_ALIGN);
+        int textFileOff = headersSize;
+
+        int rdataRva = textRva + textVirt;
+        int importVirt = this.padToAlign(importDataSize, SECT_ALIGN);
+        int importRaw = this.padToAlign(importDataSize, FILE_ALIGN);
+        int rdataFileOff = textFileOff + textRaw;
+
+        int rsrcRva = rdataRva + importVirt;
+        int rsrcVirt = 0;
+        int rsrcRaw = 0;
+        int rsrcFileOff = 0;
+        if (rsrcData.length > 0) {
+            rsrcVirt = this.padToAlign(rsrcData.length, SECT_ALIGN);
+            rsrcRaw = this.padToAlign(rsrcData.length, FILE_ALIGN);
+            rsrcFileOff = rdataFileOff + importRaw;
+        }
+
+        int iatSectionStart = descBytes + iltTotal;
+        int[] groupIatStart = [];
+        int runOff = 0;
+        for (int g = 0; g < numGroups; g++) {
+            groupIatStart.add(descBytes + iltTotal + runOff);
+            runOff += iltSizes[g];
+        }
+        int firstIatRva = rdataRva + groupIatStart[0];
+        int iatSize = iatTotal;
+
+        int imageSize = this.padToAlign(rdataRva + importVirt + rsrcVirt, SECT_ALIGN);
+        int totalSize = rdataFileOff + importRaw;
+        if (rsrcData.length > 0) { totalSize = rsrcFileOff + rsrcRaw; }
+        int[] pe = [];
+        for (int i = 0; i < totalSize; i++) {
+            pe.add(0);
+        }
+
+        pe[0] = 0x4D; pe[1] = 0x5A;
+        this.writeLe32(pe, 0x3C, 64);
+
+        int p = 64;
+        pe[p] = 0x50; pe[p+1] = 0x45; pe[p+2] = 0; pe[p+3] = 0;
+        p += 4;
+        pe[p] = 0x64; pe[p+1] = 0x86; p += 2;
+        pe[p] = numSections; pe[p+1] = 0; p += 2;
+        this.writeLe32(pe, p, 0x42); p += 4;
+        this.writeLe32(pe, p, 0); p += 4;
+        this.writeLe32(pe, p, 0); p += 4;
+        pe[p] = 0xF0; pe[p+1] = 0; p += 2;
+        pe[p] = 0x2F; pe[p+1] = 0; p += 2;
+
+        pe[p] = 0x0B; pe[p+1] = 0x02; p += 2;
+        pe[p] = 14; pe[p+1] = 0; p += 2;
+        this.writeLe32(pe, p, textRaw); p += 4;
+        this.writeLe32(pe, p, importRaw); p += 4;
+        this.writeLe32(pe, p, 0); p += 4;
+        this.writeLe32(pe, p, this.entryRva); p += 4;
+        this.writeLe32(pe, p, textRva); p += 4;
+        this.writeLe64(pe, p, 0x140000000); p += 8;
+        this.writeLe32(pe, p, SECT_ALIGN); p += 4;
+        this.writeLe32(pe, p, FILE_ALIGN); p += 4;
+        pe[p] = 6; pe[p+1] = 0; p += 2;
+        pe[p] = 0; pe[p+1] = 0; p += 2;
+        pe[p] = 0; pe[p+1] = 0; p += 2;
+        pe[p] = 0; pe[p+1] = 0; p += 2;
+        pe[p] = 6; pe[p+1] = 0; p += 2;
+        pe[p] = 0; pe[p+1] = 0; p += 2;
+        this.writeLe32(pe, p, 0); p += 4;
+        this.writeLe32(pe, p, imageSize); p += 4;
+        this.writeLe32(pe, p, headersSize); p += 4;
+        this.writeLe32(pe, p, 0); p += 4;
+        pe[p] = this.subsystem; pe[p+1] = 0; p += 2;
+        pe[p] = 0; pe[p+1] = 0; p += 2;
+        this.writeLe64(pe, p, 0x100000); p += 8;
+        this.writeLe64(pe, p, 0x1000); p += 8;
+        this.writeLe64(pe, p, 0x100000); p += 8;
+        this.writeLe64(pe, p, 0x1000); p += 8;
+        this.writeLe32(pe, p, 0); p += 4;
+        this.writeLe32(pe, p, 16); p += 4;
+
+        for (int i = 0; i < 16; i++) {
+            if (i == 1) {
+                this.writeLe32(pe, p, rdataRva); p += 4;
+                this.writeLe32(pe, p, importVirt); p += 4;
+
+            } elif (i == 2 && rsrcData.length > 0) {
+                this.writeLe32(pe, p, rsrcRva); p += 4;
+                this.writeLe32(pe, p, rsrcData.length); p += 4;
+            } elif (i == 12) {
+                this.writeLe32(pe, p, firstIatRva); p += 4;
+                this.writeLe32(pe, p, iatSize); p += 4;
+            } else {
+                this.writeLe32(pe, p, 0); p += 4;
+                this.writeLe32(pe, p, 0); p += 4;
+            }
+        }
+
+        pe[p] = 0x2E; pe[p+1] = 0x74; pe[p+2] = 0x65; pe[p+3] = 0x78; pe[p+4] = 0x74; pe[p+5] = 0; pe[p+6] = 0; pe[p+7] = 0;
+        p += 8;
+        this.writeLe32(pe, p, textVirt); p += 4;
+        this.writeLe32(pe, p, textRva); p += 4;
+        this.writeLe32(pe, p, textRaw); p += 4;
+        this.writeLe32(pe, p, textFileOff); p += 4;
+        this.writeLe32(pe, p, 0); p += 4;
+        this.writeLe32(pe, p, 0); p += 4;
+        this.writeLe32(pe, p, 0); p += 4;
+        this.writeLe32(pe, p, 0xE0000020); p += 4;
+
+        pe[p] = 0x2E; pe[p+1] = 0x72; pe[p+2] = 0x64; pe[p+3] = 0x61; pe[p+4] = 0x74; pe[p+5] = 0x61; pe[p+6] = 0; pe[p+7] = 0;
+        p += 8;
+        this.writeLe32(pe, p, importVirt); p += 4;
+        this.writeLe32(pe, p, rdataRva); p += 4;
+        this.writeLe32(pe, p, importRaw); p += 4;
+        this.writeLe32(pe, p, rdataFileOff); p += 4;
+        this.writeLe32(pe, p, 0); p += 4;
+        this.writeLe32(pe, p, 0); p += 4;
+        this.writeLe32(pe, p, 0); p += 4;
+        this.writeLe32(pe, p, 0xC0000040); p += 4;
+
+        if (rsrcData.length > 0) {
+            pe[p] = 0x2E; pe[p+1] = 0x72; pe[p+2] = 0x73; pe[p+3] = 0x72; pe[p+4] = 0x63; pe[p+5] = 0; pe[p+6] = 0; pe[p+7] = 0;
+            p += 8;
+            this.writeLe32(pe, p, rsrcVirt); p += 4;
+            this.writeLe32(pe, p, rsrcRva); p += 4;
+            this.writeLe32(pe, p, rsrcRaw); p += 4;
+            this.writeLe32(pe, p, rsrcFileOff); p += 4;
+            this.writeLe32(pe, p, 0); p += 4;
+            this.writeLe32(pe, p, 0); p += 4;
+            this.writeLe32(pe, p, 0); p += 4;
+            this.writeLe32(pe, p, 0x40000040); p += 4;
+        }
+
+        for (int i = 0; i < this.code.length; i++) {
+            pe[textFileOff + i] = this.code[i];
+        }
+
+        int importBase = rdataFileOff;
+
+        int descOff = 0;
+        int[] groupIltStart = [];
+        int rOff = 0;
+        for (int g = 0; g < numGroups; g++) {
+            groupIltStart.add(descBytes + rOff);
+            rOff += iltSizes[g];
+        }
+        for (int g = 0; g < numGroups; g++) {
+            int iltRva = rdataRva + groupIltStart[g];
+            int iatRva = rdataRva + groupIatStart[g];
+            int dllNameRva = rdataRva + namesStart + dllNameOffsets[g];
+
+            this.writeLe32(pe, importBase + descOff, iltRva);
+            this.writeLe32(pe, importBase + descOff + 4, 0);
+            this.writeLe32(pe, importBase + descOff + 8, 0);
+            this.writeLe32(pe, importBase + descOff + 12, dllNameRva);
+            this.writeLe32(pe, importBase + descOff + 16, iatRva);
+            descOff += 20;
+        }
+
+        int iltOff = descBytes;
+        for (int g = 0; g < numGroups; g++) {
+            int gBase = importBase + groupIltStart[g];
+            int gIatBase = importBase + groupIatStart[g];
+            for (int i = 0; i < numImports; i++) {
+                if (importGroupIdx[i] == g) {
+                    int entryOff = posInGroup[i] * 8;
+                    int hintRva = rdataRva + namesStart + hintNameOffsets[i];
+                    this.writeLe64(pe, gBase + entryOff, hintRva);
+                    this.writeLe64(pe, gIatBase + entryOff, hintRva);
+                }
+            }
+            int nullOff = groupSizes[g] * 8;
+            this.writeLe64(pe, gBase + nullOff, 0);
+            this.writeLe64(pe, gIatBase + nullOff, 0);
+        }
+
+        for (int i = 0; i < hintNames.length; i++) {
+            pe[importBase + namesStart + i] = hintNames[i];
+        }
+        for (int i = 0; i < stringData.length; i++) {
+            pe[importBase + stringsStart + i] = stringData[i];
+        }
+
+        for (int i = 0; i < rsrcData.length; i++) {
+            pe[rsrcFileOff + i] = rsrcData[i];
+        }
+
+        return pe;
+    }
+}

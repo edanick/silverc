@@ -1,0 +1,100 @@
+        this.forwardCallNames = [];
+        this.forwardCallClasses = [];
+        this.globalNames = [];
+        this.globalTypes = [];
+        this.globalOffsets = [];
+        this.globalInits = [];
+        this.globalPatchOffsets = [];
+        this.globalPatchIndices = [];
+        this.globalAreaSize = 0;
+        this.entryOffset = 0;
+        this.currentExcHandler = -1;
+        this.currentCatch = -1;
+        this.currentFinally = -1;
+        this.currentFinallyRetVal = 0;
+        this.currentFinallyRetFlag = 0;
+    }
+
+    public void collectClassLayouts(Node[] program) {
+        // First pass: collect all class names so parent references work
+        for (int i = 0; i < program.length; i++) {
+            Node item = program[i];
+            if (item.kind == 102) {
+                this.classNames.add(item.name);
+                this.classParentClasses.add(item.parentClass);
+                this.classFieldStarts.add(0);
+                this.classFieldCounts.add(0);
+            }
+        }
+        // Second pass: collect fields and methods with inheritance
+        int classIdx = 0;
+        for (int i = 0; i < program.length; i++) {
+            Node item = program[i];
+            if (item.kind == 102) {
+                int start = this.classFieldNames.length;
+                int cnt = 0;
+                if (!this.strEq(item.parentClass, "")) {
+                    int parentIdx = -1;
+                    for (int pi = 0; pi < this.classNames.length; pi++) {
+                        if (this.strEq(this.classNames[pi], item.parentClass)) {
+                            parentIdx = pi;
+                        }
+                    }
+                    if (parentIdx >= 0) {
+                        int pStart = this.classFieldStarts[parentIdx];
+                        int pCnt = this.classFieldCounts[parentIdx];
+                        for (int pj = 0; pj < pCnt; pj++) {
+                            this.classFieldNames.add(this.classFieldNames[pStart + pj]);
+                            this.classFieldOffsets.add(cnt * 8);
+                            this.classFieldTypes.add(this.classFieldTypes[pStart + pj]);
+                            cnt = cnt + 1;
+                        }
+                    }
+                }
+                for (int j = 0; j < item.childCount(); j++) {
+                    Node member = item.child(j);
+                    if (member.kind == 50) {
+                        this.classFieldNames.add(member.name);
+                        this.classFieldOffsets.add(cnt * 8);
+                        this.classFieldTypes.add(member.typeHint);
+                        cnt = cnt + 1;
+                    }
+                }
+                this.classFieldStarts[classIdx] = start;
+                this.classFieldCounts[classIdx] = cnt;
+                for (int j = 0; j < item.childCount(); j++) {
+                    Node member = item.child(j);
+                    if (member.kind == 100) {
+                        this.methodNames.add(member.name);
+                        this.methodClassNames.add(item.name);
+                    }
+                }
+                if (!this.strEq(item.parentClass, "")) {
+                    int parentIdx = -1;
+                    for (int pi = 0; pi < this.classNames.length; pi++) {
+                        if (this.strEq(this.classNames[pi], item.parentClass)) {
+                            parentIdx = pi;
+                        }
+                    }
+                    if (parentIdx >= 0) {
+                        int savedLen = this.methodNames.length;
+                        for (int mi = 0; mi < savedLen; mi++) {
+                            if (this.strEq(this.methodClassNames[mi], item.parentClass) && !this.strEq(this.methodClassNames[mi], "")) {
+                                bool hasOverride = false;
+                                for (int mj = 0; mj < this.methodNames.length; mj++) {
+                                    if (this.strEq(this.methodClassNames[mj], item.name) && this.strEq(this.methodNames[mj], this.methodNames[mi])) {
+                                        hasOverride = true;
+                                    }
+                                }
+                                if (!hasOverride) {
+                                    this.methodNames.add(this.methodNames[mi]);
+                                    this.methodClassNames.add(item.name);
+                                }
+                            }
+                        }
+                    }
+                }
+                classIdx = classIdx + 1;
+            }
+        }
+    }

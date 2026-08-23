@@ -1,3 +1,6 @@
+import * from win32.kernel32;
+import * from win32.user32;
+
 mod export process;
 
 class result {
@@ -6,19 +9,66 @@ class result {
     public int exitCode;
 }
 
-class process {
-    private int hProcess;
-    private int hStdin;
-    private int hStdout;
+class ProcessWindow {
+    public int handle;
+    public string title;
 
-    construct() { }
+    construct() {
+        this.handle = 0;
+        this.title = "";
+    }
+}
 
-    public pipe stdin;
-    public pipe stdout;
-    public pipe stderr;
+class Process {
+    public string path;
+    public string filename;
+    public int id;
+    public ProcessWindow window;
 
-    public void wait() {
-        WaitForSingleObject(this.hProcess, -1);
+    construct() {
+        this.path = "";
+        this.filename = "";
+        this.id = 0;
+        this.window = new ProcessWindow();
+    }
+
+    public static Process getFocusedProcess() {
+        Process result = new Process();
+        int hwnd = GetForegroundWindow();
+        if (hwnd == 0) { return result; }
+        result.window.handle = hwnd;
+
+        byte[] titleBuffer = new byte[512];
+        int titleLength = GetWindowTextA(hwnd, titleBuffer, 512);
+        string title = "";
+        for (int i = 0; i < titleLength; i++) { title += char(titleBuffer[i]); }
+        result.window.title = title;
+
+        int pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        result.id = pid;
+
+        int hProcess = OpenProcess(0x1000, 0, pid);
+        if (hProcess == 0) { return result; }
+        byte[] pathBuffer = new byte[1024];
+        int pathLength = 1024;
+        int ok = QueryFullProcessImageNameA(hProcess, 0, pathBuffer, &pathLength);
+        CloseHandle(hProcess);
+        if (ok == 0) { return result; }
+
+        string fullPath = "";
+        for (int i = 0; i < pathLength; i++) { fullPath += char(pathBuffer[i]); }
+        result.path = fullPath;
+        int lastSlash = -1;
+        for (int i = 0; i < fullPath.length; i++) {
+            if (fullPath[i] == '\\' || fullPath[i] == '/') { lastSlash = i; }
+        }
+        if (lastSlash >= 0) {
+            result.filename = fullPath[lastSlash + 1..fullPath.length];
+        } else {
+            result.filename = fullPath;
+        }
+        return result;
     }
 }
 
@@ -36,7 +86,7 @@ class pipe {
     public void flush() { }
 
     public string read() {
-        byte[] buf[4096];
+        byte[] buf = new byte[4096];
         int n = 0;
         ReadFile(this.hRead, buf, 4096, &n, null);
         if (n <= 0) { return ""; }
@@ -44,76 +94,33 @@ class pipe {
         for (int i = 0; i < n; i++) { result += char(buf[i]); }
         return result;
     }
-
-    public void onStdout(void callback(string line)) { }
 }
 
 public result run(string cmd, string[] args) {
-    return run(cmd, args, null);
-}
-
-public result run(string cmd, string[] args, object opts) {
     string fullCmd = cmd;
-    foreach (string a in args) {
-        fullCmd += " " + a;
-    }
-
-    string stdinData = "";
-    if (opts != null) {
-        stdinData = opts.stdin;
-    }
-
-    int hReadOut, hWriteOut;
+    for (int i = 0; i < args.length; i++) { fullCmd += " " + args[i]; }
+    byte[] outBuf = new byte[8192];
+    int n = 0;
+    int hWriteOut = 0;
+    int hReadOut = 0;
     CreatePipe(&hReadOut, &hWriteOut, null, 0);
-    int hReadIn, hWriteIn;
-    CreatePipe(&hReadIn, &hWriteIn, null, 0);
-
-    PROCESS_INFORMATION pi;
-    STARTUPINFO si;
-    si.cb = 68;
-    si.dwFlags = 0x100;
-    si.hStdOutput = hWriteOut;
-    si.hStdError = hWriteOut;
-    si.hStdInput = hReadIn;
-
-    int created = CreateProcess(null, fullCmd, null, null, 1, 0, null, null, &si, &pi);
-    if (!created) {
+    int created = CreateProcessA(null, fullCmd, null, null, 1, 0, null, null, null, null);
+    if (created == 0) {
         result r = new result();
         r.exitCode = -1;
         r.stderr = "Failed to create process";
+        CloseHandle(hWriteOut);
+        CloseHandle(hReadOut);
         return r;
     }
-
-    if (stdinData.length() > 0) {
-        byte[] inBytes = stdinData.toBytes();
-        WriteFile(hWriteIn, inBytes, inBytes.length, null, null);
-    }
-    CloseHandle(hWriteIn);
-
-    WaitForSingleObject(pi.hProcess, 5000);
-
-    byte[] outBuf[8192];
-    int n = 0;
     string output = "";
     while (ReadFile(hReadOut, outBuf, 8192, &n, null) && n > 0) {
         for (int i = 0; i < n; i++) { output += char(outBuf[i]); }
     }
-
-    int exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    CloseHandle(hReadOut);
-    CloseHandle(hWriteOut);
-    CloseHandle(hReadIn);
-
     result res = new result();
     res.stdout = output;
-    res.exitCode = exitCode;
+    res.exitCode = 0;
+    CloseHandle(hWriteOut);
+    CloseHandle(hReadOut);
     return res;
-}
-
-public process spawn(string cmd, string[] args) {
-    process proc = new process();
-    return proc;
 }

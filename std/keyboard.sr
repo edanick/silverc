@@ -1,0 +1,216 @@
+import * from win32.user32;
+import * from win32.ws2_32;
+
+// ---------------------------------------------------------------------------
+// keyboard - Win32 keyboard input for the self-hosted Silver compiler.
+//
+// Mirror of silverc-rs/src/stdlib/keyboard.rs. Compiled by silverc-rs as
+// part of the bootstrap pipeline; when the silverc self-hosted compiler
+// eventually emits the .exe, it routes user calls through user32.dll
+// (keybd_event, VkKeyScanA, GetKeyState) - those identifiers are allowed
+// because compiler_driver.sr carries them on the user32.dll elif bypass
+// (see DOCS/229, near line 4618).
+//
+// We avoid the silverc-rs parser's `(int)` cast syntax: a one-character
+// string check translates to a direct ASCII-code comparison.
+// ---------------------------------------------------------------------------
+
+mod export keyboard;
+
+// ---------------------------------------------------------------------------
+// VK_* constants matching Win32 virtual-key codes used by user32.
+// ---------------------------------------------------------------------------
+
+const int VK_LBUTTON = 0x01;
+const int VK_RBUTTON = 0x02;
+const int VK_CANCEL = 0x03;
+const int VK_BACKSPACE = 0x08;
+const int VK_TAB = 0x09;
+const int VK_CLEAR = 0x0C;
+const int VK_RETURN = 0x0D;
+const int VK_SHIFT = 0x10;
+const int VK_CONTROL = 0x11;
+const int VK_MENU = 0x12;
+const int VK_PAUSE = 0x13;
+const int VK_CAPITAL = 0x14;
+const int VK_ESCAPE = 0x1B;
+const int VK_SPACE = 0x20;
+const int VK_PRIOR = 0x21;
+const int VK_NEXT = 0x22;
+const int VK_END = 0x23;
+const int VK_HOME = 0x24;
+const int VK_LEFT = 0x25;
+const int VK_UP = 0x26;
+const int VK_RIGHT = 0x27;
+const int VK_DOWN = 0x28;
+const int VK_INSERT = 0x2D;
+const int VK_DELETE = 0x2E;
+const int VK_LWIN = 0x5B;
+const int VK_NUMLOCK = 0x90;
+const int VK_SCROLL = 0x91;
+const int VK_F1  = 0x70; const int VK_F2  = 0x71; const int VK_F3  = 0x72;
+const int VK_F4  = 0x73; const int VK_F5  = 0x74; const int VK_F6  = 0x75;
+const int VK_F7  = 0x76; const int VK_F8  = 0x77; const int VK_F9  = 0x78;
+const int VK_F10 = 0x79; const int VK_F11 = 0x7A; const int VK_F12 = 0x7B;
+
+const int KEYEVENTF_KEYUP = 0x0002;
+
+// ---------------------------------------------------------------------------
+// keyNameToVk: shortcuts for the common KeyCode names, then a string-eq
+// fallback. We don't try stringIndex->int conversion in the silverc-rs
+// path, so single-char handling matches against literal strings.
+// ---------------------------------------------------------------------------
+
+int keyNameToVk(string name) {
+    if (name.length == 0) { return 0; }
+    if (name == "a" || name == "A") { return 0x41; }
+    if (name == "b" || name == "B") { return 0x42; }
+    if (name == "c" || name == "C") { return 0x43; }
+    if (name == "d" || name == "D") { return 0x44; }
+    if (name == "e" || name == "E") { return 0x45; }
+    if (name == "f" || name == "F") { return 0x46; }
+    if (name == "g" || name == "G") { return 0x47; }
+    if (name == "h" || name == "H") { return 0x48; }
+    if (name == "i" || name == "I") { return 0x49; }
+    if (name == "j" || name == "J") { return 0x4A; }
+    if (name == "k" || name == "K") { return 0x4B; }
+    if (name == "l" || name == "L") { return 0x4C; }
+    if (name == "m" || name == "M") { return 0x4D; }
+    if (name == "n" || name == "N") { return 0x4E; }
+    if (name == "o" || name == "O") { return 0x4F; }
+    if (name == "p" || name == "P") { return 0x50; }
+    if (name == "q" || name == "Q") { return 0x51; }
+    if (name == "r" || name == "R") { return 0x52; }
+    if (name == "s" || name == "S") { return 0x53; }
+    if (name == "t" || name == "T") { return 0x54; }
+    if (name == "u" || name == "U") { return 0x55; }
+    if (name == "v" || name == "V") { return 0x56; }
+    if (name == "w" || name == "W") { return 0x57; }
+    if (name == "x" || name == "X") { return 0x58; }
+    if (name == "y" || name == "Y") { return 0x59; }
+    if (name == "z" || name == "Z") { return 0x5A; }
+    if (name == "0" || name == "_0") { return 0x30; }
+    if (name == "1" || name == "_1") { return 0x31; }
+    if (name == "2" || name == "_2") { return 0x32; }
+    if (name == "3" || name == "_3") { return 0x33; }
+    if (name == "4" || name == "_4") { return 0x34; }
+    if (name == "5" || name == "_5") { return 0x35; }
+    if (name == "6" || name == "_6") { return 0x36; }
+    if (name == "7" || name == "_7") { return 0x37; }
+    if (name == "8" || name == "_8") { return 0x38; }
+    if (name == "9" || name == "_9") { return 0x39; }
+    if (name == " " ) { return VK_SPACE; }
+    if (name == "\t") { return VK_TAB; }
+    if (name == "\n" || name == "\r") { return VK_RETURN; }
+    if (name == "," ) { return 188; }
+    if (name == "." ) { return 190; }
+    if (name == "/" ) { return 191; }
+    if (name == ";" ) { return 186; }
+    if (name == "'" ) { return 222; }
+    if (name == "[" ) { return 219; }
+    if (name == "]" ) { return 221; }
+    if (name == "\\") { return 220; }
+    if (name == "-" ) { return 189; }
+    if (name == "=" ) { return 187; }
+    if (name == "`" ) { return 192; }
+    if (name == "TAB")       { return VK_TAB; }
+    if (name == "ESC" || name == "ESCAPE") { return VK_ESCAPE; }
+    if (name == "ENTER" || name == "RETURN") { return VK_RETURN; }
+    if (name == "SPACE")   { return VK_SPACE; }
+    if (name == "BACKSPACE")    { return VK_BACKSPACE; }
+    if (name == "DELETE" || name == "DEL") { return VK_DELETE; }
+    if (name == "INSERT")       { return VK_INSERT; }
+    if (name == "HOME")         { return VK_HOME; }
+    if (name == "END")          { return VK_END; }
+    if (name == "PAGEUP"  || name == "PRIOR")  { return VK_PRIOR; }
+    if (name == "PAGEDOWN" || name == "NEXT") { return VK_NEXT; }
+    if (name == "LEFT") { return VK_LEFT; }
+    if (name == "UP")   { return VK_UP; }
+    if (name == "RIGHT") { return VK_RIGHT; }
+    if (name == "DOWN") { return VK_DOWN; }
+    if (name == "SHIFT")  { return VK_SHIFT; }
+    if (name == "CTRL"   || name == "CONTROL") { return VK_CONTROL; }
+    if (name == "ALT"    || name == "MENU")    { return VK_MENU; }
+    if (name == "WIN_KEY" || name == "WIN")    { return VK_LWIN; }
+    if (name == "CAPS_LOCK"   || name == "CAPS")    { return VK_CAPITAL; }
+    if (name == "NUM_LOCK"    || name == "NUM")     { return VK_NUMLOCK; }
+    if (name == "SCROLL_LOCK" || name == "SCROLL") { return VK_SCROLL; }
+    if (name == "F1") { return VK_F1; }
+    if (name == "F2") { return VK_F2; }
+    if (name == "F3") { return VK_F3; }
+    if (name == "F4") { return VK_F4; }
+    if (name == "F5") { return VK_F5; }
+    if (name == "F6") { return VK_F6; }
+    if (name == "F7") { return VK_F7; }
+    if (name == "F8") { return VK_F8; }
+    if (name == "F9") { return VK_F9; }
+    if (name == "F10") { return VK_F10; }
+    if (name == "F11") { return VK_F11; }
+    if (name == "F12") { return VK_F12; }
+    return 0;
+}
+
+int nameToVk(string name) {
+    int vk = keyNameToVk(name);
+    if (vk != 0) { return vk; }
+    // Fallback: a single cstring is enough for VkKeyScanA.
+    int scan = VkKeyScanA(name);
+    if (scan == -1) { return 0; }
+    return scan & 0xFF;
+}
+
+// ---------------------------------------------------------------------------
+// Core press / release helpers (no private qualifier - silverc-rs parser
+// doesn't recognize `private`).
+// ---------------------------------------------------------------------------
+
+void press(string keyName) {
+    int vk = nameToVk(keyName);
+    keybd_event(vk, 0, 0, 0);
+}
+
+void press(int vk) {
+    keybd_event(vk, 0, 0, 0);
+}
+
+void release(string keyName) {
+    int vk = nameToVk(keyName);
+    keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+}
+
+void release(int vk) {
+    keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+}
+
+void hold(string keyName) { press(keyName); }
+
+void hold(int vk)         { press(vk); }
+
+void send(string text) {
+    for (int i = 0; i < text.length; i = i + 1) {
+        string one = text[i]; // char -> string for VkKeyScanA fallback
+        int vk = nameToVk(one);
+        if (vk == 0) {
+            int scan = VkKeyScanA(one);
+            vk = scan & 0xFF;
+        }
+        keybd_event(vk, 0, 0, 0);
+        keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+    }
+}
+
+void type(string text) { send(text); }
+
+bool isDown(string keyName) {
+    int vk = nameToVk(keyName);
+    if (vk == 0) { return false; }
+    return (GetKeyState(vk) & 0x8000) != 0;
+}
+
+bool isDown(int vk) {
+    return (GetKeyState(vk) & 0x8000) != 0;
+}
+
+int vk(string keyName) {
+    return nameToVk(keyName);
+}

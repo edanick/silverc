@@ -1,0 +1,100 @@
+        if (this.strEq(recv.name, "os")) { return true; }
+        if (this.strEq(recv.name, "url")) { return true; }
+        return false;
+    }
+
+    public void genCall(Node call) {
+        string name = call.name;
+        int isClass = 0;
+        for (int i = 0; i < this.classNames.length; i++) {
+            if (this.strEq(this.classNames[i], name)) { isClass = 1; }
+        }
+        bool builtinName = (!call.isMember || this.isBuiltinModuleReceiver(call));
+        // A receiver that names a user-declared symbol is never a stdlib
+        // namespace (see isUserSymbol), so the module dispatch branches below
+        // must skip it. Value is deliberately exempt: it is both a user class
+        // and the magic tagged-union factory.
+        bool recvIsUserSymbol = false;
+        if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6) {
+            recvIsUserSymbol = this.isUserSymbol(call.child(0).name);
+        }
+        if (this.strEq(name, "byte") && !call.isMember) {
+            // Explicit checked conversion to the unsigned byte range.
+            if (call.childCount() > 0) {
+                this.genExpr(call.child(0));
+                int byteInvalid = this.newLabel();
+                int byteDone = this.newLabel();
+                this.asm.cmpRI32(0, 0);
+                this.asm.jlLabel(byteInvalid);
+                this.asm.cmpRI32(0, 255);
+                this.asm.jgLabel(byteInvalid);
+                this.asm.jmpLabel(byteDone);
+                this.asm.bindLabel(byteInvalid);
+                this.emitThrowException("byte value out of range");
+                this.asm.bindLabel(byteDone);
+            } else {
+                this.asm.xorRR64(0, 0);
+            }
+        } elif (isClass == 1) {
+            this.genNewCall(call);
+        } elif (builtinName && this.strEq(name, "printline")) {
+            this.genPrintCall(call, 1);
+        } elif (builtinName && this.strEq(name, "print")) {
+            this.genPrintCall(call, 0);
+        } elif (builtinName && this.strEq(name, "readString")) {
+            this.genReadStringCall(call);
+        } elif (builtinName && this.strEq(name, "readFile")) {
+            this.genReadStringCall(call);
+        } elif (builtinName && this.strEq(name, "input")) {
+            this.genInputCall(call);
+        } elif (builtinName && this.strEq(name, "readLine")) {
+            this.genInputCall(call);
+        } elif (builtinName && this.strEq(name, "writeBytes")) {
+            this.genWriteBytesCall(call);
+        } elif (builtinName && this.strEq(name, "writeFile")) {
+            this.genWriteBytesCall(call);
+        } elif (builtinName && this.strEq(name, "writeString")) {
+            this.genWriteBytesCall(call);
+        } elif (builtinName && this.strEq(name, "strlen")) {
+            this.genStrlenCall(call);
+        } elif (builtinName && this.strEq(name, "len")) {
+            this.genLenCall(call);
+        } elif (builtinName && this.strEq(name, "exit")) {
+            this.genExitCall(call);
+        } elif (builtinName && this.strEq(name, "cargs")) {
+            this.genCargsCall(call);
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "llmai") || this.strEq(call.child(0).name, "LLMAI")) && this.strEq(call.name, "chat")) {
+            // Builtin LLM chat completion (DOCS/206): llmai.chat(url, headers, body)
+            this.genLlmaiChatCall(call);
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.strEq(call.child(0).name, "mouse") && (this.strEq(call.name, "cursorX") || this.strEq(call.name, "getCursorX"))) {
+            // Win32 cursor X read. GetCursorPos(LPPOINT) needs a real Win32
+            // pointer; the high-level caller can't supply one. We allocate a
+            // 16-byte POINT struct on the stack, call GetCursorPos, and
+            // sign-extend the X int32 into RAX.
+            this.genCursorXCall();
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.strEq(call.child(0).name, "mouse") && (this.strEq(call.name, "cursorY") || this.strEq(call.name, "getCursorY"))) {
+            // Win32 cursor Y read. Same dance as cursorX but reads +4.
+            this.genCursorYCall();
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && this.strEq(call.child(0).name, "env") && (this.strEq(call.name, "get") || this.strEq(call.name, "getenv") || this.strEq(call.name, "getEnv"))) {
+            // Environment variable lookup: env.get(name) / env.getenv(name)
+            this.genGetEnvCall(call);
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file") || this.strEq(call.child(0).name, "folder")) && (this.strEq(call.name, "getExt") || this.strEq(call.name, "getExtension"))) {
+            this.genGetExtCall(call);
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file") || this.strEq(call.child(0).name, "folder")) && (this.strEq(call.name, "getenv") || this.strEq(call.name, "getEnv"))) {
+            // fs.getenv(name) alias for environment variable lookup
+            this.genGetEnvCall(call);
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && this.strEq(call.child(0).name, "url") && (this.strEq(call.name, "isUrl") || this.strEq(call.name, "isFtp") || this.strEq(call.name, "isFtps"))) {
+            this.genUrlCall(call);
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file") || this.strEq(call.child(0).name, "folder")) && this.strEq(call.name, "exists")) {
+            this.genFileExistsCall(call);
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file")) && this.strEq(call.name, "delete")) {
+            this.genFileDeleteCall(call);
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && this.strEq(call.child(0).name, "folder") && this.strEq(call.name, "delete")) {
+            this.genFolderDeleteCall(call);
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file") || this.strEq(call.child(0).name, "folder")) && this.strEq(call.name, "copy")) {
+            this.genFileCopyCall(call);
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file")) && this.strEq(call.name, "getSize")) {
+            this.genFileSizeCall(call);
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && this.strEq(call.child(0).name, "folder") && this.strEq(call.name, "getSize")) {
+            this.genFolderSizeCall(call);
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file") || this.strEq(call.child(0).name, "folder")) && this.strEq(call.name, "isDir")) {

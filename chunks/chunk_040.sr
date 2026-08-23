@@ -1,0 +1,100 @@
+                int fieldOff4 = this.findFieldOffset(ownerType, arrNode.name);
+                if (fieldOff4 < 0) {
+                    fieldOff4 = this.findFieldOffsetInAllClasses(arrNode.name);
+                }
+                if (fieldOff4 >= 0) {
+                    this.asm.movMBaseR(1, 0, fieldOff4);
+                }
+            } elif (arrObj2.kind == 6) {
+                // A normal object field (for example node.children) can also
+                // move during growth.  The old lowering updated only the
+                // temporary array slot, leaving the object's field pointing
+                // at the exhausted buffer.  That silently drops later AST
+                // children in stage 2 and makes the generated compiler emit
+                // only a prefix of a block.
+                this.asm.pushR64(0);
+                this.genExpr(arrObj2);
+                this.asm.movRR64(1, 0);
+                this.asm.popR64(0);
+                string ownerType2 = this.inferExprType(arrObj2);
+                int fieldOff5 = this.findFieldOffset(ownerType2, arrNode.name);
+                if (fieldOff5 < 0) {
+                    fieldOff5 = this.findFieldOffsetInAllClasses(arrNode.name);
+                }
+                if (fieldOff5 >= 0) {
+                    this.asm.movMBaseR(1, 0, fieldOff5);
+                }
+            }
+        }
+        this.asm.bindLabel(doneGrow);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(1, 0, -8);
+        this.asm.shlR64Imm(1, 3);
+        this.asm.addRR64(0, 1);
+        this.asm.movRMBase(8, 5, valOff);
+        this.asm.movMBaseR(0, 8, 0);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(1, 0, -8);
+        this.asm.addRI32(1, 1);
+        this.asm.movMBaseR(0, 1, -8);
+        // Persist the (possibly reallocated) array pointer back into the
+        // member field slot so later field reads see the appended element.
+        if (arrNode.kind == 13) {
+            Node arrObj3 = arrNode.child(0);
+            if (arrObj3.kind == 6 && this.strEq(arrObj3.name, "this")) {
+                int thisOff4 = this.findLocal("this");
+                int fieldOff6 = this.findFieldOffset(this.currentClassName, arrNode.name);
+                if (fieldOff6 >= 0 && thisOff4 != 0) {
+                    this.asm.movRMBase(1, 5, thisOff4);
+                    this.asm.movRMBase(0, 5, arrOff);
+                    this.asm.movMBaseR(1, 0, fieldOff6);
+                }
+            }
+        }
+    }
+
+    public bool hasDynamicAsmArg(Node call) {
+        // Calls on this.asm are compiler-time assembler operations.  Their
+        // identifier operands (local offsets, label ids, and sentinels) are
+        // values in MiniCg's compile-time environment, not values that the
+        // generated compiler must pass through MiniAsm at runtime.
+        //
+        // Routing non-literal operands through genDynamicAsmCall emits a
+        // runtime call to a MiniAsm method while compiling compiler_driver.sr;
+        // that corrupts the stage-2 compiler before it can process cargs.
+        return false;
+    }
+
+    public bool isUserSymbol(string name) {
+        // A name declared anywhere in user source (parameter, local, global,
+        // or class) shadows a same-named stdlib namespace. silveri passes its
+        // Env object around as a parameter named `env`; without this guard,
+        // `env.get(...)` would be misrouted to the environment-variable
+        // builtin instead of the Env.get method.
+        if (this.findLocal(name) != 0) { return true; }
+        if (this.findGlobal(name) >= 0) { return true; }
+        for (int i = 0; i < this.classNames.length; i++) {
+            if (this.strEq(this.classNames[i], name)) { return true; }
+        }
+        return false;
+    }
+
+    public bool isBuiltinModuleReceiver(Node call) {
+        // A member call is routed to a global builtin only when its receiver
+        // is a stdlib namespace object (fs, file, folder, json, yaml, llmai,
+        // Value).  Member calls on user objects (e.g. a Lexer with a
+        // readString method) must dispatch to their own class methods, never
+        // to the fs/printline builtins -- mirroring the Rust compiler's
+        // MethodCall dispatch which only special-cases those receiver names.
+        if (!call.isMember || call.childCount() < 1) { return false; }
+        Node recv = call.child(0);
+        if (recv.kind != 6) { return false; }
+        if (this.isUserSymbol(recv.name)) { return false; }
+        if (this.strEq(recv.name, "fs")) { return true; }
+        if (this.strEq(recv.name, "env")) { return true; }
+        if (this.strEq(recv.name, "file")) { return true; }
+        if (this.strEq(recv.name, "folder")) { return true; }
+        if (this.strEq(recv.name, "json")) { return true; }
+        if (this.strEq(recv.name, "yaml")) { return true; }
+        if (this.strEq(recv.name, "llmai") || this.strEq(recv.name, "LLMAI")) { return true; }
+        if (this.strEq(recv.name, "Value")) { return true; }

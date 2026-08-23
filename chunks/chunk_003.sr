@@ -1,0 +1,100 @@
+                string projectOutput = projectManifestValue(manifest, "output");
+                if (!cliArgEq(projectOutput, "")) { outputFile = projectOutput; }
+            }
+        }
+    }
+
+    if (skipCompile) {
+        // Do nothing else; fall through to the ExitProcess at the end.
+    } elif (inputIsProject && cliArgEq(projectType, "quicksilver")) {
+        // `type: quicksilver` (DOCS/226): emit a QuickSilver (.qs) library
+        // bundle instead of an executable. The bundle is a binary container
+        // of minified module sources plus metadata, written as bytes.
+        int[] bundle = projectBuildBundle(inputFile);
+        file.writeBytes(outputFile, bundle);
+    } else {
+    string source = file.readString(inputFile);
+    if (inputIsProject) {
+        source = projectBuildSource(inputFile);
+    } else {
+        // `.col` declarations require a project manifest with a configured
+        // collection directory. Standalone source compilation reports the
+        // same UnknownCollectionException as the native compiler.
+        source = projectExpandCollections(source, ".", "");
+
+        // The universal llmai client is a source-level standard library. Keep
+        // the low-level WinInet builtin available, but include the shared
+        // wrapper when a standalone source imports llmai. The test runner
+        // invokes the compiler from tests/, so ../std is the stable library
+        // location for both self-hosting and top-level suites.
+        int llmaiImport = projectFind(source, "from llmai", 0);
+        if (llmaiImport < 0) { llmaiImport = projectFind(source, "from LLMAI", 0); }
+        if (llmaiImport >= 0) {
+            // Load the wrapper by content instead of probing with
+            // file.exists(): the self-hosted exists lowering is not reliable
+            // for paths containing `..` on every bootstrap stage. Try paths
+            // relative to the process cwd and the test-suite directories.
+            string llmaiSource = tryReadFile("std\\llmai.sr");
+            if (llmaiSource.length == 0) {
+                llmaiSource = tryReadFile("silverc\\std\\llmai.sr");
+            }
+            if (llmaiSource.length == 0) {
+                llmaiSource = tryReadFile("..\\std\\llmai.sr");
+            }
+            if (llmaiSource.length == 0) {
+                llmaiSource = tryReadFile("..\\silverc\\std\\llmai.sr");
+            }
+            if (llmaiSource.length == 0) {
+                llmaiSource = tryReadFile("..\\..\\std\\llmai.sr");
+            }
+            source = llmaiSource + "\\n" + source;
+        }
+
+        // The exception hierarchy is a source-level standard library. When a
+        // standalone source imports it (`import * from exception;`), prepend the
+        // std class definitions so `catch (Exception e) { e.message }` resolves
+        // the shared fields to strings. Mirrors the llmai handling above.
+        int excImport = projectFind(source, "from exception", 0);
+        if (excImport >= 0) {
+            string excSource = tryReadFile("std\\exception.sr");
+            if (excSource.length == 0) {
+                excSource = tryReadFile("silverc\\std\\exception.sr");
+            }
+            if (excSource.length == 0) {
+                excSource = tryReadFile("..\\std\\exception.sr");
+            }
+            if (excSource.length == 0) {
+                excSource = tryReadFile("..\\silverc\\std\\exception.sr");
+            }
+            if (excSource.length == 0) {
+                excSource = tryReadFile("..\\..\\std\\exception.sr");
+            }
+            source = excSource + "\\n" + source;
+        }
+
+        // BOM and focused-process APIs are source-level standard libraries.
+        // Prepend their definitions for standalone compilation, matching the
+        // self-hosted import behavior used by llmai and exception.
+        int bomImport = projectFind(source, "from bom", 0);
+        if (bomImport >= 0) {
+            string bomSource = tryReadFile("std\\bom.sr");
+            if (bomSource.length == 0) { bomSource = tryReadFile("silverc\\std\\bom.sr"); }
+            if (bomSource.length == 0) { bomSource = tryReadFile("..\\std\\bom.sr"); }
+            if (bomSource.length == 0) { bomSource = tryReadFile("..\\silverc\\std\\bom.sr"); }
+            if (bomSource.length == 0) { bomSource = tryReadFile("..\\..\\std\\bom.sr"); }
+            source = bomSource + "\\n" + source;
+        }
+        int processImport = projectFind(source, "from process", 0);
+        if (processImport >= 0) {
+            string processSource = tryReadFile("std\\process.sr");
+            if (processSource.length == 0) { processSource = tryReadFile("silverc\\std\\process.sr"); }
+            if (processSource.length == 0) { processSource = tryReadFile("..\\std\\process.sr"); }
+            if (processSource.length == 0) { processSource = tryReadFile("..\\silverc\\std\\process.sr"); }
+            if (processSource.length == 0) { processSource = tryReadFile("..\\..\\std\\process.sr"); }
+            source = processSource + "\\n" + source;
+        }
+    }
+
+    Lexer lexer;
+    lexer = new Lexer(source);
+
