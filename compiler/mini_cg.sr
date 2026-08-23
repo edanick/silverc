@@ -4759,6 +4759,34 @@ public void genNewCall(Node call) {
             this.asm.emitCallTeardown();
             return;
         }
+        // DOCS/248 -- bare window-GUI bridges (guiCreateWindow/guiShow/... and
+        // loadIcon). silverc-rs emits the real user32 sequence for these; the
+        // self-hosted backend's std/gui.sr drives user32 directly instead, so
+        // these names have no source-level caller in this checkout. They are
+        // still routed here (instead of falling into the internal forward-call
+        // path) so a program written against silverc-rs/std/gui.sr compiles
+        // deterministically: every bridge yields 0, which the Window class
+        // guards treat as "no window".
+        if (this.strEq(name, "guiCreateWindow") || this.strEq(name, "guiShow") || this.strEq(name, "guiHide") || this.strEq(name, "guiMaximize") || this.strEq(name, "guiMinimize") || this.strEq(name, "guiSetTitle") || this.strEq(name, "guiClose") || this.strEq(name, "guiRunLoop") || this.strEq(name, "guiSetIcon") || this.strEq(name, "loadIcon")) {
+            this.asm.xorRR64(0, 0);
+            this.asm.emitCallTeardown();
+            return;
+        }
+        // Private interpreter bridge (silveri/src/builtins.sr): silverc-rs
+        // serializes foreground-process metadata as
+        // path\x1ffilename\x1ftitle\x1fpid\x1fwindowHandle. The self-hosted
+        // backend has no consumer for that contract today; return the empty
+        // string so the call site never lands on the unpatched forward-call
+        // path with a garbage pointer.
+        if (this.strEq(name, "getFocusedProcessDataNative")) {
+            int strIdx = this.addString("");
+            int sp = this.asm.buf.length;
+            this.asm.emitImm64(0, 0);
+            this.stringPatchOffsets.add(sp + 2);
+            this.stringPatchIndices.add(strIdx);
+            this.asm.emitCallTeardown();
+            return;
+        }
         bool isWin32 = false;
         string win32Dll = "";
         if (this.strEq(name, "FindFirstFileA") || this.strEq(name, "FindNextFileA") || this.strEq(name, "FindClose") || this.strEq(name, "DeleteFileA") || this.strEq(name, "MoveFileA") || this.strEq(name, "GetFileAttributesA") || this.strEq(name, "CreateDirectoryA") || this.strEq(name, "RemoveDirectoryA") || this.strEq(name, "SetCurrentDirectoryA") || this.strEq(name, "CreateProcessA") || this.strEq(name, "WaitForSingleObject") || this.strEq(name, "GetStdHandle") || this.strEq(name, "SetConsoleTextAttribute") || this.strEq(name, "GetConsoleScreenBufferInfo") || this.strEq(name, "SetConsoleCursorPosition") || this.strEq(name, "GetModuleHandleA") || this.strEq(name, "LoadLibraryA") || this.strEq(name, "GetProcAddress") || this.strEq(name, "Sleep") || this.strEq(name, "GetTickCount") || this.strEq(name, "GetLastError") || this.strEq(name, "GetCurrentDirectoryA") || this.strEq(name, "WriteConsoleA") || this.strEq(name, "ReadConsoleA") || this.strEq(name, "GetConsoleMode") || this.strEq(name, "SetConsoleMode") || this.strEq(name, "CreatePipe") || this.strEq(name, "GetExitCodeProcess") || this.strEq(name, "CreateFileA") || this.strEq(name, "GetFileSize") || this.strEq(name, "ReadFile") || this.strEq(name, "WriteFile") || this.strEq(name, "CloseHandle") || this.strEq(name, "GetFileAttributesW") || this.strEq(name, "SetFilePointer") || this.strEq(name, "GetCurrentProcessId") || this.strEq(name, "GetCurrentProcess") || this.strEq(name, "GetCurrentThreadId") || this.strEq(name, "GetCurrentThread") || this.strEq(name, "GetEnvironmentVariableA") || this.strEq(name, "GetEnvironmentVariableW") || this.strEq(name, "SetEnvironmentVariableA") || this.strEq(name, "SetEnvironmentVariableW") || this.strEq(name, "ExpandEnvironmentStringsA") || this.strEq(name, "GetEnvironmentStringsA") || this.strEq(name, "FreeEnvironmentStringsA") || this.strEq(name, "GetTempPathA") || this.strEq(name, "GetComputerNameA") || this.strEq(name, "GetUserNameA") || this.strEq(name, "CopyFileA") || this.strEq(name, "SetFileAttributesA") || this.strEq(name, "GetFullPathNameA") || this.strEq(name, "GetModuleFileNameA") || this.strEq(name, "QueryPerformanceCounter") || this.strEq(name, "QueryPerformanceFrequency") || this.strEq(name, "GetTickCount64") || this.strEq(name, "TerminateProcess") || this.strEq(name, "OpenProcess") || this.strEq(name, "GetProcessId") || this.strEq(name, "FlushFileBuffers") || this.strEq(name, "GetFileSizeEx") || this.strEq(name, "CreateProcessW") || this.strEq(name, "CreateProcess") || this.strEq(name, "GetVersionExA") || this.strEq(name, "GetSystemDirectoryA") || this.strEq(name, "GetWindowsDirectoryA") || this.strEq(name, "GetLocalTime") || this.strEq(name, "GetSystemTime") || this.strEq(name, "OutputDebugStringA") || this.strEq(name, "IsDebuggerPresent") || this.strEq(name, "GetCommandLineA") || this.strEq(name, "GlobalAlloc") || this.strEq(name, "GlobalFree") || this.strEq(name, "VirtualAlloc") || this.strEq(name, "VirtualFree") || this.strEq(name, "HeapFree") || this.strEq(name, "GetProcessHeap") || this.strEq(name, "lstrlenA") || this.strEq(name, "lstrcpyA") || this.strEq(name, "lstrcatA") || this.strEq(name, "lstrcmpA") || this.strEq(name, "SetThreadPriority") || this.strEq(name, "QueryFullProcessImageNameA")) {
@@ -4780,7 +4808,7 @@ public void genNewCall(Node call) {
         } elif (this.strEq(name, "ShellExecuteA") || this.strEq(name, "ShellExecuteW") || this.strEq(name, "ShellExecuteExA") || this.strEq(name, "ShellExecuteExW")) {
             isWin32 = true;
             win32Dll = "shell32.dll";
-        } elif (this.strEq(name, "WinHttpOpen") || this.strEq(name, "WinHttpConnect") || this.strEq(name, "WinHttpOpenRequest") || this.strEq(name, "WinHttpSendRequest") || this.strEq(name, "WinHttpReceiveResponse") || this.strEq(name, "WinHttpReadData") || this.strEq(name, "WinHttpCloseHandle") || this.strEq(name, "WinHttpQueryHeaders") || this.strEq(name, "WinHttpSetOption")) {
+        } elif (this.strEq(name, "WinHttpOpen") || this.strEq(name, "WinHttpConnect") || this.strEq(name, "WinHttpOpenRequest") || this.strEq(name, "WinHttpSendRequest") || this.strEq(name, "WinHttpReceiveResponse") || this.strEq(name, "WinHttpReadData") || this.strEq(name, "WinHttpCloseHandle") || this.strEq(name, "WinHttpQueryHeaders") || this.strEq(name, "WinHttpQueryDataAvailable") || this.strEq(name, "WinHttpSetOption")) {
             isWin32 = true;
             win32Dll = "winhttp.dll";
         } elif (this.strEq(name, "keybd_event") || this.strEq(name, "VkKeyScanA") || this.strEq(name, "GetKeyState") || this.strEq(name, "GetAsyncKeyState") || this.strEq(name, "GetKeyboardState") || this.strEq(name, "SetKeyboardState") || this.strEq(name, "MapVirtualKeyA") || this.strEq(name, "SendInput")) {
