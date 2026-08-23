@@ -2,18 +2,826 @@ mod export guard;
 
 import node;
 
-// Bootstrap-stage MemoryGuard. The native backend performs its own safety
-// analysis while compiling (see MEMORY_GUARD docs); this pass-through keeps
-// self-hosted driver builds linked and running. `checked` records that the
-// stage ran so callers can observe it.
-class MemoryGuard {
-    public prop int checked;
+const int GND_INT_LIT = 0;
+const int GND_FLOAT_LIT = 1;
+const int GND_STRING_LIT = 2;
+const int GND_CHAR_LIT = 3;
+const int GND_BOOL_LIT = 4;
+const int GND_NULL_LIT = 5;
+const int GND_IDENT = 6;
+const int GND_BINARY = 7;
+const int GND_UNARY = 8;
+const int GND_CALL = 10;
+const int GND_MEMBER = 13;
+const int GND_BLOCK = 16;
+const int GND_DICT_PAIR = 18;
+const int GND_ARRAY_LIT = 19;
+const int GND_MATCH_EXPR = 20;
+const int GND_MATCH_ARM = 21;
+const int GND_PAREN = 23;
+const int GND_INDEX = 24;
+const int GND_VAR_DECL = 50;
+const int GND_RETURN = 51;
+const int GND_RETURN_SHORT = 52;
+const int GND_IF_STMT = 53;
+const int GND_WHILE = 54;
+const int GND_FOR_C = 55;
+const int GND_TRY_CATCH = 59;
+const int GND_UNSET = 60;
+const int GND_EXPR_STMT = 61;
+const int GND_BREAK = 62;
+const int GND_CONTINUE = 63;
+const int GND_FOREACH = 64;
+const int GND_TERNARY = 65;
+const int GND_DICT_LIT = 66;
+const int GND_SLICE = 67;
+const int GND_THROW = 68;
+const int GND_INTERP = 69;
+const int GND_TUPLE_LIT = 70;
+const int GND_DESTRUCTURE = 71;
+const int GND_ADDRESS_OF = 72;
+const int GND_ALIAS_DECL = 73;
+const int GND_FUNC = 100;
+const int GND_STRUCT_DEF = 101;
+const int GND_CLASS_DEF = 102;
+const int GND_CONST = 104;
+
+const int GOP_ADD = 1;
+const int GOP_SUB = 2;
+const int GOP_MUL = 3;
+const int GOP_DIV = 4;
+const int GOP_EQ = 5;
+const int GOP_NEQ = 6;
+const int GOP_AND = 11;
+const int GOP_OR = 12;
+const int GOP_MOD = 13;
+const int GOP_ADD_ASSIGN = 14;
+const int GOP_SUB_ASSIGN = 15;
+const int GOP_MUL_ASSIGN = 16;
+const int GOP_DIV_ASSIGN = 17;
+const int GOP_SHL = 18;
+const int GOP_SHR = 19;
+const int GOP_ASSIGN = 20;
+const int GOP_BIT_AND = 22;
+const int GOP_BIT_OR = 23;
+const int GOP_BIT_XOR = 24;
+const int GOP_COALESCE = 25;
+const int GOP_MOVE = 28;
+
+class GuardVar {
+    public prop string name;
+    public prop string typeHint;
+    public prop bool isInit;
+    public prop bool isAlive;
+    public prop bool isOnce;
+    public prop bool isNullable;
+    public prop bool isFixed;
+    public prop bool isAlias;
+    public prop bool holdsAddress;
+    public prop string aliasOf;
+    public prop string addrTarget;
+    public prop int line;
+    public prop int col;
 
     construct () {
-        this.checked = 0;
+        this.name = "";
+        this.typeHint = "";
+        this.isInit = false;
+        this.isAlive = false;
+        this.isOnce = false;
+        this.isNullable = false;
+        this.isFixed = false;
+        this.isAlias = false;
+        this.holdsAddress = false;
+        this.aliasOf = "";
+        this.addrTarget = "";
+        this.line = 0;
+        this.col = 0;
+    }
+}
+
+class MemoryGuard {
+    private prop GuardVar[] vars;
+    private prop int[] scopeEnds;
+    private prop string[] globalNames;
+    private prop string[] nonNullNames;
+    private prop int unwrapDepth;
+
+    construct () {
+        this.vars = [];
+        this.scopeEnds = [];
+        this.globalNames = [];
+        this.nonNullNames = [];
+        this.unwrapDepth = 0;
+    }
+
+    private bool eq(string a, string b) {
+        if (a.length != b.length) { return false; }
+        for (int i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    private bool endsWithQ(string s) {
+        if (s.length == 0) { return false; }
+        return s[s.length - 1] == '?';
+    }
+
+    private string i2s(int v) {
+        if (v == 0) { return "0"; }
+        bool neg = false;
+        if (v < 0) { neg = true; v = 0 - v; }
+        int[] digs = [];
+        while (v > 0) { digs.add(v % 10); v = v / 10; }
+        string s = "";
+        if (neg) { s = "-"; }
+        for (int i = digs.length - 1; i >= 0; i--) {
+            s = s + charToString((char)(48 + digs[i]));
+        }
+        return s;
+    }
+
+    private void fail(string exc, int line, int col, string varName, string msg) {
+        printline("GuardError: " + exc + " at line " + this.i2s(line) + ", column " + this.i2s(col) + ": " + varName + ": " + msg);
+        exit(1);
+    }
+
+    private int findVar(string name) {
+        for (int i = this.vars.length - 1; i >= 0; i--) {
+            if (this.eq(this.vars[i].name, name)) { return i; }
+        }
+        return -1;
+    }
+
+    private void pushScope() {
+        this.scopeEnds.add(this.vars.length);
+    }
+
+    private void popScope() {
+        if (this.scopeEnds.length == 0) { return; }
+        int start = this.scopeEnds[this.scopeEnds.length - 1];
+        int[] newSE = [];
+        for (int i = 0; i < this.scopeEnds.length - 1; i++) { newSE.add(this.scopeEnds[i]); }
+        this.scopeEnds = newSE;
+        for (int d = start; d < this.vars.length; d++) {
+            GuardVar dying = this.vars[d];
+            for (int j = 0; j < start; j++) {
+                GuardVar outer = this.vars[j];
+                if (outer.isAlive && outer.aliasOf.length > 0 && this.eq(outer.aliasOf, dying.name)) {
+                    this.fail("UnsetAliasCallException", outer.line, outer.col, outer.name, "alias outlives its target " + dying.name);
+                }
+                if (outer.isAlive && outer.addrTarget.length > 0 && this.eq(outer.addrTarget, dying.name)) {
+                    this.fail("UnsetAliasCallException", outer.line, outer.col, outer.name, "address held by '" + outer.name + "' outlives target '" + dying.name + "'");
+                }
+            }
+        }
+        GuardVar[] kept = [];
+        for (int i = 0; i < start; i++) { kept.add(this.vars[i]); }
+        this.vars = kept;
+    }
+
+    private GuardVar cloneVar(GuardVar v) {
+        GuardVar c = new GuardVar();
+        c.name = v.name;
+        c.typeHint = v.typeHint;
+        c.isInit = v.isInit;
+        c.isAlive = v.isAlive;
+        c.isOnce = v.isOnce;
+        c.isNullable = v.isNullable;
+        c.isFixed = v.isFixed;
+        c.isAlias = v.isAlias;
+        c.holdsAddress = v.holdsAddress;
+        c.aliasOf = v.aliasOf;
+        c.addrTarget = v.addrTarget;
+        c.line = v.line;
+        c.col = v.col;
+        return c;
+    }
+
+    private GuardVar[] snapshot() {
+        GuardVar[] out = [];
+        for (int i = 0; i < this.vars.length; i++) { out.add(this.cloneVar(this.vars[i])); }
+        return out;
+    }
+
+    private void declareVar(string name, string typeHint, bool init, bool alive, bool onceFlag, bool fixedFlag, bool nullable, bool aliasFlag, int line, int col) {
+        GuardVar v = new GuardVar();
+        v.name = name;
+        v.typeHint = typeHint;
+        v.isInit = init;
+        v.isAlive = alive;
+        v.isOnce = onceFlag;
+        v.isFixed = fixedFlag;
+        v.isNullable = nullable;
+        v.isAlias = aliasFlag;
+        v.line = line;
+        v.col = col;
+        this.vars.add(v);
+    }
+
+    private bool targetAlive(string target) {
+        int idx = this.findVar(target);
+        if (idx < 0) { return false; }
+        return this.vars[idx].isAlive;
+    }
+
+    private bool isNullableVar(string name) {
+        int idx = this.findVar(name);
+        if (idx < 0) { return false; }
+        return this.vars[idx].isNullable;
+    }
+
+    private void killAliasesOf(string name) {
+        for (int i = 0; i < this.vars.length; i++) {
+            GuardVar a = this.vars[i];
+            if (a.aliasOf.length > 0 && this.eq(a.aliasOf, name)) {
+                a.isAlive = false;
+                a.isInit = false;
+            }
+        }
+    }
+
+    private bool isNonNullHere(string name) {
+        for (int i = 0; i < this.nonNullNames.length; i++) {
+            if (this.eq(this.nonNullNames[i], name)) { return true; }
+        }
+        return false;
+    }
+
+    private bool isGlobalName(string name) {
+        for (int i = 0; i < this.globalNames.length; i++) {
+            if (this.eq(this.globalNames[i], name)) { return true; }
+        }
+        return false;
+    }
+
+    private void checkRead(Node n) {
+        string name = n.name;
+        if (this.eq(name, "this")) { return; }
+        int idx = this.findVar(name);
+        if (idx < 0) { return; }
+        GuardVar v = this.vars[idx];
+        if (!v.isAlive) {
+            this.fail("NonexistenceException", n.line, n.col, name, "variable is dead (moved, unset, or already consumed)");
+        }
+        if (!v.isInit) {
+            this.fail("UnassignedVariableCallException", n.line, n.col, name, "read before it is assigned on all paths");
+        }
+        if (v.aliasOf.length > 0) {
+            if (!this.targetAlive(v.aliasOf)) {
+                this.fail("UnsetAliasCallException", n.line, n.col, name, "alias target is dead or out of scope");
+            }
+        }
+        if (v.isNullable && this.unwrapDepth == 0 && !this.isNonNullHere(name)) {
+            this.fail("NullValueException", n.line, n.col, name, "nullable value used without a null check (use ??)");
+        }
+        if (v.isOnce) {
+            v.isAlive = false;
+            v.isInit = false;
+        }
+    }
+
+    private void checkPeek(Node n) {
+        string name = n.name;
+        if (this.eq(name, "this")) { return; }
+        int idx = this.findVar(name);
+        if (idx < 0) { return; }
+        GuardVar v = this.vars[idx];
+        if (!v.isAlive) {
+            this.fail("NonexistenceException", n.line, n.col, name, "variable is dead (moved, unset, or already consumed)");
+        }
+        if (!v.isInit) {
+            this.fail("UnassignedVariableCallException", n.line, n.col, name, "read before it is assigned on all paths");
+        }
+    }
+
+    private int checkAddr(Node n) {
+        Node op = n.child(0);
+        if (op.kind == GND_IDENT) {
+            string name = op.name;
+            if (!this.eq(name, "this")) {
+                int idx = this.findVar(name);
+                if (idx >= 0) {
+                    GuardVar v = this.vars[idx];
+                    if (!v.isAlive) {
+                        this.fail("NonexistenceException", op.line, op.col, name, "variable is dead (moved, unset, or already consumed)");
+                    }
+                    if (!v.isInit) {
+                        this.fail("UnassignedVariableCallException", op.line, op.col, name, "read before it is assigned on all paths");
+                    }
+                    if (!v.isFixed) {
+                        this.fail("AddressTypeMistmatchException", op.line, op.col, name, "@ requires a fixed variable");
+                    }
+                    if (v.isOnce) {
+                        v.isAlive = false;
+                        v.isInit = false;
+                    }
+                }
+            }
+        } else {
+            this.fail("AddressTypeMistmatchException", op.line, op.col, "", "@ requires a fixed variable");
+        }
+        return 1;
+    }
+
+    private void killMoveSource(Node src) {
+        if (src.kind == GND_IDENT && !this.eq(src.name, "this")) {
+            int si = this.findVar(src.name);
+            if (si >= 0) {
+                GuardVar sv = this.vars[si];
+                if (!sv.isAlive) {
+                    this.fail("NonexistenceException", src.line, src.col, src.name, "moved-from variable is dead");
+                }
+                if (!sv.isInit) {
+                    this.fail("UnassignedVariableCallException", src.line, src.col, src.name, "cannot move an uninitialized variable");
+                }
+                sv.isAlive = false;
+                sv.isInit = false;
+                this.killAliasesOf(src.name);
+            }
+        } else {
+            this.checkExpr(src);
+        }
+    }
+
+    private void checkMove(Node n) {
+        Node dest = n.child(0);
+        if (dest.kind == GND_IDENT && !this.eq(dest.name, "this")) {
+            int di = this.findVar(dest.name);
+            if (di >= 0) {
+                this.vars[di].isInit = true;
+                this.vars[di].isAlive = true;
+            }
+        } else if (dest.kind != GND_IDENT) {
+            this.checkExpr(dest);
+        }
+        this.killMoveSource(n.child(1));
+    }
+
+    private void markAddrHolding(GuardVar v, Node init, Node lhs) {
+        if (init.kind == GND_ADDRESS_OF) {
+            Node op = init.child(0);
+            if (op.kind == GND_IDENT) {
+                int oi = this.findVar(op.name);
+                if (oi >= 0) {
+                    GuardVar ov = this.vars[oi];
+                    if (v.typeHint.length > 0 && ov.typeHint.length > 0 && !this.eq(v.typeHint, ov.typeHint)) {
+                        this.fail("AddressTypeMistmatchException", lhs.line, lhs.col, v.name, "type punning of an address (@" + op.name + " is " + ov.typeHint + ", target is " + v.typeHint + ")");
+                    }
+                    v.holdsAddress = true;
+                    v.addrTarget = op.name;
+                }
+            }
+            return;
+        }
+        if (init.kind == GND_IDENT) {
+            int oi = this.findVar(init.name);
+            if (oi >= 0 && this.vars[oi].holdsAddress) {
+                GuardVar ov = this.vars[oi];
+                if (v.typeHint.length > 0 && ov.typeHint.length > 0 && !this.eq(v.typeHint, ov.typeHint)) {
+                    this.fail("AddressTypeMistmatchException", lhs.line, lhs.col, v.name, "type punning of an address (" + init.name + " is " + ov.typeHint + ", target is " + v.typeHint + ")");
+                }
+                v.holdsAddress = true;
+                v.addrTarget = ov.addrTarget;
+            }
+        }
+    }
+
+    private int checkAssign(Node n) {
+        Node lhs = n.child(0);
+        Node rhs = n.child(1);
+        if (lhs.kind == GND_IDENT && !this.eq(lhs.name, "this")) {
+            if (this.isGlobalName(lhs.name)) {
+                this.fail("InvalidAssignment", lhs.line, lhs.col, lhs.name, "cannot write to a global or const");
+            }
+            int idx = this.findVar(lhs.name);
+            if (idx >= 0) {
+                GuardVar v = this.vars[idx];
+                if (!v.isAlive) {
+                    this.fail("NonexistenceException", lhs.line, lhs.col, lhs.name, "assignment to a dead variable");
+                }
+                if (v.isAlias && rhs.kind == GND_IDENT) {
+                    v.aliasOf = rhs.name;
+                    if (!this.targetAlive(rhs.name)) {
+                        this.fail("UnsetAliasCallException", lhs.line, lhs.col, v.name, "alias target is dead or out of scope");
+                    }
+                }
+                v.isInit = true;
+                v.isAlive = true;
+                this.markAddrHolding(v, rhs, lhs);
+            }
+        } else if (lhs.kind == GND_MEMBER) {
+            this.checkExpr(lhs.child(0));
+        } else {
+            this.checkExpr(lhs);
+        }
+        return this.checkExpr(rhs);
+    }
+
+    private bool isPrimitive(string t) {
+        if (this.eq(t, "int") || this.eq(t, "string") || this.eq(t, "bool") || this.eq(t, "char")) { return true; }
+        if (this.eq(t, "float") || this.eq(t, "float64") || this.eq(t, "int32") || this.eq(t, "int64")) { return true; }
+        if (this.eq(t, "uint") || this.eq(t, "double") || this.eq(t, "void") || this.eq(t, "var")) { return true; }
+        if (this.eq(t, "byte")) { return true; }
+        return false;
+    }
+
+    private void checkVarDecl(Node n) {
+        string name = n.name;
+        bool nullable = this.endsWithQ(n.typeHint);
+        bool onceFlag = n.isOnce;
+        bool fixedFlag = n.isFixed;
+        bool liveFlag = n.isLive;
+        if (n.childCount() == 0) {
+            bool autoInit = liveFlag || onceFlag || !this.isPrimitive(n.typeHint);
+            this.declareVar(name, n.typeHint, autoInit, true, onceFlag, fixedFlag, nullable, false, n.line, n.col);
+            return;
+        }
+        Node init = n.child(0);
+        if (init.kind == GND_BINARY && init.op == GOP_MOVE) {
+            this.killMoveSource(init.child(1));
+            this.declareVar(name, n.typeHint, true, true, onceFlag, fixedFlag, nullable, false, n.line, n.col);
+            return;
+        }
+        this.checkExpr(init);
+        GuardVar v = new GuardVar();
+        v.name = name;
+        v.typeHint = n.typeHint;
+        v.isInit = true;
+        v.isAlive = true;
+        v.isOnce = onceFlag;
+        v.isFixed = fixedFlag;
+        v.isNullable = nullable;
+        v.isAlias = false;
+        v.holdsAddress = false;
+        v.aliasOf = "";
+        v.addrTarget = "";
+        v.line = n.line;
+        v.col = n.col;
+        this.markAddrHolding(v, init, n);
+        this.vars.add(v);
+    }
+
+    private void checkAlias(Node n) {
+        string aname = n.name;
+        bool nullable = this.endsWithQ(n.typeHint);
+        if (n.childCount() >= 2) {
+            Node tgt = n.child(1);
+            if (tgt.kind == GND_IDENT) {
+                this.checkPeek(tgt);
+                GuardVar v = new GuardVar();
+                v.name = aname;
+                v.typeHint = n.typeHint;
+                v.isInit = true;
+                v.isAlive = true;
+                v.isNullable = nullable;
+                v.isAlias = true;
+                v.aliasOf = tgt.name;
+                v.line = n.line;
+                v.col = n.col;
+                this.vars.add(v);
+            } else if (tgt.kind == GND_NULL_LIT) {
+                this.declareVar(aname, n.typeHint, true, true, false, false, nullable, true, n.line, n.col);
+            } else {
+                this.checkExpr(tgt);
+                this.declareVar(aname, n.typeHint, true, true, false, false, nullable, true, n.line, n.col);
+            }
+        } else {
+            this.declareVar(aname, n.typeHint, true, true, false, false, nullable, true, n.line, n.col);
+        }
+    }
+
+    private void checkUnset(Node n) {
+        int idx = this.findVar(n.name);
+        if (idx >= 0) {
+            GuardVar v = this.vars[idx];
+            v.isAlive = false;
+            v.isInit = false;
+            this.killAliasesOf(n.name);
+        }
+    }
+
+    private void checkBlock(Node n) {
+        this.pushScope();
+        for (int i = 0; i < n.childCount(); i++) {
+            this.checkStmt(n.child(i));
+        }
+        this.popScope();
+    }
+
+    private void checkIf(Node n) {
+        Node cond = n.child(0);
+        this.checkExpr(cond);
+        string thenNonNull = "";
+        string elseNonNull = "";
+        if (cond.kind == GND_BINARY && cond.child(1).kind == GND_NULL_LIT && cond.child(0).kind == GND_IDENT) {
+            if (cond.op == GOP_NEQ && this.isNullableVar(cond.child(0).name)) { thenNonNull = cond.child(0).name; }
+            if (cond.op == GOP_EQ && this.isNullableVar(cond.child(0).name)) { elseNonNull = cond.child(0).name; }
+        }
+        GuardVar[] before = this.snapshot();
+        this.pushScope();
+        if (thenNonNull.length > 0) { this.nonNullNames.add(thenNonNull); }
+        this.checkStmt(n.child(1));
+        if (thenNonNull.length > 0) {
+            string[] trimmed = [];
+            for (int t = 0; t < this.nonNullNames.length - 1; t++) { trimmed.add(this.nonNullNames[t]); }
+            this.nonNullNames = trimmed;
+        }
+        this.popScope();
+        GuardVar[] afterThen = this.snapshot();
+        this.vars = before;
+        GuardVar[] afterElse = [];
+        if (n.childCount() >= 3) {
+            this.pushScope();
+            if (elseNonNull.length > 0) { this.nonNullNames.add(elseNonNull); }
+            this.checkStmt(n.child(2));
+            if (elseNonNull.length > 0) {
+                string[] trimmed2 = [];
+                for (int t2 = 0; t2 < this.nonNullNames.length - 1; t2++) { trimmed2.add(this.nonNullNames[t2]); }
+                this.nonNullNames = trimmed2;
+            }
+            this.popScope();
+            afterElse = this.snapshot();
+        } else {
+            afterElse = this.snapshot();
+        }
+        for (int i = 0; i < this.vars.length; i++) {
+            GuardVar v = this.vars[i];
+            v.isInit = afterThen[i].isInit && afterElse[i].isInit;
+            v.isAlive = afterThen[i].isAlive || afterElse[i].isAlive;
+            v.holdsAddress = afterThen[i].holdsAddress || afterElse[i].holdsAddress;
+        }
+    }
+
+    private void checkWhile(Node n) {
+        this.checkExpr(n.child(0));
+        GuardVar[] before = this.snapshot();
+        this.pushScope();
+        this.checkStmt(n.child(1));
+        this.popScope();
+        this.vars = before;
+    }
+
+    private void checkFor(Node n) {
+        this.pushScope();
+        this.checkStmt(n.child(0));
+        GuardVar[] before = this.snapshot();
+        this.checkExpr(n.child(1));
+        this.pushScope();
+        this.checkStmt(n.child(3));
+        this.popScope();
+        this.vars = before;
+        this.checkExpr(n.child(2));
+        this.popScope();
+    }
+
+    private void checkForeach(Node n) {
+        this.checkExpr(n.child(1));
+        this.pushScope();
+        Node vd = n.child(0);
+        this.declareVar(vd.name, vd.typeHint, true, true, false, false, this.endsWithQ(vd.typeHint), false, vd.line, vd.col);
+        this.checkStmt(n.child(2));
+        this.popScope();
+    }
+
+    private void checkTryCatch(Node n) {
+        this.pushScope();
+        this.checkStmt(n.child(0));
+        this.popScope();
+        GuardVar[] afterTry = this.snapshot();
+        this.vars = afterTry;
+        this.pushScope();
+        string cv = n.name;
+        if (cv.length > 0) {
+            this.declareVar(cv, n.typeHint, true, true, false, false, this.endsWithQ(n.typeHint), false, n.line, n.col);
+        }
+        this.checkStmt(n.child(1));
+        this.popScope();
+        GuardVar[] afterCatch = this.snapshot();
+        for (int i = 0; i < this.vars.length; i++) {
+            GuardVar v = this.vars[i];
+            v.isInit = afterTry[i].isInit && afterCatch[i].isInit;
+            v.isAlive = afterTry[i].isAlive || afterCatch[i].isAlive;
+            v.holdsAddress = afterTry[i].holdsAddress || afterCatch[i].holdsAddress;
+        }
+        if (n.hasFinally && n.childCount() >= 3) {
+            this.pushScope();
+            this.checkStmt(n.child(2));
+            this.popScope();
+        }
+    }
+
+    private void checkMatchBody(Node body) {
+        if (body.kind == GND_BLOCK) {
+            this.pushScope();
+            for (int i = 0; i < body.childCount(); i++) {
+                this.checkStmt(body.child(i));
+            }
+            this.popScope();
+        } else {
+            this.checkExpr(body);
+        }
+    }
+
+    private void checkDestructure(Node n) {
+        if (n.childCount() < 2) { return; }
+        Node init = n.child(n.childCount() - 1);
+        this.checkExpr(init);
+        for (int i = 0; i < n.childCount() - 1; i++) {
+            Node nm = n.child(i);
+            this.declareVar(nm.name, "", true, true, false, false, false, false, nm.line, nm.col);
+        }
+    }
+
+    private bool isArithOp(int op) {
+        if (op == GOP_ADD || op == GOP_SUB || op == GOP_MUL || op == GOP_DIV || op == GOP_MOD) { return true; }
+        if (op == GOP_SHL || op == GOP_SHR || op == GOP_BIT_AND || op == GOP_BIT_OR || op == GOP_BIT_XOR) { return true; }
+        if (op == GOP_AND || op == GOP_OR) { return true; }
+        return false;
+    }
+
+    private int checkExpr(Node n) {
+        int k = n.kind;
+        if (k == GND_INT_LIT || k == GND_FLOAT_LIT || k == GND_STRING_LIT || k == GND_CHAR_LIT || k == GND_BOOL_LIT || k == GND_NULL_LIT) { return 0; }
+        if (k == GND_IDENT) {
+            this.checkRead(n);
+            int idx = this.findVar(n.name);
+            if (idx >= 0 && this.vars[idx].holdsAddress) { return 1; }
+            return 0;
+        }
+        if (k == GND_BINARY) {
+            int op = n.op;
+            if (op == GOP_ASSIGN || op == GOP_ADD_ASSIGN || op == GOP_SUB_ASSIGN || op == GOP_MUL_ASSIGN || op == GOP_DIV_ASSIGN) { return this.checkAssign(n); }
+            if (op == GOP_MOVE) { this.checkMove(n); return 0; }
+            if (op == GOP_COALESCE) {
+                this.unwrapDepth = this.unwrapDepth + 1;
+                this.checkExpr(n.child(0));
+                this.unwrapDepth = this.unwrapDepth - 1;
+                this.checkExpr(n.child(1));
+                return 0;
+            }
+            if (op == GOP_EQ || op == GOP_NEQ) {
+                Node nl = n.child(0);
+                Node nr = n.child(1);
+                if (nr.kind == GND_NULL_LIT && nl.kind != GND_NULL_LIT) {
+                    this.unwrapDepth = this.unwrapDepth + 1;
+                    this.checkExpr(nl);
+                    this.unwrapDepth = this.unwrapDepth - 1;
+                    this.checkExpr(nr);
+                    return 0;
+                }
+                this.checkExpr(nl);
+                this.checkExpr(nr);
+                return 0;
+            }
+            int la = this.checkExpr(n.child(0));
+            int ra = this.checkExpr(n.child(1));
+            if (this.isArithOp(op)) {
+                if (la == 1 || ra == 1) {
+                    Node bad = n.child(0);
+                    if (ra == 1 && la != 1) { bad = n.child(1); }
+                    string bname = "";
+                    int bline = n.line;
+                    int bcol = n.col;
+                    if (bad.kind == GND_ADDRESS_OF) {
+                        Node u = bad.child(0);
+                        if (u.kind == GND_IDENT) { bname = u.name; bline = u.line; bcol = u.col; }
+                    } else if (bad.kind == GND_IDENT) {
+                        bname = bad.name;
+                        bline = bad.line;
+                        bcol = bad.col;
+                    }
+                    this.fail("AddressTypeMistmatchException", bline, bcol, bname, "address arithmetic is not allowed");
+                }
+            }
+            return 0;
+        }
+        if (k == GND_UNARY) { this.checkExpr(n.child(0)); return 0; }
+        if (k == GND_CALL) {
+            for (int i = 0; i < n.childCount(); i++) { this.checkExpr(n.child(i)); }
+            return 0;
+        }
+        if (k == GND_MEMBER) { this.checkExpr(n.child(0)); return 0; }
+        if (k == GND_INDEX || k == GND_SLICE) {
+            for (int i = 0; i < n.childCount(); i++) { this.checkExpr(n.child(i)); }
+            return 0;
+        }
+        if (k == GND_PAREN) { this.checkExpr(n.child(0)); return 0; }
+        if (k == GND_ARRAY_LIT || k == GND_TUPLE_LIT || k == GND_DICT_LIT || k == GND_INTERP || k == GND_STRUCT_DEF) {
+            for (int i = 0; i < n.childCount(); i++) { this.checkExpr(n.child(i)); }
+            return 0;
+        }
+        if (k == GND_DICT_PAIR) {
+            this.checkExpr(n.child(0));
+            this.checkExpr(n.child(1));
+            return 0;
+        }
+        if (k == GND_ADDRESS_OF) { return this.checkAddr(n); }
+        if (k == GND_MATCH_EXPR) {
+            this.checkExpr(n.child(0));
+            for (int i = 1; i < n.childCount(); i++) {
+                Node arm = n.child(i);
+                if (arm.kind == GND_MATCH_ARM && arm.childCount() >= 2) { this.checkMatchBody(arm.child(1)); }
+            }
+            return 0;
+        }
+        if (k == GND_TERNARY) {
+            for (int i = 0; i < n.childCount(); i++) { this.checkExpr(n.child(i)); }
+            return 0;
+        }
+        return 0;
+    }
+
+    private void checkStmt(Node n) {
+        int k = n.kind;
+        if (k == GND_BLOCK) { this.checkBlock(n); return; }
+        if (k == GND_VAR_DECL) { this.checkVarDecl(n); return; }
+        if (k == GND_ALIAS_DECL) { this.checkAlias(n); return; }
+        if (k == GND_RETURN || k == GND_RETURN_SHORT) {
+            if (n.childCount() > 0) { this.checkExpr(n.child(0)); }
+            return;
+        }
+        if (k == GND_IF_STMT) { this.checkIf(n); return; }
+        if (k == GND_WHILE) { this.checkWhile(n); return; }
+        if (k == GND_FOR_C) { this.checkFor(n); return; }
+        if (k == GND_FOREACH) { this.checkForeach(n); return; }
+        if (k == GND_TRY_CATCH) { this.checkTryCatch(n); return; }
+        if (k == GND_UNSET) { this.checkUnset(n); return; }
+        if (k == GND_DESTRUCTURE) { this.checkDestructure(n); return; }
+        if (k == GND_THROW) {
+            for (int i = 0; i < n.childCount(); i++) { this.checkExpr(n.child(i)); }
+            return;
+        }
+        if (k == GND_EXPR_STMT) {
+            if (n.childCount() > 0) { this.checkExpr(n.child(0)); }
+            return;
+        }
+    }
+
+    private void checkFunction(Node n) {
+        this.vars = [];
+        this.scopeEnds = [];
+        this.nonNullNames = [];
+        this.unwrapDepth = 0;
+        Node params = n.child(0);
+        for (int i = 0; i < params.childCount(); i++) {
+            Node p = params.child(i);
+            this.declareVar(p.name, p.typeHint, true, true, false, false, this.endsWithQ(p.typeHint), false, p.line, p.col);
+        }
+        if (n.childCount() >= 2) {
+            Node body = n.child(1);
+            if (body.kind == GND_BLOCK) {
+                this.checkBlock(body);
+            } else {
+                this.checkExpr(body);
+            }
+        }
+    }
+
+    private void checkConst(Node n) {
+        if (n.childCount() == 0) {
+            this.fail("UnassignedConstDeclarationException", n.line, n.col, n.name, "const must be declared with a value");
+        }
+    }
+
+    private void checkTop(Node n) {
+        if (n.kind == GND_FUNC) {
+            this.checkFunction(n);
+        } elif (n.kind == GND_CONST) {
+            this.checkConst(n);
+        } elif (n.kind == GND_CLASS_DEF) {
+            for (int j = 0; j < n.childCount(); j++) {
+                Node m = n.child(j);
+                if (m.kind == GND_FUNC) { this.checkFunction(m); }
+            }
+        } elif (n.kind == GND_VAR_DECL) {
+            this.checkVarDecl(n);
+        } elif (n.kind == GND_ALIAS_DECL) {
+            this.checkAlias(n);
+        } elif (n.kind == GND_BLOCK || n.kind == GND_EXPR_STMT || n.kind == GND_IF_STMT || n.kind == GND_WHILE
+            || n.kind == GND_FOR_C || n.kind == GND_FOREACH || n.kind == GND_TRY_CATCH
+            || n.kind == GND_UNSET || n.kind == GND_THROW || n.kind == GND_DESTRUCTURE) {
+            this.checkStmt(n);
+        }
     }
 
     public void checkProgram(Node[] program) {
-        this.checked = 1;
+        for (int i = 0; i < program.length; i++) {
+            Node n = program[i];
+            if (n.kind == GND_CONST) {
+                this.globalNames.add(n.name);
+            } elif (n.kind == GND_CLASS_DEF) {
+                for (int j = 0; j < n.childCount(); j++) {
+                    Node m = n.child(j);
+                    if (m.kind == GND_CONST) { this.globalNames.add(m.name); }
+                }
+            } elif (n.kind == GND_VAR_DECL) {
+                this.globalNames.add(n.name);
+            }
+        }
+        for (int i = 0; i < program.length; i++) {
+            this.checkTop(program[i]);
+        }
     }
 }

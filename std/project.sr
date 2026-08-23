@@ -564,6 +564,31 @@ void projectCollectionFail(string path, int line) {
     exit(1);
 }
 
+// True when the source contains a line whose `collects` occurrence passes
+// the same comment/string-literal guards the expansion pass applies. The
+// self-hosted bootstrap's own sources mention `collects` inside string
+// literals (project.sr itself), so a bare substring scan would wrongly take
+// the per-line aggregate-rebuild path and leak its way out of memory on
+// large projects.
+bool projectHasRealCollectDecl(string source) {
+    int cursor = 0;
+    while (cursor < source.length) {
+        int end = cursor;
+        while (end < source.length && source[end] != '\n') { end = end + 1; }
+        string text = projectSlice(source, cursor, end);
+        int marker = projectFind(text, "collects", 0);
+        if (marker >= 0) {
+            int comment = projectFind(text, "//", 0);
+            int quote = projectFind(text, "\"", 0);
+            if ((comment < 0 || comment > marker) && (quote < 0 || quote > marker)) {
+                return true;
+            }
+        }
+        cursor = end + 1;
+    }
+    return false;
+}
+
 string projectExpandCollections(string source, string root, string collections) {
     // Most projects do not declare collections. Avoid rebuilding a large
     // aggregate source one character at a time when there is nothing to
@@ -573,7 +598,7 @@ string projectExpandCollections(string source, string root, string collections) 
         // A declaration always uses the word as a standalone operator between
         // the array variable and its .col path. Comments and string literals
         // may mention `collects`; they must not force a full aggregate scan.
-        if (projectFind(source, " collects ", 0) < 0) { return source; }
+        if (!projectHasRealCollectDecl(source)) { return source; }
     }
     int markerLen = 8;
     string result = "";
