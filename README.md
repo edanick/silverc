@@ -77,15 +77,6 @@ void main() {
 }
 ```
 
-## Project layout
-
-| Directory | Purpose |
-| --- | --- |
-| `silverc/` | The Silver compiler project and standard library |
-| `silveri/` | Silver interpreter for direct execution |
-| `DOCS/` | Language feature documentation and examples |
-| `silver-vscode-extension/` | VS Code language support |
-
 ## License
 
 Edan M. © 2025 All Rights Reserved Proprietary
