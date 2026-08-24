@@ -2165,6 +2165,8 @@ int strIdx = this.stringPatchIndices[i];
             this.genMatch(expr);
         } elif (kind == 67) {
             this.genSlice(expr);
+        } elif (kind == 69) {
+            this.genStringInterpValue(expr);
         } elif (kind == 72) {
             if (expr.childCount() > 0) {
                 Node addrChild = expr.child(0);
@@ -2423,6 +2425,9 @@ int strIdx = this.stringPatchIndices[i];
         }
         if (expr.kind == 67) {
             return this.inferExprType(expr.child(0));
+        }
+        if (expr.kind == 69) {
+            return "string";
         }
         if (expr.kind == 70) {
             return "tuple";
@@ -7668,6 +7673,9 @@ public void genNewCall(Node call) {
                 if (this.isStringLike(expr.child(1))) { return true; }
             }
         }
+        if (expr.kind == 69) {
+            return true;
+        }
         return false;
     }
 
@@ -7777,6 +7785,72 @@ public void genNewCall(Node call) {
         this.asm.movMBaseByteR(0, 1, 0);
         this.asm.movRI64(2, 0);
         this.asm.movMBaseByteR(0, 2, 1);
+    }
+
+    public void genStringInterpValue(Node arg) {
+        // Interpolated string `$"text {expr} ..."` as a general expression
+        // (assigned to a variable, passed as an argument, ...): sprintf the
+        // parts into a freshly malloc'd buffer and leave the buffer pointer in
+        // RAX. Mirrors the Rust bootstrap's gen_string_interp_value.
+        string fmt = "";
+        Node[] exprs = [];
+        for (int pi = 0; pi < arg.childCount(); pi++) {
+            Node part = arg.child(pi);
+            if (part.kind == 2) {
+                string txt = part.strVal;
+                for (int ci = 0; ci < txt.length; ci++) {
+                    if (txt[ci] == '%') { fmt = fmt + "%%"; }
+                    else { fmt = fmt + charToString(txt[ci]); }
+                }
+            } else {
+                if (this.isStringLike(part)) { fmt = fmt + "%s"; }
+                else { fmt = fmt + "%lld"; }
+                exprs.add(part);
+            }
+        }
+        int strIdx = this.addString(fmt);
+        int sp = this.asm.buf.length;
+        this.asm.emitImm64(0, 0);
+        this.stringPatchOffsets.add(sp + 2);
+        this.stringPatchIndices.add(strIdx);
+        int fmtOff = this.allocLocal("__interp_val_fmt");
+        this.asm.movMBaseR(5, 0, fmtOff);
+        this.asm.movRI64(1, 512);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int bufOff = this.allocLocal("__interp_val_buf");
+        this.asm.movMBaseR(5, 0, bufOff);
+        int[] argOffs = [];
+        for (int ei = 0; ei < exprs.length; ei++) {
+            this.genExpr(exprs[ei]);
+            int ao = this.allocLocal("__interp_val_arg");
+            this.asm.movMBaseR(5, 0, ao);
+            argOffs.add(ao);
+        }
+        int extraStack = 0;
+        if (exprs.length > 2) { extraStack = (exprs.length - 2) * 8; }
+        this.asm.emitCallSetup(extraStack);
+        this.asm.movRMBase(1, 5, bufOff);
+        this.asm.movRMBase(2, 5, fmtOff);
+        int[] argRegs = [8, 9];
+        for (int ai = 0; ai < exprs.length && ai < 2; ai++) {
+            this.asm.movRMBase(argRegs[ai], 5, argOffs[ai]);
+        }
+        for (int ai = 2; ai < exprs.length; ai++) {
+            this.asm.movRMBase(0, 5, argOffs[ai]);
+            this.asm.movMBaseR(4, 0, 32 + (ai - 2) * 8);
+        }
+        this.addImportPatch("msvcrt.dll", "sprintf");
+        int s1 = 0xDEADBEEFCAFEBAD6;
+        this.asm.emitImm64(0, s1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(0, 5, bufOff);
     }
 
     public void genIntToStringRadix(Node expr, string selector) {
