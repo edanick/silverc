@@ -6837,6 +6837,10 @@ public void genNewCall(Node call) {
             this.genAssign(bin);
             return;
         }
+        if (op == 35 || op == 36) {
+            this.genPostIncDec(bin, op == 35);
+            return;
+        }
         if (op == 27) {
             this.genRangeArray(bin);
             return;
@@ -7415,6 +7419,106 @@ public void genNewCall(Node call) {
             }
         }
         this.genExpr(rhs);
+    }
+
+    public void genPostIncDec(Node bin, bool plus) {
+        // Post-increment `x++` / post-decrement `x--` must evaluate to the
+        // OLD value of the target while storing old +/- 1 (parity with the
+        // Rust bootstrap's PostInc/PostDec codegen). The old value is stashed
+        // on the runtime stack before the store and restored into RAX after.
+        Node lhs = bin.child(0);
+        if (lhs.kind == 6) {
+            int off = this.findLocal(lhs.name);
+            int gi = this.findGlobal(lhs.name);
+            if (off != 0) {
+                this.asm.movRMBase(0, 5, off);
+                this.asm.pushR64(0);
+                if (plus) { this.asm.addRI32(0, 1); }
+                else { this.asm.subRI32(0, 1); }
+                this.asm.movMBaseR(5, 0, off);
+                this.asm.popR64(0);
+                return;
+            }
+            if (gi >= 0) {
+                this.genGlobalLoad(gi);
+                this.asm.pushR64(0);
+                if (plus) { this.asm.addRI32(0, 1); }
+                else { this.asm.subRI32(0, 1); }
+                this.genGlobalStore(gi);
+                this.asm.popR64(0);
+                return;
+            }
+            if (!this.strEq(this.currentClassName, "")) {
+                int fieldOff = this.findFieldOffset(this.currentClassName, lhs.name);
+                int thisOff = this.findLocal("this");
+                if (fieldOff >= 0 && thisOff != 0) {
+                    this.asm.movRMBase(0, 5, thisOff);
+                    this.asm.movRMBase(0, 0, fieldOff);
+                    this.asm.pushR64(0);
+                    if (plus) { this.asm.addRI32(0, 1); }
+                    else { this.asm.subRI32(0, 1); }
+                    this.asm.pushR64(0);
+                    this.asm.movRMBase(10, 5, thisOff);
+                    this.asm.addRI32(10, fieldOff);
+                    this.asm.popR64(1);
+                    this.asm.movMBaseR(10, 1, 0);
+                    this.asm.popR64(0);
+                    return;
+                }
+            }
+        }
+        if (lhs.kind == 13 && lhs.childCount() >= 1) {
+            Node obj = lhs.child(0);
+            int fieldOff = -1;
+            int objOff = 0;
+            int objGi = -1;
+            if (obj.kind == 6 && this.strEq(obj.name, "this")) {
+                int thisOff = this.findLocal("this");
+                fieldOff = this.findFieldOffset(this.currentClassName, lhs.name);
+                objOff = thisOff;
+            } elif (obj.kind == 6) {
+                string varType = this.getLocalType(obj.name);
+                string lookupType = varType;
+                string elemType = this.arrayElementType(varType);
+                if (!this.strEq(elemType, "")) { lookupType = elemType; }
+                fieldOff = this.findFieldOffset(lookupType, lhs.name);
+                objOff = this.findLocal(obj.name);
+                objGi = this.findGlobal(obj.name);
+            }
+            if (fieldOff >= 0 && objOff != 0) {
+                this.asm.movRMBase(0, 5, objOff);
+                this.asm.movRMBase(0, 0, fieldOff);
+                this.asm.pushR64(0);
+                if (plus) { this.asm.addRI32(0, 1); }
+                else { this.asm.subRI32(0, 1); }
+                this.asm.pushR64(0);
+                this.asm.movRMBase(10, 5, objOff);
+                this.asm.addRI32(10, fieldOff);
+                this.asm.popR64(1);
+                this.asm.movMBaseR(10, 1, 0);
+                this.asm.popR64(0);
+                return;
+            }
+            if (fieldOff >= 0 && objGi >= 0) {
+                this.genGlobalLoad(objGi);
+                this.asm.movRMBase(0, 0, fieldOff);
+                this.asm.pushR64(0);
+                if (plus) { this.asm.addRI32(0, 1); }
+                else { this.asm.subRI32(0, 1); }
+                this.asm.pushR64(0);
+                this.genGlobalLoad(objGi);
+                this.asm.addRI32(0, fieldOff);
+                this.asm.popR64(1);
+                this.asm.movMBaseR(0, 1, 0);
+                this.asm.popR64(0);
+                return;
+            }
+        }
+        // Non-identifier lvalues (array elements, nested member chains) fall
+        // back to compound-assignment semantics; the value yielded is the
+        // updated one, mirroring the Rust bootstrap.
+        if (plus) { this.genCompoundAssign(bin, 14); }
+        else { this.genCompoundAssign(bin, 15); }
     }
 
     public void genRangeArray(Node bin) {
