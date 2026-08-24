@@ -1265,18 +1265,39 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 this.advance();
                 return n;
             }
-            // Braced string/int key pairs are dictionary literals; other
-            // braced expressions retain the historical array-compatible form.
+            // Braced string/int key pairs are dictionary literals; a braced
+            // identifier-keyed form is a struct literal; other braced
+            // expressions retain the historical array-compatible form.
             if (this.check(3) || this.check(1) || this.check(7)) {
                 int saved = this.pos;
                 Node firstKey = this.parseExpr(0);
                 if (this.check(109)) {
-                    n.kind = 66;
                     this.advance();
-                    Node pair = new Node(); pair.kind = 18;
-                    pair.children.add(firstKey);
-                    pair.children.add(this.parseExpr(0));
-                    n.children.add(pair);
+                    if (firstKey.kind == 6) {
+                        // Struct literal: `{name: value, ...}`. Field names are
+                        // identifiers; keep each pair as `(identifier, value)`.
+                        n.kind = 74;
+                        Node pair = new Node(); pair.kind = 18;
+                        pair.children.add(firstKey);
+                        pair.children.add(this.parseExpr(0));
+                        n.children.add(pair);
+                        while (this.check(107)) {
+                            this.advance();
+                            Node key = this.parseExpr(0);
+                            this.expect(109);
+                            Node nextPair = new Node(); nextPair.kind = 18;
+                            nextPair.children.add(key);
+                            nextPair.children.add(this.parseExpr(0));
+                            n.children.add(nextPair);
+                        }
+                        this.expect(103);
+                        return n;
+                    }
+                    n.kind = 66;
+                    Node dpair = new Node(); dpair.kind = 18;
+                    dpair.children.add(firstKey);
+                    dpair.children.add(this.parseExpr(0));
+                    n.children.add(dpair);
                     while (this.check(107)) {
                         this.advance();
                         Node key = this.parseExpr(0);

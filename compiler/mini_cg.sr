@@ -172,17 +172,21 @@ class MiniCg {
     }
 
     public void collectClassLayouts(Node[] program) {
-        // First pass: collect all class names so parent references work
+        // First pass: collect all class and struct names so parent references
+        // work. Structs (kind 101) share the same layout tables as classes:
+        // their fields are parsed as identifier-less kind-0 nodes, so the
+        // field-collection pass below reads typeHint/name directly.
         for (int i = 0; i < program.length; i++) {
             Node item = program[i];
-            if (item.kind == 102) {
+            if (item.kind == 102 || item.kind == 101) {
                 this.classNames.add(item.name);
                 this.classParentClasses.add(item.parentClass);
                 this.classFieldStarts.add(0);
                 this.classFieldCounts.add(0);
             }
         }
-        // Second pass: collect fields and methods with inheritance
+        // Second pass: collect fields and methods with inheritance. Structs
+        // (kind 101) have no inheritance and no methods; only their fields.
         int classIdx = 0;
         for (int i = 0; i < program.length; i++) {
             Node item = program[i];
@@ -250,6 +254,20 @@ class MiniCg {
                         }
                     }
                 }
+                classIdx = classIdx + 1;
+            } elif (item.kind == 101) {
+                // Struct layout: fields only, no inheritance or methods.
+                int start = this.classFieldNames.length;
+                int cnt = 0;
+                for (int j = 0; j < item.childCount(); j++) {
+                    Node member = item.child(j);
+                    this.classFieldNames.add(member.name);
+                    this.classFieldOffsets.add(cnt * 8);
+                    this.classFieldTypes.add(member.typeHint);
+                    cnt = cnt + 1;
+                }
+                this.classFieldStarts[classIdx] = start;
+                this.classFieldCounts[classIdx] = cnt;
                 classIdx = classIdx + 1;
             }
         }
@@ -1508,6 +1526,8 @@ int strIdx = this.stringPatchIndices[i];
                 } else {
                 if (this.strEq(stmt.typeHint, "byte[]") && initNode.kind == 19) {
                     this.genByteArrayLiteral(initNode);
+                } elif (initNode.kind == 74) {
+                    this.genStructLiteral(initNode, stmt.typeHint);
                 } else {
                     this.genExpr(initNode);
                 }
@@ -1876,6 +1896,51 @@ int strIdx = this.stringPatchIndices[i];
         }
         this.asm.movRMBase(0, 5, arrOff);
         this.asm.addRI32(0, 16);
+    }
+
+    public void genStructLiteral(Node expr, string typeName) {
+        // Allocate a struct object (same layout as a class instance: each
+        // field at offset cnt*8), then store every `name: value` pair at the
+        // offset registered for that field.
+        int fieldCnt = 0;
+        for (int ci = 0; ci < this.classNames.length; ci++) {
+            if (this.typeNameEq(this.classNames[ci], typeName)) {
+                fieldCnt = this.classFieldCounts[ci];
+            }
+        }
+        int size = fieldCnt * 8;
+        if (size < 16) { size = 16; }
+        this.asm.emitImm64(1, size);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        int sStruct = 0xDEADBEEFCAFEBAB0;
+        this.asm.emitImm64(0, sStruct);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int objOff = this.allocLocal("__struct_lit");
+        this.asm.movMBaseR(5, 0, objOff);
+        for (int fi = 0; fi < expr.childCount(); fi++) {
+            Node pair = expr.child(fi);
+            if (pair.kind != 18 || pair.childCount() < 2) { continue; }
+            Node key = pair.child(0);
+            Node value = pair.child(1);
+            int fieldOff = this.findFieldOffset(typeName, key.name);
+            if (fieldOff < 0) { continue; }
+            // Nested struct literal: the field type is itself a struct, so
+            // recurse with that type instead of treating `{...}` as a dict.
+            string fieldType = this.findFieldType(typeName, key.name);
+            if (value.kind == 74 && this.typeNameEq(fieldType, typeName)) {
+                this.genStructLiteral(value, fieldType);
+            } elif (value.kind == 74) {
+                this.genStructLiteral(value, fieldType);
+            } else {
+                this.genExpr(value);
+            }
+            this.asm.movRMBase(1, 5, objOff);
+            this.asm.movMBaseR(1, 0, fieldOff);
+        }
+        this.asm.movRMBase(0, 5, objOff);
     }
 
     public void genExpr(Node expr) {
@@ -4104,7 +4169,7 @@ public void genNewCall(Node call) {
         // ChatCompletionRequest's second parameter is ChatMessage[]. Lower
         // anonymous `{role: ..., content: ...}` entries to actual objects.
         bool hasAnonymousMessage = false;                if (call.child(i).kind == 19 && call.child(i).childCount() > 0) {
-            if (call.child(i).child(0).kind == 66) { hasAnonymousMessage = true; }
+            if (call.child(i).child(0).kind == 66 || call.child(i).child(0).kind == 74) { hasAnonymousMessage = true; }
         }
         if (this.strEq(call.name, "ChatCompletionRequest") && i == 1 && hasAnonymousMessage) {
             int count = call.child(i).childCount();
@@ -6712,7 +6777,15 @@ public void genNewCall(Node call) {
         if (lhs.kind == 6) {
             int off = this.findLocal(lhs.name);
             int gi = this.findGlobal(lhs.name);
-            this.genExpr(rhs);
+            if (rhs.kind == 74) {
+                // Struct literal assigned to an existing struct variable:
+                // build a fresh struct object with the variable's type.
+                string lhsType = this.getLocalType(lhs.name);
+                if (this.strEq(lhsType, "")) { lhsType = this.getLocalType(lhs.name); }
+                this.genStructLiteral(rhs, lhsType);
+            } else {
+                this.genExpr(rhs);
+            }
             if (off != 0) {
                 this.asm.movMBaseR(5, 0, off);
             } elif (gi >= 0) {
