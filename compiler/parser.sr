@@ -1407,7 +1407,10 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
 
         if (kind == 16) {
             // `match (subject) { pattern => expr; ... }` is an expression: the
-            // value of the matched arm is the match's value.
+            // value of the matched arm is the match's value.  Arms may carry a
+            // guard `pattern if cond => body` (DOCS/154); the guard (if any)
+            // is stored as arm child(1) so codegen can test it after the
+            // pattern binds.
             Node m = new Node(); m.kind = 20;
             if (this.check(100)) {
                 this.advance();
@@ -1420,9 +1423,13 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             while (!this.check(103) && !this.check(0)) {
                 Node arm = new Node(); arm.kind = 21;
                 arm.children.add(this.parsePattern());
+                if (this.check(10)) {
+                    this.advance();
+                    arm.children.add(this.parseExpr(0));
+                }
                 this.expect(146);
                 arm.children.add(this.parseExpr(0));
-                this.expect(106);
+                if (this.check(106)) { this.advance(); }
                 m.children.add(arm);
             }
             this.expect(103);
@@ -1614,6 +1621,19 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         Token t = this.advance();
         if (t.kind == 126) { n.name = "_"; return n; }
         if (t.kind == 1) { n.kind = 0; n.intVal = t.intVal; return n; }
+        if (t.kind == 3) { n.kind = 2; n.strVal = t.strVal; return n; }
+        if (t.kind == 4) { n.kind = 3; n.charVal = t.charVal; return n; }
+        if (t.kind == 100) {
+            // Tuple pattern `(p1, p2, ...)` (kind 78): positional compare and
+            // bind.  The codegen walks each element at ptr + i*8.
+            n.kind = 78;
+            while (!this.check(101) && !this.check(0)) {
+                n.children.add(this.parsePattern());
+                if (this.check(107)) { this.advance(); }
+            }
+            this.expect(101);
+            return n;
+        }
         if (t.kind == 7) {
             n.name = t.text;
             if (this.check(108)) {

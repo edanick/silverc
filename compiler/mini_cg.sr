@@ -2448,21 +2448,42 @@ int strIdx = this.stringPatchIndices[i];
     }
 
     // `match` expressions: subject child(0), arms child(1..) where each arm is
-    // (pattern, body-expr).  The subject is stashed on the stack so each arm's
-    // pattern test can compare against it; the matched arm's body runs and
-    // jumps past the fallback, leaving its value in RAX.
+    // (pattern, body-expr) or (pattern, guard, body-expr).  The subject is
+    // stashed on the stack so each arm's pattern test can compare against it;
+    // the matched arm's body runs and jumps past the fallback, leaving its
+    // value in RAX.  Binding patterns store the subject in a fresh local that
+    // stays in scope for the guard and the arm body (DOCS/44, DOCS/154).
     public void genMatch(Node expr) {
         this.genExpr(expr.child(0));
         this.asm.pushR64(0);
+        string subjType = this.inferExprType(expr.child(0));
         int endLbl = this.newLabel();
         for (int i = 1; i < expr.childCount(); i++) {
             Node arm = expr.child(i);
             int armBody = this.newLabel();
             int nextArm = this.newLabel();
             this.asm.popR64(0);
-            this.genMatchPattern(arm.child(0), armBody, nextArm);
+            this.genMatchPattern(arm.child(0), armBody, nextArm, subjType);
             this.asm.bindLabel(armBody);
-            this.genExpr(arm.child(1));
+            if (arm.childCount() > 2) {
+                // Guarded arm: child(1) is the guard expression.  Save the
+                // subject (RAX) on the stack before the guard so that on
+                // guard failure the stack is restored for the next arm.
+                this.asm.pushR64(0);
+                this.genExpr(arm.child(1));
+                this.asm.cmpRI32(0, 0);
+                int guardPass = this.newLabel();
+                this.asm.jneLabel(guardPass);
+                // Guard failed: subject is on stack from the pushR64 above.
+                // The next arm will pop it via popR64, so just jump.
+                this.asm.jmpLabel(nextArm);
+                this.asm.bindLabel(guardPass);
+                // Guard passed: pop the saved subject from stack.
+                this.asm.addRI32(4, 8);
+                this.genExpr(arm.child(2));
+            } else {
+                this.genExpr(arm.child(1));
+            }
             this.asm.jmpLabel(endLbl);
             this.asm.bindLabel(nextArm);
         }
@@ -2470,15 +2491,51 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.bindLabel(endLbl);
     }
 
-    public void genMatchPattern(Node pattern, int armBody, int nextArm) {
+    public void genMatchPattern(Node pattern, int armBody, int nextArm, string subjType) {
         if (pattern.kind == 0 && this.strEq(pattern.name, "_")) {
-            // Wildcard: always matches. The subject was popped by genMatch
-            // before the arm; do NOT push it back (a push here would leak an
-            // 8-byte stack slot past the match end label, shifting later
-            // stack-relative locals and reading uninitialized memory).
+            // Wildcard: always matches.
+        } elif (pattern.kind == 0 && !this.strEq(pattern.name, "")) {
+            // Binding pattern: always matches; the subject becomes a fresh
+            // local visible to the arm's guard and body.
+            int off = this.allocLocal(pattern.name);
+            this.asm.movRR64(1, 0);
+            this.asm.movMBaseR(5, 1, off);
+            if (!this.strEq(subjType, "")) {
+                this.setLocalType(pattern.name, subjType);
+            }
         } elif (pattern.kind == 0 && this.strEq(pattern.name, "")) {
             // Integer literal: match when the subject equals it.
             this.asm.cmpRI32(0, pattern.intVal);
+            this.asm.jeLabel(armBody);
+            this.asm.pushR64(0);
+            this.asm.jmpLabel(nextArm);
+        } elif (pattern.kind == 2) {
+            // String literal: match when strcmp(subject, literal) == 0.
+            this.asm.pushR64(0);
+            this.asm.movRR64(1, 0);
+            this.emitLlmaiStringLiteral(pattern.strVal);
+            this.asm.movRR64(2, 0);
+            this.addImportPatch("ucrtbase.dll", "strcmp");
+            int sMp = 0xDEADBEEFCAFEBAC2;
+            this.asm.emitImm64(0, sMp);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.cmpRI32(0, 0);
+            int strMatch = this.newLabel();
+            this.asm.jeLabel(strMatch);
+            // Mismatch: restore the subject and push it back for the next arm.
+            this.asm.popR64(0);
+            this.asm.pushR64(0);
+            this.asm.jmpLabel(nextArm);
+            this.asm.bindLabel(strMatch);
+            // Match: restore the subject, jump to the arm body.
+            this.asm.popR64(0);
+            this.asm.jmpLabel(armBody);
+        } elif (pattern.kind == 3) {
+            // Char literal: match when the subject equals the code point.
+            this.asm.cmpRI32(0, pattern.charVal);
             this.asm.jeLabel(armBody);
             this.asm.pushR64(0);
             this.asm.jmpLabel(nextArm);
@@ -2502,9 +2559,47 @@ int strIdx = this.stringPatchIndices[i];
             }
             this.asm.pushR64(0);
             this.asm.jmpLabel(nextArm);
+        } elif (pattern.kind == 78) {
+            // Tuple pattern `(p1, p2, ...)`: push subject, then test each
+            // element at ptr + i*8.  A mismatch jumps to nextArm with the
+            // subject still on the stack (the next arm pops it); the arm body
+            // is reached only after the whole shape matches.
+            this.asm.pushR64(0);
+            for (int pi = 0; pi < pattern.childCount(); pi++) {
+                int elemLbl = this.newLabel();
+                this.asm.movRMBase(0, 4, 0);
+                this.asm.addRI32(0, pi * 8);
+                this.asm.movRMBase(0, 0, 0);
+                this.genMatchTuplePattern(pattern.child(pi), elemLbl, nextArm, "");
+                this.asm.bindLabel(elemLbl);
+            }
+            // All elements matched: pop the subject copy, jump to the body.
+            this.asm.popR64(0);
+            this.asm.jmpLabel(armBody);
         } else {
             // Unsupported pattern kinds never match.
             this.asm.pushR64(0);
+            this.asm.jmpLabel(nextArm);
+        }
+    }
+
+    public void genMatchTuplePattern(Node pattern, int elemLbl, int nextArm, string subjType) {
+        if (pattern.kind == 0 && this.strEq(pattern.name, "_")) {
+            // Wildcard element: always matches.
+        } elif (pattern.kind == 0 && !this.strEq(pattern.name, "")) {
+            // Binding pattern: store the element value into a fresh local.
+            int off = this.allocLocal(pattern.name);
+            this.asm.movRR64(1, 0);
+            this.asm.movMBaseR(5, 1, off);
+            if (!this.strEq(subjType, "")) {
+                this.setLocalType(pattern.name, subjType);
+            }
+        } elif (pattern.kind == 0 && this.strEq(pattern.name, "")) {
+            // Integer literal: match when elem equals it.
+            this.asm.cmpRI32(0, pattern.intVal);
+            this.asm.jneLabel(nextArm);
+        } else {
+            // Unsupported: never matches.
             this.asm.jmpLabel(nextArm);
         }
     }
