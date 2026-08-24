@@ -6617,6 +6617,13 @@ public void genNewCall(Node call) {
             this.genRangeArray(bin);
             return;
         }
+        if (op == 26) {
+            string rptLt = this.inferExprType(bin.child(0));
+            if (this.strEq(rptLt, "string")) {
+                this.genStringRepeat(bin);
+                return;
+            }
+        }
         if (op >= 14 && op <= 17) {
             this.genCompoundAssign(bin, op);
             return;
@@ -7461,6 +7468,77 @@ public void genNewCall(Node call) {
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
         this.asm.movRMBase(0, 5, bufOff);
+    }
+
+    public void genStringRepeat(Node bin) {
+        // lhs ... count: repeat lhs string count times, return new string.
+        this.genExpr(bin.child(1));
+        int cntOff = this.allocLocal("__rpt_cnt");
+        this.asm.movMBaseR(5, 0, cntOff);
+        this.genExpr(bin.child(0));
+        int strOff = this.allocLocal("__rpt_str");
+        this.asm.movMBaseR(5, 0, strOff);
+        this.asm.movRMBase(1, 5, strOff);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int lenOff = this.allocLocal("__rpt_len");
+        this.asm.movMBaseR(5, 0, lenOff);
+        // count <= 0 returns the empty string.
+        int zeroCnt = this.newLabel();
+        int zeroDone = this.newLabel();
+        this.asm.movRMBase(0, 5, cntOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jleLabel(zeroCnt);
+        // allocSize = len * count + 1
+        this.asm.movRMBase(1, 5, cntOff);
+        this.asm.mulRR64(1);
+        this.asm.addRI32(0, 1);
+        this.asm.movRR64(1, 0);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int dstOff = this.allocLocal("__rpt_dst");
+        this.asm.movMBaseR(5, 0, dstOff);
+        int iOff = this.allocLocal("__rpt_i");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        int loop = this.newLabel();
+        int done = this.newLabel();
+        this.asm.bindLabel(loop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, cntOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(done);
+        // dst + i*len = str
+        this.asm.movRMBase(1, 5, dstOff);
+        this.asm.movRMBase(2, 5, iOff);
+        this.asm.movRMBase(0, 5, lenOff);
+        this.asm.mulRR64(2);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(2, 5, strOff);
+        this.addImportPatch("ucrtbase.dll", "strcpy");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD4);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(loop);
+        this.asm.bindLabel(done);
+        this.asm.movRMBase(0, 5, dstOff);
+        this.asm.jmpLabel(zeroDone);
+        this.asm.bindLabel(zeroCnt);
+        this.emitLlmaiEmptyString();
+        this.asm.bindLabel(zeroDone);
     }
 
     public void genStringConcat(Node bin) {
