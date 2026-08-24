@@ -187,6 +187,7 @@ class Parser {
         if (kind == 146) { return "=>"; }
         if (kind == 147) { return "..."; }
         if (kind == 148) { return "??"; }
+        if (kind == 163) { return "?."; }
         if (kind == 149) { return "$"; }
         if (kind == 150) { return "local"; }
         if (kind == 151) { return "alias"; }
@@ -1043,6 +1044,37 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     member.children.add(lhs);
                     lhs = member;
                 }
+                continue;
+            }
+            if (this.check(163)) {
+                // Nullable-conditional member access `a?.b`: evaluate the
+                // receiver once; when it is null the whole expression yields
+                // null instead of dereferencing.  Wrapped in a kind-75 node
+                // so codegen can short-circuit the member access/call.
+                this.advance();
+                Token name = this.advance();
+                Node qmMember = null;
+                if (this.check(100)) {
+                    Node call = new Node(); call.kind = 10;
+                    call.name = name.text;
+                    call.isMember = true;
+                    call.children.add(lhs);
+                    this.advance();
+                    while (!this.check(101) && !this.check(0)) {
+                        call.children.add(this.parseExpr(0));
+                        if (this.check(107)) { this.advance(); }
+                    }
+                    this.expect(101);
+                    qmMember = call;
+                } else {
+                    Node member = new Node(); member.kind = 13;
+                    member.name = name.text;
+                    member.children.add(lhs);
+                    qmMember = member;
+                }
+                Node qm = new Node(); qm.kind = 75;
+                qm.children.add(qmMember);
+                lhs = qm;
                 continue;
             }
             if (this.check(142)) {

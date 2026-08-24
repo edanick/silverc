@@ -94,6 +94,7 @@ class MiniCg {
     public prop int entryOffset;
     public prop int[] liveSlots;
     public prop bool[] liveSlotIsArray;
+    public prop int qcTempCounter;
 
     construct (MiniAsm asm) {
         this.asm = asm;
@@ -164,6 +165,7 @@ class MiniCg {
         this.entryOffset = 0;
         this.liveSlots = [];
         this.liveSlotIsArray = [];
+        this.qcTempCounter = 0;
         this.currentExcHandler = -1;
         this.currentCatch = -1;
         this.currentFinally = -1;
@@ -2029,7 +2031,55 @@ int strIdx = this.stringPatchIndices[i];
                 this.asm.movMBaseR(1, 0, 16 + i * 8);
             }
             this.asm.movRMBase(0, 5, arrOff);
-            this.asm.addRI32(0, 16);    } elif (kind == 6) {
+            this.asm.addRI32(0, 16);
+        } elif (kind == 75) {
+            // Nullable-conditional member access `a?.b` / method call
+            // `a?.m(...)`: evaluate the receiver once; when it is null the
+            // whole expression yields 0 (null) without dereferencing.  The
+            // receiver is stashed in a scratch stack slot and the member
+            // expression is re-run against that slot so field access and
+            // member-call codegen reuse the value (no side-effect re-eval).
+            if (expr.childCount() > 0) {
+                Node qmMember = expr.child(0);
+                if (qmMember.childCount() > 0) {
+                    Node qmRecv = qmMember.child(0);
+                    this.genExpr(qmRecv);
+                    this.asm.pushR64(0);
+                    int qmNull = this.newLabel();
+                    int qmEnd = this.newLabel();
+                    this.asm.cmpRI32(0, 0);
+                    this.asm.jeLabel(qmNull);
+                    this.asm.popR64(0);
+                    string qcName = "__qc" + this.qcTempCounter.toString();
+                    this.qcTempCounter = this.qcTempCounter + 1;
+                    int qcOff = this.allocLocal(qcName);
+                    string qcType = this.inferReceiverType(qmRecv);
+                    this.setLocalType(qcName, qcType);
+                    this.asm.movMBaseR(5, 0, qcOff);
+                    Node qmTmp = new Node(); qmTmp.kind = 6; qmTmp.name = qcName;
+                    if (qmMember.kind == 13) {
+                        Node fresh = new Node(); fresh.kind = 13;
+                        fresh.name = qmMember.name;
+                        fresh.children.add(qmTmp);
+                        this.genMemberAccess(fresh);
+                    } elif (qmMember.kind == 10) {
+                        Node fresh = new Node(); fresh.kind = 10;
+                        fresh.name = qmMember.name;
+                        fresh.isMember = true;
+                        fresh.children.add(qmTmp);
+                        for (int qai = 1; qai < qmMember.childCount(); qai = qai + 1) {
+                            fresh.children.add(qmMember.child(qai));
+                        }
+                        this.genCall(fresh);
+                    }
+                    this.asm.jmpLabel(qmEnd);
+                    this.asm.bindLabel(qmNull);
+                    this.asm.popR64(0);
+                    this.asm.xorRR64(0, 0);
+                    this.asm.bindLabel(qmEnd);
+                }
+            }
+        } elif (kind == 6) {
         bool isConst = false;
         int constVal = 0;
         string constString = "";
