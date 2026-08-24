@@ -1186,6 +1186,77 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         return n;
     }
 
+    // Array methods that take a predicate/transform lambda argument
+    // (DOCS/81-84, 91, 99): map/filter/reduce/forEach/every/some/all/any/find.
+    private bool isHofMethod(string name) {
+        if (this.strEq(name, "map")) { return true; }
+        if (this.strEq(name, "filter")) { return true; }
+        if (this.strEq(name, "reduce")) { return true; }
+        if (this.strEq(name, "forEach")) { return true; }
+        if (this.strEq(name, "every")) { return true; }
+        if (this.strEq(name, "some")) { return true; }
+        if (this.strEq(name, "all")) { return true; }
+        if (this.strEq(name, "any")) { return true; }
+        if (this.strEq(name, "find")) { return true; }
+        return false;
+    }
+
+    // Parse one argument of a higher-order call: either an inline lambda
+    // (`x => expr`, `x << expr`, `(a, b) => expr`) or a plain expression.
+    // Lambdas are represented as a kind-80 node whose children are the
+    // parameter name nodes followed by the body expression.
+    private Node parseLambdaArg() {
+        // Multi-param form: `(a, b) => body` / `(a, b) << body`.  Backtracks
+        // when the parenthesized text is really a plain expression.
+        if (this.check(100)) {
+            int saved = this.pos;
+            Node? pl = this.tryParseParenLambda();
+            if (pl != null) {
+                return pl;
+            }
+            this.pos = saved;
+        }
+        // Single-param form: `x => body` / `x << body`.
+        if (this.check(7) && this.pos + 1 < this.tokens.length) {
+            int nextKind = this.tokens[this.pos + 1].kind;
+            if (nextKind == 146 || nextKind == 140) {
+                Node lam = new Node(); lam.kind = 80;
+                lam.children.add(this.makeNameNode(this.advance().text));
+                this.advance();
+                lam.children.add(this.parseExpr(0));
+                return lam;
+            }
+        }
+        Node e = this.parseExpr(0);
+        // `x << expr` can also arrive here as a shift expression when the
+        // single form above did not catch it; per DOCS/81 it binds x in the
+        // method's element position.
+        if (e.kind == 7 && e.op == 18 && e.childCount() >= 2 && e.child(0).kind == 6) {
+            Node lam = new Node(); lam.kind = 80;
+            lam.children.add(e.child(0));
+            lam.children.add(e.child(1));
+            return lam;
+        }
+        return e;
+    }
+
+    private Node? tryParseParenLambda() {
+        if (!this.check(100)) { return null; }
+        this.advance();
+        Node lam = new Node(); lam.kind = 80;
+        while (this.check(7)) {
+            lam.children.add(this.makeNameNode(this.advance().text));
+            if (this.check(107)) { this.advance(); }
+            else { break; }
+        }
+        if (!this.check(101)) { return null; }
+        this.advance();
+        if (!this.check(146) && !this.check(140)) { return null; }
+        this.advance();
+        lam.children.add(this.parseExpr(0));
+        return lam;
+    }
+
     private Node parseExpr(int minPrec) {
         Node lhs = this.parsePrefix();
         while (true) {
@@ -1237,9 +1308,14 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     call.name = name.text;
                     call.isMember = true;
                     call.children.add(lhs);
+                    bool hof = this.isHofMethod(name.text);
                     this.advance();
                     while (!this.check(101) && !this.check(0)) {
-                        call.children.add(this.parseExpr(0));
+                        if (hof) {
+                            call.children.add(this.parseLambdaArg());
+                        } else {
+                            call.children.add(this.parseExpr(0));
+                        }
                         if (this.check(107)) { this.advance(); }
                     }
                     this.expect(101);

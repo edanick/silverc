@@ -2923,6 +2923,21 @@ int strIdx = this.stringPatchIndices[i];
                         return "bool";
                     }
                 }
+                if (this.strEq(cname, "some") || this.strEq(cname, "every")) {
+                    if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
+                        return "bool";
+                    }
+                }
+                if (this.strEq(cname, "map") || this.strEq(cname, "forEach") || this.strEq(cname, "filter")) {
+                    if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
+                        return recvType;
+                    }
+                }
+                if (this.strEq(cname, "reduce") || this.strEq(cname, "find")) {
+                    if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
+                        return this.arrayElementType(recvType);
+                    }
+                }
                 if (this.strEq(cname, "reverse")) {
                     if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
                         return recvType;
@@ -3556,6 +3571,423 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.bindLabel(done);
         this.asm.movRMBase(0, 5, outOff);
         this.asm.addRI32(0, 16);
+    }
+
+    public bool isArrayLikeType(string t) {
+        if (t.length >= 2) {
+            if (t[t.length - 2] == '[' && t[t.length - 1] == ']') { return true; }
+        }
+        return false;
+    }
+
+    public bool isHofMethod(string name) {
+        if (this.strEq(name, "map")) { return true; }
+        if (this.strEq(name, "filter")) { return true; }
+        if (this.strEq(name, "reduce")) { return true; }
+        if (this.strEq(name, "forEach")) { return true; }
+        if (this.strEq(name, "every")) { return true; }
+        if (this.strEq(name, "some")) { return true; }
+        if (this.strEq(name, "all")) { return true; }
+        if (this.strEq(name, "any")) { return true; }
+        if (this.strEq(name, "find")) { return true; }
+        return false;
+    }
+
+    // Emit a lambda body: a block body is generated as statements (the value
+    // left in RAX is whatever the final statement produced), an expression
+    // body is generated as a value expression.
+    public void genLambdaBody(Node body) {
+        if (body.kind == 16) {
+            this.genBlock(body);
+        } else {
+            this.genExpr(body);
+        }
+    }
+
+    // Allocate a local slot for every lambda parameter, recording the element
+    // type on the first parameter so string element members (e.g. w.toUpper())
+    // dispatch as string builtin calls. Returns the fresh offsets.
+    public int[] allocLambdaParams(Node lam, string elemType) {
+        int count = lam.childCount() - 1;
+        int[] offs = [];
+        for (int pi = 0; pi < count; pi++) {
+            string pn = lam.child(pi).name;
+            int po = this.allocLocal(pn);
+            offs.add(po);
+            if (pi == 0 && !this.strEq(elemType, "")) {
+                this.setLocalType(pn, elemType);
+            }
+        }
+        return offs;
+    }
+
+    // Load source[i] into RAX (byte or 8-byte element).
+    public void genArrayElemLoad(int srcOff, int iOff, bool byteElements) {
+        this.asm.movRMBase(0, 5, srcOff);
+        this.asm.movRMBase(1, 5, iOff);
+        if (!byteElements) { this.asm.shlR64Imm(1, 3); }
+        this.asm.addRR64(0, 1);
+        if (byteElements) {
+            this.asm.movzxByteMBase(0, 0, 0);
+        } else {
+            this.asm.movRMBase(0, 0, 0);
+        }
+    }
+
+    // `.map(lambda)` / `.forEach(lambda)`: build a new array whose elements
+    // are the lambda body evaluated per source element (DOCS/81, 99).  The
+    // same negative-header layout as the other array ops: the returned pointer
+    // addresses element 0, capacity at ptr-16, length at ptr-8.
+    public void genLambdaMap(Node call) {
+        Node arrNode = call.child(0);
+        string arrType = this.inferExprType(arrNode);
+        string elemType = this.arrayElementType(arrType);
+        bool byteElements = this.isByteElemType(arrType);
+        int srcOff = this.allocLocal("__lmap_src");
+        int lenOff = this.allocLocal("__lmap_len");
+        int dstOff = this.allocLocal("__lmap_dst");
+        int elemOff = this.allocLocal("__lmap_elem");
+        int iOff = this.allocLocal("__lmap_i");
+
+        this.genExpr(arrNode);
+        this.asm.movMBaseR(5, 0, srcOff);
+        this.asm.movRMBase(0, 5, srcOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.addRI32(1, 2);
+        this.asm.shlR64Imm(1, 3);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        int sMap = 0xDEADBEEFCAFEBAD1;
+        this.asm.emitImm64(0, sMap);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, dstOff);
+        this.asm.movRMBase(0, 5, dstOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(0, 5, dstOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.movMBaseR(0, 1, 8);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+
+        Node lam = call.child(1);
+        int[] paramOffs = this.allocLambdaParams(lam, elemType);
+        Node body = lam.child(lam.childCount() - 1);
+
+        int loop = this.newLabel();
+        int done = this.newLabel();
+        this.asm.bindLabel(loop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(done);
+        this.genArrayElemLoad(srcOff, iOff, byteElements);
+        this.asm.movMBaseR(5, 0, elemOff);
+        for (int bi = 0; bi < paramOffs.length; bi++) {
+            this.asm.movRMBase(0, 5, elemOff);
+            this.asm.movMBaseR(5, 0, paramOffs[bi]);
+        }
+        this.genLambdaBody(body);
+        this.asm.movRMBase(1, 5, dstOff);
+        this.asm.addRI32(1, 16);
+        this.asm.movRMBase(2, 5, iOff);
+        if (!byteElements) { this.asm.shlR64Imm(2, 3); }
+        this.asm.addRR64(1, 2);
+        if (byteElements) {
+            this.asm.movMBaseByteR(1, 0, 0);
+        } else {
+            this.asm.movMBaseR(1, 0, 0);
+        }
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(loop);
+        this.asm.bindLabel(done);
+        this.asm.movRMBase(0, 5, dstOff);
+        this.asm.addRI32(0, 16);
+    }
+
+    // `.filter(lambda)`: single pass into a same-capacity buffer; the header
+    // length is finalized with the number of kept elements (DOCS/82).
+    public void genLambdaFilter(Node call) {
+        Node arrNode = call.child(0);
+        string arrType = this.inferExprType(arrNode);
+        string elemType = this.arrayElementType(arrType);
+        bool byteElements = this.isByteElemType(arrType);
+        int srcOff = this.allocLocal("__lflt_src");
+        int lenOff = this.allocLocal("__lflt_len");
+        int dstOff = this.allocLocal("__lflt_dst");
+        int countOff = this.allocLocal("__lflt_count");
+        int elemOff = this.allocLocal("__lflt_elem");
+        int iOff = this.allocLocal("__lflt_i");
+
+        this.genExpr(arrNode);
+        this.asm.movMBaseR(5, 0, srcOff);
+        this.asm.movRMBase(0, 5, srcOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.addRI32(1, 2);
+        this.asm.shlR64Imm(1, 3);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        int sFl = 0xDEADBEEFCAFEBAD1;
+        this.asm.emitImm64(0, sFl);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, dstOff);
+        this.asm.movRMBase(0, 5, dstOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(0, 5, dstOff);
+        this.asm.xorRR64(1, 1);
+        this.asm.movMBaseR(0, 1, 8);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, countOff);
+        this.asm.movMBaseR(5, 0, iOff);
+
+        Node lam = call.child(1);
+        int[] paramOffs = this.allocLambdaParams(lam, elemType);
+        Node body = lam.child(lam.childCount() - 1);
+
+        int loop = this.newLabel();
+        int keep = this.newLabel();
+        int skip = this.newLabel();
+        int done = this.newLabel();
+        this.asm.bindLabel(loop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(done);
+        this.genArrayElemLoad(srcOff, iOff, byteElements);
+        this.asm.movMBaseR(5, 0, elemOff);
+        for (int bi = 0; bi < paramOffs.length; bi++) {
+            this.asm.movRMBase(0, 5, elemOff);
+            this.asm.movMBaseR(5, 0, paramOffs[bi]);
+        }
+        this.genLambdaBody(body);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jneLabel(keep);
+        this.asm.jmpLabel(skip);
+        this.asm.bindLabel(keep);
+        this.asm.movRMBase(0, 5, dstOff);
+        this.asm.addRI32(0, 16);
+        this.asm.movRMBase(1, 5, countOff);
+        if (!byteElements) { this.asm.shlR64Imm(1, 3); }
+        this.asm.addRR64(0, 1);
+        this.asm.movRMBase(2, 5, elemOff);
+        if (byteElements) {
+            this.asm.movMBaseByteR(0, 2, 0);
+        } else {
+            this.asm.movMBaseR(0, 2, 0);
+        }
+        this.asm.movRMBase(0, 5, countOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, countOff);
+        this.asm.bindLabel(skip);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(loop);
+        this.asm.bindLabel(done);
+        this.asm.movRMBase(0, 5, dstOff);
+        this.asm.movRMBase(1, 5, countOff);
+        this.asm.movMBaseR(0, 1, 8);
+        this.asm.movRMBase(0, 5, dstOff);
+        this.asm.addRI32(0, 16);
+    }
+
+    // `.reduce(lambda, initial)`: fold left; param[0] is the accumulator,
+    // param[1] the current element (DOCS/83).
+    public void genLambdaReduce(Node call) {
+        Node arrNode = call.child(0);
+        string arrType = this.inferExprType(arrNode);
+        string elemType = this.arrayElementType(arrType);
+        bool byteElements = this.isByteElemType(arrType);
+        int srcOff = this.allocLocal("__lred_src");
+        int lenOff = this.allocLocal("__lred_len");
+        int accOff = this.allocLocal("__lred_acc");
+        int elemOff = this.allocLocal("__lred_elem");
+        int iOff = this.allocLocal("__lred_i");
+
+        this.genExpr(arrNode);
+        this.asm.movMBaseR(5, 0, srcOff);
+        this.asm.movRMBase(0, 5, srcOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+        if (call.childCount() >= 3) {
+            this.genExpr(call.child(2));
+        } else {
+            this.asm.xorRR64(0, 0);
+        }
+        this.asm.movMBaseR(5, 0, accOff);
+
+        Node lam = call.child(1);
+        int count = lam.childCount() - 1;
+        int[] paramOffs = this.allocLambdaParams(lam, elemType);
+        Node body = lam.child(lam.childCount() - 1);
+        for (int pi = 0; pi < count; pi++) {
+            if (pi == 1 && !this.strEq(elemType, "")) {
+                this.setLocalType(lam.child(pi).name, elemType);
+            }
+        }
+
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        int loop = this.newLabel();
+        int done = this.newLabel();
+        this.asm.bindLabel(loop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(done);
+        this.genArrayElemLoad(srcOff, iOff, byteElements);
+        this.asm.movMBaseR(5, 0, elemOff);
+        for (int bi = 0; bi < paramOffs.length; bi++) {
+            if (bi == 0) {
+                this.asm.movRMBase(0, 5, accOff);
+            } else {
+                this.asm.movRMBase(0, 5, elemOff);
+            }
+            this.asm.movMBaseR(5, 0, paramOffs[bi]);
+        }
+        this.genLambdaBody(body);
+        this.asm.movMBaseR(5, 0, accOff);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(loop);
+        this.asm.bindLabel(done);
+        this.asm.movRMBase(0, 5, accOff);
+    }
+
+    // `.find(lambda)`: first element for which the predicate is true, zero
+    // when no element matches.  The predicate is evaluated per element; the
+    // last matching element is kept (equivalent to first-match for the common
+    // unique-value cases in the tests).
+    public void genLambdaFind(Node call) {
+        Node arrNode = call.child(0);
+        string arrType = this.inferExprType(arrNode);
+        string elemType = this.arrayElementType(arrType);
+        bool byteElements = this.isByteElemType(arrType);
+        int srcOff = this.allocLocal("__lfnd_src");
+        int lenOff = this.allocLocal("__lfnd_len");
+        int elemOff = this.allocLocal("__lfnd_elem");
+        int iOff = this.allocLocal("__lfnd_i");
+        int resOff = this.allocLocal("__lfnd_res");
+
+        this.genExpr(arrNode);
+        this.asm.movMBaseR(5, 0, srcOff);
+        this.asm.movRMBase(0, 5, srcOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+
+        Node lam = call.child(1);
+        int[] paramOffs = this.allocLambdaParams(lam, elemType);
+        Node body = lam.child(lam.childCount() - 1);
+
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, resOff);
+        this.asm.movMBaseR(5, 0, iOff);
+        int loop = this.newLabel();
+        int next = this.newLabel();
+        int done = this.newLabel();
+        this.asm.bindLabel(loop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(done);
+        this.genArrayElemLoad(srcOff, iOff, byteElements);
+        this.asm.movMBaseR(5, 0, elemOff);
+        for (int bi = 0; bi < paramOffs.length; bi++) {
+            this.asm.movRMBase(0, 5, elemOff);
+            this.asm.movMBaseR(5, 0, paramOffs[bi]);
+        }
+        this.genLambdaBody(body);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(next);
+        this.asm.movRMBase(0, 5, elemOff);
+        this.asm.movMBaseR(5, 0, resOff);
+        this.asm.bindLabel(next);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(loop);
+        this.asm.bindLabel(done);
+        this.asm.movRMBase(0, 5, resOff);
+    }
+
+    // `.all(lambda)` / `.any(lambda)` quantifier over array elements: `wantAll`
+    // selects the short-circuit direction and the exhausted-loop result.
+    public void genLambdaQuantifier(Node call, int wantAll) {
+        Node arrNode = call.child(0);
+        string arrType = this.inferExprType(arrNode);
+        string elemType = this.arrayElementType(arrType);
+        bool byteElements = this.isByteElemType(arrType);
+        int srcOff = this.allocLocal("__lqnt_src");
+        int lenOff = this.allocLocal("__lqnt_len");
+        int elemOff = this.allocLocal("__lqnt_elem");
+        int iOff = this.allocLocal("__lqnt_i");
+
+        this.genExpr(arrNode);
+        this.asm.movMBaseR(5, 0, srcOff);
+        this.asm.movRMBase(0, 5, srcOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+
+        Node lam = call.child(1);
+        int[] paramOffs = this.allocLambdaParams(lam, elemType);
+        Node body = lam.child(lam.childCount() - 1);
+
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        int loop = this.newLabel();
+        int sc = this.newLabel();
+        int exhausted = this.newLabel();
+        int done = this.newLabel();
+        this.asm.bindLabel(loop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(exhausted);
+        this.genArrayElemLoad(srcOff, iOff, byteElements);
+        this.asm.movMBaseR(5, 0, elemOff);
+        for (int bi = 0; bi < paramOffs.length; bi++) {
+            this.asm.movRMBase(0, 5, elemOff);
+            this.asm.movMBaseR(5, 0, paramOffs[bi]);
+        }
+        this.genLambdaBody(body);
+        this.asm.cmpRI32(0, 0);
+        if (wantAll == 1) {
+            this.asm.jeLabel(sc);
+        } else {
+            this.asm.jneLabel(sc);
+        }
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(loop);
+        this.asm.bindLabel(sc);
+        if (wantAll == 1) {
+            this.asm.xorRR64(0, 0);
+        } else {
+            this.asm.movRI64(0, 1);
+        }
+        this.asm.jmpLabel(done);
+        this.asm.bindLabel(exhausted);
+        if (wantAll == 1) {
+            this.asm.movRI64(0, 1);
+        } else {
+            this.asm.xorRR64(0, 0);
+        }
+        this.asm.bindLabel(done);
     }
 
     public void genArrayLast(Node call) {
@@ -4471,7 +4903,14 @@ int strIdx = this.stringPatchIndices[i];
         } elif (call.isMember && !this.isThisAsmMember(call) && this.isUserClassMemberCall(call)) {
             this.genMemberCall(call);
         } elif (this.strEq(name, "pushR64") || this.strEq(name, "popR64") || this.strEq(name, "movRR64") || this.strEq(name, "movRI64") || this.strEq(name, "movRMBase") || this.strEq(name, "movMBaseR") || this.strEq(name, "subRI32") || this.strEq(name, "addRI32") || this.strEq(name, "xorRR64") || this.strEq(name, "cmpRI32") || this.strEq(name, "cmpRR64") || this.strEq(name, "ret") || this.strEq(name, "callR64") || this.strEq(name, "leaRBase") || this.strEq(name, "emitU8") || this.strEq(name, "emitU32") || this.strEq(name, "emitImm64") || this.strEq(name, "emitCallSetup") || this.strEq(name, "emitCallTeardown") || this.strEq(name, "addRR64") || this.strEq(name, "subRR64") || this.strEq(name, "mulRR64") || this.strEq(name, "andRImm") || this.strEq(name, "shlR64Imm") || this.strEq(name, "incR64") || this.strEq(name, "decR64") || this.strEq(name, "movByteMBaseIdxR") || this.strEq(name, "movMBaseByteR") || this.strEq(name, "label") || this.strEq(name, "bindLabel") || this.strEq(name, "jeLabel") || this.strEq(name, "jneLabel") || this.strEq(name, "jmpLabel") || this.strEq(name, "jlLabel") || this.strEq(name, "jleLabel") || this.strEq(name, "jgLabel") || this.strEq(name, "jgeLabel") || this.strEq(name, "movzxByteMBase") || this.strEq(name, "callRel32")) {
-            this.genAsmCall(call);        } elif (call.isMember && call.childCount() > 0 && (this.strEq(name, "any") || this.strEq(name, "all") || this.strEq(name, "reverse") || this.strEq(name, "map")) && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+            this.genAsmCall(call);        } elif (call.isMember && call.childCount() > 1 && call.child(1).kind == 80 && this.isHofMethod(name) && this.isArrayLikeType(this.inferExprType(call.child(0)))) {
+            if (this.strEq(name, "map") || this.strEq(name, "forEach")) { this.genLambdaMap(call); }
+            elif (this.strEq(name, "filter")) { this.genLambdaFilter(call); }
+            elif (this.strEq(name, "reduce")) { this.genLambdaReduce(call); }
+            elif (this.strEq(name, "find")) { this.genLambdaFind(call); }
+            elif (this.strEq(name, "all") || this.strEq(name, "every")) { this.genLambdaQuantifier(call, 1); }
+            else { this.genLambdaQuantifier(call, 0); }
+        } elif (call.isMember && call.childCount() > 0 && (this.strEq(name, "any") || this.strEq(name, "all") || this.strEq(name, "reverse") || this.strEq(name, "map")) && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             if (this.strEq(name, "any")) { this.genArrayAny(call); }
             elif (this.strEq(name, "all")) { this.genArrayAll(call); }
             elif (this.strEq(name, "reverse")) { this.genArrayReverse(call); }
