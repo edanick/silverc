@@ -3852,6 +3852,14 @@ int strIdx = this.stringPatchIndices[i];
             this.genValueFactoryCall(call);
         } elif (call.isMember && call.childCount() > 1 && this.strEq(call.name, "contains") && this.isDictType(this.inferReceiverType(call.child(0)))) {
             this.genDictContains(call);
+        } elif (call.isMember && call.childCount() > 0 && this.strEq(call.name, "count") && this.isDictType(this.inferReceiverType(call.child(0)))) {
+            this.genDictCount(call);
+        } elif (call.isMember && call.childCount() > 0 && this.strEq(call.name, "remove") && this.isDictType(this.inferReceiverType(call.child(0)))) {
+            this.genDictRemove(call);
+        } elif (call.isMember && call.childCount() > 0 && this.strEq(call.name, "keys") && this.isDictType(this.inferReceiverType(call.child(0)))) {
+            this.genDictKeys(call);
+        } elif (call.isMember && call.childCount() > 0 && this.strEq(call.name, "values") && this.isDictType(this.inferReceiverType(call.child(0)))) {
+            this.genDictValues(call);
         } elif (call.isMember && this.isThisAsmMember(call)) {
             // MiniAsm is a runtime object owned by MiniCg. Every this.asm
             // operation must remain a receiver-aware method call in the
@@ -3961,6 +3969,220 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.bindLabel(nL);
         this.asm.xorRR64(0, 0);
         this.asm.bindLabel(eL);
+    }
+
+    public void genDictCount(Node call) {
+        // Dict layout: [capacity, length, key/value slots...]. The data
+        // pointer returned by the literal is allocation base + 16, so the
+        // length lives at [data - 8].
+        this.genExpr(call.child(0));
+        this.asm.movRMBase(0, 0, -8);
+    }
+
+    public void genDictRemove(Node call) {
+        // Remove the first slot whose key matches, shifting later slots left
+        // by one entry (16 bytes) and decrementing the length.
+        Node dictNode = call.child(0);
+        Node keyNode = call.child(1);
+        this.genExpr(dictNode);
+        int dBase = this.allocLocal("__dr_base");
+        this.asm.movMBaseR(5, 0, dBase);
+        this.genExpr(keyNode);
+        int dKey = this.allocLocal("__dr_key");
+        this.asm.movMBaseR(5, 0, dKey);
+        int dI = this.allocLocal("__dr_i");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, dI);
+        int lL = this.newLabel();
+        int fL = this.newLabel();
+        int eL = this.newLabel();
+        int iter = this.newLabel();
+        this.asm.bindLabel(lL);
+        this.asm.movRMBase(0, 5, dI);
+        this.asm.movRMBase(1, 5, dBase);
+        this.asm.movRMBase(1, 1, -8);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(eL);
+        this.asm.movRMBase(0, 5, dI);
+        this.asm.shlR64Imm(0, 1);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.movRR64(11, 0);
+        this.asm.movRMBase(0, 5, dBase);
+        this.asm.addRR64(0, 11);
+        this.asm.movRMBase(1, 0, 0);
+        this.asm.cmpRI32(1, 0);
+        this.asm.jeLabel(iter);
+        this.asm.movRR64(1, 1);
+        this.asm.movRMBase(2, 5, dKey);
+        this.addImportPatch("ucrtbase.dll", "strcmp");
+        int sCmpDr = 0xDEADBEEFCAFEBADE;
+        this.asm.emitImm64(0, sCmpDr);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(fL);
+        this.asm.bindLabel(iter);
+        this.asm.movRMBase(0, 5, dI);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, dI);
+        this.asm.jmpLabel(lL);
+        // Found: shift slots [i+1 .. len) left by one 16-byte entry.
+        this.asm.bindLabel(fL);
+        int shift = this.newLabel();
+        int shiftDone = this.newLabel();
+        this.asm.bindLabel(shift);
+        this.asm.movRMBase(0, 5, dI);
+        this.asm.addRI32(0, 1);
+        this.asm.movRMBase(1, 5, dBase);
+        this.asm.movRMBase(1, 1, -8);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(shiftDone);
+        // dst slot = dBase + i*16
+        this.asm.movRMBase(0, 5, dI);
+        this.asm.shlR64Imm(0, 1);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.movRR64(11, 0);
+        this.asm.movRMBase(1, 5, dBase);
+        this.asm.addRR64(1, 11);
+        // src slot = dBase + (i+1)*16
+        this.asm.movRMBase(0, 5, dI);
+        this.asm.addRI32(0, 1);
+        this.asm.shlR64Imm(0, 1);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.movRR64(12, 0);
+        this.asm.movRMBase(0, 5, dBase);
+        this.asm.addRR64(0, 12);
+        // key: [dst+0] = [src+0]; value: [dst+8] = [src+8]
+        this.asm.movRMBase(2, 0, 0);
+        this.asm.movMBaseR(1, 2, 0);
+        this.asm.movRMBase(2, 0, 8);
+        this.asm.movMBaseR(1, 2, 8);
+        this.asm.movRMBase(0, 5, dI);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, dI);
+        this.asm.jmpLabel(shift);
+        this.asm.bindLabel(shiftDone);
+        // length--
+        this.asm.movRMBase(0, 5, dBase);
+        this.asm.movRMBase(1, 0, -8);
+        this.asm.subRI32(1, 1);
+        this.asm.movMBaseR(0, 1, -8);
+        this.asm.movRI64(0, 1);
+        this.asm.bindLabel(eL);
+    }
+
+    public void genDictKeys(Node call) {
+        // Allocate a string array holding every key, in insertion order.
+        Node dictNode = call.child(0);
+        this.genExpr(dictNode);
+        int dBase = this.allocLocal("__dk_base");
+        this.asm.movMBaseR(5, 0, dBase);
+        this.asm.movRMBase(0, 5, dBase);
+        this.asm.movRMBase(0, 0, -8);
+        int dLen = this.allocLocal("__dk_len");
+        this.asm.movMBaseR(5, 0, dLen);
+        int capacity = 8;
+        int allocSize = (capacity + 2) * 8;
+        this.asm.emitImm64(1, allocSize);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        int sDk = 0xDEADBEEFCAFEBAB0;
+        this.asm.emitImm64(0, sDk);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int outOff = this.allocLocal("__dk_out");
+        this.asm.movMBaseR(5, 0, outOff);
+        this.asm.movRMBase(0, 5, outOff);
+        this.asm.movRMBase(1, 5, dLen);
+        this.asm.movMBaseR(0, 1, 8);
+        int dI = this.allocLocal("__dk_i");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, dI);
+        int lL = this.newLabel();
+        int eL = this.newLabel();
+        this.asm.bindLabel(lL);
+        this.asm.movRMBase(0, 5, dI);
+        this.asm.movRMBase(1, 5, dLen);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(eL);
+        this.asm.movRMBase(0, 5, dBase);
+        this.asm.movRMBase(1, 5, dI);
+        this.asm.shlR64Imm(1, 1);
+        this.asm.shlR64Imm(1, 3);
+        this.asm.addRR64(0, 1);
+        this.asm.movRMBase(1, 0, 0);
+        this.asm.movRMBase(0, 5, outOff);
+        this.asm.addRI32(0, 16);
+        this.asm.movRMBase(2, 5, dI);
+        this.asm.shlR64Imm(2, 3);
+        this.asm.addRR64(0, 2);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(0, 5, dI);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, dI);
+        this.asm.jmpLabel(lL);
+        this.asm.bindLabel(eL);
+        this.asm.movRMBase(0, 5, outOff);
+        this.asm.addRI32(0, 16);
+    }
+
+    public void genDictValues(Node call) {
+        // Allocate an int array holding every value, in insertion order.
+        Node dictNode = call.child(0);
+        this.genExpr(dictNode);
+        int dBase = this.allocLocal("__dv_base");
+        this.asm.movMBaseR(5, 0, dBase);
+        this.asm.movRMBase(0, 5, dBase);
+        this.asm.movRMBase(0, 0, -8);
+        int dLen = this.allocLocal("__dv_len");
+        this.asm.movMBaseR(5, 0, dLen);
+        int capacity = 8;
+        int allocSize = (capacity + 2) * 8;
+        this.asm.emitImm64(1, allocSize);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        int sDv = 0xDEADBEEFCAFEBAB0;
+        this.asm.emitImm64(0, sDv);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int outOff = this.allocLocal("__dv_out");
+        this.asm.movMBaseR(5, 0, outOff);
+        this.asm.movRMBase(0, 5, outOff);
+        this.asm.movRMBase(1, 5, dLen);
+        this.asm.movMBaseR(0, 1, 8);
+        int dI = this.allocLocal("__dv_i");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, dI);
+        int lL = this.newLabel();
+        int eL = this.newLabel();
+        this.asm.bindLabel(lL);
+        this.asm.movRMBase(0, 5, dI);
+        this.asm.movRMBase(1, 5, dLen);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(eL);
+        this.asm.movRMBase(0, 5, dBase);
+        this.asm.movRMBase(1, 5, dI);
+        this.asm.shlR64Imm(1, 1);
+        this.asm.shlR64Imm(1, 3);
+        this.asm.addRR64(0, 1);
+        this.asm.movRMBase(1, 0, 8);
+        this.asm.movRMBase(0, 5, outOff);
+        this.asm.addRI32(0, 16);
+        this.asm.movRMBase(2, 5, dI);
+        this.asm.shlR64Imm(2, 3);
+        this.asm.addRR64(0, 2);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(0, 5, dI);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, dI);
+        this.asm.jmpLabel(lL);
+        this.asm.bindLabel(eL);
+        this.asm.movRMBase(0, 5, outOff);
+        this.asm.addRI32(0, 16);
     }
 
     public void genDictIndexSet(Node bin) {
