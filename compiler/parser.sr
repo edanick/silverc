@@ -220,7 +220,20 @@ class Parser {
                 if (item.kind == 100 && this.strEq(item.name, "main")) {
                     mainSeen = true;
                 }
-                if (item.kind == 61 || item.kind == 50 || item.kind == 73 || item.kind == 16 || item.kind == 53 || item.kind == 54 || item.kind == 55 || item.kind == 59 || item.kind == 68) {
+                if (item.kind == 112) {
+                    // Inline module block: hoist its items to top level.
+                    for (int mi = 0; mi < item.childCount(); mi++) {
+                        Node inner = item.child(mi);
+                        if (inner.kind == 100 && this.strEq(inner.name, "main")) {
+                            mainSeen = true;
+                        }
+                        if (inner.kind == 61 || inner.kind == 50 || inner.kind == 73 || inner.kind == 16 || inner.kind == 53 || inner.kind == 54 || inner.kind == 55 || inner.kind == 59 || inner.kind == 68) {
+                            mainBody.children.add(inner);
+                        } else {
+                            items.add(inner);
+                        }
+                    }
+                } elif (item.kind == 61 || item.kind == 50 || item.kind == 73 || item.kind == 16 || item.kind == 53 || item.kind == 54 || item.kind == 55 || item.kind == 59 || item.kind == 68) {
                     mainBody.children.add(item);
                 } else {
                     items.add(item);
@@ -252,7 +265,38 @@ class Parser {
         }
         return items;
     }    private Node? parseItem() {
-        if (this.check(35)) { this.advance(); if (this.check(59)) { this.advance(); } this.advance(); this.expect(106); return null; }
+        if (this.check(35)) {
+            this.advance();
+            if (this.check(59)) { this.advance(); }
+            if (this.check(102)) { return null; }
+            string modName = this.advance().text;
+            if (this.check(102)) {
+                // Inline module block `mod name { ... }`: lift the inner items
+                // to top level so `name.f()` qualified calls resolve to global
+                // functions.  Returns a kind-112 container that parseProgram
+                // flattens (mirrors silverc-rs flatten_inline_modules).
+                this.advance();
+                Node modNode = new Node();
+                modNode.kind = 112;
+                modNode.name = modName;
+                while (!this.check(103) && !this.check(0)) {
+                    Node? inner = this.parseItem();
+                    if (inner != null) {
+                        if (inner.kind == 112) {
+                            for (int mi = 0; mi < inner.childCount(); mi++) {
+                                modNode.children.add(inner.child(mi));
+                            }
+                        } else {
+                            modNode.children.add(inner);
+                        }
+                    }
+                }
+                this.expect(103);
+                return modNode;
+            }
+            this.expect(106);
+            return null;
+        }
 		if (this.check(36)) { return this.parseImport(); }
         if (this.check(165)) { return this.parseTypeAlias(); }
         if (this.check(40)) { return this.parseConst(); }
