@@ -319,10 +319,16 @@ class Parser {
                 typePos = this.pos + 1;
                 t0 = this.tokens[typePos];
             }
-            bool typeStart = t0.kind == 17 || t0.kind == 18 || t0.kind == 19 || t0.kind == 20 || t0.kind == 22 || t0.kind == 23 || t0.kind == 25 || t0.kind == 26 || t0.kind == 27 || t0.kind == 28 || t0.kind == 7 || t0.kind == 150 || t0.kind == 151 || t0.kind == 152 || t0.kind == 153 || t0.kind == 154 || t0.kind == 155;
+            bool typeStart = t0.kind == 17 || t0.kind == 18 || t0.kind == 19 || t0.kind == 20 || t0.kind == 22 || t0.kind == 23 || t0.kind == 25 || t0.kind == 26 || t0.kind == 27 || t0.kind == 28 || t0.kind == 7 || t0.kind == 120 || t0.kind == 150 || t0.kind == 151 || t0.kind == 152 || t0.kind == 153 || t0.kind == 154 || t0.kind == 155;
             if (typeStart) {
                 int scan = typePos + 1;
-                if (this.tokens[scan].kind == 120) {
+                if (this.tokens[typePos].kind == 120) {
+                    // Union/result type `<A | B>` (DOCS/29) starting at the
+                    // `<`: skip the whole `<...>` group before looking for
+                    // the function name.
+                    while (scan < this.tokens.length && this.tokens[scan].kind != 121) { scan = scan + 1; }
+                    scan = scan + 1;
+                } elif (this.tokens[scan].kind == 120) {
                     scan = scan + 1;
                     while (scan < this.tokens.length && this.tokens[scan].kind != 121) { scan = scan + 1; }
                     scan = scan + 1;
@@ -636,6 +642,12 @@ class Parser {
                 retType = retType + this.advance().text;
             }
             if (this.check(121)) { retType = retType + ">"; this.advance(); }
+        } elif (this.strEq(retType, "<")) {
+            // Union/result return type `<A | B>` (DOCS/29).
+            while (!this.check(121) && !this.check(106) && !this.check(103)) {
+                retType = retType + this.advance().text;
+            }
+            if (this.check(121)) { retType = retType + ">"; this.advance(); }
         }
         if (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } retType = retType + "[]"; }
         if (this.check(123)) { this.advance(); retType = retType + "?"; }
@@ -757,6 +769,10 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             if (next.kind == 120) {
                 return this.parseVarDecl();
             }
+        }
+        if (this.check(120)) {
+            // Union/result type `<A | B>` (DOCS/29) in declaration position.
+            return this.parseVarDecl();
         }
         if (this.check(15)) {
             Node n = new Node(); n.kind = 51;
@@ -923,6 +939,13 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             }
             this.expect(121);
             if (isTupleType) { typeName = "tuple"; }
+        } elif (this.strEq(typeName, "<")) {
+            // Union/result type `<A | B>` (DOCS/29) or nullable `<T>`: collect
+            // the member tokens into the type hint string.
+            while (!this.check(121) && !this.check(106) && !this.check(103)) {
+                typeName = typeName + this.advance().text;
+            }
+            if (this.check(121)) { typeName = typeName + ">"; this.advance(); }
         }
         while (this.check(104)) {
             this.advance();
