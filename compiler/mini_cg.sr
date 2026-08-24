@@ -2928,6 +2928,11 @@ int strIdx = this.stringPatchIndices[i];
                         return recvType;
                     }
                 }
+                if (this.strEq(cname, "join")) {
+                    if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
+                        return "string";
+                    }
+                }
                 if ((this.strEq(cname, "pad") || this.strEq(cname, "padLeft") || this.strEq(cname, "padRight") || this.strEq(cname, "slugify")) && this.strEq(recvType, "string")) {
 
                     return "string";
@@ -3891,6 +3896,159 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.addRI32(0, 16);
     }
 
+    public void genArrayJoin(Node call) {
+        // arr.join(sep): concatenate the string elements with sep between
+        // them and return the new heap string (DOCS/88, silverc-rs "Array
+        // .sort() and .join(sep)").  call.child(0) = array, child(1) = sep.
+        this.genExpr(call.child(1));
+        int sepOff = this.allocLocal("__join_sep");
+        this.asm.movMBaseR(5, 0, sepOff);
+        this.genExpr(call.child(0));
+        int arrOff = this.allocLocal("__join_arr");
+        this.asm.movMBaseR(5, 0, arrOff);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(0, 0, -8);
+        int lenOff = this.allocLocal("__join_len");
+        this.asm.movMBaseR(5, 0, lenOff);
+        // Empty array returns the empty string.
+        int nonEmpty = this.newLabel();
+        int emptyDone = this.newLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jgLabel(nonEmpty);
+        this.emitLlmaiStringLiteral("");
+        this.asm.jmpLabel(emptyDone);
+        this.asm.bindLabel(nonEmpty);
+        // dlen = strlen(sep)
+        this.asm.movRMBase(1, 5, sepOff);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int dlenOff = this.allocLocal("__join_dlen");
+        this.asm.movMBaseR(5, 0, dlenOff);
+        // total = sum(strlen(arr[i])); i from 0 to len.
+        int iOff = this.allocLocal("__join_i");
+        int totalOff = this.allocLocal("__join_total");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, totalOff);
+        int sumLoop = this.newLabel();
+        int sumEnd = this.newLabel();
+        this.asm.bindLabel(sumLoop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(sumEnd);
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.movRMBase(2, 5, iOff);
+        this.asm.shlR64Imm(2, 3);
+        this.asm.addRR64(1, 2);
+        this.asm.movRMBase(1, 1, 0);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(1, 5, totalOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(5, 0, totalOff);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(sumLoop);
+        this.asm.bindLabel(sumEnd);
+        // total += dlen * (len - 1)
+        this.asm.movRMBase(0, 5, lenOff);
+        this.asm.subRI32(0, 1);
+        this.asm.movRMBase(1, 5, dlenOff);
+        this.asm.mulRR64(1);
+        this.asm.movRMBase(1, 5, totalOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(5, 0, totalOff);
+        // buf = malloc(total + 1)
+        this.asm.movRMBase(1, 5, totalOff);
+        this.asm.addRI32(1, 1);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int bufOff = this.allocLocal("__join_buf");
+        this.asm.movMBaseR(5, 0, bufOff);
+        int posOff = this.allocLocal("__join_pos");
+        this.asm.movMBaseR(5, 0, posOff);
+        // Fill: for each element, copy sep (except first), then the element.
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        int fillLoop = this.newLabel();
+        int fillEnd = this.newLabel();
+        this.asm.bindLabel(fillLoop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(fillEnd);
+        int noSep = this.newLabel();
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(noSep);
+        // strcpy(pos, sep); pos += dlen
+        this.asm.movRMBase(1, 5, posOff);
+        this.asm.movRMBase(2, 5, sepOff);
+        this.addImportPatch("ucrtbase.dll", "strcpy");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD4);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(0, 5, posOff);
+        this.asm.movRMBase(1, 5, dlenOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(5, 0, posOff);
+        this.asm.bindLabel(noSep);
+        // elen = strlen(arr[i]); strcpy(pos, arr[i]); pos += elen
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.movRMBase(2, 5, iOff);
+        this.asm.shlR64Imm(2, 3);
+        this.asm.addRR64(1, 2);
+        this.asm.movRMBase(1, 1, 0);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int elenOff = this.allocLocal("__join_elen");
+        this.asm.movMBaseR(5, 0, elenOff);
+        this.asm.movRMBase(1, 5, posOff);
+        this.asm.movRMBase(2, 5, arrOff);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.addRR64(2, 0);
+        this.asm.movRMBase(2, 2, 0);
+        this.addImportPatch("ucrtbase.dll", "strcpy");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD4);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(0, 5, posOff);
+        this.asm.movRMBase(1, 5, elenOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(5, 0, posOff);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(fillLoop);
+        this.asm.bindLabel(fillEnd);
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.bindLabel(emptyDone);
+    }
+
     public void genArrayAdd(Node call) {
         Node arrNode = call.child(0);
         Node valNode = call.child(1);
@@ -4328,6 +4486,8 @@ int strIdx = this.stringPatchIndices[i];
             this.genArraySort(call);
         } elif (call.isMember && call.childCount() > 0 && this.strEq(name, "unique") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArrayUnique(call);
+        } elif (call.isMember && call.childCount() > 1 && this.strEq(name, "join") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+            this.genArrayJoin(call);
 } elif ((call.isMember && this.strEq(name, "add") && call.childCount() > 0) || (call.isMember && this.strEq(name, "push") && call.childCount() > 0) || (call.isMember && this.strEq(name, "append") && call.childCount() > 0)) {
               string addRecvType = this.inferExprType(call.child(0));
               if (addRecvType.length >= 2 && addRecvType[addRecvType.length - 2] == '[' && addRecvType[addRecvType.length - 1] == ']') {
