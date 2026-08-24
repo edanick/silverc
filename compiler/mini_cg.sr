@@ -25,6 +25,7 @@ class MiniCg {
     public prop int[] funcParamCounts;
     public prop int[] funcParamHasDefaults;
     public prop Node[] funcParamDefaults;
+    public prop int[] funcHasVariadic;
     public prop string[] funcParamTypes;
     public prop int[] localOffsets;
     public prop string[] localNames;
@@ -113,6 +114,7 @@ class MiniCg {
         this.funcParamCounts = [];
         this.funcParamHasDefaults = [];
         this.funcParamDefaults = [];
+        this.funcHasVariadic = [];
         this.funcParamTypes = [];
         this.localOffsets = [];
         this.localNames = [];
@@ -987,12 +989,14 @@ int strIdx = this.stringPatchIndices[i];
                 this.funcOffsets.add(-1);
                 int paramStart = this.funcParamDefaults.length;
                 int paramCount = 0;
+                bool hasVariadic = false;
                 if (pi.childCount() > 0) {
                     Node params = pi.child(0);
                     paramCount = params.childCount();
                     for (int p = 0; p < params.childCount(); p++) {
                         Node param = params.child(p);
                         this.funcParamTypes.add(param.typeHint);
+                        if (param.isVariadic) { hasVariadic = true; }
                         if (param.childCount() > 0) {
                             this.funcParamHasDefaults.add(1);
                             this.funcParamDefaults.add(param.child(0));
@@ -1005,6 +1009,7 @@ int strIdx = this.stringPatchIndices[i];
                 }
                 this.funcParamStarts.add(paramStart);
                 this.funcParamCounts.add(paramCount);
+                this.funcHasVariadic.add(hasVariadic ? 1 : 0);
             }
         }
         for (int i = 0; i < program.length; i++) {
@@ -1019,12 +1024,14 @@ int strIdx = this.stringPatchIndices[i];
                         this.funcOffsets.add(-1);
                         int paramStart = this.funcParamDefaults.length;
                         int paramCount = 0;
+                        bool hasVariadic = false;
                         if (member.childCount() > 0) {
                             Node params = member.child(0);
                             paramCount = params.childCount();
                             for (int p = 0; p < params.childCount(); p++) {
                                 Node param = params.child(p);
                                 this.funcParamTypes.add(param.typeHint);
+                                if (param.isVariadic) { hasVariadic = true; }
                                 if (param.childCount() > 0) {
                                     this.funcParamHasDefaults.add(1);
                                     this.funcParamDefaults.add(param.child(0));
@@ -1037,6 +1044,7 @@ int strIdx = this.stringPatchIndices[i];
                         }
                         this.funcParamStarts.add(paramStart);
                         this.funcParamCounts.add(paramCount);
+                        this.funcHasVariadic.add(hasVariadic ? 1 : 0);
                     }
                 }
             }
@@ -5216,10 +5224,29 @@ public void genNewCall(Node call) {
             int targetOff = this.funcOffsets[funcIdx];
             int[] argRegs = [1, 2, 8, 9];
             int explicitArgs = call.childCount() - argStart;
+            if (explicitArgs < 0) { explicitArgs = 0; }
+            Node packedArg = null;
+            int packIndex = -1;
             int totalArgs = explicitArgs;
             if (funcIdx < this.funcParamCounts.length) {
                 int paramCount = this.funcParamCounts[funcIdx];
                 int paramStart = this.funcParamStarts[funcIdx];
+                bool variadicFn = funcIdx < this.funcHasVariadic.length && this.funcHasVariadic[funcIdx] == 1;
+                int fixedCount = paramCount - 1;
+                if (fixedCount < 0) { fixedCount = 0; }
+                if (variadicFn && explicitArgs >= fixedCount) {
+                    // Variadic tail: pack the trailing call-site arguments
+                    // into a single array literal (DOCS/112).  Zero variadic
+                    // arguments still pass an empty array.
+                    Node arr = new Node(); arr.kind = 19;
+                    for (int ai = fixedCount; ai < explicitArgs; ai++) {
+                        arr.children.add(call.child(ai + argStart));
+                    }
+                    packedArg = arr;
+                    packIndex = fixedCount;
+                    explicitArgs = paramCount;
+                    totalArgs = paramCount;
+                }
                 while (totalArgs < paramCount && totalArgs + paramStart < this.funcParamHasDefaults.length && this.funcParamHasDefaults[totalArgs + paramStart] == 1) {
                     totalArgs = totalArgs + 1;
                 }
@@ -5247,7 +5274,11 @@ public void genNewCall(Node call) {
             // (rcx/rdx/r8/r9) already holding earlier arguments.
             for (int i = 0; i < totalArgs; i++) {
                 if (i < explicitArgs) {
-                    this.genExpr(call.child(i + argStart));
+                    if (packedArg != null && i == packIndex) {
+                        this.genExpr(packedArg);
+                    } else {
+                        this.genExpr(call.child(i + argStart));
+                    }
                 } elif (funcIdx < this.funcParamStarts.length && this.funcParamStarts[funcIdx] + i < this.funcParamDefaults.length) {
                     this.genExpr(this.funcParamDefaults[this.funcParamStarts[funcIdx] + i]);
                 } else {
@@ -6851,9 +6882,27 @@ public void genNewCall(Node call) {
         int explicitArgs = call.childCount() - 1;
         if (explicitArgs < 0) { explicitArgs = 0; }
         int totalUserArgs = explicitArgs;
+        Node packedArg = null;
+        int packIndex = -1;
         if (funcIdx >= 0 && funcIdx < this.funcParamCounts.length) {
             int paramCount = this.funcParamCounts[funcIdx];
             int paramStart = this.funcParamStarts[funcIdx];
+            bool variadicFn = funcIdx < this.funcHasVariadic.length && this.funcHasVariadic[funcIdx] == 1;
+            int fixedCount = paramCount - 1;
+            if (fixedCount < 0) { fixedCount = 0; }
+            if (variadicFn && explicitArgs >= fixedCount) {
+                // Variadic tail: pack the trailing call-site arguments into
+                // a single array literal (DOCS/112).  child(1..) are the
+                // declared arguments, so child(1) is the first one.
+                Node arr = new Node(); arr.kind = 19;
+                for (int ai = fixedCount; ai < explicitArgs; ai++) {
+                    arr.children.add(call.child(ai + 1));
+                }
+                packedArg = arr;
+                packIndex = fixedCount + 1;
+                explicitArgs = paramCount;
+                totalUserArgs = paramCount;
+            }
             while (totalUserArgs < paramCount && totalUserArgs + paramStart < this.funcParamHasDefaults.length && this.funcParamHasDefaults[totalUserArgs + paramStart] == 1) {
                 totalUserArgs = totalUserArgs + 1;
             }
@@ -6872,7 +6921,11 @@ public void genNewCall(Node call) {
                 this.genExpr(call.child(0));
 
             } elif (i <= explicitArgs) {
-                this.genExpr(call.child(i));
+                if (packedArg != null && i == packIndex) {
+                    this.genExpr(packedArg);
+                } else {
+                    this.genExpr(call.child(i));
+                }
             } elif (funcIdx >= 0 && funcIdx < this.funcParamStarts.length) {
                 int defaultIndex = this.funcParamStarts[funcIdx] + i - 1;
                 if (defaultIndex < this.funcParamDefaults.length) {
