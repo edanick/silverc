@@ -487,6 +487,37 @@ class Parser {
             }
             this.expect(101);
             ctor.children.add(params);
+            // `construct(args) : base(parentArgs) { ... }` chains the parent
+            // constructor.  Desugar the `: base(...)` clause into an injected
+            // `super(...)` call at the top of the body, reusing the existing
+            // super() codegen.
+            if (this.check(109)) {
+                this.advance();
+                if (this.check(7) && this.strEq(this.peek().text, "base")) {
+                    this.advance();
+                    this.expect(100);
+                    Node superCall = new Node();
+                    superCall.kind = 10;
+                    superCall.name = "super";
+                    while (!this.check(101) && !this.check(0)) {
+                        superCall.children.add(this.parseExpr(0));
+                        if (this.check(107)) { this.advance(); }
+                    }
+                    this.expect(101);
+                    Node origBody = this.parseBlock();
+                    Node newBody = new Node();
+                    newBody.kind = 16;
+                    Node superStmt = new Node();
+                    superStmt.kind = 61;
+                    superStmt.children.add(superCall);
+                    newBody.children.add(superStmt);
+                    for (int bi = 0; bi < origBody.childCount(); bi++) {
+                        newBody.children.add(origBody.child(bi));
+                    }
+                    ctor.children.add(newBody);
+                    return ctor;
+                }
+            }
             ctor.children.add(this.parseBlock());
             return ctor;
         }
