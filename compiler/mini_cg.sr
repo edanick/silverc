@@ -3195,6 +3195,37 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.bindLabel(done);
     }
 
+    public void genArrayPop(Node call) {
+        Node arrNode = call.child(0);
+        this.genExpr(arrNode);
+        int arrOff = this.allocLocal("__arr_pop_arr");
+        int lenOff = this.allocLocal("__arr_pop_len");
+        this.asm.movMBaseR(5, 0, arrOff);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+        int empty = this.newLabel();
+        int done = this.newLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jleLabel(empty);
+        this.asm.subRI32(0, 1);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(0, 1, 0);
+        this.asm.pushR64(0);
+        // Decrement the array's length in place at [base - 8].
+        this.asm.movRMBase(0, 5, lenOff);
+        this.asm.subRI32(0, 1);
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.movMBaseR(1, 0, -8);
+        this.asm.popR64(0);
+        this.asm.jmpLabel(done);
+        this.asm.bindLabel(empty);
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(done);
+    }
+
     public void genArrayUnique(Node call) {
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
@@ -3676,6 +3707,8 @@ int strIdx = this.stringPatchIndices[i];
             else { this.genArrayMap(call); }
         } elif (call.isMember && call.childCount() > 0 && this.strEq(name, "last") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArrayLast(call);
+        } elif (call.isMember && call.childCount() > 0 && (this.strEq(name, "pop") || this.strEq(name, "outlast")) && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+            this.genArrayPop(call);
         } elif (call.isMember && call.childCount() > 0 && this.strEq(name, "unique") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArrayUnique(call);
 } elif ((call.isMember && this.strEq(name, "add") && call.childCount() > 0) || (call.isMember && this.strEq(name, "push") && call.childCount() > 0) || (call.isMember && this.strEq(name, "append") && call.childCount() > 0)) {
