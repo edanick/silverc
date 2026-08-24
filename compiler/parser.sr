@@ -714,6 +714,9 @@ class Parser {
     }
 
     private Node parseStmt() {
+        if (this.check(7) && this.strEq(this.peek().text, "switch")) {
+            return this.parseSwitch();
+        }
         if ((this.check(18) || this.check(19) || this.check(20) || this.check(22) || this.check(23) || this.check(25) || this.check(26) || this.check(27)) && this.pos + 3 < this.tokens.length && this.tokens[this.pos + 1].kind == 7 && this.tokens[this.pos + 2].kind == 104) {
             return this.parseFixedVarDecl();
         }
@@ -976,6 +979,41 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         n.children.add(this.parseExpr(0));
         this.expect(101);
         n.children.add(this.parseBlockOrStmt());
+        return n;
+    }
+
+    // `switch (subject) { case v { body } ... else { body } }` (DOCS/108).
+    // `switch`/`case` lex as identifiers.  Node shape: child(0) = subject,
+    // then alternating (case value, case body) children; when the child count
+    // is even the final child is the else body.  Codegen tests each case
+    // against the subject with no fall-through.
+    private Node parseSwitch() {
+        Node n = new Node(); n.kind = 76;
+        this.advance();
+        this.expect(100);
+        n.children.add(this.parseExpr(0));
+        this.expect(101);
+        this.expect(102);
+        while (!this.check(103) && !this.check(0)) {
+            if (this.check(7) && this.strEq(this.peek().text, "case")) {
+                this.advance();
+                if (this.check(100)) {
+                    this.advance();
+                    n.children.add(this.parseExpr(0));
+                    this.expect(101);
+                } else {
+                    n.children.add(this.parseExpr(0));
+                }
+                n.children.add(this.parseBlock());
+            } elif (this.check(11) || (this.check(7) && this.strEq(this.peek().text, "default"))) {
+                this.advance();
+                n.children.add(this.parseBlock());
+            } else {
+                printline("Parse error at line " + this.peek().line.toString() + ", column " + this.peek().col.toString() + ": expected case or else in switch");
+                exit(1);
+            }
+        }
+        this.expect(103);
         return n;
     }
 

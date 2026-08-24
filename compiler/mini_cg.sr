@@ -1749,6 +1749,64 @@ int strIdx = this.stringPatchIndices[i];
             this.popLoopStart();
             this.popLoopEnd();
             this.popLoopContinue();
+        } elif (stmt.kind == 76) {
+            // switch (subject) { case v { body } ... else { body } } — each
+            // case tests subject == v and runs its block with no fall-through
+            // into the next case or the else body (DOCS/108).
+            int subjOff = this.allocLocal("__switch_subj");
+            this.genExpr(stmt.child(0));
+            this.asm.movMBaseR(5, 0, subjOff);
+            int endLbl = this.newLabel();
+            int total = stmt.childCount();
+            int numCases = (total - 1) / 2;
+            bool hasElse = (total % 2) == 0;
+            for (int ci = 0; ci < numCases; ci++) {
+                int bodyLbl = this.newLabel();
+                int nextLbl = this.newLabel();
+                Node value = stmt.child(1 + ci * 2);
+                if (value.kind == 2) {
+                    // String case: match when strcmp(subject, value) == 0.
+                    this.genExpr(value);
+                    this.asm.movRR64(2, 0);
+                    this.asm.movRMBase(1, 5, subjOff);
+                    this.addImportPatch("ucrtbase.dll", "strcmp");
+                    int sSc = 0xDEADBEEFCAFEBAC1;
+                    this.asm.emitImm64(0, sSc);
+                    this.asm.movRMBase(0, 0, 0);
+                    this.asm.emitCallSetup(0);
+                    this.asm.callR64(0);
+                    this.asm.emitCallTeardown();
+                    this.asm.cmpRI32(0, 0);
+                    this.asm.jeLabel(bodyLbl);
+                } else {
+                    this.asm.movRMBase(0, 5, subjOff);
+                    this.asm.pushR64(0);
+                    this.genExpr(value);
+                    this.asm.movRR64(1, 0);
+                    this.asm.popR64(0);
+                    this.asm.cmpRR64(0, 1);
+                    this.asm.jeLabel(bodyLbl);
+                }
+                this.asm.jmpLabel(nextLbl);
+                this.asm.bindLabel(bodyLbl);
+                Node body = stmt.child(2 + ci * 2);
+                if (body.kind == 16) {
+                    this.genBlock(body);
+                } else {
+                    this.genStmt(body);
+                }
+                this.asm.jmpLabel(endLbl);
+                this.asm.bindLabel(nextLbl);
+            }
+            if (hasElse) {
+                Node elseBody = stmt.child(total - 1);
+                if (elseBody.kind == 16) {
+                    this.genBlock(elseBody);
+                } else {
+                    this.genStmt(elseBody);
+                }
+            }
+            this.asm.bindLabel(endLbl);
         } elif (stmt.kind == 55) {
             // C-style for loop: child(0)=init, child(1)=cond, child(2)=update, child(3)=body
             if (stmt.childCount() > 0) {
