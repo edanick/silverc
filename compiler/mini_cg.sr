@@ -3226,6 +3226,65 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.bindLabel(done);
     }
 
+    public void genArrayIndexOf(Node call) {
+        Node arrNode = call.child(0);
+        string arrType = this.inferExprType(arrNode);
+        string elemType = this.arrayElementType(arrType);
+        bool stringElements = this.strEq(elemType, "string");
+        int arrOff = this.allocLocal("__index_arr");
+        int needleOff = this.allocLocal("__index_needle");
+        int lenOff = this.allocLocal("__index_len");
+        int iOff = this.allocLocal("__index_i");
+        this.genExpr(arrNode);
+        this.asm.movMBaseR(5, 0, arrOff);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+        this.genExpr(call.child(1));
+        this.asm.movMBaseR(5, 0, needleOff);
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        int loop = this.newLabel();
+        int hit = this.newLabel();
+        int miss = this.newLabel();
+        int done = this.newLabel();
+        this.asm.bindLabel(loop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(miss);
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(0, 1, 0);
+        if (stringElements) {
+            this.asm.movRR64(1, 0);
+            this.asm.movRMBase(2, 5, needleOff);
+            this.addImportPatch("ucrtbase.dll", "strcmp");
+            this.asm.emitImm64(0, 0xDEADBEEFCAFEBADF);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.cmpRI32(0, 0);
+        } else {
+            this.asm.movRMBase(1, 5, needleOff);
+            this.asm.cmpRR64(0, 1);
+        }
+        this.asm.jeLabel(hit);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(loop);
+        this.asm.bindLabel(hit);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.jmpLabel(done);
+        this.asm.bindLabel(miss);
+        this.asm.movRI64(0, -1);
+        this.asm.bindLabel(done);
+    }
+
     public void genArrayUnique(Node call) {
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
@@ -3709,6 +3768,8 @@ int strIdx = this.stringPatchIndices[i];
             this.genArrayLast(call);
         } elif (call.isMember && call.childCount() > 0 && (this.strEq(name, "pop") || this.strEq(name, "outlast")) && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArrayPop(call);
+        } elif (call.isMember && call.childCount() > 1 && (this.strEq(name, "indexOf") || this.strEq(name, "find")) && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+            this.genArrayIndexOf(call);
         } elif (call.isMember && call.childCount() > 0 && this.strEq(name, "unique") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArrayUnique(call);
 } elif ((call.isMember && this.strEq(name, "add") && call.childCount() > 0) || (call.isMember && this.strEq(name, "push") && call.childCount() > 0) || (call.isMember && this.strEq(name, "append") && call.childCount() > 0)) {
