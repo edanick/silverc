@@ -122,10 +122,41 @@ string collectModule(string name, string inputFile, string[] visited) {
         }
         cursor = semi + 1;
     }
-    return result + modSrc + "\\n";
+    return result + modSrc + "\n";
 }
 
-string collectImports(string source, string inputFile, string ignored) {
+// Known built-in module names used for did-you-mean suggestions on imports.
+string[] diagKnownModules() {
+    string[] known = [];
+    known.add("fs"); known.add("json"); known.add("yaml"); known.add("env");
+    known.add("url"); known.add("hash"); known.add("path"); known.add("bom");
+    known.add("console"); known.add("math"); known.add("http");
+    return known;
+}
+
+// Compute the 1-based line and column of a character offset in src into loc
+// (loc[0] = line, loc[1] = column).
+void diagLocateOffset(string src, int off, int[] loc) {
+    int total = src.length;
+    if (off > total) { off = total; }
+    if (off < 0) { off = 0; }
+    int line = 1;
+    int lineStart = 0;
+    for (int i = 0; i < off; i++) {
+        if (src[i] == '\n') { line = line + 1; lineStart = i + 1; }
+    }
+    loc[0] = line;
+    loc[1] = off - lineStart + 1;
+}
+
+// `win32.<module>` imports name native DLL access, never Silver sources
+// (DOCS/213).
+bool importIsWin32(string name) {
+    if (name.length < 5) { return false; }
+    return name[0] == 'w' && name[1] == 'i' && name[2] == 'n' && name[3] == '3' && name[4] == '2';
+}
+
+string collectImports(string source, string inputFile, string ignored, string[] errs) {
     string[] visited = [];
     string result = "";
     int cursor = 0;
@@ -146,12 +177,53 @@ string collectImports(string source, string inputFile, string ignored) {
             cursor = importPos + 6;
             continue;
         }
+        // Whole-word check: reject matches glued to identifier characters
+        // (e.g. an identifier spelled `importGroupIdx`).
+        bool importWord = true;
+        if (importPos + 6 < source.length) {
+            char inc = source[importPos + 6];
+            if (inc != ' ' && inc != '\t' && inc != '\r' && inc != '\n' && inc != '{' && inc != '*') {
+                importWord = false;
+            }
+        }
+        if (!importWord) {
+            cursor = importPos + 6;
+            continue;
+        }
         int semi = projectFind(source, ";", importPos + 6);
         if (semi < 0) { break; }
         string statement = projectSlice(source, importPos + 6, semi);
         string moduleName = projectImportModule(statement);
-        if (moduleName.length > 0 && !projectBuiltin(moduleName) && !cliArgEq(moduleName, "project")) {
-            result = result + collectModule(moduleName, inputFile, visited);
+        if (moduleName.length > 0 && !projectBuiltin(moduleName) && !importIsWin32(moduleName) && !cliArgEq(moduleName, "project")) {
+            // Native builtin modules and the modules the driver prepends by
+            // hand above always resolve; probing them would report a bogus
+            // unknown-module error.
+            bool prepended = cliArgEq(moduleName, "llmai") || cliArgEq(moduleName, "LLMAI")
+                || cliArgEq(moduleName, "exception") || cliArgEq(moduleName, "bom")
+                || cliArgEq(moduleName, "process") || cliArgEq(moduleName, "notifications")
+                || cliArgEq(moduleName, "env") || cliArgEq(moduleName, "url")
+                || cliArgEq(moduleName, "hash") || cliArgEq(moduleName, "path")
+                || cliArgEq(moduleName, "console") || cliArgEq(moduleName, "math")
+                || cliArgEq(moduleName, "http") || cliArgEq(moduleName, "os");
+            string depProbe = "";
+            if (!prepended) { depProbe = findModuleSource(moduleName, inputFile); }
+            if (!prepended && depProbe.length == 0) {
+                // SYNTAX_EXCEPTIONS.md — unknown module, with a did-you-mean
+                // suggestion when it resembles a known one.
+                int rel = projectFind(statement, moduleName, 0);
+                int absOff = importPos + 6;
+                if (rel >= 0) { absOff = importPos + 6 + rel; }
+                int[] loc = []; loc.add(0); loc.add(0);
+                diagLocateOffset(source, absOff, loc);
+                string sugg = diagClosestMatch(moduleName, diagKnownModules());
+                if (sugg.length > 0) {
+                    errs.add("did you mean to import the module \"" + sugg + "\"?, unknown module \"" + moduleName + "\" was found at line " + loc[0].toString() + " column " + loc[1].toString());
+                } else {
+                    errs.add("unknown module \"" + moduleName + "\" was found at line " + loc[0].toString() + ", column " + loc[1].toString() + ". module either doesn't exist or not installed.");
+                }
+            } else {
+                result = result + collectModule(moduleName, inputFile, visited);
+            }
         }
         cursor = semi + 1;
     }
@@ -366,7 +438,7 @@ void main() {
             if (llmaiSource.length == 0) {
                 llmaiSource = tryReadFile("..\\..\\std\\llmai.sr");
             }
-            source = llmaiSource + "\\n" + source;
+            source = llmaiSource + "\n" + source;
         }
 
         // The exception hierarchy is a source-level standard library. When a
@@ -388,7 +460,7 @@ void main() {
             if (excSource.length == 0) {
                 excSource = tryReadFile("..\\..\\std\\exception.sr");
             }
-            source = excSource + "\\n" + source;
+            source = excSource + "\n" + source;
         }
 
         // BOM and focused-process APIs are source-level standard libraries.
@@ -401,7 +473,7 @@ void main() {
             if (bomSource.length == 0) { bomSource = tryReadFile("..\\std\\bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile("..\\silverc\\std\\bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile("..\\..\\std\\bom.sr"); }
-            source = bomSource + "\\n" + source;
+            source = bomSource + "\n" + source;
         }
         int processImport = projectFind(source, "from " + "process", 0);
         if (processImport >= 0) {
@@ -410,7 +482,7 @@ void main() {
             if (processSource.length == 0) { processSource = tryReadFile("..\\std\\process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile("..\\silverc\\std\\process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile("..\\..\\std\\process.sr"); }
-            source = processSource + "\\n" + source;
+            source = processSource + "\n" + source;
         }
         // Notifications (Windows toast / tray-balloon) is a source-level
         // standard library.  Prepend its definitions when a standalone source
@@ -422,7 +494,7 @@ void main() {
             if (notifSource.length == 0) { notifSource = tryReadFile("..\\std\\notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile("..\\silverc\\std\\notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile("..\\..\\std\\notifications.sr"); }
-            source = notifSource + "\\n" + source;
+            source = notifSource + "\n" + source;
         }
 
         // Generic source-level imports (`import * from helper;`, `import
@@ -430,8 +502,27 @@ void main() {
         // file next to the input, under std/, or under silveri/src is
         // collected the same way. Native modules (fs/json/yaml/os + the
         // special-cased std libs above) are never read from disk.
-        source = collectImports(source, inputFile, "");
+        string[] moduleErrors = [];
+        source = collectImports(source, inputFile, "", moduleErrors);
+        if (moduleErrors.length > 0) {
+            for (int meI = 0; meI < moduleErrors.length; meI++) {
+                printline(moduleErrors[meI]);
+            }
+            exit(1);
+        }
     }
+
+    // Per-line character lengths so bracket diagnostics can point just past
+    // the end of a line (SYNTAX_EXCEPTIONS.md #3).
+    int[] lineLens = [];
+    int lineCur = 0;
+    int srcTotal = source.length;
+    for (int li = 0; li < srcTotal; li++) {
+        char lc = source[li];
+        if (lc == '\n') { lineLens.add(lineCur); lineCur = 0; }
+        elif (lc != '\r') { lineCur = lineCur + 1; }
+    }
+    lineLens.add(lineCur);
 
     Lexer lexer;
     lexer = new Lexer(source);
@@ -439,11 +530,34 @@ void main() {
     Token[] tokens;
     tokens = lexer.tokenize();
 
+    // Lexical diagnostics print one per line and abort before parsing.
+    if (lexer.lexErrors.length > 0) {
+        for (int leI = 0; leI < lexer.lexErrors.length; leI++) {
+            printline(lexer.lexErrors[leI]);
+        }
+        exit(1);
+    }
+
     Parser parser;
     parser = new Parser(tokens);
+    parser.setLineLengths(lineLens);
 
     Node[] ast;
     ast = parser.parseProgram();
+
+    // Post-parse call diagnostics (EXCEPTIONS/*.md): unknown-method /
+    // did-you-mean over the fully collected symbol table, and filesystem
+    // ValueException checks over literal path arguments.
+    parser.checkCallDiagnostics(ast);
+
+    // Syntax diagnostics: one per line, in source order
+    // (SYNTAX_EXCEPTIONS.md #4).
+    if (parser.diagErrors.length > 0) {
+        for (int deI = 0; deI < parser.diagErrors.length; deI++) {
+            printline(parser.diagErrors[deI]);
+        }
+        exit(1);
+    }
 
     MemoryGuard guard;
     guard = new MemoryGuard();

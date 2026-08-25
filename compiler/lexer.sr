@@ -16,6 +16,10 @@ class Lexer {
     // reading it inside every `while (pos < src.length)` loop re-scans the
     // entire source per iteration (O(n^2)).  Cache it once in the constructor.
     private prop int srcLen;
+    // Diagnostics collected while scanning (VALUE_EXCEPTION.md position
+    // rules): unterminated string literals report the opening line and its
+    // last character column.
+    public prop string[] lexErrors;
 
     construct (string source) {
         this.src = source;
@@ -25,6 +29,29 @@ class Lexer {
         this.col = 1;
         this.lastChar = ' ';
         this.currentCode = 0;
+        this.lexErrors = [];
+    }
+
+    private void recordLexError(string msg) {
+        this.lexErrors.add(msg);
+    }
+
+    // Character length of the given 1-based source line, excluding CR.
+    private int lineCharLen(int targetLine) {
+        int lineNum = 1;
+        int i = 0;
+        while (i < this.srcLen && lineNum < targetLine) {
+            if (this.src[i] == '\n') { lineNum = lineNum + 1; }
+            i = i + 1;
+        }
+        int len = 0;
+        while (i < this.srcLen) {
+            char c = this.src[i];
+            if (c == '\n') { break; }
+            if (c != '\r') { len = len + 1; }
+            i = i + 1;
+        }
+        return len;
     }
 
     private bool strEq(string a, string b) {
@@ -134,8 +161,22 @@ class Lexer {
             if (next == '*') { this.advance(); this.advance(); this.skipBlockComment(); return null; }
         }
 
-        if (c == '"') { this.advance(); return this.readStringToken(); }
-        if (c == '\'') { this.advance(); return this.readChar(); }
+        // The token position must point AT the opening quote (EXCEPTIONS
+        // value-position rule), so capture it before the quote is consumed.
+        if (c == '"') {
+            int qLine = ln; int qCol = cl;
+            this.advance();
+            Token st = this.readStringToken();
+            st.line = qLine; st.col = qCol;
+            return st;
+        }
+        if (c == '\'') {
+            int qLine2 = ln; int qCol2 = cl;
+            this.advance();
+            Token ct = this.readChar();
+            ct.line = qLine2; ct.col = qCol2;
+            return ct;
+        }
         if ((c >= '0' && c <= '9')) { this.currentCode = c; return this.readNumber(); }
         if (isAlpha(c) || c == '_') { this.currentCode = c; return this.readIdent(); }
 
@@ -239,9 +280,10 @@ class Lexer {
     private Token readStringToken() {
         int ln = this.line; int cl = this.col;
         string s = "";
+        bool closed = false;
         while (this.pos < this.srcLen) {
             char ch = this.src[this.pos]; this.advance();
-            if (ch == '"') { break; }
+            if (ch == '"') { closed = true; break; }
             if (ch == '\\') {
                 if (this.pos < this.srcLen) {
                     char esc = this.src[this.pos]; this.advance();
@@ -279,6 +321,13 @@ class Lexer {
             } else {
                 s = s + charToString(ch);
             }
+        }
+        // SYNTAX_EXCEPTIONS.md — an unterminated literal reports the opening
+        // line with the column of its last character.
+        if (!closed) {
+            int endCol = this.lineCharLen(ln);
+            if (endCol <= 0) { endCol = cl; }
+            this.recordLexError("you forgot to close your string quotes at line " + ln.toString() + ", column " + endCol.toString());
         }
         Token tok = new Token(3, s, ln, cl);
         tok.strVal = s;

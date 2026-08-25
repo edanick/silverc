@@ -10,11 +10,390 @@ class Parser {
     // Inside a `[...]` index, a top-level `..` (token 144) starts a slice
     // rather than a binary range expression.
     private bool rangeIsSliceBoundary;
+    // ---- EXCEPTIONS/*.md diagnostics --------------------------------------
+    // Recoverable syntax errors, one message per line, in source order
+    // (SYNTAX_EXCEPTIONS.md #4).  The driver prints them all and exits.
+    public prop string[] diagErrors;
+    // Missing-semicolon positions, flushed as ONE merged message at the end
+    // of parseProgram.
+    private int[] missingSemiLines;
+    private int[] missingSemiCols;
+    // Lowercase user-declared type names (def/enum/struct/class/typealias):
+    // `direction dir = ...` is a declaration, not an unknown keyword.
+    private string[] declaredTypes;
+    // Identifiers with known meaning that may appear as bare statements
+    // (builtins plus every function/const name parsed so far).
+    private string[] knownIdents;
+    // Parsed function signatures for TYPE_EXCEPTIONS call-arg checks:
+    // parallel arrays; types/names joined with commas per signature.
+    private string[] sigNames;
+    private string[] sigTypes;
+    private string[] sigParams;
+    private int[] sigVariadic;
+    // Per-line character lengths (1-based indexing via line-1) used to point
+    // just past the end of a line for missing-bracket diagnostics.
+    private int[] lineLens;
+    // win32 grants recorded from import statements (DOCS/213): a full open
+    // (`import * from win32;`), opened module names (`win32.<mod>`), and
+    // individually granted export names.  Used by the post-parse
+    // unknown-method walk so free Win32 calls are never flagged.
+    private bool win32AllModules;
+    private string[] win32OpenModules;
+    private string[] win32GrantNames;
 
     construct (Token[] toks) {
         this.tokens = toks;
         this.pos = 0;
         this.rangeIsSliceBoundary = false;
+        this.diagErrors = [];
+        this.missingSemiLines = [];
+        this.missingSemiCols = [];
+        this.declaredTypes = [];
+        this.knownIdents = [];
+        this.sigNames = [];
+        this.sigTypes = [];
+        this.sigParams = [];
+        this.sigVariadic = [];
+        this.lineLens = [];
+        this.win32AllModules = false;
+        this.win32OpenModules = [];
+        this.win32GrantNames = [];
+    }
+
+    // Provide per-line character lengths so bracket diagnostics can point
+    // just past the end of a line (SYNTAX_EXCEPTIONS.md #3).
+    public void setLineLengths(int[] lens) {
+        this.lineLens = lens;
+    }
+
+    private void recordError(string msg) {
+        this.diagErrors.add(msg);
+    }
+
+    // Source width of a token (quotes included for literals), used for
+    // insertion-point columns of missing `;` / `,` / `)`.
+    private int tokenSrcLen(Token t) {
+        if (t.kind == 3 || t.kind == 4) { return t.text.length + 2; }
+        return t.text.length;
+    }
+
+    private int prevEndLine() {
+        if (this.pos == 0) { return this.peek().line; }
+        return this.tokens[this.pos - 1].line;
+    }
+
+    private int prevEndCol() {
+        if (this.pos == 0) { return this.peek().col; }
+        Token prev = this.tokens[this.pos - 1];
+        return prev.col + this.tokenSrcLen(prev);
+    }
+
+    // Column one past the last character of the given line (1-based), or -1
+    // when line lengths were not provided.
+    private int lineEndCol(int line) {
+        if (line >= 1 && line <= this.lineLens.length) { return this.lineLens[line - 1] + 1; }
+        return -1;
+    }
+
+    // Statement-final semicolon: consume it, or record the position and keep
+    // parsing (SYNTAX_EXCEPTIONS.md "Missing semicolons").  EOF tolerates
+    // the final statement of a file, and a preceding `}` already terminates
+    // braced statements (match/switch/block expressions).
+    private void expectSemi() {
+        if (this.check(106)) { this.advance(); return; }
+        if (this.check(0)) { return; }
+        if (this.pos > 0 && this.tokens[this.pos - 1].kind == 103) { return; }
+        this.missingSemiLines.add(this.prevEndLine());
+        this.missingSemiCols.add(this.prevEndCol());
+    }
+
+    // All Silver keywords, used for did-you-mean suggestions.
+    public string[] keywordCandidates() {
+        string[] cands = [];
+        cands.add("if"); cands.add("else"); cands.add("elif"); cands.add("while");
+        cands.add("for"); cands.add("foreach"); cands.add("return"); cands.add("match");
+        cands.add("void"); cands.add("int"); cands.add("int32"); cands.add("int64");
+        cands.add("uint"); cands.add("float"); cands.add("float64"); cands.add("double");
+        cands.add("bool"); cands.add("byte"); cands.add("char"); cands.add("string");
+        cands.add("var"); cands.add("struct"); cands.add("class"); cands.add("enum");
+        cands.add("def"); cands.add("found"); cands.add("collect"); cands.add("mod");
+        cands.add("export"); cands.add("import"); cands.add("from"); cands.add("as");
+        cands.add("new"); cands.add("const"); cands.add("true"); cands.add("false");
+        cands.add("null"); cands.add("public"); cands.add("private"); cands.add("static");
+        cands.add("prop"); cands.add("construct"); cands.add("unset"); cands.add("local");
+        cands.add("alias"); cands.add("fixed"); cands.add("live"); cands.add("once");
+        cands.add("shared"); cands.add("mut"); cands.add("ref"); cands.add("try");
+        cands.add("catch"); cands.add("finally"); cands.add("throw"); cands.add("to");
+        cands.add("in"); cands.add("break"); cands.add("continue"); cands.add("switch");
+        cands.add("case"); cands.add("typealias"); cands.add("loop");
+        return cands;
+    }
+
+    private bool identStartsLower(string word) {
+        if (word.length == 0) { return false; }
+        char fc = word[0];
+        return fc >= 'a' && fc <= 'z';
+    }
+
+    // True when a statement-leading lowercase identifier is an unknown
+    // keyword: not a declared type heading a declaration shape, and not an
+    // identifier with known meaning (SYNTAX_EXCEPTIONS.md).
+    private bool identShouldFlag(Token cur, int nk) {
+        if (!this.identStartsLower(cur.text)) { return false; }
+        // Primitive type words that lex as identifiers (e.g. `double`) head
+        // declarations, never unknown keywords.
+        if (this.strEq(cur.text, "double") || this.strEq(cur.text, "long")
+            || this.strEq(cur.text, "uint") || this.strEq(cur.text, "byte")
+            || this.strEq(cur.text, "int32") || this.strEq(cur.text, "int64")
+            || this.strEq(cur.text, "float64") || this.strEq(cur.text, "string")
+            || this.strEq(cur.text, "boolean")) { return false; }
+        bool declShape = nk == 7 || nk == 104 || nk == 123 || nk == 120;
+        if (declShape) {
+            // `T name (` is a function-signature shape — legacy sources use
+            // non-keyword return spellings there; leave it to parseFunction.
+            if (nk == 7 && this.pos + 2 < this.tokens.length && this.tokens[this.pos + 2].kind == 100) {
+                return false;
+            }
+            return !this.isDeclaredTypeName(cur.text);
+        }
+        return !this.knownIdentName(cur.text);
+    }
+
+    // `print"hello world");` — an identifier immediately followed by a string
+    // literal: the open parenthesis of the call is missing and is reported at
+    // the string literal's position.
+    private Node parseCallMissingOpenParen() {
+        Token nameTok = this.advance();
+        Token strTok = this.peek();
+        string lit = "";
+        if (strTok.kind == 3) { lit = strTok.strVal; }
+        this.advance();
+        if (this.check(101)) { this.advance(); }
+        this.recordError("Missing open parenthesis at line " + strTok.line.toString() + ", column " + strTok.col.toString());
+        this.expectSemi();
+        Node call = new Node(); call.kind = 10;
+        call.name = nameTok.text;
+        Node strNode = new Node(); strNode.kind = 2;
+        strNode.strVal = lit;
+        strNode.line = strTok.line; strNode.col = strTok.col;
+        call.children.add(strNode);
+        Node stmt = new Node(); stmt.kind = 61;
+        stmt.children.add(call);
+        return stmt;
+    }
+
+    private bool isDeclaredTypeName(string name) {
+        for (int i = 0; i < this.declaredTypes.length; i++) {
+            if (this.strEq(this.declaredTypes[i], name)) { return true; }
+        }
+        return false;
+    }
+
+    private bool knownIdentName(string name) {
+        for (int i = 0; i < this.knownIdents.length; i++) {
+            if (this.strEq(this.knownIdents[i], name)) { return true; }
+        }
+        if (this.strEq(name, "cargs") || this.strEq(name, "getCommandLine")
+            || this.strEq(name, "print") || this.strEq(name, "printline")
+            || this.strEq(name, "exit") || this.strEq(name, "input")
+            || this.strEq(name, "sleep") || this.strEq(name, "assert")
+            || this.strEq(name, "strlen") || this.strEq(name, "now")) { return true; }
+        return false;
+    }
+
+    private void registerDeclaredType(string name) {
+        if (!this.isDeclaredTypeName(name)) { this.declaredTypes.add(name); }
+    }
+
+    // Can the token kind continue an identifier as a real expression or
+    // declaration?  If not, a lowercase statement-leading identifier is an
+    // unknown keyword (SYNTAX_EXCEPTIONS.md).
+    private bool tokenContinuesExpr(int nk) {
+        if (nk == 100 || nk == 108 || nk == 104 || nk == 110) { return true; }
+        if (nk == 130 || nk == 131 || nk == 132 || nk == 133 || nk == 115) { return true; }
+        if (nk == 116 || nk == 117 || nk == 118 || nk == 160 || nk == 158 || nk == 159) { return true; }
+        if (nk == 161 || nk == 162 || nk == 142 || nk == 143) { return true; }
+        if (nk == 123 || nk == 148 || nk == 144 || nk == 147) { return true; }
+        if (nk == 109 || nk == 120 || nk == 140) { return true; }
+        return false;
+    }
+
+    // Flag an unknown keyword / keyword typo at the token's position.
+    private void flagUnknownKeywordAt(Token t) {
+        string sugg = diagClosestMatch(t.text, this.keywordCandidates());
+        if (sugg.length > 0) {
+            this.recordError("did you mean \"" + sugg + "\"?, at line " + t.line.toString() + ", column " + t.col.toString());
+        } else {
+            this.recordError("unknown keyword \"" + t.text + "\" at line " + t.line.toString() + ", column " + t.col.toString());
+        }
+    }
+
+    // No-op expression-statement node used during error recovery.
+    private Node noopNode() {
+        Node n = new Node(); n.kind = 61;
+        Node zero = new Node(); zero.kind = 0; zero.intVal = 0;
+        n.children.add(zero);
+        return n;
+    }
+
+    // Skip ahead to the next top-level statement boundary: past a terminating
+    // semicolon, or to the first token on a later line — whichever first.
+    private void syncToStatementEnd() {
+        while (!this.check(0) && !this.check(103)) {
+            int line = this.peek().line;
+            if (this.check(106)) { this.advance(); return; }
+            this.advance();
+            if (this.pos < this.tokens.length && this.tokens[this.pos].line > line) { return; }
+        }
+    }
+
+    // TYPE_EXCEPTIONS.md fundamental value classes that must never mix
+    // silently: numbers/chars interoperate; strings and booleans do not.
+    private int typeFamily(string t) {
+        for (int i = 0; i < t.length; i++) {
+            char c = t[i];
+            if (c == '[' || c == ']' || c == '?' || c == '<' || c == '>' || c == '.' || c == ',') { return -1; }
+        }
+        if (this.strEq(t, "int") || this.strEq(t, "int32") || this.strEq(t, "int64")
+            || this.strEq(t, "uint") || this.strEq(t, "byte") || this.strEq(t, "float")
+            || this.strEq(t, "float64") || this.strEq(t, "double") || this.strEq(t, "char")) { return 0; }
+        if (this.strEq(t, "string")) { return 1; }
+        if (this.strEq(t, "bool")) { return 2; }
+        return -1;
+    }
+
+    private int literalFamily(Node n) {
+        if (n.kind == 0 || n.kind == 1 || n.kind == 3) { return 0; }
+        if (n.kind == 2) { return 1; }
+        if (n.kind == 4) { return 2; }
+        return -1;
+    }
+
+    private string literalTypeName(Node n) {
+        if (n.kind == 0) { return "int"; }
+        if (n.kind == 1) { return "float"; }
+        if (n.kind == 2) { return "string"; }
+        if (n.kind == 3) { return "char"; }
+        if (n.kind == 4) { return "bool"; }
+        return "var";
+    }
+
+    // `an int`, `a string`, ... for exception message phrasing.
+    private string articleOf(string typeName) {
+        if (typeName.length == 0) { return "a " + typeName; }
+        char fc = typeName[0];
+        if (fc == 'a' || fc == 'e' || fc == 'i' || fc == 'o') { return "an " + typeName; }
+        return "a " + typeName;
+    }
+
+    // Split a comma-joined signature component back into entries.
+    private string[] splitSigList(string joined) {
+        string[] parts = [];
+        string cur = "";
+        for (int i = 0; i < joined.length; i++) {
+            char c = joined[i];
+            if (c == ',') { parts.add(cur); cur = ""; }
+            else { cur = cur + charToString(c); }
+        }
+        parts.add(cur);
+        return parts;
+    }
+
+    // VALUE_EXCEPTION.md — a numeric parse conversion receiving a non-numeric
+    // string literal raises a ValueException pointing at the literal.
+    private bool stringIsNumber(string s, bool wantInt) {
+        string t = "";
+        int start = 0;
+        int end = s.length;
+        while (start < end && s[start] == ' ') { start = start + 1; }
+        while (end > start && s[end - 1] == ' ') { end = end - 1; }
+        for (int i = start; i < end; i++) { t = t + charToString(s[i]); }
+        int len = t.length;
+        if (len == 0) { return false; }
+        int i2 = 0;
+        if (t[0] == '+' || t[0] == '-') { i2 = 1; }
+        if (i2 >= len) { return false; }
+        bool sawDigit = false;
+        bool sawDot = false;
+        bool sawExp = false;
+        while (i2 < len) {
+            char c = t[i2];
+            if (c >= '0' && c <= '9') { sawDigit = true; }
+            elif (c == '.' && !wantInt && !sawDot && !sawExp) { sawDot = true; }
+            elif ((c == 'e' || c == 'E') && !wantInt && sawDigit && !sawExp) {
+                sawExp = true;
+                if (i2 + 1 < len && (t[i2 + 1] == '+' || t[i2 + 1] == '-')) { i2 = i2 + 1; }
+                if (i2 + 1 >= len) { return false; }
+            }
+            else { return false; }
+            i2 = i2 + 1;
+        }
+        return sawDigit;
+    }
+
+    // TYPE_EXCEPTIONS.md — chained parameter type mismatches for a plain
+    // call whose callee matches a signature parsed in this file.
+    private void checkCallArgTypes(Node call) {
+        int idx = -1;
+        for (int i = 0; i < this.sigNames.length; i++) {
+            if (this.strEq(this.sigNames[i], call.name)) { idx = i; break; }
+        }
+        if (idx < 0) { return; }
+        string bestSegs = "";
+        int bestCount = 0;
+        // Accept the call when any same-named signature fits its arguments.
+        for (int m = 0; m < this.sigNames.length; m++) {
+            if (!this.strEq(this.sigNames[m], call.name)) { continue; }
+            string[] types = this.splitSigList(this.sigTypes[m]);
+            string[] names = this.splitSigList(this.sigParams[m]);
+            int limit = types.length;
+            if (call.childCount() < limit) { limit = call.childCount(); }
+            if (this.sigVariadic[m] == 1 && limit > types.length - 1) { limit = types.length - 1; }
+            string segs = "";
+            int count = 0;
+            for (int j = 0; j < limit; j++) {
+                int pf = this.typeFamily(types[j]);
+                if (pf < 0) { continue; }
+                Node arg = call.child(j);
+                int af = this.literalFamily(arg);
+                if (af < 0 || af == pf) { continue; }
+                if (count > 0) { segs = segs + ", and "; }
+                segs = segs + "line " + arg.line.toString() + ", column " + arg.col.toString() + " for \"" + names[j] + "\" parameter expected " + this.articleOf(types[j]) + " got " + this.articleOf(this.literalTypeName(arg));
+                count = count + 1;
+            }
+            if (count == 0) { return; }
+            if (count > 0) { bestSegs = segs; bestCount = count; }
+        }
+        if (bestCount > 0) {
+            this.recordError("wrong value type at " + bestSegs);
+        }
+    }
+
+    // VALUE_EXCEPTION.md — `expected a string of a number at line L,
+    // column C, got "hello"` for numeric parse conversions on literals.
+    private void checkParseValueException(string recv, string method, Node arg) {
+        bool isIntRecv = this.strEq(recv, "int") || this.strEq(recv, "int64");
+        bool isDblRecv = this.strEq(recv, "double") || this.strEq(recv, "float");
+        if (!isIntRecv && !isDblRecv) { return; }
+        bool wantsInt = this.strEq(method, "parseInt") || this.strEq(method, "toInt")
+            || this.strEq(method, "parseLong") || this.strEq(method, "toInt64");
+        bool wantsDouble = this.strEq(method, "parseDouble") || this.strEq(method, "toDouble")
+            || this.strEq(method, "parseFloat");
+        if (!wantsInt && !wantsDouble) { return; }
+        if (arg.kind != 2) { return; }
+        if (this.stringIsNumber(arg.strVal, wantsInt)) { return; }
+        this.recordError("expected a string of a number at line " + arg.line.toString() + ", column " + arg.col.toString() + ", got \"" + arg.strVal + "\"");
+    }
+
+    // TYPE_EXCEPTIONS.md — a declaration whose initializer's value kind
+    // cannot possibly fit (`int x = "hello"`) points at the value and names
+    // the declared type and variable.
+    private void checkDeclValueType(string declaredType, Node value, string varName) {
+        int df = this.typeFamily(declaredType);
+        if (df < 0) { return; }
+        int vf = this.literalFamily(value);
+        if (vf < 0 || vf == df) { return; }
+        this.recordError("wrong value type at line " + value.line.toString() + ", column " + value.col.toString() + ", expected " + this.articleOf(declaredType) + " got " + this.articleOf(this.literalTypeName(value)) + " for " + declaredType + " \"" + varName + "\"");
     }
 
     private bool strEq(string a, string b) {
@@ -23,6 +402,281 @@ class Parser {
             if (a[i] != b[i]) { return false; }
         }
         return true;
+    }
+
+    private string sliceStr(string s, int a, int b) {
+        string out = "";
+        for (int i = a; i < b; i++) { out = out + charToString(s[i]); }
+        return out;
+    }
+
+    private bool strStartsWith(string s, string prefix) {
+        if (s.length < prefix.length) { return false; }
+        for (int i = 0; i < prefix.length; i++) {
+            if (s[i] != prefix[i]) { return false; }
+        }
+        return true;
+    }
+
+    // ---- Post-parse call diagnostics (EXCEPTIONS/*.md) ---------------------
+    // Runs once after parseProgram so the whole symbol table (functions,
+    // methods, types, win32 grants) is visible to every call site.
+
+    // SYNTAX_EXCEPTIONS.md — undefined plain calls emit `unknown method`,
+    // with a did-you-mean suggestion when the name resembles a known one.
+    // VALUE_EXCEPTION.md — filesystem calls receiving a URL or an unusable
+    // path literal where a file path is required.
+    public void checkCallDiagnostics(Node[] ast) {
+        for (int i = 0; i < ast.length; i++) {
+            this.walkCallDiagnostics(ast[i]);
+        }
+    }
+
+    private void walkCallDiagnostics(Node n) {
+        if (n.kind == 10 && n.line > 0) {
+            // Recovery-built call nodes carry no source position and already
+            // reported their own syntax error.
+            if (!n.isMember) { this.checkPlainCallTarget(n); }
+            this.checkFsPathValueException(n);
+        }
+        // Struct/collect/class bodies are opaque to this pass: their member
+        // functions are not symbol-checked (the reference checker walks free
+        // functions only; unresolved helpers inside classes stay a codegen-
+        // time warning).
+        if (n.kind == 101 || n.kind == 102) { return; }
+        for (int i = 0; i < n.childCount(); i++) {
+            this.walkCallDiagnostics(n.child(i));
+        }
+    }
+
+    private void checkPlainCallTarget(Node call) {
+        string name = call.name;
+        if (name.length == 0) { return; }
+        if (this.isKnownCallableName(name)) { return; }
+        string sugg = diagClosestMatch(name, this.callableCandidates());
+        if (sugg.length > 0) {
+            this.recordError("did you mean \"" + sugg + "\"?, at line " + call.line.toString() + ", column " + call.col.toString());
+        } else {
+            this.recordError("unknown method \"" + name + "\", at line " + call.line.toString() + ", column " + call.col.toString());
+        }
+    }
+
+    private bool isKnownCallableName(string name) {
+        for (int i = 0; i < this.sigNames.length; i++) {
+            if (this.strEq(this.sigNames[i], name)) { return true; }
+        }
+        if (this.isDeclaredTypeName(name)) { return true; }
+        if (this.isBuiltinCallableName(name)) { return true; }
+        if (this.win32Resolvable(name)) { return true; }
+        // ALL-CAPS identifiers stay native-call placeholders.
+        if (name.length > 0) {
+            bool allCaps = true;
+            for (int c = 0; c < name.length; c++) {
+                char ch = name[c];
+                if (!((ch >= 'A' && ch <= 'Z') || ch == '_')) { allCaps = false; }
+            }
+            if (allCaps) { return true; }
+        }
+        if (this.strStartsWith(name, "__Value_")) { return true; }
+        return false;
+    }
+
+    private bool win32Resolvable(string name) {
+        if (this.win32AllModules) { return true; }
+        for (int g = 0; g < this.win32GrantNames.length; g++) {
+            if (this.strEq(this.win32GrantNames[g], name)) { return true; }
+        }
+        for (int m = 0; m < this.win32OpenModules.length; m++) {
+            string dll = this.win32ModuleNameDll(this.win32OpenModules[m]);
+            if (dll.length > 0 && this.win32TableHas(dll, name)) { return true; }
+        }
+        return false;
+    }
+
+    private string win32ModuleNameDll(string module) {
+        if (this.strEq(module, "kernel32")) { return "kernel32.dll"; }
+        if (this.strEq(module, "ws2_32")) { return "ws2_32.dll"; }
+        if (this.strEq(module, "winhttp")) { return "winhttp.dll"; }
+        if (this.strEq(module, "wininet")) { return "wininet.dll"; }
+        if (this.strEq(module, "shell32")) { return "shell32.dll"; }
+        if (this.strEq(module, "msvcrt")) { return "msvcrt.dll"; }
+        if (this.strEq(module, "user32")) { return "user32.dll"; }
+        if (this.strEq(module, "registry") || this.strEq(module, "advapi32")) { return "advapi32.dll"; }
+        if (this.strEq(module, "version")) { return "version.dll"; }
+        return "";
+    }
+
+    private string win32DllExportTable(string dll) {
+        if (this.strEq(dll, "kernel32.dll")) { return "CreateFileA ReadFile WriteFile CloseHandle GetFileSize GetFileSizeEx SetFilePointer FlushFileBuffers DeleteFileA MoveFileA CopyFileA GetFileAttributesA SetFileAttributesA CreateDirectoryA RemoveDirectoryA SetCurrentDirectoryA GetCurrentDirectoryA GetFullPathNameA FindFirstFileA FindNextFileA FindClose GetStdHandle SetConsoleTextAttribute GetConsoleScreenBufferInfo SetConsoleCursorPosition GetConsoleMode SetConsoleMode ReadConsoleA WriteConsoleA GetModuleHandleA GetModuleFileNameA LoadLibraryA GetProcAddress Sleep GetTickCount GetTickCount64 GetLastError CreateProcessA CreateProcessW WaitForSingleObject GetExitCodeProcess TerminateProcess OpenProcess GetProcessId CreatePipe GetProcessHeap HeapFree GlobalAlloc GlobalFree VirtualAlloc VirtualFree GetCurrentProcessId GetCurrentProcess GetCurrentThreadId GetCurrentThread GetEnvironmentVariableA GetEnvironmentVariableW SetEnvironmentVariableA SetEnvironmentVariableW ExpandEnvironmentStringsA GetEnvironmentStringsA FreeEnvironmentStringsA GetTempPathA GetComputerNameA GetUserNameA QueryPerformanceCounter QueryPerformanceFrequency GetVersionExA GetSystemDirectoryA GetWindowsDirectoryA GetLocalTime GetSystemTime OutputDebugStringA IsDebuggerPresent GetCommandLineA SetThreadPriority QueryFullProcessImageNameA GetFileAttributesW lstrlenA lstrcpyA lstrcatA lstrcmpA CreateProcess"; }
+        if (this.strEq(dll, "ws2_32.dll")) { return "WSAStartup WSACleanup socket bind listen accept recv send shutdown closesocket connect select setsockopt ioctlsocket htons inet_addr getaddrinfo freeaddrinfo WSAGetLastError"; }
+        if (this.strEq(dll, "winhttp.dll")) { return "WinHttpOpen WinHttpConnect WinHttpOpenRequest WinHttpSendRequest WinHttpReceiveResponse WinHttpQueryHeaders WinHttpQueryDataAvailable WinHttpReadData WinHttpCloseHandle WinHttpSetOption"; }
+        if (this.strEq(dll, "wininet.dll")) { return "InternetOpenA InternetConnectA InternetOpenUrlA InternetReadFile InternetReadFileExA InternetCloseHandle HttpSendRequestA HttpSendRequestExA InternetQueryDataAvailable InternetSetOptionA InternetQueryOptionA HttpQueryInfoA InternetWriteFile InternetGetConnectedState InternetCrackUrlA InternetCanonicalizeUrlA InternetSetStatusCallback"; }
+        if (this.strEq(dll, "shell32.dll")) { return "ShellExecuteA ShellExecuteW ShellExecuteExA ShellExecuteExW"; }
+        if (this.strEq(dll, "msvcrt.dll")) { return "memcpy memset memmove memcmp strlen strcmp strchr strstr strrchr strcpy strcat strncmp strncat strncpy strtok strpbrk strspn strcspn atoi atol strtol malloc free realloc calloc printf fprintf sprintf sscanf fopen fclose fread fwrite fflush fgets fputs fseek ftell system getenv putenv time rand srand abs labs toupper tolower isalpha isdigit isspace isprint isalnum isxdigit isupper islower"; }
+        if (this.strEq(dll, "user32.dll")) { return "keybd_event VkKeyScanA GetKeyState GetAsyncKeyState GetKeyboardState SetKeyboardState MapVirtualKeyA SendInput mouse_event GetCursorPos SetCursorPos SetCursor ClipCursor GetClipCursor GetDoubleClickTime SetDoubleClickTime GetForegroundWindow GetWindowTextA GetWindowThreadProcessId RegisterHotKey UnregisterHotKey MessageBeep RegisterRawInputDevices GetRawInputData GetRawInputDeviceList RegisterClassExA CreateWindowExA ShowWindow UpdateWindow SetWindowTextA DestroyWindow GetMessageA TranslateMessage DispatchMessageA DefWindowProcA PostQuitMessage GetSystemMetrics LoadIconA LoadCursorA LoadImageA SendMessageA GetCursorX GetCursorY"; }
+        if (this.strEq(dll, "advapi32.dll")) { return "RegOpenKeyExA RegCreateKeyExA RegQueryValueExA RegSetValueExA RegDeleteValueA RegDeleteKeyA RegEnumKeyExA RegEnumValueA RegQueryInfoKeyA RegCloseKey"; }
+        if (this.strEq(dll, "version.dll")) { return "GetFileVersionInfoSizeA GetFileVersionInfoA VerQueryValueA"; }
+        return "";
+    }
+
+    private bool win32TableHas(string dll, string fn) {
+        string table = this.win32DllExportTable(dll);
+        int i = 0;
+        while (i < table.length) {
+            while (i < table.length && table[i] == ' ') { i++; }
+            int start = i;
+            while (i < table.length && table[i] != ' ') { i++; }
+            if (i > start && this.strEq(fn, this.sliceStr(table, start, i))) { return true; }
+        }
+        return false;
+    }
+
+    private bool isBuiltinCallableName(string name) {
+        if (this.strEq(name, "print") || this.strEq(name, "printline")) { return true; }
+        if (this.strEq(name, "exit") || this.strEq(name, "input")) { return true; }
+        if (this.strEq(name, "sleep") || this.strEq(name, "assert")) { return true; }
+        if (this.strEq(name, "int") || this.strEq(name, "float")) { return true; }
+        if (this.strEq(name, "double") || this.strEq(name, "char")) { return true; }
+        if (this.strEq(name, "byte") || this.strEq(name, "string_cast")) { return true; }
+        if (this.strEq(name, "now") || this.strEq(name, "cargs")) { return true; }
+        if (this.strEq(name, "getCommandLine") || this.strEq(name, "super")) { return true; }
+        if (this.strEq(name, "readFile") || this.strEq(name, "readString")) { return true; }
+        if (this.strEq(name, "writeBytes") || this.strEq(name, "writeString")) { return true; }
+        if (this.strEq(name, "writeFile") || this.strEq(name, "strlen")) { return true; }
+        if (this.strEq(name, "exists") || this.strEq(name, "delete")) { return true; }
+        if (this.strEq(name, "deleteFile")) { return true; }
+        if (this.strEq(name, "keybd_event") || this.strEq(name, "mouse_event")) { return true; }
+        if (this.strEq(name, "VkKeyScanA") || this.strEq(name, "GetKeyState")) { return true; }
+        if (this.strEq(name, "GetAsyncKeyState") || this.strEq(name, "MapVirtualKeyA")) { return true; }
+        if (this.strEq(name, "GetCursorPos") || this.strEq(name, "SetCursorPos")) { return true; }
+        if (this.strEq(name, "SetCursor") || this.strEq(name, "ClipCursor")) { return true; }
+        if (this.strEq(name, "GetClipCursor") || this.strEq(name, "GetDoubleClickTime")) { return true; }
+        if (this.strEq(name, "SetDoubleClickTime") || this.strEq(name, "RegisterHotKey")) { return true; }
+        if (this.strEq(name, "UnregisterHotKey") || this.strEq(name, "MessageBeep")) { return true; }
+        if (this.strEq(name, "RegisterRawInputDevices") || this.strEq(name, "GetRawInputData")) { return true; }
+        if (this.strEq(name, "GetRawInputDeviceList") || this.strEq(name, "SendInput")) { return true; }
+        if (this.strEq(name, "GetForegroundWindow") || this.strEq(name, "GetWindowTextA")) { return true; }
+        if (this.strEq(name, "GetWindowThreadProcessId") || this.strEq(name, "OpenProcess")) { return true; }
+        if (this.strEq(name, "QueryFullProcessImageNameA") || this.strEq(name, "CloseHandle")) { return true; }
+        if (this.strEq(name, "getFocusedProcessDataNative")) { return true; }
+        if (this.strEq(name, "__binaryMetadataStatus") || this.strEq(name, "__binaryMetadataField")) { return true; }
+        if (this.strEq(name, "__binaryMetadataStatusNative") || this.strEq(name, "__binaryMetadataFieldNative")) { return true; }
+        if (this.strEq(name, "nativeToastShow") || this.strEq(name, "loadIcon")) { return true; }
+        if (this.strEq(name, "guiSetIcon") || this.strEq(name, "guiCreateWindow")) { return true; }
+        if (this.strEq(name, "guiShow") || this.strEq(name, "guiHide")) { return true; }
+        if (this.strEq(name, "guiMaximize") || this.strEq(name, "guiMinimize")) { return true; }
+        if (this.strEq(name, "guiSetTitle") || this.strEq(name, "guiClose")) { return true; }
+        if (this.strEq(name, "guiRunLoop")) { return true; }
+        if (this.strEq(name, "trayAdd") || this.strEq(name, "traySetTooltip")) { return true; }
+        if (this.strEq(name, "trayDelete") || this.strEq(name, "trayRemove")) { return true; }
+        if (this.strEq(name, "traySetMenu") || this.strEq(name, "trayRunLoop")) { return true; }
+        if (this.strEq(name, "trayPollMenu") || this.strEq(name, "trayPollClick")) { return true; }
+        if (this.strEq(name, "regOpen") || this.strEq(name, "regCreate")) { return true; }
+        if (this.strEq(name, "regClose") || this.strEq(name, "regSubKey")) { return true; }
+        if (this.strEq(name, "regGetString") || this.strEq(name, "regSetString")) { return true; }
+        if (this.strEq(name, "regGetInt") || this.strEq(name, "regSetInt")) { return true; }
+        if (this.strEq(name, "regGetInt64") || this.strEq(name, "regSetInt64")) { return true; }
+        if (this.strEq(name, "regDeleteValue") || this.strEq(name, "regDeleteKey")) { return true; }
+        if (this.strEq(name, "regValueExists")) { return true; }
+        if (this.strEq(name, "regEnumSubKeyName") || this.strEq(name, "regEnumValueName")) { return true; }
+        if (this.strEq(name, "regSubKeyCount") || this.strEq(name, "regValueCount")) { return true; }
+        return false;
+    }
+
+    // Did-you-mean candidate pool: every user-defined function plus the
+    // builtin free calls.
+    private string[] callableCandidates() {
+        string[] cands = [];
+        for (int i = 0; i < this.sigNames.length; i++) { cands.add(this.sigNames[i]); }
+        cands.add("print"); cands.add("printline");
+        cands.add("exit"); cands.add("input");
+        cands.add("sleep"); cands.add("assert");
+        cands.add("int"); cands.add("float");
+        cands.add("double"); cands.add("char");
+        cands.add("byte"); cands.add("string_cast");
+        cands.add("now"); cands.add("cargs");
+        cands.add("getCommandLine");
+        cands.add("readFile"); cands.add("readString");
+        cands.add("writeBytes"); cands.add("writeString");
+        cands.add("writeFile"); cands.add("strlen");
+        cands.add("exists"); cands.add("delete");
+        cands.add("deleteFile");
+        cands.add("toString"); cands.add("toInt");
+        cands.add("toUpper"); cands.add("toLower");
+        return cands;
+    }
+
+    // Filesystem entry points whose first argument must be a file path
+    // (VALUE_EXCEPTION.md).
+    private bool isPathFirstArgMethod(string m) {
+        if (this.strEq(m, "readString") || this.strEq(m, "readFile")) { return true; }
+        if (this.strEq(m, "readBytes") || this.strEq(m, "writeString")) { return true; }
+        if (this.strEq(m, "writeFile") || this.strEq(m, "writeBytes")) { return true; }
+        if (this.strEq(m, "exists") || this.strEq(m, "delete")) { return true; }
+        if (this.strEq(m, "deleteFile") || this.strEq(m, "rename")) { return true; }
+        if (this.strEq(m, "copy") || this.strEq(m, "mkdir")) { return true; }
+        if (this.strEq(m, "createDirectory") || this.strEq(m, "createDir")) { return true; }
+        if (this.strEq(m, "directoryExists") || this.strEq(m, "folderExists")) { return true; }
+        if (this.strEq(m, "isFile") || this.strEq(m, "isDirectory")) { return true; }
+        if (this.strEq(m, "size") || this.strEq(m, "listFiles")) { return true; }
+        return false;
+    }
+
+    private void checkFsPathValueException(Node call) {
+        if (!this.isPathFirstArgMethod(call.name)) { return; }
+        int argStart = 0;
+        if (call.isMember) { argStart = 1; }
+        this.checkPathLiteralArg(call, argStart);
+        // rename(src, dst) / copy(src, dst): both arguments are paths.
+        if (this.strEq(call.name, "rename") || this.strEq(call.name, "copy")) {
+            this.checkPathLiteralArg(call, argStart + 1);
+        }
+    }
+
+    private void checkPathLiteralArg(Node call, int idx) {
+        if (idx < 0 || idx >= call.childCount()) { return; }
+        Node arg = call.child(idx);
+        if (arg.kind != 2) { return; }
+        if (this.looksLikeUrl(arg.strVal)) {
+            this.recordError("expected a string of a file path at line " + arg.line.toString() + ", column " + arg.col.toString() + ", got a url");
+            return;
+        }
+        if (this.isInvalidPathLiteral(arg.strVal)) {
+            this.recordError("expected a valid file path at line " + arg.line.toString() + ", column " + arg.col.toString() + ", got an invalid path");
+        }
+    }
+
+    private bool looksLikeUrl(string s) {
+        string lo = diagToLower(s);
+        if (this.strStartsWith(lo, "http://")) { return true; }
+        if (this.strStartsWith(lo, "https://")) { return true; }
+        if (this.strStartsWith(lo, "http:")) { return true; }
+        if (this.strStartsWith(lo, "https:")) { return true; }
+        if (this.strStartsWith(lo, "ftp://")) { return true; }
+        if (this.strStartsWith(lo, "ftps://")) { return true; }
+        if (this.strStartsWith(lo, "file://")) { return true; }
+        if (this.strStartsWith(lo, "www.")) { return true; }
+        return false;
+    }
+
+    // A literal is an unusable local path when it is empty, carries
+    // characters Windows forbids in paths, or sits on a drive that does not
+    // exist (probed through the drive root).
+    private bool isInvalidPathLiteral(string s) {
+        if (s.length == 0) { return true; }
+        for (int i = 0; i < s.length; i++) {
+            char c = s[i];
+            if (c == '<' || c == '>' || c == '"' || c == '|' || c == '?' || c == '*') { return true; }
+            if (c < 32) { return true; }
+        }
+        if (s.length >= 2 && s[1] == ':') {
+            char d = s[0];
+            if ((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z')) {
+                string root = charToString(d) + ":" + charToString((char)(92));
+                if (!file.exists(root)) { return true; }
+            }
+        }
+        return false;
     }
 
     private void pppp() {
@@ -264,8 +918,23 @@ class Parser {
                 }
             }
         }
+        // Flush the merged missing-semicolon message (single line listing
+        // every position, joined with "and").
+        if (this.missingSemiLines.length > 0) {
+            string msg = "you forgot to put a semicolon \";\" in ";
+            for (int si = 0; si < this.missingSemiLines.length; si++) {
+                if (si > 0) { msg = msg + " and "; }
+                msg = msg + "line " + this.missingSemiLines[si].toString() + ", column " + this.missingSemiCols[si].toString();
+            }
+            this.recordError(msg);
+        }
         return items;
     }    private Node? parseItem() {
+        // Skip access modifiers preceding a top-level declaration
+        // (`public const int X = 1;`, `private void helper() { ... }`).
+        while (this.check(44) || this.check(45) || this.check(164) || this.check(46)) {
+            this.advance();
+        }
         if (this.check(35)) {
             this.advance();
             if (this.check(59)) { this.advance(); }
@@ -306,6 +975,27 @@ class Parser {
         if (this.check(29)) { return this.parseStruct(); }
         if (this.check(30)) { return this.parseClass(); }
         if (this.check(31)) { return this.parseEnum(); }
+        // Unknown keyword at top level (e.g. a typo like `impor`), with a
+        // did-you-mean suggestion when it resembles a real keyword.  Recovery
+        // resyncs to the next statement boundary so the damaged region does
+        // not cascade into unrelated follow-on errors.
+        if (this.check(7)) {
+            Token curTok = this.peek();
+            if (!this.strEq(curTok.text, "switch") && !this.strEq(curTok.text, "tuple")) {
+                int nk = -1;
+                if (this.pos + 1 < this.tokens.length) { nk = this.tokens[this.pos + 1].kind; }
+                bool continuesExpr = this.tokenContinuesExpr(nk);
+                if (!continuesExpr && nk == 3) {
+                    return this.parseCallMissingOpenParen();
+                }
+                if (!continuesExpr && this.identShouldFlag(curTok, nk)) {
+                    this.advance();
+                    this.flagUnknownKeywordAt(curTok);
+                    this.syncToStatementEnd();
+                    return null;
+                }
+            }
+        }
         // Top-level statements (e.g. `printline(42);`) are legal: a source
         // without a function is compiled as if the statements were the body
         // of an implicit `void main()`.  Functions are recognized by their
@@ -380,8 +1070,36 @@ class Parser {
             }
             node.typeHint = src;
         }
-        this.expect(106);
+        // Remember win32 grants for the post-parse unknown-method walk
+        // (DOCS/213): free Win32 calls resolve only through these imports.
+        this.recordWin32ImportGrant(node);
+        this.expectSemi();
         return node;
+    }
+
+    // Mirror of MiniCg.registerWin32Import, kept in the parser so the
+    // diagnostics pass can tell granted Win32 exports from unknown methods.
+    private void recordWin32ImportGrant(Node node) {
+        string src = node.typeHint;
+        if (this.strEq(src, "win32")) {
+            if (node.isStatic) { this.win32AllModules = true; return; }
+            this.win32OpenModules.add(node.name);
+            for (int j = 0; j < node.childCount(); j++) {
+                this.win32OpenModules.add(node.child(j).name);
+            }
+            return;
+        }
+        if (src.length > 6 && this.strEq(this.sliceStr(src, 0, 6), "win32.")) {
+            string module = this.sliceStr(src, 6, src.length);
+            if (node.isStatic) {
+                this.win32OpenModules.add(module);
+                return;
+            }
+            this.win32GrantNames.add(node.name);
+            for (int j2 = 0; j2 < node.childCount(); j2++) {
+                this.win32GrantNames.add(node.child(j2).name);
+            }
+        }
     }
 
     private Node parseConst() {
@@ -398,11 +1116,12 @@ class Parser {
             node.typeHint = "";
         }
         node.name = this.advance().text;
+        this.knownIdents.add(node.name);
         if (this.check(110)) {
             this.advance();
             node.children.add(this.parseExpr(0));
         }
-        this.expect(106);
+        this.expectSemi();
         return node;
     }
 
@@ -410,6 +1129,7 @@ class Parser {
         Node node = new Node();
         this.expect(32);
         node.name = this.advance().text;
+        this.registerDeclaredType(node.name);
         if (this.check(110)) {
             node.kind = 103;
             this.advance();
@@ -420,10 +1140,10 @@ class Parser {
                 if (this.check(107)) { this.advance(); }
             }
             this.expect(103);
-            this.expect(106);
+            this.expectSemi();
         } else {
             node.kind = 110;
-            this.expect(106);
+            this.expectSemi();
         }
         return node;
     }
@@ -446,7 +1166,7 @@ class Parser {
             if (this.check(107)) { this.advance(); }
         }
         this.expect(101);
-        this.expect(106);
+        this.expectSemi();
         return node;
     }
 
@@ -455,6 +1175,7 @@ class Parser {
         node.kind = 101;
         this.expect(29);
         node.name = this.advance().text;
+        this.registerDeclaredType(node.name);
         this.expect(102);
         while (!this.check(103) && !this.check(0)) {
             Node field = new Node();
@@ -474,6 +1195,7 @@ class Parser {
         node.kind = 102;
         this.expect(30);
         node.name = this.advance().text;
+        this.registerDeclaredType(node.name);
         if (this.check(109) || this.check(60)) {
             this.advance();
             node.parentClass = this.advance().text;
@@ -492,6 +1214,7 @@ class Parser {
         Node node = new Node();
         node.kind = 105;
         node.name = this.advance().text;
+        this.registerDeclaredType(node.name);
         this.expect(102);
         int value = 0;
         while (!this.check(103) && !this.check(0)) {
@@ -632,6 +1355,14 @@ class Parser {
         return this.parseFunction();
     }
 
+    // Kinds that can begin a parameter's type inside a `( ... )` list.
+    private bool tokenStartsParam(int kind) {
+        if (kind == 17 || kind == 18 || kind == 19 || kind == 20 || kind == 22 || kind == 23 || kind == 25 || kind == 26 || kind == 27) { return true; }
+        if (kind == 28 || kind == 7 || kind == 120 || kind == 50 || kind == 51) { return true; }
+        if (kind == 150 || kind == 151 || kind == 152 || kind == 153 || kind == 154 || kind == 155) { return true; }
+        return false;
+    }
+
     private Node parseFunction() {
         Node node = new Node();
         node.kind = 100;
@@ -653,9 +1384,22 @@ class Parser {
         if (this.check(123)) { this.advance(); retType = retType + "?"; }
         node.typeHint = retType;
         node.name = this.advance().text;
-        this.expect(100);
+        this.knownIdents.add(node.name);
+        Token openParen = this.expect(100);
         Node params = new Node();
+        bool sawParam = false;
         while (!this.check(101) && !this.check(0)) {
+            // Consume the separating comma, or report its absence
+            // (`int add(int x int y)`).
+            if (this.check(107)) {
+                this.advance();
+            } elif (sawParam) {
+                Token prevT = this.tokens[this.pos - 1];
+                this.recordError("you forgot a comma \",\" at line " + prevT.line.toString() + ", column " + (prevT.col + this.tokenSrcLen(prevT)).toString());
+            }
+            // A `{` (or any token that cannot start a type) before the closing
+            // parenthesis means the `)` itself is missing.
+            if (!this.tokenStartsParam(this.peek().kind)) { break; }
             Node param = new Node();
             string pt = this.advance().text;
             if (this.check(120)) {
@@ -680,10 +1424,31 @@ class Parser {
                 param.children.add(this.parseExpr(0));
             }
             params.children.add(param);
-            if (this.check(107)) { this.advance(); }
+            sawParam = true;
         }
-        this.expect(101);
+        if (this.check(101)) {
+            this.advance();
+        } else {
+            // `void main( {` — the closing parenthesis is missing; it is
+            // reported just past the opening one.
+            this.recordError("Missing close parenthesis at line " + openParen.line.toString() + ", column " + (openParen.col + 1).toString());
+        }
         node.children.add(params);
+        // TYPE_EXCEPTIONS.md — remember this signature for call-arg checks.
+        string joinTypes = "";
+        string joinNames = "";
+        bool variadicTail = false;
+        for (int spi = 0; spi < params.childCount(); spi++) {
+            Node sp = params.child(spi);
+            if (spi > 0) { joinTypes = joinTypes + ","; joinNames = joinNames + ","; }
+            joinTypes = joinTypes + sp.typeHint;
+            joinNames = joinNames + sp.name;
+            if (sp.isVariadic) { variadicTail = true; }
+        }
+        this.sigNames.add(node.name);
+        this.sigTypes.add(joinTypes);
+        this.sigParams.add(joinNames);
+        if (variadicTail) { this.sigVariadic.add(1); } else { this.sigVariadic.add(0); }
         if (this.check(145)) {
             this.advance();
             string ret = this.advance().text;
@@ -700,6 +1465,19 @@ class Parser {
         if (this.check(140)) {
             this.advance();
             node.children.add(this.parseExpr(0));
+        } elif (this.check(102)) {
+            node.children.add(this.parseBlock());
+        } elif (this.check(103) || this.check(0)) {
+            // `void main()` followed by `}` on the next line: the opening
+            // curly bracket is missing; point just past the signature's
+            // end-of-line.
+            int sigLine = this.prevEndLine();
+            int sigEndCol = this.lineEndCol(sigLine);
+            if (sigEndCol < 0) { sigEndCol = this.prevEndCol(); }
+            this.recordError("Missing opening curly bracket at line " + sigLine.toString() + ", column " + sigEndCol.toString());
+            if (this.check(103)) { this.advance(); }
+            Node emptyBody = new Node(); emptyBody.kind = 16;
+            node.children.add(emptyBody);
         } else {
             node.children.add(this.parseBlock());
         }
@@ -713,7 +1491,15 @@ class Parser {
         while (!this.check(103) && !this.check(0)) {
             block.children.add(this.parseStmt());
         }
-        this.expect(103);
+        if (this.check(103)) {
+            this.advance();
+        } else {
+            // Missing `}` at end of file: reported one line after the last
+            // line of code inside the block, column 1 (SYNTAX_EXCEPTIONS.md #3
+            // bracket position).
+            int closeLine = this.prevEndLine() + 1;
+            this.recordError("Missing closing curly bracket at line " + closeLine.toString() + ", column 1");
+        }
         return block;
     }
 
@@ -727,6 +1513,9 @@ class Parser {
     }
 
     private Node parseStmt() {
+        // A stray `;` is an empty statement (also the recovery anchor used
+        // after an unknown-keyword error).
+        if (this.check(106)) { this.advance(); return this.noopNode(); }
         if (this.check(7) && this.strEq(this.peek().text, "switch")) {
             return this.parseSwitch();
         }
@@ -752,8 +1541,30 @@ class Parser {
             this.expect(101);
             this.expect(110);
             destr.children.add(this.parseExpr(0));
-            this.expect(106);
+            this.expectSemi();
             return destr;
+        }
+        // Unknown-keyword detection (SYNTAX_EXCEPTIONS.md).  A statement that
+        // begins with a lowercase identifier not followed by any expression
+        // continuation (`(`, `.`, `=`, `[`, ...) is an unknown keyword or a
+        // typo of one.  Uppercase-led identifiers stay on the user-defined
+        // type-declaration path below.
+        if (this.check(7)) {
+            Token curTok = this.peek();
+            if (!this.strEq(curTok.text, "switch") && !this.strEq(curTok.text, "tuple")) {
+                int nk = -1;
+                if (this.pos + 1 < this.tokens.length) { nk = this.tokens[this.pos + 1].kind; }
+                bool continuesExpr = this.tokenContinuesExpr(nk);
+                // `print"hello world");` — a call missing its open parenthesis.
+                if (!continuesExpr && nk == 3) {
+                    return this.parseCallMissingOpenParen();
+                }
+                if (!continuesExpr && this.identShouldFlag(curTok, nk)) {
+                    this.advance();
+                    this.flagUnknownKeywordAt(curTok);
+                    return this.noopNode();
+                }
+            }
         }
         if (this.check(7) && this.pos + 1 < this.tokens.length) {
             Token next = this.tokens[this.pos + 1];
@@ -778,23 +1589,26 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             Node n = new Node(); n.kind = 51;
             this.advance();
             if (!this.check(106)) { n.children.add(this.parseExpr(0)); }
-            this.expect(106);
+            this.expectSemi();
             return n;
         }
         if (this.check(141)) {
             Node n = new Node(); n.kind = 52;
             this.advance();
             n.children.add(this.parseExpr(0));
-            this.expect(106);
+            this.expectSemi();
             return n;
         }
         if (this.check(10)) { return this.parseIf(); }
+        // A leading `elif` continues an if-chain begun by a previous
+        // statement (`if (...) { } else { }\n elif (...) { }`).
+        if (this.check(56)) { return this.parseIf(); }
         if (this.check(12)) { return this.parseWhile(); }
         if (this.check(13)) { return this.parseFor(); }
         if (this.check(166)) { return this.parseLoop(); }
         if (this.check(14)) { return this.pppp(); }
-        if (this.check(57)) { Node n = new Node(); n.kind = 62; this.advance(); this.expect(106); return n; }
-        if (this.check(58)) { Node n = new Node(); n.kind = 63; this.advance(); this.expect(106); return n; }
+        if (this.check(57)) { Node n = new Node(); n.kind = 62; this.advance(); this.expectSemi(); return n; }
+        if (this.check(58)) { Node n = new Node(); n.kind = 63; this.advance(); this.expectSemi(); return n; }
         if (this.check(150)) {
             this.advance();
             return this.parseVarDecl();
@@ -846,26 +1660,28 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 this.advance();
                 n.children.add(this.parseExpr(0));
             }
-            this.expect(106);
+            this.expectSemi();
             return n;
         }
         if (this.check(49)) {
             Node n = new Node(); n.kind = 60;
             this.advance();
             n.name = this.advance().text;
-            this.expect(106);
+            this.expectSemi();
             return n;
         }
         if (this.check(52)) { return this.parseTryCatch(); }
         if (this.check(64)) { return this.parseThrow(); }
-        if (this.check(28) || this.check(18) || this.check(19) || this.check(20) || this.check(25) || this.check(27) || this.check(22) || this.check(23) || this.check(26)) {
+        // A primitive type keyword followed by `.` is a static-method
+        // receiver (`int.parseInt(s)`), not a declaration.
+        if ((this.check(28) || this.check(18) || this.check(19) || this.check(20) || this.check(25) || this.check(27) || this.check(22) || this.check(23) || this.check(26)) && !(this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 108)) {
             return this.parseVarDecl();
         }
         Node exprStmt = new Node(); exprStmt.kind = 61;
         exprStmt.children.add(this.parseExpr(0));
-        // A trailing semicolon is optional for the final statement (top-level
-        // scripts and legacy tests such as test_42.sr omit it).
-        if (this.check(106)) { this.advance(); }
+        // Statement-final semicolon: recorded (merged into one message) when
+        // missing, tolerated at end of file.
+        this.expectSemi();
         return exprStmt;
     }
 
@@ -880,7 +1696,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         Node arr = new Node(); arr.kind = 19; arr.op = 1;
         if (sizeExpr.kind == 0) { arr.intVal = sizeExpr.intVal; }
         n.children.add(arr);
-        this.expect(106);
+        this.expectSemi();
         return n;
     }
 
@@ -895,7 +1711,8 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             n.typeHint = typeName;
             this.advance();
             n.name = this.advance().text;
-            this.expect(106);
+            this.registerDeclaredType(n.name);
+            this.expectSemi();
             return n;
         }
         this.pos = this.pos - 1;
@@ -925,7 +1742,8 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         }
         if (this.check(123)) { this.advance(); aliasType = aliasType + "?"; }
         n.typeHint = aliasType;
-        this.expect(106);
+        this.registerDeclaredType(n.name);
+        this.expectSemi();
         return n;
     }
 
@@ -968,7 +1786,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             }
             this.expect(110);
             destr.children.add(this.parseExpr(0));
-            this.expect(106);
+            this.expectSemi();
             return destr;
         }
         if (this.check(110)) {
@@ -982,7 +1800,12 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             moveBin.children.add(rhs);
             n.children.add(moveBin);
         }
-        this.expect(106);
+        // TYPE_EXCEPTIONS.md — flag an initializer literal whose value kind
+        // can never fit the declared scalar type (`int x = "hello"`).
+        if (n.childCount() > 0) {
+            this.checkDeclValueType(typeName, n.child(0), n.name);
+        }
+        this.expectSemi();
         return n;
     }
 
@@ -1097,7 +1920,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         Node n = new Node(); n.kind = 68;
         this.advance();
         n.children.add(this.parseExpr(0));
-        this.expect(106);
+        this.expectSemi();
         return n;
     }
 
@@ -1263,12 +2086,32 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             if (this.check(100) && lhs.kind == 6) {
                 Node call = new Node(); call.kind = 10;
                 call.name = lhs.name;
+                // The callee's own position: unknown-method diagnostics point
+                // at the name, not at the arguments.
+                call.line = lhs.line; call.col = lhs.col;
+                Token openTok = this.peek();
                 this.advance();
+                int argc = 0;
                 while (!this.check(101) && !this.check(0)) {
+                    // Consume the separating comma, or report its absence
+                    // (`add (1 2)`).
+                    if (this.check(107)) {
+                        this.advance();
+                    } elif (argc > 0) {
+                        Token prevT = this.tokens[this.pos - 1];
+                        this.recordError("you forgot a comma \",\" at line " + prevT.line.toString() + ", column " + (prevT.col + this.tokenSrcLen(prevT)).toString());
+                    }
                     call.children.add(this.parseExpr(0));
-                    if (this.check(107)) { this.advance(); }
+                    argc = argc + 1;
                 }
-                this.expect(101);
+                if (this.check(101)) {
+                    this.advance();
+                } else {
+                    // Missing closing parenthesis: reported just past the
+                    // opening one.
+                    this.recordError("Missing close parenthesis at line " + openTok.line.toString() + ", column " + (openTok.col + 1).toString());
+                }
+                this.checkCallArgTypes(call);
                 lhs = call;
                 continue;
             }
@@ -1307,18 +2150,40 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     Node call = new Node(); call.kind = 10;
                     call.name = name.text;
                     call.isMember = true;
+                    // Receiver-side position keeps post-parse diagnostics
+                    // (VALUE_EXCEPTION.md path checks) pointed at this call.
+                    call.line = lhs.line; call.col = lhs.col;
                     call.children.add(lhs);
                     bool hof = this.isHofMethod(name.text);
+                    Token openTok2 = this.peek();
                     this.advance();
+                    int mArgc = 0;
                     while (!this.check(101) && !this.check(0)) {
+                        if (this.check(107)) {
+                            this.advance();
+                        } elif (mArgc > 0) {
+                            Token prevT2 = this.tokens[this.pos - 1];
+                            this.recordError("you forgot a comma \",\" at line " + prevT2.line.toString() + ", column " + (prevT2.col + this.tokenSrcLen(prevT2)).toString());
+                        }
                         if (hof) {
                             call.children.add(this.parseLambdaArg());
                         } else {
                             call.children.add(this.parseExpr(0));
                         }
-                        if (this.check(107)) { this.advance(); }
+                        mArgc = mArgc + 1;
                     }
-                    this.expect(101);
+                    if (this.check(101)) {
+                        this.advance();
+                    } else {
+                        // Missing closing parenthesis: reported just past the
+                        // opening one.
+                        this.recordError("Missing close parenthesis at line " + openTok2.line.toString() + ", column " + (openTok2.col + 1).toString());
+                    }
+                    // VALUE_EXCEPTION.md — numeric parse conversions on a
+                    // literal string argument (`int.parseInt("hello")`).
+                    if (lhs.kind == 6 && mArgc == 1) {
+                        this.checkParseValueException(lhs.name, name.text, call.child(1));
+                    }
                     lhs = call;
                 } else {
                     Node member = new Node(); member.kind = 13;
@@ -1340,6 +2205,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     Node call = new Node(); call.kind = 10;
                     call.name = name.text;
                     call.isMember = true;
+                    call.line = lhs.line; call.col = lhs.col;
                     call.children.add(lhs);
                     this.advance();
                     while (!this.check(101) && !this.check(0)) {
@@ -1761,4 +2627,70 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         }
         return n;
     }
+}
+
+// ---- EXCEPTIONS/*.md shared suggestion helpers ----------------------------
+
+// Levenshtein edit distance between two lowercase-folded words.
+int diagLevenshtein(string a, string b) {
+    int alen = a.length;
+    int blen = b.length;
+    if (alen == 0) { return blen; }
+    if (blen == 0) { return alen; }
+    int[] prev = [];
+    int[] cur = [];
+    for (int j = 0; j <= blen; j++) { prev.add(j); cur.add(0); }
+    for (int i = 1; i <= alen; i++) {
+        cur[0] = i;
+        for (int j = 1; j <= blen; j++) {
+            int cost = 1;
+            if (a[i - 1] == b[j - 1]) { cost = 0; }
+            int del = prev[j] + 1;
+            int ins = cur[j - 1] + 1;
+            int sub = prev[j - 1] + cost;
+            int best = del;
+            if (ins < best) { best = ins; }
+            if (sub < best) { best = sub; }
+            cur[j] = best;
+        }
+        for (int k = 0; k <= blen; k++) { prev[k] = cur[k]; }
+    }
+    return prev[blen];
+}
+
+string diagToLower(string word) {
+    string lo = "";
+    for (int i = 0; i < word.length; i++) {
+        char c = word[i];
+        if (c >= 'A' && c <= 'Z') { c = c + 32; }
+        lo = lo + charToString(c);
+    }
+    return lo;
+}
+
+// Smallest-edit-distance suggestion lookup (Levenshtein).  A candidate
+// qualifies when it differs by one edit, or by two edits with the same first
+// two letters (a real typo shape, not merely similar junk).
+string diagClosestMatch(string needle, string[] candidates) {
+    string needleLc = diagToLower(needle);
+    if (needleLc.length == 0) { return ""; }
+    string best = "";
+    int bestDist = 0;
+    for (int i = 0; i < candidates.length; i++) {
+        string candLc = diagToLower(candidates[i]);
+        if (candLc.length == 0) { continue; }
+        int d = diagLevenshtein(needleLc, candLc);
+        bool acceptable = false;
+        if (d == 1) { acceptable = true; }
+        elif (d == 2 && needleLc.length >= 3) {
+            if (needleLc[0] == candLc[0] && needleLc[1] == candLc[1]) { acceptable = true; }
+        }
+        if (acceptable) {
+            if (best.length == 0 || d < bestDist) {
+                best = candidates[i];
+                bestDist = d;
+            }
+        }
+    }
+    return best;
 }
