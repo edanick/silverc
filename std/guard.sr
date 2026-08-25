@@ -273,9 +273,6 @@ class MemoryGuard {
                 this.fail("UnsetAliasCallException", n.line, n.col, name, "alias target is dead or out of scope");
             }
         }
-        if (v.isNullable && this.unwrapDepth == 0 && !this.isNonNullHere(name)) {
-            this.fail("NullValueException", n.line, n.col, name, "nullable value used without a null check (use ??)");
-        }
         if (v.isOnce) {
             v.isAlive = false;
             v.isInit = false;
@@ -407,6 +404,14 @@ class MemoryGuard {
                         this.fail("UnsetAliasCallException", lhs.line, lhs.col, v.name, "alias target is dead or out of scope");
                     }
                 }
+                if (rhs.kind == GND_IDENT && n.op == GOP_ASSIGN) {
+                    int ri = this.findVar(rhs.name);
+                    if (ri >= 0 && this.vars[ri].isNullable) {
+                        if (v.typeHint.length > 0 && !this.endsWithQ(v.typeHint)) {
+                            this.fail("NullValueException", rhs.line, rhs.col, lhs.name, "nullable value " + rhs.name + " used without a null check (use ??)");
+                        }
+                    }
+                }
                 v.isInit = true;
                 v.isAlive = true;
                 this.markAddrHolding(v, rhs, lhs);
@@ -427,6 +432,17 @@ class MemoryGuard {
         return false;
     }
 
+    private void checkNullableInit(Node node, Node init) {
+        if (init.kind == GND_IDENT) {
+            int ri = this.findVar(init.name);
+            if (ri >= 0 && this.vars[ri].isNullable) {
+                if (node.typeHint.length > 0 && !this.endsWithQ(node.typeHint)) {
+                    this.fail("NullValueException", init.line, init.col, node.name, "nullable value " + init.name + " used without a null check (use ??)");
+                }
+            }
+        }
+    }
+
     private void checkVarDecl(Node n) {
         string name = n.name;
         bool nullable = this.endsWithQ(n.typeHint);
@@ -444,6 +460,7 @@ class MemoryGuard {
             this.declareVar(name, n.typeHint, true, true, onceFlag, fixedFlag, nullable, false, n.line, n.col);
             return;
         }
+        this.checkNullableInit(n, init);
         this.checkExpr(init);
         GuardVar v = new GuardVar();
         v.name = name;
