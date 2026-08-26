@@ -96,6 +96,21 @@ class MiniCg {
     public prop int[] liveSlots;
     public prop bool[] liveSlotIsArray;
     public prop int qcTempCounter;
+    // OVERHAUL.md threading module: effective worker count for this
+    // compilation (total - 2 by default or the explicit --threads N).
+    public prop int threadCount;
+    // OVERHAUL.md --runtime: embed the Silver runtime (allocator + GC
+    // scaffolding) into the emitted program and route HeapAlloc calls
+    // through the embedded bump allocator.
+    public prop bool runtimeMode;
+    public prop int rtInitOffset;
+    public prop int rtAllocOffset;
+    public prop int rtGcOffset;
+    public prop int runtimeEntryOffset;
+    public prop int[] rtStatePatchOffsets;
+    public prop int[] heapAllocPatchPos;
+    public prop int rtStateDataOff;
+    public prop int rtPtrSlotDataOff;
 
     construct (MiniAsm asm) {
         this.asm = asm;
@@ -173,6 +188,16 @@ class MiniCg {
         this.currentFinally = -1;
         this.currentFinallyRetVal = 0;
         this.currentFinallyRetFlag = 0;
+        this.threadCount = 1;
+        this.runtimeMode = false;
+        this.rtInitOffset = -1;
+        this.rtAllocOffset = -1;
+        this.rtGcOffset = -1;
+        this.runtimeEntryOffset = -1;
+        this.rtStatePatchOffsets = [];
+        this.heapAllocPatchPos = [];
+        this.rtStateDataOff = 0;
+        this.rtPtrSlotDataOff = 0;
     }
 
     public void collectClassLayouts(Node[] program) {
@@ -471,6 +496,12 @@ class MiniCg {
         this.importPatchOffsets.add(this.asm.buf.length + 2);
         this.importPatchDllIndices.add(-1);
         this.importPatchFuncIndices.add(idx);
+        // OVERHAUL.md --runtime: remember every HeapAlloc reference so the
+        // driver can repoint it at the embedded __silver_rt_alloc slot after
+        // the ordinary IAT patch pass.
+        if (this.runtimeMode && this.strEq(name, "HeapAlloc") && this.strEq(dll, "kernel32.dll")) {
+            this.heapAllocPatchPos.add(this.asm.buf.length + 2);
+        }
         return idx;
     }
 
@@ -510,6 +541,11 @@ class MiniCg {
     }
 
     public bool win32TableHas(string dll, string fn) {
+        // OVERHAUL.md --cache-bytecode / --watch: GetFileTime supplies the
+        // creation/write timestamps recorded per .sr file in the .sbcr record
+        // and polled by the watcher. It sits beside the other handle-based
+        // file APIs (CreateFileA/GetFileSize).
+        if (this.strEq(fn, "GetFileTime")) { return true; }
         string table = this.win32ExportTable(dll);
         int i = 0;
         while (i < table.length) {
@@ -1083,6 +1119,210 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.emitCallSetup(0);
             this.asm.callR64(0);
             this.asm.emitCallTeardown();
+        }
+        // OVERHAUL.md --runtime: append the embedded allocator + GC entry
+        // points after all program code, then an entry trampoline that brings
+        // the runtime up before user code or global initializers run.
+        if (this.runtimeMode) {
+            this.emitRuntimeFunctions();
+            this.emitRuntimeEntryStub();
+        }
+    }
+
+    // Register one of the embedded --runtime helper functions in the function
+    // tables so the ordinary forward-call patching resolves calls to it.
+    public void rtRegisterFunc(string fname) {
+        int off = this.asm.buf.length;
+        bool existed = false;
+        for (int i = 0; i < this.funcNames.length; i++) {
+            if (this.strEq(this.funcNames[i], fname) && this.funcOffsets[i] == -1) {
+                this.funcOffsets[i] = off;
+                existed = true;
+            }
+        }
+        if (!existed) {
+            this.funcNames.add(fname);
+            this.funcClasses.add("");
+            this.funcRetTypes.add("void");
+            this.funcOffsets.add(off);
+        }
+    }
+
+    // Emit `movabs reg, <runtime state>` and remember the immediate's patch
+    // position; the driver fills in the state block's absolute address after
+    // the PE layout is known.
+    public void emitRtStateAddr(int reg) {
+        this.rtStatePatchOffsets.add(this.asm.buf.length + 2);
+        this.asm.emitImm64(reg, 0);
+    }
+
+    public void emitRuntimeFunctions() {
+        // ---- __silver_rt_init ------------------------------------------
+        // VirtualAlloc(NULL, RT_HEAP_RESERVE, MEM_COMMIT|MEM_RESERVE,
+        //              PAGE_READWRITE); on success records base/offset in the
+        // writable state block. On failure the allocator falls back to the
+        // process heap for the whole run.
+        this.rtRegisterFunc("__silver_rt_init");
+        this.rtInitOffset = this.asm.buf.length;
+        int okLbl = this.newLabel();
+        this.asm.emitCallSetup(0);
+        this.asm.xorRR64(1, 1);
+        this.asm.movRI64(2, 16777216);
+        this.asm.movRI64(8, 12288);
+        this.asm.movRI64(9, 4);
+        this.addImportPatch("kernel32.dll", "VirtualAlloc");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.orRR64(0, 0);
+        this.asm.jeLabel(okLbl);
+        this.emitRtStateAddr(10);
+        this.asm.movMBaseR(10, 0, 0);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(10, 0, 8);
+        this.asm.bindLabel(okLbl);
+        this.asm.ret();
+
+        // ---- __silver_rt_alloc(size in R8) -----------------------------
+        // Mirrors the Win32 HeapAlloc call shape already emitted at every call
+        // site (RCX = heap handle, RDX = flags, R8 = bytes) so no call site
+        // changes. Bump-allocates from the reserved region; falls back to the
+        // real HeapAlloc import when it is exhausted.
+        this.rtRegisterFunc("__silver_rt_alloc");
+        this.rtAllocOffset = this.asm.buf.length;
+        int fbLbl = this.newLabel();
+        int doneLbl = this.newLabel();
+        this.emitRtStateAddr(10);
+        this.asm.movRMBase(0, 10, 0);
+        this.asm.orRR64(0, 0);
+        this.asm.jeLabel(fbLbl);
+        this.asm.movRR64(9, 8);
+        this.asm.addRI32(9, 15);
+        this.asm.andRImm(9, -16);
+        this.asm.movRMBase(11, 10, 8);
+        this.asm.movRR64(2, 11);
+        this.asm.addRR64(2, 9);
+        this.asm.cmpRI32(2, 16777216);
+        this.asm.jgLabel(fbLbl);
+        this.asm.movMBaseR(10, 2, 8);
+        this.asm.addRR64(0, 11);
+        this.asm.jmpLabel(doneLbl);
+        this.asm.bindLabel(fbLbl);
+        this.asm.emitCallSetup(0);
+        this.addImportPatch("kernel32.dll", "GetProcessHeap");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.emitCallSetup(0);
+        this.asm.movRR64(1, 0);
+        this.asm.movRI64(2, 8);
+        this.addImportPatch("kernel32.dll", "HeapAlloc");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.bindLabel(doneLbl);
+        this.asm.ret();
+
+        // ---- __silver_rt_gc_collect ------------------------------------
+        // Scaffolding stub: advances the cycle counter. Exact mark-sweep needs
+        // tagged values in native codegen (see DOCS/GC collector design.md).
+        this.rtRegisterFunc("__silver_rt_gc_collect");
+        this.rtGcOffset = this.asm.buf.length;
+        this.emitRtStateAddr(10);
+        this.asm.movRMBase(0, 10, 16);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(10, 0, 16);
+        this.asm.ret();
+    }
+
+    public void emitRuntimeEntryStub() {
+        // The trampoline that becomes the PE entry point in --runtime mode:
+        // bring up the embedded heap, run global initializers, call main, and
+        // exit with its status. The driver prefers runtimeEntryOffset over
+        // the plain main/global-init entries whenever it is set.
+        this.runtimeEntryOffset = this.asm.buf.length;
+        this.asm.emitCallSetup(0);
+        this.asm.callRel32(0);
+        this.forwardCalls.add(this.asm.buf.length - 4);
+        this.forwardCallNames.add("__silver_rt_init");
+        this.forwardCallClasses.add("");
+        this.asm.emitCallTeardown();
+        if (this.globalNames.length > 0) {
+            this.asm.emitCallSetup(0);
+            this.asm.callRel32(0);
+            this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallNames.add("__init_globals");
+            this.forwardCallClasses.add("");
+            this.asm.emitCallTeardown();
+        }
+        if (this.hasMain) {
+            this.asm.emitCallSetup(0);
+            this.asm.callRel32(0);
+            this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallNames.add("main");
+            this.forwardCallClasses.add("");
+            this.asm.emitCallTeardown();
+            this.asm.movRR64(1, 0);
+        } else {
+            this.asm.xorRR64(0, 0);
+            this.asm.movRR64(1, 0);
+        }
+        this.addImportPatch("kernel32.dll", "ExitProcess");
+        int sRtEx = 0xDEADBEEFCAFEBABF;
+        this.asm.emitImm64(0, sRtEx);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+    }
+
+    // Reserve the writable runtime state block (heap base + bump offset + gc
+    // cycles) and the internal pointer slot that redirects HeapAlloc calls to
+    // __silver_rt_alloc. Called by the driver right after getStringData().
+    public void appendRuntimeData() {
+        if (!this.runtimeMode) { return; }
+        this.rtStateDataOff = this.stringData.length;
+        for (int i = 0; i < 24; i++) { this.stringData.add(0); }
+        this.rtPtrSlotDataOff = this.stringData.length;
+        for (int i = 0; i < 8; i++) { this.stringData.add(0); }
+    }
+
+    // Patch the embedded-runtime references once the layout is known: the
+    // state-block address into every movabs site, __silver_rt_alloc's address
+    // into the pointer slot, and the slot address over every HeapAlloc IAT
+    // reference. Runs after patchImportRefs so the redirect wins.
+    public void patchRuntimeRefs(int[] code, int stringsStart, int rdataRva) {
+        if (!this.runtimeMode) { return; }
+        int64 stateAddr = 0x140000000 + rdataRva + stringsStart + this.rtStateDataOff;
+        for (int i = 0; i < this.rtStatePatchOffsets.length; i++) {
+            int pos = this.rtStatePatchOffsets[i];
+            code[pos] = stateAddr & 0xFF;
+            code[pos + 1] = (stateAddr >> 8) & 0xFF;
+            code[pos + 2] = (stateAddr >> 16) & 0xFF;
+            code[pos + 3] = (stateAddr >> 24) & 0xFF;
+            code[pos + 4] = (stateAddr >> 32) & 0xFF;
+            code[pos + 5] = (stateAddr >> 40) & 0xFF;
+            code[pos + 6] = (stateAddr >> 48) & 0xFF;
+            code[pos + 7] = (stateAddr >> 56) & 0xFF;
+        }
+        int64 allocAddr = 0x140000000 + 0x1000 + this.rtAllocOffset;
+        for (int b = 0; b < 8; b++) {
+            this.stringData[this.rtPtrSlotDataOff + b] = (allocAddr >> (b * 8)) & 0xFF;
+        }
+        int64 slotAddr = 0x140000000 + rdataRva + stringsStart + this.rtPtrSlotDataOff;
+        for (int p = 0; p < this.heapAllocPatchPos.length; p++) {
+            int pos = this.heapAllocPatchPos[p];
+            code[pos] = slotAddr & 0xFF;
+            code[pos + 1] = (slotAddr >> 8) & 0xFF;
+            code[pos + 2] = (slotAddr >> 16) & 0xFF;
+            code[pos + 3] = (slotAddr >> 24) & 0xFF;
+            code[pos + 4] = (slotAddr >> 32) & 0xFF;
+            code[pos + 5] = (slotAddr >> 40) & 0xFF;
+            code[pos + 6] = (slotAddr >> 48) & 0xFF;
+            code[pos + 7] = (slotAddr >> 56) & 0xFF;
         }
     }
 
@@ -2644,6 +2884,14 @@ int strIdx = this.stringPatchIndices[i];
             // The self-hosted backend uses the documented empty fallback for
             // title reads on hosts where a native title query is unavailable.
             this.emitLlmaiStringLiteral("");
+            return;
+        }
+        // OVERHAUL.md threading module: `threads.length` is the effective
+        // thread count used for this compilation (total - 2 by default or the
+        // explicit --threads N), embedded as an immediate at compile time.
+        if (obj.kind == 6 && this.strEq(obj.name, "threads") && this.strEq(fieldName, "length")
+            && this.getLocalType("threads").length == 0 && this.findGlobal("threads") < 0) {
+            this.asm.emitImm64(0, this.threadCount);
             return;
         }
         if (obj.kind == 6 && this.strEq(obj.name, "os")) {
@@ -4809,6 +5057,12 @@ int strIdx = this.stringPatchIndices[i];
             this.genPrintCall(call, 1);
         } elif (builtinName && this.strEq(name, "print")) {
             this.genPrintCall(call, 0);
+        } elif (builtinName && this.strEq(name, "eprintln")) {
+            // OVERHAUL.md CLI diagnostics: compiler error messages go to the
+            // standard error stream, matching silverc-rs's eprintln!.
+            this.genEprintCall(call, 1);
+        } elif (builtinName && this.strEq(name, "eprint")) {
+            this.genEprintCall(call, 0);
         } elif (builtinName && this.strEq(name, "readString")) {
             this.genReadStringCall(call);
         } elif (builtinName && this.strEq(name, "readFile")) {
@@ -6339,7 +6593,7 @@ public void genNewCall(Node call) {
         }
         bool isWin32 = false;
         string win32Dll = "";
-        if (this.strEq(name, "FindFirstFileA") || this.strEq(name, "FindNextFileA") || this.strEq(name, "FindClose") || this.strEq(name, "DeleteFileA") || this.strEq(name, "MoveFileA") || this.strEq(name, "GetFileAttributesA") || this.strEq(name, "CreateDirectoryA") || this.strEq(name, "RemoveDirectoryA") || this.strEq(name, "SetCurrentDirectoryA") || this.strEq(name, "CreateProcessA") || this.strEq(name, "WaitForSingleObject") || this.strEq(name, "GetStdHandle") || this.strEq(name, "SetConsoleTextAttribute") || this.strEq(name, "GetConsoleScreenBufferInfo") || this.strEq(name, "SetConsoleCursorPosition") || this.strEq(name, "GetModuleHandleA") || this.strEq(name, "LoadLibraryA") || this.strEq(name, "GetProcAddress") || this.strEq(name, "Sleep") || this.strEq(name, "GetTickCount") || this.strEq(name, "GetLastError") || this.strEq(name, "GetCurrentDirectoryA") || this.strEq(name, "WriteConsoleA") || this.strEq(name, "ReadConsoleA") || this.strEq(name, "GetConsoleMode") || this.strEq(name, "SetConsoleMode") || this.strEq(name, "CreatePipe") || this.strEq(name, "GetExitCodeProcess") || this.strEq(name, "CreateFileA") || this.strEq(name, "GetFileSize") || this.strEq(name, "ReadFile") || this.strEq(name, "WriteFile") || this.strEq(name, "CloseHandle") || this.strEq(name, "GetFileAttributesW") || this.strEq(name, "SetFilePointer") || this.strEq(name, "GetCurrentProcessId") || this.strEq(name, "GetCurrentProcess") || this.strEq(name, "GetCurrentThreadId") || this.strEq(name, "GetCurrentThread") || this.strEq(name, "GetEnvironmentVariableA") || this.strEq(name, "GetEnvironmentVariableW") || this.strEq(name, "SetEnvironmentVariableA") || this.strEq(name, "SetEnvironmentVariableW") || this.strEq(name, "ExpandEnvironmentStringsA") || this.strEq(name, "GetEnvironmentStringsA") || this.strEq(name, "FreeEnvironmentStringsA") || this.strEq(name, "GetTempPathA") || this.strEq(name, "GetComputerNameA") || this.strEq(name, "GetUserNameA") || this.strEq(name, "CopyFileA") || this.strEq(name, "SetFileAttributesA") || this.strEq(name, "GetFullPathNameA") || this.strEq(name, "GetModuleFileNameA") || this.strEq(name, "QueryPerformanceCounter") || this.strEq(name, "QueryPerformanceFrequency") || this.strEq(name, "GetTickCount64") || this.strEq(name, "TerminateProcess") || this.strEq(name, "OpenProcess") || this.strEq(name, "GetProcessId") || this.strEq(name, "FlushFileBuffers") || this.strEq(name, "GetFileSizeEx") || this.strEq(name, "CreateProcessW") || this.strEq(name, "CreateProcess") || this.strEq(name, "GetVersionExA") || this.strEq(name, "GetSystemDirectoryA") || this.strEq(name, "GetWindowsDirectoryA") || this.strEq(name, "GetLocalTime") || this.strEq(name, "GetSystemTime") || this.strEq(name, "OutputDebugStringA") || this.strEq(name, "IsDebuggerPresent") || this.strEq(name, "GetCommandLineA") || this.strEq(name, "GlobalAlloc") || this.strEq(name, "GlobalFree") || this.strEq(name, "VirtualAlloc") || this.strEq(name, "VirtualFree") || this.strEq(name, "HeapFree") || this.strEq(name, "GetProcessHeap") || this.strEq(name, "lstrlenA") || this.strEq(name, "lstrcpyA") || this.strEq(name, "lstrcatA") || this.strEq(name, "lstrcmpA") || this.strEq(name, "SetThreadPriority") || this.strEq(name, "QueryFullProcessImageNameA")) {
+        if (this.strEq(name, "FindFirstFileA") || this.strEq(name, "FindNextFileA") || this.strEq(name, "FindClose") || this.strEq(name, "GetFileTime") || this.strEq(name, "DeleteFileA") || this.strEq(name, "MoveFileA") || this.strEq(name, "GetFileAttributesA") || this.strEq(name, "CreateDirectoryA") || this.strEq(name, "RemoveDirectoryA") || this.strEq(name, "SetCurrentDirectoryA") || this.strEq(name, "CreateProcessA") || this.strEq(name, "WaitForSingleObject") || this.strEq(name, "GetStdHandle") || this.strEq(name, "SetConsoleTextAttribute") || this.strEq(name, "GetConsoleScreenBufferInfo") || this.strEq(name, "SetConsoleCursorPosition") || this.strEq(name, "GetModuleHandleA") || this.strEq(name, "LoadLibraryA") || this.strEq(name, "GetProcAddress") || this.strEq(name, "Sleep") || this.strEq(name, "GetTickCount") || this.strEq(name, "GetLastError") || this.strEq(name, "GetCurrentDirectoryA") || this.strEq(name, "WriteConsoleA") || this.strEq(name, "ReadConsoleA") || this.strEq(name, "GetConsoleMode") || this.strEq(name, "SetConsoleMode") || this.strEq(name, "CreatePipe") || this.strEq(name, "GetExitCodeProcess") || this.strEq(name, "CreateFileA") || this.strEq(name, "GetFileSize") || this.strEq(name, "ReadFile") || this.strEq(name, "WriteFile") || this.strEq(name, "CloseHandle") || this.strEq(name, "GetFileAttributesW") || this.strEq(name, "SetFilePointer") || this.strEq(name, "GetCurrentProcessId") || this.strEq(name, "GetCurrentProcess") || this.strEq(name, "GetCurrentThreadId") || this.strEq(name, "GetCurrentThread") || this.strEq(name, "GetEnvironmentVariableA") || this.strEq(name, "GetEnvironmentVariableW") || this.strEq(name, "SetEnvironmentVariableA") || this.strEq(name, "SetEnvironmentVariableW") || this.strEq(name, "ExpandEnvironmentStringsA") || this.strEq(name, "GetEnvironmentStringsA") || this.strEq(name, "FreeEnvironmentStringsA") || this.strEq(name, "GetTempPathA") || this.strEq(name, "GetComputerNameA") || this.strEq(name, "GetUserNameA") || this.strEq(name, "CopyFileA") || this.strEq(name, "SetFileAttributesA") || this.strEq(name, "GetFullPathNameA") || this.strEq(name, "GetModuleFileNameA") || this.strEq(name, "QueryPerformanceCounter") || this.strEq(name, "QueryPerformanceFrequency") || this.strEq(name, "GetTickCount64") || this.strEq(name, "TerminateProcess") || this.strEq(name, "OpenProcess") || this.strEq(name, "GetProcessId") || this.strEq(name, "FlushFileBuffers") || this.strEq(name, "GetFileSizeEx") || this.strEq(name, "CreateProcessW") || this.strEq(name, "CreateProcess") || this.strEq(name, "GetVersionExA") || this.strEq(name, "GetSystemDirectoryA") || this.strEq(name, "GetWindowsDirectoryA") || this.strEq(name, "GetLocalTime") || this.strEq(name, "GetSystemTime") || this.strEq(name, "OutputDebugStringA") || this.strEq(name, "IsDebuggerPresent") || this.strEq(name, "GetCommandLineA") || this.strEq(name, "GlobalAlloc") || this.strEq(name, "GlobalFree") || this.strEq(name, "VirtualAlloc") || this.strEq(name, "VirtualFree") || this.strEq(name, "HeapFree") || this.strEq(name, "GetProcessHeap") || this.strEq(name, "lstrlenA") || this.strEq(name, "lstrcpyA") || this.strEq(name, "lstrcatA") || this.strEq(name, "lstrcmpA") || this.strEq(name, "SetThreadPriority") || this.strEq(name, "QueryFullProcessImageNameA")) {
             isWin32 = true;
             win32Dll = "kernel32.dll";
         } elif (this.strEq(name, "GetFileVersionInfoSizeA") || this.strEq(name, "GetFileVersionInfoA") || this.strEq(name, "VerQueryValueA")) {
@@ -8844,6 +9098,68 @@ public void genNewCall(Node call) {
         this.asm.emitCallSetup(0);
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
+        }
+    }
+
+    public void genEprintCall(Node call, bool newline) {
+        // OVERHAUL.md CLI diagnostics: write one message to the standard
+        // error handle (GetStdHandle(STD_ERROR_HANDLE) + WriteFile). Only
+        // string arguments reach this path -- every compiler diagnostic is
+        // built by string concatenation before printing.
+        if (call.childCount() < 1) { return; }
+        Node arg = call.child(0);
+        this.genExpr(arg);
+        int msgOff = this.allocLocal("__emsg");
+        this.asm.movMBaseR(5, 0, msgOff);
+        int lenOff = this.allocLocal("__elen");
+        int hOff = this.allocLocal("__ehnd");
+        int wroteOff = this.allocLocal("__ewrote");
+        this.asm.movRMBase(1, 5, msgOff);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, lenOff);
+        this.asm.emitCallSetup(0);
+        this.asm.movRI64(1, -12);
+        this.addImportPatch("kernel32.dll", "GetStdHandle");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, hOff);
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, hOff);
+        this.asm.movRMBase(2, 5, msgOff);
+        this.asm.movRMBase(8, 5, lenOff);
+        this.asm.leaRBase(9, 5, wroteOff);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(4, 0, 32);
+        this.addImportPatch("kernel32.dll", "WriteFile");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        if (newline) {
+            int nlIdx = this.addString("\n");
+            int sp = this.asm.buf.length;
+            this.asm.emitImm64(0, 0);
+            this.stringPatchOffsets.add(sp + 2);
+            this.stringPatchIndices.add(nlIdx);
+            this.asm.emitCallSetup(0);
+            this.asm.movRR64(2, 0);
+            this.asm.movRMBase(1, 5, hOff);
+            this.asm.movRI64(8, 1);
+            this.asm.leaRBase(9, 5, wroteOff);
+            this.asm.xorRR64(0, 0);
+            this.asm.movMBaseR(4, 0, 32);
+            this.addImportPatch("kernel32.dll", "WriteFile");
+            this.asm.emitImm64(0, 0);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
         }
     }
 

@@ -11,6 +11,19 @@ import * from lexer;
 import * from token;
 import * from parser;
 import * from node;
+import * from cli_flags;
+import * from optimizer;
+import * from bcache;
+import * from watcher;
+import * from win32.kernel32;
+
+// Per-file cache markers: when --cache-bytecode is active the aggregate
+// source carries one marker comment line before each collected file so the
+// driver can split it back into per-file chunks and route each through the
+// bytecode cache. Marker lines are plain comments to every other stage.
+string cacheMarkerPrefix() {
+    return "//@@SILVER_FILE@@ ";
+}
 
 void printHelp() {
     printline("Silver Compiler v0.4.5");
@@ -19,12 +32,24 @@ void printHelp() {
     printline("Usage:");
     printline("  silverc [options] [<input.sr> [<output.exe>]]");
     printline("  silverc -i <input.sr> -o <output.exe>");
+    printline("  silverc <project.srp> [flags]");
     printline("");
     printline("Options:");
     printline("  -h, --help, -?    Show this help message");
     printline("  -v, --version     Show compiler and language version");
     printline("  -i <file>         Input Silver source file (default: compiler_driver.sr)");
     printline("  -o <file>         Output executable file (default: silverc)");
+    printline("");
+    printline("Execution modes (mutually exclusive):");
+    printline("  --aot             Ahead-of-time compilation (default pipeline)");
+    printline("  --jit             Compile then execute in this run");
+    printline("  --runtime         Embed the full runtime (allocator + GC)");
+    printline("");
+    printline("Independent flags:");
+    printline("  --optimize        Dead-code elimination + constant folding + peephole");
+    printline("  --cache-bytecode  Persistent bytecode cache (APPDATA\\silver cache)");
+    printline("  --watch           Predictive precompilation watcher");
+    printline("  --threads <N>     Explicit worker count (default: total - 2)");
     printline("");
     printline("Examples:");
     printline("  silverc --help");
@@ -48,12 +73,29 @@ string tryReadFile(string path) {
     return result;
 }
 
-// Locate a source-level module by name, returning its full source text (or
-// "" when the module is native/builtin or cannot be found). The candidate
-// paths mirror silverc-rs's resolve_imports: the input file's directory
-// first (sibling modules such as helper.sr), then std/ and silveri/src in
-// the locations the test suites and checkouts use.
-string findModuleSource(string name, string inputFile) {
+// File stem of a path: characters after the last separator, extension
+// removed.
+string drvFileStem(string path) {
+    int last = -1;
+    for (int i = 0; i < path.length; i++) {
+        if (path[i] == '\\' || path[i] == '/') { last = i; }
+    }
+    string name = path;
+    if (last >= 0) { name = projectSlice(path, last + 1, path.length); }
+    int dot = -1;
+    for (int j = name.length - 1; j >= 0; j--) {
+        if (name[j] == '.') { dot = j; break; }
+    }
+    if (dot > 0) { return projectSlice(name, 0, dot); }
+    return name;
+}
+
+// Locate a source-level module by name, returning its path (or "" when the
+// module is native/builtin or cannot be found). The candidate paths mirror
+// silverc-rs's resolve_imports: the input file's directory first (sibling
+// modules such as helper.sr), then std/ and silveri/src in the locations the
+// test suites and checkouts use.
+string findModulePath(string name, string inputFile) {
     if (projectBuiltin(name)) { return ""; }
     // Modules the driver already prepends above (llmai/exception/bom/process/
     // notifications) and the compiler's own baked-in modules must not be
@@ -88,9 +130,21 @@ string findModuleSource(string name, string inputFile) {
     candidates.add("..\\..\\silveri\\src\\" + name + ".sr");
     for (int i = 0; i < candidates.length; i++) {
         string src = tryReadFile(candidates[i]);
-        if (src.length > 0) { return src; }
+        if (src.length > 0) { return candidates[i]; }
     }
     return "";
+}
+
+// Locate a source-level module by name, returning its full source text (or
+// "" when the module is native/builtin or cannot be found).
+string findModuleSource(string name, string inputFile) {
+    string path = findModulePath(name, inputFile);
+    if (path.length == 0) { return ""; }
+    return tryReadFile(path);
+}
+
+string cacheMarkerLine(string path) {
+    return cacheMarkerPrefix() + bcNormalizeSlashes(path) + "\n";
 }
 
 // Recursively collect the sources of every non-builtin module imported by
@@ -98,12 +152,16 @@ string findModuleSource(string name, string inputFile) {
 // collected once (by name). The result is the concatenation of all module
 // sources (with the leading `mod export` line and inner import lines intact:
 // the parser ignores import statements and `mod export` at the top level).
-string collectModule(string name, string inputFile, string[] visited) {
+// With emitMarkers set, one cache-marker comment line precedes each file's
+// content so the aggregate can be split per file again (--cache-bytecode).
+string collectModule(string name, string inputFile, string[] visited, bool emitMarkers) {
     for (int i = 0; i < visited.length; i++) {
         if (cliArgEq(visited[i], name)) { return ""; }
     }
     visited.add(name);
-    string modSrc = findModuleSource(name, inputFile);
+    string modPath = findModulePath(name, inputFile);
+    if (modPath.length == 0) { return ""; }
+    string modSrc = tryReadFile(modPath);
     if (modSrc.length == 0) { return ""; }
     string result = "";
     int cursor = 0;
@@ -115,14 +173,16 @@ string collectModule(string name, string inputFile, string[] visited) {
         string statement = projectSlice(modSrc, importPos + 6, semi);
         string depName = projectImportModule(statement);
         if (depName.length > 0) {
-            string depSrc = findModuleSource(depName, inputFile);
-            if (depSrc.length > 0) {
-                result = result + collectModule(depName, inputFile, visited);
+            string depPath = findModulePath(depName, inputFile);
+            if (depPath.length > 0) {
+                result = result + collectModule(depName, inputFile, visited, emitMarkers);
             }
         }
         cursor = semi + 1;
     }
-    return result + modSrc + "\n";
+    string marker = "";
+    if (emitMarkers) { marker = cacheMarkerLine(modPath); }
+    return result + marker + modSrc + "\n";
 }
 
 // Known built-in module names used for did-you-mean suggestions on imports.
@@ -156,7 +216,7 @@ bool importIsWin32(string name) {
     return name[0] == 'w' && name[1] == 'i' && name[2] == 'n' && name[3] == '3' && name[4] == '2';
 }
 
-string collectImports(string source, string inputFile, string ignored, string[] errs) {
+string collectImports(string source, string inputFile, string ignored, string[] errs, bool emitMarkers) {
     string[] visited = [];
     string result = "";
     int cursor = 0;
@@ -222,191 +282,238 @@ string collectImports(string source, string inputFile, string ignored, string[] 
                     errs.add("unknown module \"" + moduleName + "\" was found at line " + loc[0].toString() + ", column " + loc[1].toString() + ". module either doesn't exist or not installed.");
                 }
             } else {
-                result = result + collectModule(moduleName, inputFile, visited);
+                result = result + collectModule(moduleName, inputFile, visited, emitMarkers);
             }
         }
         cursor = semi + 1;
+    }
+    if (emitMarkers) {
+        if (result.length > 0) { return result + cacheMarkerLine(inputFile) + source; }
+        return cacheMarkerLine(inputFile) + source;
     }
     if (result.length > 0) { return result + source; }
     return source;
 }
 
+// ---------------------------------------------------------------------------
+// OVERHAUL.md --jit: execute the emitted image as a direct child process (no
+// shell involved — CreateProcessA maps straight onto the OS), wait for it to
+// finish, and hand its exit code back to the caller.
+// ---------------------------------------------------------------------------
+
+int jitExecute(CliFlags flags, int[] peData, string inputPath) {
+    string tempBase = bcEnvValue("TEMP");
+    if (tempBase.length == 0) { tempBase = bcEnvValue("TMP"); }
+    if (tempBase.length == 0) { tempBase = "."; }
+    string jitDir = tempBase + "\\silverc-jit";
+    ensureDirTree(jitDir);
+    string stem = drvFileStem(inputPath);
+    if (stem.length == 0) { stem = "jit"; }
+    string exePath = jitDir + "\\" + stem + "_" + bcNowMillis().toString() + "_" + GetCurrentProcessId().toString() + ".exe";
+    file.writeBytes(exePath, peData);
+    // Zeroed STARTUPINFO (104 bytes) and PROCESS_INFORMATION (24 bytes)
+    // buffers; the arrays lower to data pointers across the Win32 boundary.
+    int[] si = [];
+    for (int zi = 0; zi < 104; zi++) { si.add(0); }
+    int[] pi = [];
+    for (int pz = 0; pz < 6; pz++) { pi.add(0); }
+    int created = CreateProcessA(null, "\"" + exePath + "\"", null, null, 0, 0, null, null, si, pi);
+    if (created == 0) {
+        flags.errLine("jit: failed to execute " + exePath);
+        return 1;
+    }
+    int hProcess = pi[0];
+    WaitForSingleObject(hProcess, -1);
+    int gotCode = 0;
+    GetExitCodeProcess(hProcess, &gotCode);
+    CloseHandle(hProcess);
+    file.delete(exePath);
+    return gotCode;
+}
+
+// Split a marked aggregate into per-file chunks (paths, texts, and the
+// aggregate 0-based line index of each chunk's first content line). Field
+// arrays grow through `this`, which every backend supports.
+class MarkedChunks {
+    public prop string[] paths;
+    public prop string[] texts;
+    public prop int[] startLines;
+
+    construct () {
+        this.paths = [];
+        this.texts = [];
+        this.startLines = [];
+    }
+
+    public void split(string source) {
+        this.paths = [];
+        this.texts = [];
+        this.startLines = [];
+        int prefixLen = cacheMarkerPrefix().length;
+        int pos = 0;
+        int lineStart = 0;
+        int aggLine = 0;
+        string curPath = "";
+        bool havePath = true;
+        int bodyStart = 0;
+        int bodyLine = 0;
+        while (pos <= source.length) {
+            bool atEnd = pos == source.length;
+            if (atEnd || source[pos] == '\n') {
+                string line = projectSlice(source, lineStart, pos);
+                bool isMarker = line.length > prefixLen;
+                if (isMarker) {
+                    for (int k = 0; k < prefixLen; k++) {
+                        if (line[k] != cacheMarkerPrefix()[k]) { isMarker = false; break; }
+                    }
+                }
+                if (isMarker) {
+                    if (havePath && pos > bodyStart) {
+                        this.paths.add(curPath);
+                        this.texts.add(projectSlice(source, bodyStart, pos));
+                        this.startLines.add(bodyLine);
+                    }
+                    curPath = projectSlice(line, prefixLen, line.length);
+                    havePath = true;
+                    bodyStart = pos + 1;
+                    bodyLine = aggLine + 1;
+                }
+                if (atEnd) { break; }
+                aggLine++;
+                lineStart = pos + 1;
+            }
+            pos++;
+        }
+        if (havePath && source.length > bodyStart) {
+            this.paths.add(curPath);
+            this.texts.add(projectSlice(source, bodyStart, source.length));
+            this.startLines.add(bodyLine);
+        }
+    }
+}
+
+// Session naming mirrors silverc-rs: projects key the cache by their
+// manifest name (or manifest stem), standalone files by the source stem.
+string cacheSessionName(string inputFile, bool inputIsProject) {
+    if (inputIsProject) {
+        string mn = projectManifestValue(file.readString(inputFile), "name");
+        if (mn.length > 0) { return mn; }
+        return drvFileStem(inputFile);
+    }
+    return drvFileStem(inputFile);
+}
+
 void main() {
     string[] args = cargs;
-    string inputFile = "";
-    string outputFile = "";
-    bool showHelp = false;
-    bool showVersion = false;
 
     // cargs[0] is the executable name. Keep argument handling independent of
     // the platform's quoting rules and of the current working directory.
-    int argIdx = 1;
-    bool inputSet = false;
-    bool outputSet = false;
-    while (argIdx < args.length) {
-        string arg = args[argIdx];
-        bool isOption = false;
-
-        // Compare option spelling by length and characters.  String equality
-        // is deliberately avoided here: the self-hosted backend represents
-        // strings as pointers, while character equality is value-based.
-        if (arg.length == 2) {
-            if (arg[0] == '-') {
-                if (arg[1] == 'h') {
-                    showHelp = true;
-                    isOption = true;
-                }
-                if (arg[1] == 'v') {
-                    showVersion = true;
-                    isOption = true;
-                }
-                if (arg[1] == 'i') {
-                    isOption = true;
-                    argIdx = argIdx + 1;
-                    if (argIdx < args.length) {
-                        inputFile = args[argIdx];
-                        inputSet = true;
-                    }
-                }
-                if (arg[1] == 'o') {
-                    isOption = true;
-                    argIdx = argIdx + 1;
-                    if (argIdx < args.length) {
-                        outputFile = args[argIdx];
-                        outputSet = true;
-                    }
-                }
-                if (arg[1] == '?') {
-                    showHelp = true;
-                    isOption = true;
-                }
-            }
-            if (arg[0] == '/') {
-                if (arg[1] == '?') {
-                    showHelp = true;
-                    isOption = true;
-                }
-            }
-        }
-        if (arg.length == 5) {
-            if (arg[0] == '-') {
-                if (arg[1] == 'h') {
-                    if (arg[2] == 'e') {
-                        if (arg[3] == 'l') {
-                            if (arg[4] == 'p') {
-                                showHelp = true;
-                                isOption = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if (arg.length == 6) {
-            if (arg[0] == '-') {
-                if (arg[1] == '-') {
-                    if (arg[2] == 'h') {
-                        if (arg[3] == 'e') {
-                            if (arg[4] == 'l') {
-                                if (arg[5] == 'p') {
-                                    showHelp = true;
-                                    isOption = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if (arg.length == 9) {
-            if (arg[0] == '-') {
-                if (arg[1] == '-') {
-                    if (arg[2] == 'v') {
-                        if (arg[3] == 'e') {
-                            if (arg[4] == 'r') {
-                                if (arg[5] == 's') {
-                                    if (arg[6] == 'i') {
-                                        if (arg[7] == 'o') {
-                                            if (arg[8] == 'n') {
-                                                showVersion = true;
-                                                isOption = true;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if (isOption == false) {
-            if (inputSet == false) {
-                inputFile = arg;
-                inputSet = true;
-            } else {
-                if (outputSet == false) {
-                    outputFile = arg;
-                    outputSet = true;
-                }
-            }
-        }
-        argIdx = argIdx + 1;
+    if (args.length <= 1) {
+        printHelp();
+        exit(0);
     }
-
-    bool skipCompile = false;
-    if (showVersion) {
+    string arg0 = args[1];
+    if (cliArgEq(arg0, "--version") || cliArgEq(arg0, "-v")) {
         printline("Silver Compiler v0.4.5");
         printline("Language: Silver");
         printline("Version:  0.4.5");
         printline("Copyright: © 2025 Edan M.");
         printline("Run with --help for usage information.");
-        skipCompile = true;
+        exit(0);
     }
-
-    if (args.length <= 1) {
+    if (cliArgEq(arg0, "--help") || cliArgEq(arg0, "-h") || cliArgEq(arg0, "-?") || cliArgEq(arg0, "/?")) {
         printHelp();
-        skipCompile = true;
-    } elif (showHelp) {
-        printHelp();
-        skipCompile = true;
+        exit(0);
     }
 
-    if (inputFile == "") {
-        inputFile = "compiler_driver.sr";
-    }
-    if (outputFile == "") {
-        outputFile = "silverc";
+    // OVERHAUL.md flag parsing: modes, independent flags, validation.
+    CliFlags flags = parseCliArgs(args);
+    if (flags.failed()) {
+        flags.errLine(flags.error);
+        exit(1);
     }
 
-    // Compute the exact project suffix once. Keeping this decision in one
-    // boolean avoids duplicated string-index lowering in self-generated stages.
-    bool inputIsProject = false;
-    string projectType = "";
-    if (!skipCompile) {
-        inputIsProject = projectHasSuffix(inputFile, ".srp");
-        if (inputIsProject) {
-            string manifest = file.readString(inputFile);
-            projectType = projectManifestValue(manifest, "type");
-            if (!outputSet) {
-                string projectOutput = projectManifestValue(manifest, "output");
-                if (!cliArgEq(projectOutput, "")) { outputFile = projectOutput; }
-            }
+    // Hard-coded self-protection layer: refuse dangerous modes on
+    // compiler/interpreter inputs and outputs regardless of any manifest.
+    string spErr = flags.selfProtectionError();
+    if (spErr.length > 0) {
+        flags.errLine(spErr);
+        exit(1);
+    }
+
+    // Legacy default invocation keeps compiling the compiler itself.
+    string inputFile = flags.input;
+    if (inputFile.length == 0) { inputFile = "compiler_driver.sr"; }
+
+    // Legacy guard retained: unknown suffixes still report the same error.
+    bool inputIsProject = projectHasSuffix(inputFile, ".srp");
+    if (!inputIsProject && !projectHasSuffix(inputFile, ".sr")) {
+        printline("Error: Unknown file type. Expected .sr or .srp");
+        exit(1);
+    }
+
+    string outputFile = flags.output;
+
+    // Manifest-level forbidden_flags are checked before anything runs.
+    string manifestText = "";
+    if (inputIsProject) {
+        manifestText = file.readString(inputFile);
+        string ffErr = flags.forbiddenFlagsError(manifestText);
+        if (ffErr.length > 0) {
+            flags.errLine(ffErr);
+            exit(1);
+        }
+        if (outputFile.length == 0) {
+            string projectOutput = projectManifestValue(manifestText, "output");
+            if (!cliArgEq(projectOutput, "")) { outputFile = projectOutput; }
+        }
+    }
+    if (outputFile.length == 0) { outputFile = "silverc"; }
+
+    // OVERHAUL.md --threads resolution: over-request aborts with the exact
+    // spec message and no fallback; requesting every thread warns about
+    // hang/lag with a margin of at least 2 recommended.
+    flags.resolveThreads();
+    if (flags.failed()) {
+        flags.errLine(flags.error);
+        exit(1);
+    }
+    if (flags.warnAllThreads) {
+        flags.errLine(flags.warnAllMessage());
+    }
+
+    // OVERHAUL.md --watch: idle-debounce precompilation loop.
+    if (flags.watch) {
+        runWatchLoop(flags, inputIsProject, manifestText, outputFile);
+        exit(0);
+    }
+
+    int code = compileOnce(flags, outputFile);
+    exit(code);
+}
+
+// One full pipeline pass. Returns the process exit code: 0 on success, 1 on
+// failure; in --jit mode the compiled program runs as a child and its exit
+// code propagates.
+int compileOnce(CliFlags flags, string outputFile) {
+    string inputFile = flags.input;
+    bool inputIsProject = projectHasSuffix(inputFile, ".srp");
+
+    if (inputIsProject) {
+        string manifest = file.readString(inputFile);
+        string projectType = projectManifestValue(manifest, "type");
+        if (cliArgEq(projectType, "quicksilver")) {
+            // `type: quicksilver` (DOCS/226): emit a QuickSilver (.qs) library
+            // bundle instead of an executable.
+            int[] bundle = projectBuildBundle(inputFile);
+            file.writeBytes(outputFile, bundle);
+            return 0;
         }
     }
 
-    if (skipCompile) {
-        // Do nothing else; fall through to the ExitProcess at the end.
-    } elif (inputIsProject && cliArgEq(projectType, "quicksilver")) {
-        // `type: quicksilver` (DOCS/226): emit a QuickSilver (.qs) library
-        // bundle instead of an executable. The bundle is a binary container
-        // of minified module sources plus metadata, written as bytes.
-        int[] bundle = projectBuildBundle(inputFile);
-        file.writeBytes(outputFile, bundle);
-    } else {
     string source = file.readString(inputFile);
     if (inputIsProject) {
-        source = projectBuildSource(inputFile);
+        source = projectBuildSource(inputFile, flags.cacheBytecode);
     } else {
         // `.col` declarations require a project manifest with a configured
         // collection directory. Standalone source compilation reports the
@@ -503,7 +610,7 @@ void main() {
         // collected the same way. Native modules (fs/json/yaml/os + the
         // special-cased std libs above) are never read from disk.
         string[] moduleErrors = [];
-        source = collectImports(source, inputFile, "", moduleErrors);
+        source = collectImports(source, inputFile, "", moduleErrors, flags.cacheBytecode);
         if (moduleErrors.length > 0) {
             for (int meI = 0; meI < moduleErrors.length; meI++) {
                 printline(moduleErrors[meI]);
@@ -513,7 +620,9 @@ void main() {
     }
 
     // Per-line character lengths so bracket diagnostics can point just past
-    // the end of a line (SYNTAX_EXCEPTIONS.md #3).
+    // the end of a line (SYNTAX_EXCEPTIONS.md #3). Computed over the whole
+    // aggregate either way; cached token streams get re-offset below so their
+    // line numbers land on the same aggregate rows.
     int[] lineLens = [];
     int lineCur = 0;
     int srcTotal = source.length;
@@ -524,26 +633,56 @@ void main() {
     }
     lineLens.add(lineCur);
 
-    Lexer lexer;
-    lexer = new Lexer(source);
+    Token[] tokens = [];
+    CacheSession? sess = null;
+    if (!flags.cacheBytecode) {
+        Lexer lexer = new Lexer(source);
+        tokens = lexer.tokenize();
 
-    Token[] tokens;
-    tokens = lexer.tokenize();
-
-    // Lexical diagnostics print one per line and abort before parsing.
-    if (lexer.lexErrors.length > 0) {
-        for (int leI = 0; leI < lexer.lexErrors.length; leI++) {
-            printline(lexer.lexErrors[leI]);
+        // Lexical diagnostics print one per line and abort before parsing.
+        if (lexer.lexErrors.length > 0) {
+            for (int leI = 0; leI < lexer.lexErrors.length; leI++) {
+                printline(lexer.lexErrors[leI]);
+            }
+            exit(1);
         }
-        exit(1);
+    } else {
+        // OVERHAUL.md --cache-bytecode: lex each collected file separately,
+        // going through the persistent bytecode cache; only files whose hash
+        // or mtime changed are re-lexed and re-cached.
+        MarkedChunks chunks = new MarkedChunks();
+        chunks.split(source);
+        sess = new CacheSession(bcDirname(inputFile), cacheSessionName(inputFile, inputIsProject));
+        if (sess.ok && chunks.paths.length > 0) {
+            for (int ci2 = 0; ci2 < chunks.paths.length; ci2++) {
+                Token[] part = sess.tokensFor(bcReplaceAll(chunks.paths[ci2], "/", "\\"), chunks.texts[ci2]);
+                int off = chunks.startLines[ci2];
+                for (int tj = 0; tj < part.length; tj++) {
+                    Token t = part[tj];
+                    // Each chunk's stream carries its own trailing EOF; keep
+                    // them all so only one sentinel reaches the parser.
+                    if (t.kind == 0) { continue; }
+                    t.line = t.line + off;
+                    tokens.add(t);
+                }
+            }
+            tokens.add(new Token(0, "", 1, 1));
+        } else {
+            Lexer lexer = new Lexer(source);
+            tokens = lexer.tokenize();
+            if (lexer.lexErrors.length > 0) {
+                for (int leJ = 0; leJ < lexer.lexErrors.length; leJ++) {
+                    printline(lexer.lexErrors[leJ]);
+                }
+                exit(1);
+            }
+        }
     }
 
-    Parser parser;
-    parser = new Parser(tokens);
+    Parser parser = new Parser(tokens);
     parser.setLineLengths(lineLens);
 
-    Node[] ast;
-    ast = parser.parseProgram();
+    Node[] ast = parser.parseProgram();
 
     // Post-parse call diagnostics (EXCEPTIONS/*.md): unknown-method /
     // did-you-mean over the fully collected symbol table, and filesystem
@@ -559,32 +698,56 @@ void main() {
         exit(1);
     }
 
-    MemoryGuard guard;
-    guard = new MemoryGuard();
+    MemoryGuard guard = new MemoryGuard();
     guard.checkProgram(ast);
 
-    MiniAsm asm;
-    asm = new MiniAsm();
+    // OVERHAUL.md --optimize: constant folding + dead-code elimination run
+    // after parsing and guarding so diagnostics stay unchanged; codegen
+    // consumes the optimized program.
+    if (flags.optimize) {
+        Optimizer opt = new Optimizer();
+        opt.optimizeProgram(ast);
+    }
 
-    MiniCg cg;
-    cg = new MiniCg(asm);
+    MiniAsm asm = new MiniAsm();
+
+    MiniCg cg = new MiniCg(asm);
+
+    // OVERHAUL.md threading model: programs can query the effective worker
+    // count via threads.length; --runtime embeds allocator/GC entry points.
+    cg.threadCount = flags.threadCount;
+    cg.runtimeMode = flags.mode == 2;
 
     cg.genProgram(ast);
     cg.getStringData();
 
-    MiniPe pe;
-    pe = new MiniPe();
+    // OVERHAUL.md --optimize: behavior-preserving peephole pass over the
+    // emitted machine code (in-place NOP rewrites only).
+    if (flags.optimize) {
+        peepholeOptimize(asm);
+    }
+
+    MiniPe pe = new MiniPe();
 
     // DOCS/253 -- project type selects the PE subsystem. `app` and `service`
     // use the Windows GUI subsystem so the process starts with no attached
     // console (no FreeConsole/hide-console boilerplate); `console` (the
     // default) and standalone sources keep the console subsystem.
+    string projectType = "";
+    if (inputIsProject) {
+        projectType = projectManifestValue(file.readString(inputFile), "type");
+    }
     if (cliArgEq(projectType, "app") || cliArgEq(projectType, "service")) {
         pe.subsystem = 2;
     }
 
+    // OVERHAUL.md --runtime: reserve the writable runtime state block and the
+    // internal __silver_rt_alloc pointer slot inside the data area.
+    cg.appendRuntimeData();
+
     int entryOff = cg.mainLabelOffset;
     if (cg.globalNames.length > 0) { entryOff = cg.entryOffset; }
+    if (cg.runtimeEntryOffset >= 0) { entryOff = cg.runtimeEntryOffset; }
     pe.entryRva = 0x1000 + entryOff;
 
     int nImp = cg.importDlls.length;
@@ -594,20 +757,24 @@ void main() {
         pe.addImport(impDll, impFn);
     }
 
-    int[] stringData = cg.stringData;
+    int[] stringData = cg.getStringData();
 
     int[] finalCode = asm.getBytes();
     pe.code = finalCode;
 
-        int rdataRva = pe.computeRdataRva();
-        int[] layout = pe.computeLayout(stringData.length);
-        int stringsStart = layout[0];
-        int[] iatAddrs = cg.computeIatAddresses(layout);
+    int rdataRva = pe.computeRdataRva();
+    int[] layout = pe.computeLayout(stringData.length);
+    int stringsStart = layout[0];
+    int[] iatAddrs = cg.computeIatAddresses(layout);
 
     cg.patchForwardCalls(finalCode);
 
     cg.patchStringRefs(finalCode, stringsStart, rdataRva);
     cg.patchImportRefs(finalCode, iatAddrs, rdataRva);
+    // OVERHAUL.md --runtime: repoint HeapAlloc references at the embedded
+    // allocator slot and fix up the runtime state addresses. Runs after the
+    // ordinary IAT patch so the redirect wins.
+    cg.patchRuntimeRefs(finalCode, stringsStart, rdataRva);
     cg.patchGlobalRefs(finalCode, stringsStart + stringData.length, rdataRva);
 
     string[] viKeys = [];
@@ -637,6 +804,150 @@ void main() {
 
     pe.globalAreaSize = cg.globalAreaSize;
     int[] peData = pe.build(finalCode, stringData, versionData);
+
+    // OVERHAUL.md --cache-bytecode: persist the record file after a full
+    // compilation (stale entries dropped too).
+    if (sess != null) {
+        sess.flush();
+    }
+
+    if (flags.mode == 1) {
+        // OVERHAUL.md --jit: run the emitted image as a direct child process
+        // and propagate its exit code. Standalone outputs keep the requested
+        // binary on disk (legacy parity); projects leave nothing behind.
+        if (!inputIsProject) {
+            file.writeBytes(outputFile, peData);
+        }
+        return jitExecute(flags, peData, inputFile);
+    }
+
     file.writeBytes(outputFile, peData);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// OVERHAUL.md --watch: idle-debounce watcher loop. Every save resets the
+// timer; precompilation fires only after exactly the configured idle time.
+// Polling goes through the fs builtins (mtime + size signatures every 500 ms).
+// ---------------------------------------------------------------------------
+
+void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, string outputFile) {
+    string root = ".";
+    string[] files = [];
+    bool multiFile = false;
+    string cfgManifest = "";
+    if (inputIsProject) {
+        root = projectDirname(flags.input);
+        files = watchScanSources(root);
+        multiFile = files.length > 1;
+        cfgManifest = manifestText;
+    } else {
+        root = bcDirname(flags.input);
+        files.add(flags.input);
+    }
+
+    WatchConfig cfg = watchConfigFor(multiFile, cfgManifest);
+    int totalSize = wtTotalSize(files);
+    if (totalSize > cfg.sizeLimitBytes) {
+        flags.errLine("watch: project exceeds the size limit (" + totalSize.toString() + " bytes); nothing is watched");
+        exit(1);
+    }
+
+    flags.errLine("watching " + root + " (" + files.length.toString() + " file(s), idle timer " + cfg.frequencySecs.toString() + "s)");
+
+    // Initial signature snapshot (mtime + size per watched file).
+    string[] sigPaths = [];
+    int[] sigMtimes = [];
+    int[] sigSizes = [];
+    for (int i = 0; i < files.length; i++) {
+        sigPaths.add(files[i]);
+        sigMtimes.add(bcModifiedMs(files[i]));
+        sigSizes.add(wtFileSize(files[i]));
+    }
+
+    int idleStart = GetTickCount();
+    while (true) {
+        Sleep(500);
+
+        // Rescan: any change (mtime, size, new or removed file) resets the
+        // idle timer to zero.
+        string[] current = files;
+        if (inputIsProject) { current = watchScanSources(root); }
+        bool changed = current.length != sigPaths.length;
+        int newestSrc = 0;
+        for (int c = 0; c < current.length && !changed; c++) {
+            string path = current[c];
+            int m = bcModifiedMs(path);
+            if (m <= 0) {
+                // File vanished mid-save; treat as a change.
+                changed = true;
+                break;
+            }
+            int s = wtFileSize(path);
+            bool known = false;
+            for (int p = 0; p < sigPaths.length; p++) {
+                if (cliArgEq(sigPaths[p], path)) {
+                    known = true;
+                    if (sigMtimes[p] != m || sigSizes[p] != s) {
+                        sigMtimes[p] = m;
+                        sigSizes[p] = s;
+                        changed = true;
+                    }
+                    break;
+                }
+            }
+            if (!known) { changed = true; }
+        }
+        if (changed) {
+            // Re-sync the snapshot so newly added files gain entries.
+            sigPaths = [];
+            sigMtimes = [];
+            sigSizes = [];
+            for (int r = 0; r < current.length; r++) {
+                sigPaths.add(current[r]);
+                sigMtimes.add(bcModifiedMs(current[r]));
+                sigSizes.add(wtFileSize(current[r]));
+            }
+            idleStart = GetTickCount();
+            continue;
+        }
+
+        // Idle long enough? Fires only after exactly the configured idle
+        // duration with no saves in between.
+        if (GetTickCount() - idleStart < cfg.frequencySecs * 1000) { continue; }
+
+        // Manual-compilation guard: if the output binary is newer than the
+        // newest source mtime recorded at the last check, someone built it
+        // externally since then — skip this tick and resync.
+        if (bcFileExists(outputFile)) {
+            int outM = bcModifiedMs(outputFile);
+            for (int m2 = 0; m2 < sigMtimes.length; m2++) {
+                if (sigMtimes[m2] > newestSrc) { newestSrc = sigMtimes[m2]; }
+            }
+            if (outM > newestSrc) {
+                flags.errLine("watch: external build detected, skipping this tick");
+                idleStart = GetTickCount();
+                continue;
+            }
+        }
+
+        flags.errLine("watch: idle timer expired, precompiling");
+        int code = compileOnce(flags, outputFile);
+        if (code != 0) {
+            flags.errLine("watch: precompilation failed");
+        }
+
+        // Re-sync state after the tick.
+        sigPaths = [];
+        sigMtimes = [];
+        sigSizes = [];
+        string[] post = files;
+        if (inputIsProject) { post = watchScanSources(root); }
+        for (int q = 0; q < post.length; q++) {
+            sigPaths.add(post[q]);
+            sigMtimes.add(bcModifiedMs(post[q]));
+            sigSizes.add(wtFileSize(post[q]));
+        }
+        idleStart = GetTickCount();
     }
 }

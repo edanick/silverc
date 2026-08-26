@@ -499,7 +499,18 @@ string projectStripDirectives(string source) {
     return result;
 }
 
-string projectCollect(string path, string root, string[] sourceDirs, string[] visited) {
+// Cache-marker comment line (--cache-bytecode): the driver splits the
+// aggregate back into per-file chunks along these lines.
+string projectCacheMarker(string path) {
+    string norm = "";
+    for (int i = 0; i < path.length; i++) {
+        if (path[i] == '\\') { norm = norm + '/'; }
+        else { norm = norm + path[i]; }
+    }
+    return "//@@SILVER_FILE@@ " + norm + "\n";
+}
+
+string projectCollect(string path, string root, string[] sourceDirs, string[] visited, bool emitMarkers) {
     if (projectVisited(visited, path)) { return ""; }
     visited.add(path);
     string source = file.readString(path);
@@ -515,12 +526,14 @@ string projectCollect(string path, string root, string[] sourceDirs, string[] vi
         if (moduleName.length > 0 && !projectBuiltin(moduleName)) {
             string importPath = projectSourcePath(root, sourceDirs, moduleName);
             if (!cliArgEq(importPath, "")) {
-                result = result + projectCollect(importPath, root, sourceDirs, visited) + "\n";
+                result = result + projectCollect(importPath, root, sourceDirs, visited, emitMarkers) + "\n";
             }
         }
         cursor = semi + 1;
     }
-    return result + source + "\n";
+    string marker = "";
+    if (emitMarkers) { marker = projectCacheMarker(path); }
+    return result + marker + source + "\n";
 }
 
 string projectCollectionEscape(string value) {
@@ -647,7 +660,7 @@ string projectExpandCollections(string source, string root, string collections) 
     return result;
 }
 
-string projectBuildSource(string projectPath) {
+string projectBuildSource(string projectPath, bool emitMarkers) {
     string manifest = file.readString(projectPath);
     string root = projectDirname(projectPath);
     string entry = projectManifestValue(manifest, "entry");
@@ -657,7 +670,7 @@ string projectBuildSource(string projectPath) {
 
     string entryPath = projectJoin(root, entry);
     string[] visited = [];
-    string collected = projectCollect(entryPath, root, sources, visited);
+    string collected = projectCollect(entryPath, root, sources, visited, emitMarkers);
     string body = projectStripDirectives(collected);
 
     // `.qs` libraries listed under `imports` are not auto-imported; declaring

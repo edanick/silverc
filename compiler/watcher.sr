@@ -1,0 +1,107 @@
+mod export watcher;
+
+import * from win32.kernel32;
+import * from fs;
+import * from bcache;
+import * from cli_flags;
+
+// OVERHAUL.md --watch — predictive precompilation watcher helpers.
+//
+// The watcher is an idle debounce timer, not an interval: every save resets
+// the timer to zero and precompilation fires only after exactly the
+// configured idle duration with no saves in between.
+//
+// Defaults (replaced entirely by .srp precompile overrides):
+//   single .sr file            30 s
+//   multi-file project         5 min
+//   project size limit         5 MB
+
+class WatchConfig {
+    public prop int frequencySecs;
+    public prop int sizeLimitBytes;
+
+    construct () {
+        this.frequencySecs = 30;
+        this.sizeLimitBytes = 5242880;
+    }
+}
+
+// Automatic defaults for an input; a manifest's precompile block replaces
+// them entirely (custom settings do not mix with the built-ins). An empty
+// manifest string means standalone-file defaults.
+public WatchConfig watchConfigFor(bool multiFile, string manifest) {
+    WatchConfig cfg = new WatchConfig();
+    if (multiFile) {
+        cfg.frequencySecs = 300;
+    } else {
+        cfg.frequencySecs = 30;
+    }
+    if (manifest.length > 0) {
+        int freq = precompileNumericValue(manifest, "frequency");
+        if (freq >= 0) { cfg.frequencySecs = freq; }
+        int limitKb = precompileNumericValue(manifest, "project_size_limit");
+        if (limitKb >= 0) { cfg.sizeLimitBytes = limitKb * 1024; }
+    }
+    return cfg;
+}
+
+// Recursively list the .sr files under root (sorted by discovery order is
+// not required; stability comes from the directory walk).
+public string[] watchScanSources(string rootDir) {
+    string[] result = [];
+    wtWalk(rootDir, "", result);
+    return result;
+}
+
+private void wtWalk(string rootDir, string relDir, string[] result) {
+    string dir = rootDir;
+    if (relDir.length > 0) {
+        if (rootDir == ".") { dir = relDir; } else { dir = rootDir + "\\" + relDir; }
+    }
+    string[] names = folder.getFiles(dir);
+    for (int i = 0; i < names.length; i++) {
+        string name = names[i];
+        if (!wtHasSrSuffix(name)) { continue; }
+        if (relDir.length > 0) {
+            if (rootDir == ".") { result.add(relDir + "\\" + name); }
+            else { result.add(rootDir + "\\" + relDir + "\\" + name); }
+        } else {
+            if (rootDir == ".") { result.add(name); }
+            else { result.add(rootDir + "\\" + name); }
+        }
+    }
+    string[] subdirs = folder.getFolders(dir);
+    for (int k = 0; k < subdirs.length; k++) {
+        string subname = subdirs[k];
+        if (subname == ".git" || subname == "build" || subname == "target") { continue; }
+        string subrel = subname;
+        if (relDir.length > 0) { subrel = relDir + "\\" + subname; }
+        wtWalk(rootDir, subrel, result);
+    }
+}
+
+private bool wtHasSrSuffix(string name) {
+    if (name.length < 3) { return false; }
+    return name[name.length - 3] == '.' && name[name.length - 2] == 's' && name[name.length - 1] == 'r';
+}
+
+// Byte size of a file via CreateFileA + GetFileSize (no fixed-array
+// WIN32_FIND_DATA needed — the self-hosted parser does not support
+// byte[] name[size] fixed-declaration syntax).
+public int wtFileSize(string path) {
+    int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
+    if (h == -1 || h == 0) { return 0; }
+    int sz = GetFileSize(h, null);
+    CloseHandle(h);
+    if (sz < 0) { return 0; }
+    return sz;
+}
+
+// Total byte size of the given files.
+public int wtTotalSize(string[] files) {
+    int total = 0;
+    for (int i = 0; i < files.length; i++) {
+        total += wtFileSize(files[i]);
+    }
+    return total;
+}

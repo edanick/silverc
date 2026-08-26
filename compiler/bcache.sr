@@ -1,0 +1,969 @@
+mod export bcache;
+
+import * from win32.kernel32;
+import * from win32.msvcrt;
+import * from token;
+import * from lexer;
+
+// OVERHAUL.md --cache-bytecode — persistent bytecode cache.
+//
+// Cache layout under %APPDATA%\silver cache\<project>\:
+//
+//   project.sbcr            record file (one entry per .sr file, recursive)
+//   src/main.srbc           cached token stream mirroring the source tree
+//
+// Both artifacts are written in the reference binary formats so caches stay
+// toolchain-compatible:
+//
+// **.sbcr (Silver ByteCode Record) v1** — little-endian:
+//   magic "SBCR" | u16 version=1 | u64 created (ms since epoch)
+//   u32 name_len + UTF-8 project name
+//   u32 entry_count
+//   per entry: u32 rel_path_len + UTF-8 '/'-separated path,
+//              u64 creation_millis u64 modified_millis
+//              u64 fnv1_hash       u64 last_cached_millis
+//
+// **.srbc (Silver ByteCode) v1** — the linear token stream of one file:
+//   magic "SRBC" | u16 version=1
+//   u64 fnv1_hash   u64 last_cached_millis
+//   u32 token_count
+//   per token: u16 kind_tag, payload, u32 line, u32 col
+//
+// Tag space: 0..119 unit kinds in reference declaration order, 200+ payload
+// kinds (200 int literal i64 LE, 201 float literal f64 bits, 202 string
+// u32len+bytes, 203 char u32 codepoint, 204 identifier, 205 annotation,
+// 206 EOF).
+//
+// Because the compiled Silver runtime cannot re-read NUL-containing binaries
+// safely (strings are strlen-based and managed arrays are not byte-dense),
+// each binary artifact has a NUL-free text companion ("*.sbcri"/"*.srbc.t")
+// that carries the same information. The companions are the authoritative
+// read side; the binaries are written byte-exactly for other toolchains.
+//
+// Workflow: compare current files against the records; re-cache only files
+// whose FNV-1 hash / size changed; compile from the refreshed cache.
+
+class CacheSession {
+    public prop bool ok;
+    public prop string dir;
+    public prop string root;
+    public prop string projectName;
+    // Parallel record arrays keyed by '/'-separated relative path.
+    public prop string[] keys;
+    public prop string[] cTimesStr;
+    public prop string[] mTimesStr;
+    public prop string[] hashesStr;
+    public prop string[] cachedAtStr;
+    public prop int64 createdStamp;
+    // Record file contents at open time ("" on a fresh cache); flush skips
+    // all writes when nothing changed.
+    public prop string oldIndexText;
+    // Files whose .srbc was rewritten this run.
+    public prop int dirtyCount;
+
+    construct (string rootDir, string projName) {
+        this.ok = false;
+        this.dir = "";
+        this.root = rootDir;
+        this.projectName = projName;
+        this.keys = [];
+        this.cTimesStr = [];
+        this.mTimesStr = [];
+        this.hashesStr = [];
+        this.cachedAtStr = [];
+        this.createdStamp = 0;
+        this.oldIndexText = "";
+        this.dirtyCount = 0;
+        string appdata = bcEnvValue("APPDATA");
+        if (appdata.length == 0) { return; }
+        this.dir = appdata + "\\silver cache\\" + bcSanitize(projName);
+        ensureDirTree(this.dir);
+        this.loadRecords();
+        this.ok = true;
+    }
+
+    private bool eqStr(string a, string b) {
+        if (a.length != b.length) { return false; }
+        for (int i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    private string keyOf(int i) {
+        string sep = "|";
+        return this.keys[i] + sep + this.cTimesStr[i] + sep + this.mTimesStr[i]
+            + sep + this.hashesStr[i] + sep + this.cachedAtStr[i];
+    }
+
+    // ------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------
+
+    // Return cached tokens for absPath when its contents are unchanged and
+    // the stored bytecode decodes; otherwise lex source fresh, store the new
+    // bytecode, and return those tokens.
+    public Token[] tokensFor(string absPath, string source) {
+        if (!this.ok) { return bcLex(source); }
+        string key = this.relKey(absPath);
+        if (key.length == 0) { return bcLex(source); }
+        int64 hash = bcFnv1(source);
+        int size = bcFileSize(absPath);
+        string hashKey = bcIntToStr(hash);
+        string sizeKey = size.toString();
+        int idx = this.indexOfKey(key);
+        if (idx >= 0) {
+            if (this.eqStr(this.hashesStr[idx], hashKey) && this.eqStr(this.mTimesStr[idx], sizeKey)) {
+                Token[] cached = this.loadSrbcText(absPath);
+                if (cached.length > 0) {
+                    return cached;
+                }
+            }
+        }
+        // Re-cache this file: lex now, encode, mark dirty.
+        Token[] tokens = bcLex(source);
+        int stamp = bcNowMillis();
+        if (this.encodable(tokens)) {
+            this.storeSrbc(absPath, tokens, stamp, hashKey, sizeKey);
+            string created = stamp.toString();
+            if (idx >= 0) {
+                created = this.cTimesStr[idx];
+                this.mTimesStr[idx] = sizeKey;
+                this.hashesStr[idx] = hashKey;
+                this.cachedAtStr[idx] = stamp.toString();
+            } else {
+                this.keys.add(key);
+                this.cTimesStr.add(created);
+                this.mTimesStr.add(sizeKey);
+                this.hashesStr.add(hashKey);
+                this.cachedAtStr.add(stamp.toString());
+            }
+            this.dirtyCount++;
+        }
+        return tokens;
+    }
+
+    // Drop records whose sources vanished and rewrite the record files once
+    // after the whole import graph is resolved. Skips the rewrite when
+    // nothing changed (no-change reruns leave every artifact untouched).
+    public void flush() {
+        if (!this.ok) { return; }
+        int w = 0;
+        for (int i = 0; i < this.keys.length; i++) {
+            string abs = resolveRel(this.root, this.keys[i]);
+            if (file.exists(abs)) {
+                this.keys[w] = this.keys[i];
+                this.cTimesStr[w] = this.cTimesStr[i];
+                this.mTimesStr[w] = this.mTimesStr[i];
+                this.hashesStr[w] = this.hashesStr[i];
+                this.cachedAtStr[w] = this.cachedAtStr[i];
+                w++;
+            } else {
+                string srbcPath = this.srbcPathFor(this.keys[i]);
+                if (srbcPath.length > 0 && file.exists(srbcPath)) {
+                    file.delete(srbcPath);
+                    file.delete(srbcPath + ".t");
+                }
+            }
+        }
+        while (this.keys.length > w) { this.keys.pop(); }
+        while (this.cTimesStr.length > w) { this.cTimesStr.pop(); }
+        while (this.mTimesStr.length > w) { this.mTimesStr.pop(); }
+        while (this.hashesStr.length > w) { this.hashesStr.pop(); }
+        while (this.cachedAtStr.length > w) { this.cachedAtStr.pop(); }
+
+        this.sortRecords();
+
+        string indexText = "created " + bcIntToStr(this.createdStamp) + "\n";
+        indexText = indexText + "name " + this.projectName + "\n";
+        for (int r = 0; r < this.keys.length; r++) {
+            indexText = indexText + "f " + this.keyOf(r) + "\n";
+        }
+        if (this.eqStr(indexText, this.oldIndexText)) { return; }
+
+        ensureDirTree(this.dir);
+        file.writeString(this.dir + "\\project.sbcri", indexText);
+
+        // Reference-format binary record (little-endian, see module docs).
+        // Built fully inline for the same reason as storeSrbc(): appending
+        // inside a helper cannot grow an array owned by this frame.
+        int[] outBytes = [];
+        outBytes.add(83);
+        outBytes.add(66);
+        outBytes.add(67);
+        outBytes.add(82);
+        outBytes.add(1);
+        outBytes.add(0);
+        int64 createdV = this.createdStamp;
+        for (int cb = 0; cb < 8; cb++) {
+            outBytes.add((createdV >> (cb * 8)) & 0xFF);
+        }
+        string pn = this.projectName;
+        int pnl = pn.length;
+        for (int nb = 0; nb < 4; nb++) {
+            outBytes.add((pnl >> (nb * 8)) & 0xFF);
+        }
+        for (int ni = 0; ni < pnl; ni++) {
+            outBytes.add(pn[ni] & 0xFF);
+        }
+        int kc = this.keys.length;
+        for (int kb = 0; kb < 4; kb++) {
+            outBytes.add((kc >> (kb * 8)) & 0xFF);
+        }
+        for (int rb = 0; rb < this.keys.length; rb++) {
+            string kp = this.keys[rb];
+            int kpl = kp.length;
+            for (int pb1 = 0; pb1 < 4; pb1++) {
+                outBytes.add((kpl >> (pb1 * 8)) & 0xFF);
+            }
+            for (int pi = 0; pi < kpl; pi++) {
+                outBytes.add(kp[pi] & 0xFF);
+            }
+            int64 cv = decToI64(this.cTimesStr[rb]);
+            for (int c1 = 0; c1 < 8; c1++) {
+                outBytes.add((cv >> (c1 * 8)) & 0xFF);
+            }
+            int64 mv = decToI64(this.mTimesStr[rb]);
+            for (int c2 = 0; c2 < 8; c2++) {
+                outBytes.add((mv >> (c2 * 8)) & 0xFF);
+            }
+            int64 hv = decToI64(this.hashesStr[rb]);
+            for (int c3 = 0; c3 < 8; c3++) {
+                outBytes.add((hv >> (c3 * 8)) & 0xFF);
+            }
+            int64 lv = decToI64(this.cachedAtStr[rb]);
+            for (int c4 = 0; c4 < 8; c4++) {
+                outBytes.add((lv >> (c4 * 8)) & 0xFF);
+            }
+        }
+        file.writeBytes(this.dir + "\\project.sbcr", outBytes);
+    }
+
+    public int statsTotal() {
+        return this.keys.length;
+    }
+
+    public int statsDirty() {
+        return this.dirtyCount;
+    }
+
+    // ------------------------------------------------------------------
+    // Record loading (text index is authoritative)
+    // ------------------------------------------------------------------
+
+    private void loadRecords() {
+        string text = tryReadText(this.dir + "\\project.sbcri");
+        if (text.length == 0) { return; }
+        this.oldIndexText = text;
+        int pos = 0;
+        while (pos < text.length) {
+            int eol = pos;
+            while (eol < text.length && text[eol] != '\n') { eol++; }
+            string line = sliceRange(text, pos, eol);
+            pos = eol + 1;
+            if (startsWith(line, "created ")) {
+                this.createdStamp = decToI64(sliceRange(line, 8, line.length));
+            } elif (startsWith(line, "f ")) {
+                // f <key> <created> <modified-token> <hash> <cachedAt>
+                // (fields joined with the unit separator so paths containing
+                // spaces survive the round trip)
+                string rest = sliceRange(line, 2, line.length);
+                string f1 = wordAtSep(rest, 0, '|');
+                string f2 = wordAtSep(rest, 1, '|');
+                string f3 = wordAtSep(rest, 2, '|');
+                string f4 = wordAtSep(rest, 3, '|');
+                string f5 = wordAtSep(rest, 4, '|');
+                if (f5.length > 0) {
+                    this.keys.add(f1);
+                    this.cTimesStr.add(f2);
+                    this.mTimesStr.add(f3);
+                    this.hashesStr.add(f4);
+                    this.cachedAtStr.add(f5);
+                }
+            }
+        }
+    }
+
+    private int indexOfKey(string key) {
+        for (int i = 0; i < this.keys.length; i++) {
+            if (this.eqStr(this.keys[i], key)) { return i; }
+        }
+        return -1;
+    }
+
+    // Deterministic record order: sorted by relative path (matches the
+    // reference serializer).
+    private void sortRecords() {
+        int n = this.keys.length;
+        for (int i = 1; i < n; i++) {
+            string k = this.keys[i];
+            string c = this.cTimesStr[i];
+            string m = this.mTimesStr[i];
+            string h = this.hashesStr[i];
+            string lc = this.cachedAtStr[i];
+            int j = i - 1;
+            while (j >= 0 && bcKeyLess(k, this.keys[j])) {
+                this.keys[j + 1] = this.keys[j];
+                this.cTimesStr[j + 1] = this.cTimesStr[j];
+                this.mTimesStr[j + 1] = this.mTimesStr[j];
+                this.hashesStr[j + 1] = this.hashesStr[j];
+                this.cachedAtStr[j + 1] = this.cachedAtStr[j];
+                j--;
+            }
+            this.keys[j + 1] = k;
+            this.cTimesStr[j + 1] = c;
+            this.mTimesStr[j + 1] = m;
+            this.hashesStr[j + 1] = h;
+            this.cachedAtStr[j + 1] = lc;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Bytecode storage
+    // ------------------------------------------------------------------
+
+    private string srbcPathFor(string keyOrAbs) {
+        string rel = this.relKey(keyOrAbs);
+        if (rel.length == 0) { return ""; }
+        string dotted = rel;
+        if (dotted.length >= 3 && dotted[dotted.length - 1] == 'r'
+            && dotted[dotted.length - 2] == 's' && dotted[dotted.length - 3] == '.') {
+            dotted = sliceRange(dotted, 0, dotted.length - 3);
+        }
+        return this.dir + "\\" + bcReplaceAll(dotted, "/", "\\") + ".srbc";
+    }
+
+    private void storeSrbc(string absPath, Token[] tokens, int stamp, string hashKey, string sizeKey) {
+        string path = this.srbcPathFor(absPath);
+        if (path.length == 0) { return; }
+        ensureDirTree(bcDirname(path));
+
+        // Reference-format binary stream (see module docs). Float literals
+        // carry all-zero bits: the self-hosted front end materializes float
+        // literals as 0.0 today. The buffer is built entirely inline — an
+        // .add() that grows a received parameter array reallocates without
+        // propagating the new pointer back to the caller, so no helper may
+        // append into an array owned by this frame.
+        int[] outBytes = [];
+        outBytes.add(83);
+        outBytes.add(82);
+        outBytes.add(66);
+        outBytes.add(67);
+        outBytes.add(1);
+        outBytes.add(0);
+        int64 hv2 = decToI64(hashKey);
+        for (int hb = 0; hb < 8; hb++) {
+            outBytes.add((hv2 >> (hb * 8)) & 0xFF);
+        }
+        int64 sv = stamp;
+        for (int sb = 0; sb < 8; sb++) {
+            outBytes.add((sv >> (sb * 8)) & 0xFF);
+        }
+        int tc = tokens.length;
+        for (int cb = 0; cb < 4; cb++) {
+            outBytes.add((tc >> (cb * 8)) & 0xFF);
+        }
+        for (int ib = 0; ib < tokens.length; ib++) {
+            Token tb = tokens[ib];
+            int tag = tagOf(tb);
+            outBytes.add(tag & 0xFF);
+            outBytes.add((tag >> 8) & 0xFF);
+            if (tag == 200) {
+                int64 tv = tb.intVal;
+                for (int tb2 = 0; tb2 < 8; tb2++) {
+                    outBytes.add((tv >> (tb2 * 8)) & 0xFF);
+                }
+            } elif (tag == 201) {
+                for (int zb = 0; zb < 8; zb++) { outBytes.add(0); }
+            } elif (tag == 203) {
+                int ccv = tb.charVal;
+                for (int cb2 = 0; cb2 < 4; cb2++) {
+                    outBytes.add((ccv >> (cb2 * 8)) & 0xFF);
+                }
+            } elif (tag == 202 || tag == 204 || tag == 205) {
+                string sv2 = tb.strVal;
+                int sl = sv2.length;
+                for (int cb3 = 0; cb3 < 4; cb3++) {
+                    outBytes.add((sl >> (cb3 * 8)) & 0xFF);
+                }
+                for (int si3 = 0; si3 < sl; si3++) {
+                    outBytes.add(sv2[si3] & 0xFF);
+                }
+            }
+            int ln = tb.line;
+            for (int lb = 0; lb < 4; lb++) {
+                outBytes.add((ln >> (lb * 8)) & 0xFF);
+            }
+            int cl = tb.col;
+            for (int pb = 0; pb < 4; pb++) {
+                outBytes.add((cl >> (pb * 8)) & 0xFF);
+            }
+        }
+        file.writeBytes(path, outBytes);
+
+        // NUL-free text companion (authoritative read side).
+        string txt = hashKey + " " + stamp.toString() + " " + tokens.length.toString() + "\n";
+        for (int i = 0; i < tokens.length; i++) {
+            txt = txt + tokenLine(tokens[i]);
+        }
+        file.writeString(path + ".t", txt);
+    }
+
+    private Token[] loadSrbcText(string absPath) {
+        string path = this.srbcPathFor(absPath);
+        if (path.length == 0) { return []; }
+        string text = tryReadText(path + ".t");
+        if (text.length == 0) { return []; }
+        int pos = 0;
+        string header = "";
+        while (pos < text.length && text[pos] != '\n') {
+            header = header + text[pos];
+            pos++;
+        }
+        pos++;
+        // header: <hash> <stamp> <count>
+        string countStr = wordAt(header, 2);
+        if (countStr.length == 0) { return []; }
+        int count = strToInt(countStr);
+        if (count <= 0) { return []; }
+        Token[] tokens = [];
+        for (int i = 0; i < count && pos < text.length; i++) {
+            string line = "";
+            while (pos < text.length && text[pos] != '\n') {
+                line = line + text[pos];
+                pos++;
+            }
+            pos++;
+            Token t = tokenFromLine(line);
+            if (t == null) { return []; }
+            tokens.add(t);
+        }
+        if (tokens.length != count) { return []; }
+        return tokens;
+    }
+
+    // True when every token maps onto the reference tag space. Files using
+    // syntax without a reference spelling simply never cache (the aggregate
+    // still compiles from the fresh lex).
+    private bool encodable(Token[] tokens) {
+        for (int i = 0; i < tokens.length; i++) {
+            if (tagOf(tokens[i]) < 0) { return false; }
+        }
+        return true;
+    }
+
+    // ------------------------------------------------------------------
+    // Paths
+    // ------------------------------------------------------------------
+
+    private string relKey(string absPath) {
+        string norm = bcNormalizeSlashes(absPath);
+        string rootNorm = bcNormalizeSlashes(this.root);
+        if (rootNorm.length > 0 && norm.length > rootNorm.length + 1) {
+            bool prefix = true;
+            for (int i = 0; i < rootNorm.length; i++) {
+                if (norm[i] != rootNorm[i]) { prefix = false; break; }
+            }
+            if (prefix && norm[rootNorm.length] == '/') {
+                return sliceRange(norm, rootNorm.length + 1, norm.length);
+            }
+        }
+        return norm;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Module-level helpers. Free-function names carry a bc prefix: every module
+// flattens into one program namespace, so duplicates would collide.
+// ---------------------------------------------------------------------------
+
+public bool bcFileExists(string path) {
+    return file.exists(path);
+}
+
+// Environment lookup through a preallocated writable string buffer (strings
+// lower to dense char buffers on every backend, unlike managed arrays).
+public string bcEnvValue(string name) {
+    string buf = "                                                                ";
+    int cap = 64;
+    GetEnvironmentVariableA(name, buf, cap);
+    string r = "";
+    for (int i = 0; i < cap; i++) {
+        char c = buf[i];
+        if (c == 0) { break; }
+        r = r + c;
+    }
+    return r;
+}
+
+public int bcNowMillis() {
+    return time(0) * 1000;
+}
+
+public int bcFileSize(string path) {
+    int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
+    if (h == -1 || h == 0) { return 0; }
+    int sz = GetFileSize(h, null);
+    CloseHandle(h);
+    if (sz < 0) { return 0; }
+    return sz;
+}
+
+// Modification-time proxy recorded in the .sbcr slot: the compiled runtime
+// has no cross-stage-safe way to read FILETIMEs, so the change token is the
+// file size. Content identity is always decided by the FNV-1 hash alongside
+// it, so cache hits remain correct.
+public int bcModifiedMs(string path) {
+    return bcFileSize(path);
+}
+
+// FNV-1 64-bit hash of the source text (spec: "FNV-1 hash of the contents").
+// Compiled int64 arithmetic wraps in two's complement, matching the
+// reference's u64 wrapping bit for bit.
+public int64 bcFnv1(string data) {
+    int64 hash = -3750763034362895579;
+    for (int i = 0; i < data.length; i++) {
+        hash = hash * 1099511628211;
+        int64 b = data[i];
+        hash = hash ^ b;
+    }
+    return hash;
+}
+
+public string bcSanitize(string name) {
+    string r = "";
+    for (int i = 0; i < name.length; i++) {
+        char c = name[i];
+        if (c == '<' || c == '>' || c == ':' || c == '"' || c == '/'
+            || c == '\\' || c == '|' || c == '?' || c == '*') {
+            r = r + '_';
+        } else {
+            r = r + c;
+        }
+    }
+    return r;
+}
+
+public string bcNormalizeSlashes(string path) {
+    string r = "";
+    for (int i = 0; i < path.length; i++) {
+        if (path[i] == '\\') { r = r + '/'; }
+        else { r = r + path[i]; }
+    }
+    return r;
+}
+
+public string bcReplaceAll(string s, string what, string with) {
+    string r = "";
+    int i = 0;
+    while (i < s.length) {
+        if (i + what.length <= s.length) {
+            bool hit = true;
+            for (int j = 0; j < what.length; j++) {
+                if (s[i + j] != what[j]) { hit = false; break; }
+            }
+            if (hit) {
+                r = r + with;
+                i += what.length;
+                continue;
+            }
+        }
+        r = r + s[i];
+        i++;
+    }
+    return r;
+}
+
+public string bcDirname(string path) {
+    int last = -1;
+    for (int i = 0; i < path.length; i++) {
+        if (path[i] == '\\' || path[i] == '/') { last = i; }
+    }
+    if (last < 0) { return "."; }
+    return sliceRange(path, 0, last);
+}
+
+public string resolveRel(string root, string rel) {
+    string winRel = bcReplaceAll(rel, "/", "\\");
+    if (root.length == 0 || root == ".") { return winRel; }
+    return root + "\\" + winRel;
+}
+
+// Create every path component below the current directory; CreateDirectoryA
+// fails harmlessly when a level already exists.
+public void ensureDirTree(string dir) {
+    string cur = "";
+    for (int i = 0; i < dir.length; i++) {
+        char c = dir[i];
+        if (c == '\\' || c == '/') {
+            if (cur.length >= 2) { CreateDirectoryA(cur, null); }
+            cur = cur + '\\';
+        } else {
+            cur = cur + c;
+        }
+    }
+    if (cur.length >= 2) { CreateDirectoryA(cur, null); }
+}
+
+public string sliceRange(string s, int start, int end) {
+    string r = "";
+    for (int i = start; i < end && i < s.length; i++) { r = r + s[i]; }
+    return r;
+}
+
+private bool startsWith(string s, string prefix) {
+    if (s.length < prefix.length) { return false; }
+    for (int i = 0; i < prefix.length; i++) {
+        if (s[i] != prefix[i]) { return false; }
+    }
+    return true;
+}
+
+private string wordAt(string s, int which) {
+    return wordAtSep(s, which, ' ');
+}
+
+private string wordAtSep(string s, int which, char sep) {
+    int idx = 0;
+    int i = 0;
+    while (i < s.length) {
+        while (i < s.length && s[i] == sep) { i++; }
+        int start = i;
+        while (i < s.length && s[i] != sep) { i++; }
+        if (i > start) {
+            if (idx == which) { return sliceRange(s, start, i); }
+            idx++;
+        }
+    }
+    return "";
+}
+
+private int strToInt(string s) {
+    int v = 0;
+    for (int i = 0; i < s.length; i++) {
+        char c = s[i];
+        if (c < '0' || c > '9') { return -1; }
+        v = v * 10 + (c - '0');
+    }
+    return v;
+}
+
+private int64 decToI64(string s) {
+    bool neg = false;
+    int i = 0;
+    if (s.length > 0 && s[0] == '-') { neg = true; i = 1; }
+    int64 v = 0;
+    for (; i < s.length; i++) {
+        char c = s[i];
+        if (c < '0' || c > '9') { break; }
+        v = v * 10 + (c - '0');
+    }
+    if (neg) { v = -v; }
+    return v;
+}
+
+private string tryReadText(string path) {
+    string result = "";
+    try {
+        result = file.readString(path);
+    } catch (int e) {
+        result = "";
+    }
+    return result;
+}
+
+private bool bcKeyLess(string a, string b) {
+    int n = a.length;
+    if (b.length < n) { n = b.length; }
+    for (int i = 0; i < n; i++) {
+        if (a[i] != b[i]) { return a[i] < b[i]; }
+    }
+    return a.length < b.length;
+}
+
+// ---------------------------------------------------------------------------
+// Reference tag space (must match silverc-rs src/cache.rs SIMPLE_KINDS order)
+// ---------------------------------------------------------------------------
+
+private int tagOf(Token t) {
+    int k = t.kind;
+    if (k == 0) { return 206; }
+    if (k == 1) { return 200; }
+    if (k == 2) { return 201; }
+    if (k == 3) { return 202; }
+    if (k == 4) { return 203; }
+    if (k == 5) {
+        if (t.text.length == 4 && t.text[0] == 't') { return 32; }
+        return 33;
+    }
+    if (k == 6) { return 34; }
+    if (k == 7) { return 204; }
+    if (k == 10) { return 0; }
+    if (k == 11) { return 1; }
+    if (k == 12) { return 2; }
+    if (k == 13) { return 3; }
+    if (k == 14) { return 4; }
+    if (k == 15) { return 5; }
+    if (k == 16) { return 6; }
+    if (k == 17) { return 7; }
+    if (k == 18) { return 8; }
+    if (k == 19) { return 9; }
+    if (k == 20) { return 10; }
+    if (k == 22) { return 12; }
+    if (k == 23) { return 13; }
+    if (k == 25) { return 15; }
+    if (k == 26) { return 17; }
+    if (k == 27) { return 18; }
+    if (k == 28) { return 19; }
+    if (k == 29) { return 20; }
+    if (k == 30) { return 21; }
+    if (k == 31) { return 22; }
+    if (k == 32) { return 23; }
+    if (k == 33) { return 24; }
+    if (k == 34) { return 25; }
+    if (k == 35) { return 26; }
+    if (k == 36) { return 27; }
+    if (k == 37) { return 28; }
+    if (k == 38) { return 29; }
+    if (k == 39) { return 30; }
+    if (k == 40) { return 31; }
+    if (k == 44) { return 35; }
+    if (k == 45) { return 36; }
+    if (k == 46) { return 37; }
+    if (k == 47) { return 38; }
+    if (k == 48) { return 39; }
+    if (k == 49) { return 40; }
+    if (k == 50) { return 47; }
+    if (k == 51) { return 48; }
+    if (k == 52) { return 49; }
+    if (k == 53) { return 50; }
+    if (k == 54) { return 57; }
+    if (k == 55) { return 53; }
+    if (k == 56) { return 56; }
+    if (k == 57) { return 64; }
+    if (k == 58) { return 65; }
+    if (k == 59) { return 54; }
+    if (k == 60) { return 55; }
+    if (k == 64) { return 52; }
+    if (k == 65) { return 51; }
+    if (k == 100) { return 66; }
+    if (k == 101) { return 67; }
+    if (k == 102) { return 68; }
+    if (k == 103) { return 69; }
+    if (k == 104) { return 70; }
+    if (k == 105) { return 71; }
+    if (k == 106) { return 72; }
+    if (k == 107) { return 73; }
+    if (k == 108) { return 74; }
+    if (k == 109) { return 75; }
+    if (k == 110) { return 76; }
+    if (k == 111) { return 77; }
+    if (k == 112) { return 78; }
+    if (k == 113) { return 79; }
+    if (k == 114) { return 80; }
+    if (k == 115) { return 81; }
+    if (k == 116) { return 82; }
+    if (k == 117) { return 83; }
+    if (k == 118) { return 84; }
+    if (k == 119) { return 85; }
+    if (k == 120) { return 86; }
+    if (k == 121) { return 87; }
+    if (k == 122) { return 88; }
+    if (k == 123) { return 89; }
+    if (k == 125) { return 93; }
+    if (k == 130) { return 95; }
+    if (k == 131) { return 96; }
+    if (k == 132) { return 97; }
+    if (k == 133) { return 98; }
+    if (k == 134) { return 105; }
+    if (k == 135) { return 106; }
+    if (k == 136) { return 107; }
+    if (k == 137) { return 108; }
+    if (k == 138) { return 109; }
+    if (k == 139) { return 110; }
+    if (k == 140) { return 111; }
+    if (k == 141) { return 112; }
+    if (k == 142) { return 113; }
+    if (k == 143) { return 114; }
+    if (k == 144) { return 115; }
+    if (k == 145) { return 117; }
+    if (k == 146) { return 118; }
+    if (k == 147) { return 116; }
+    if (k == 148) { return 90; }
+    if (k == 149) { return 91; }
+    if (k == 156) { return 92; }
+    if (k == 157) { return 99; }
+    if (k == 158) { return 100; }
+    if (k == 159) { return 101; }
+    if (k == 160) { return 102; }
+    if (k == 161) { return 103; }
+    if (k == 162) { return 104; }
+    return -1;
+}
+
+// Unit-kind table indexed by reference tag 0..118 (keywords / true / false /
+// null, then punctuation and operators). -1 marks spellings this toolchain
+// never emits; those tags are neither produced nor consumed here.
+int[] bcUnitKinds = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, -1, 22, 23, -1, 25, -1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 5, 5, 6, 44, 45, 46, 47, 48, 49, 150, 151, 152, 153, 154, 155, 50, 51, 52, 53, 65, 64, 55, 59, 60, 56, 54, -1, -1, -1, -1, -1, -1, 57, 58, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 148, 149, 156, 125, -1, 130, 131, 132, 133, 157, 158, 159, 160, 161, 162, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 147, 145, 146];
+
+string[] bcUnitTexts = ["if", "else", "while", "for", "foreach", "return", "match", "void", "int", "int32", "int64", "uint", "float", "float64", "double", "bool", "byte", "char", "string", "var", "struct", "class", "enum", "def", "found", "collect", "mod", "import", "from", "as", "new", "const", "true", "false", "null", "public", "private", "static", "prop", "construct", "unset", "local", "alias", "fixed", "live", "once", "shared", "mut", "ref", "try", "catch", "finally", "throw", "to", "export", "extends", "elif", "in", "async", "await", "override", "virtual", "printline", "print", "break", "continue", "(", ")", "{", "}", "[", "]", ";", ",", ".", ":", "=", "+", "-", "*", "/", "%", "&", "|", "^", "~", "<", ">", "!", "?", "??", "$", "@", "#", "_", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "==", "!=", "<=", ">=", "&&", "||", "<<", ">>", "++", "--", "..", "...", "->", "=>"];
+
+// Rebuild a token from its reference tag. Returns null for tags this
+// toolchain never emits (unknown future variants), which forces a re-lex.
+private Token? tokenFromParts(int tag, string payload, int64 iv, int cv) {
+    Token t = new Token(0, "", 1, 1);
+    if (tag == 206) {
+        t.kind = 0;
+        return t;
+    }
+    if (tag == 200) {
+        t.kind = 1;
+        t.intVal = iv;
+        t.text = bcIntToStr(iv);
+        return t;
+    }
+    if (tag == 201) {
+        t.kind = 2;
+        t.floatVal = 0.0;
+        return t;
+    }
+    if (tag == 202) {
+        t.kind = 3;
+        t.strVal = payload;
+        t.text = payload;
+        return t;
+    }
+    if (tag == 203) {
+        t.kind = 4;
+        t.charVal = char(cv);
+        char tc = t.charVal;
+        t.text = "" + tc;
+        return t;
+    }
+    if (tag == 204) {
+        t.kind = 7;
+        t.strVal = payload;
+        t.text = payload;
+        return t;
+    }
+    if (tag >= 0 && tag <= 118 && tag != 119) {
+        int k = bcUnitKinds[tag];
+        if (k < 0) { return null; }
+        t.kind = k;
+        t.text = bcUnitTexts[tag];
+        return t;
+    }
+    return null;
+}
+
+private string bcHexDigits(int v) {
+    string digits = "0123456789abcdef";
+    string r = "";
+    for (int i = 0; i < 2; i++) {
+        int nib = (v >> ((1 - i) * 4)) & 0xF;
+        r = r + digits[nib];
+    }
+    return r;
+}
+
+private int bcHexVal(char c) {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    return -1;
+}
+
+// One-line text encoding of a token for the NUL-free .srbc.t companion:
+//   <tag> <line> <col> <payload>
+// where payload is "-" for unit tags, a decimal number for int/char, or
+// "<byteLen>:<lowercase hex>" for string payloads.
+private string tokenLine(Token t) {
+    int tag = tagOf(t);
+    string head = tag.toString() + " " + t.line.toString() + " " + t.col.toString();
+    if (tag == 200) {
+        return head + " " + bcIntToStr(t.intVal) + "\n";
+    }
+    if (tag == 201) {
+        return head + " 0\n";
+    }
+    if (tag == 203) {
+        int cvEnc = t.charVal;
+        return head + " " + cvEnc.toString() + "\n";
+    }
+    if (tag == 202 || tag == 204 || tag == 205) {
+        string s = t.strVal;
+        string hex = "";
+        for (int i = 0; i < s.length; i++) {
+            hex = hex + bcHexDigits(s[i] & 0xFF);
+        }
+        return head + " " + s.length.toString() + ":" + hex + "\n";
+    }
+    return head + " -\n";
+}
+
+private Token? tokenFromLine(string line) {
+    string t1 = wordAt(line, 0);
+    string t2 = wordAt(line, 1);
+    string t3 = wordAt(line, 2);
+    string t4 = wordAt(line, 3);
+    if (t4.length == 0) { return null; }
+    int tag = strToInt(t1);
+    int ln = strToInt(t2);
+    int cl = strToInt(t3);
+    if (tag < 0 || ln < 0 || cl < 0) { return null; }
+    string payload = "";
+    int64 iv = 0;
+    int cv = 32;
+    if (tag == 200) {
+        iv = decToI64(t4);
+    } elif (tag == 201) {
+        iv = 0;
+    } elif (tag == 203) {
+        cv = strToInt(t4);
+        if (cv < 0) { return null; }
+    } elif (tag == 202 || tag == 204 || tag == 205) {
+        // <byteLen>:<hex>
+        int colon = 0;
+        while (colon < t4.length && t4[colon] != ':') { colon++; }
+        if (colon >= t4.length) { return null; }
+        int blen = strToInt(sliceRange(t4, 0, colon));
+        string hex = sliceRange(t4, colon + 1, t4.length);
+        if (blen < 0 || hex.length < blen * 2) { return null; }
+        for (int b = 0; b < blen; b++) {
+            int hi = bcHexVal(hex[b * 2]);
+            int lo = bcHexVal(hex[b * 2 + 1]);
+            if (hi < 0 || lo < 0) { return null; }
+            char pb = char(hi * 16 + lo);
+            payload = payload + pb;
+        }
+    }
+    Token t = tokenFromParts(tag, payload, iv, cv);
+    if (t == null) { return null; }
+    t.line = ln;
+    t.col = cl;
+    return t;
+}
+
+private string bcIntToStr(int64 v) {
+    if (v == 0) { return "0"; }
+    bool neg = v < 0;
+    int64 mag = v;
+    if (neg) { mag = -v; }
+    string rev = "";
+    while (mag > 0) {
+        char digit = char(48 + (mag % 10));
+        rev = rev + digit;
+        mag = mag / 10;
+    }
+    string r = "";
+    for (int i = rev.length - 1; i >= 0; i--) {
+        r = r + rev[i];
+    }
+    if (neg) { r = "-" + r; }
+    return r;
+}
+
+// Lex source text fresh (cache-miss path).
+public Token[] bcLex(string source) {
+    Lexer lx = new Lexer(source);
+    return lx.tokenize();
+}

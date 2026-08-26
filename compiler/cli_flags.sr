@@ -1,0 +1,421 @@
+mod export cli_flags;
+
+import * from win32.kernel32;
+
+// OVERHAUL.md — compiler CLI flags & modes.
+//
+// Parses and validates the overhaul flag set:
+//   execution modes  --aot / --jit / --runtime   (mutually exclusive)
+//   independent      --optimize --cache-bytecode --watch --threads N
+//
+// The default invocation (only basic I/O flags) stays pure AOT. Error
+// messages mirror silverc-rs src/cli.rs byte for byte.
+
+class CliFlags {
+    public prop string input;
+    public prop string output;
+    public prop int mode;
+    public prop bool optimize;
+    public prop bool cacheBytecode;
+    public prop bool watch;
+    public prop bool threadsSet;
+    public prop int threadsN;
+    // Non-empty when parsing/validation failed; the driver prints it and
+    // exits with status 1.
+    public prop string error;
+    // Resolved effective worker count (set by resolveThreads).
+    public prop int threadCount;
+    // True when the user requested every system thread (--threads N == total).
+    public prop bool warnAllThreads;
+
+    construct () {
+        this.input = "";
+        this.output = "";
+        this.mode = 0;
+        this.optimize = false;
+        this.cacheBytecode = false;
+        this.watch = false;
+        this.threadsSet = false;
+        this.threadsN = 0;
+        this.error = "";
+        this.threadCount = 1;
+        this.warnAllThreads = false;
+    }
+
+    public bool failed() {
+        return this.error.length > 0;
+    }
+
+    public string modeName() {
+        if (this.mode == 1) { return "jit"; }
+        if (this.mode == 2) { return "runtime"; }
+        return "aot";
+    }
+
+    // Flag names currently active — checked against .srp forbidden_flags.
+    public string[] activeFlagNames() {
+        string[] names = [];
+        names.add(this.modeName());
+        if (this.optimize) { names.add("optimize"); }
+        if (this.cacheBytecode) { names.add("cache-bytecode"); }
+        if (this.watch) { names.add("watch"); }
+        if (this.threadsSet) { names.add("threads"); }
+        return names;
+    }
+
+    private bool eqStr(string a, string b) {
+        if (a.length != b.length) { return false; }
+        for (int i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    // Lowercase file stem of a path: the characters after the last separator,
+    // with the final extension removed.
+    public string fileStem(string path) {
+        int last = -1;
+        for (int i = 0; i < path.length; i++) {
+            if (path[i] == '\\' || path[i] == '/') { last = i; }
+        }
+        string name = path;
+        if (last >= 0) { name = cliSlice(path, last + 1, path.length); }
+        int dot = -1;
+        for (int j = name.length - 1; j >= 0; j--) {
+            if (name[j] == '.') { dot = j; break; }
+        }
+        if (dot > 0) { name = cliSlice(name, 0, dot); }
+        string low = "";
+        for (int k = 0; k < name.length; k++) {
+            int ci = name[k];
+            if (ci >= 'A' && ci <= 'Z') { ci = ci + 32; }
+            char lc = char(ci);
+            low = low + lc;
+        }
+        return low;
+    }
+
+    private bool isProtectedStem(string stem) {
+        return this.eqStr(stem, "silverc") || this.eqStr(stem, "compiler_driver")
+            || this.eqStr(stem, "silveri") || this.eqStr(stem, "silverv");
+    }
+
+    // Hard-coded self-protection layer (OVERHAUL.md): refuse --jit, --runtime
+    // and --watch when the input or output identifies a compiler or
+    // interpreter build, regardless of any manifest setting. Returns "" when
+    // the invocation may proceed.
+    public string selfProtectionError() {
+        string target = "";
+        string inputStem = this.fileStem(this.input);
+        if (this.isProtectedStem(inputStem)) {
+            target = inputStem;
+        } elif (this.output.length > 0) {
+            string outStem = this.fileStem(this.output);
+            if (this.isProtectedStem(outStem)) { target = outStem; }
+        }
+        if (target.length == 0) { return ""; }
+        string[] active = this.activeFlagNames();
+        string[] dangerous = [];
+        dangerous.add("jit");
+        dangerous.add("runtime");
+        dangerous.add("watch");
+        for (int d = 0; d < dangerous.length; d++) {
+            for (int a = 0; a < active.length; a++) {
+                if (this.eqStr(active[a], dangerous[d])) {
+                    return "Error: --" + dangerous[d] + " is not allowed when building '" + target + "' (compiler/interpreter builds are self-protected)";
+                }
+            }
+        }
+        return "";
+    }
+
+    // Check the active flags against a manifest's forbidden_flags list
+    // (OVERHAUL.md user-facing configuration layer). Returns "" when clear.
+    public string forbiddenFlagsError(string manifest) {
+        string[] forbidden = manifestForbiddenFlags(manifest);
+        if (forbidden.length == 0) { return ""; }
+        string[] active = this.activeFlagNames();
+        for (int a = 0; a < active.length; a++) {
+            for (int f = 0; f < forbidden.length; f++) {
+                if (this.eqStr(active[a], forbidden[f])) {
+                    return "Error: --" + active[a] + " is forbidden by this project's manifest (forbidden_flags)";
+                }
+            }
+        }
+        return "";
+    }
+
+    // OVERHAUL.md --threads: explicit N over the CPU total aborts with the
+    // exact spec message and no fallback; N == total warns about hang/lag
+    // with a margin of at least 2 recommended; the default is total - 2.
+    public void resolveThreads() {
+        int total = totalCpuThreads();
+        if (this.threadsSet) {
+            if (this.threadsN > total) {
+                this.error = "you have tried more threads than what your cpu has";
+                return;
+            }
+            if (this.threadsN == total) {
+                this.threadCount = total;
+                this.warnAllThreads = true;
+                return;
+            }
+            this.threadCount = this.threadsN;
+            if (this.threadCount < 1) { this.threadCount = 1; }
+            return;
+        }
+        this.threadCount = total - 2;
+        if (this.threadCount < 1) { this.threadCount = 1; }
+    }
+
+    public string warnAllMessage() {
+        return "warning: using all " + this.threadCount.toString() + " system threads — the system might hang or lag; keeping a margin of at least 2 threads is recommended";
+    }
+
+    // OVERHAUL.md CLI diagnostics go to the standard error stream
+    // (silverc-rs prints them via eprintln!). Written through raw Win32 with
+    // the string itself as the byte buffer — strings lower to dense
+    // NUL-terminated char buffers on every backend, unlike managed arrays.
+    public void errLine(string msg) {
+        this.errRaw(msg);
+        this.errRaw("\n");
+    }
+
+    public void errRaw(string msg) {
+        if (msg.length == 0) { return; }
+        int h = GetStdHandle(-12);
+        if (h == -1 || h == 0) { return; }
+        int wrote = 0;
+        WriteFile(h, msg, msg.length, &wrote, null);
+    }
+}
+
+// Logical processor count via the NUMBER_OF_PROCESSORS environment entry
+// Windows maintains for every process; falls back to 4 when unavailable.
+// The lookup writes into a preallocated string buffer (strings lower to
+// dense char buffers on every backend) and scans until the terminator.
+public int totalCpuThreads() {
+    string buf = "                    ";
+    int cap = 20;
+    GetEnvironmentVariableA("NUMBER_OF_PROCESSORS", buf, cap);
+    int v = 0;
+    bool any = false;
+    for (int i = 0; i < cap; i++) {
+        int c = buf[i];
+        if (c == 0) { break; }
+        if (c >= '0' && c <= '9') {
+            v = v * 10 + (c - '0');
+            any = true;
+        } else {
+            break;
+        }
+    }
+    if (!any || v < 1) { return 4; }
+    return v;
+}
+
+// Collect the forbidden_flags entries of a manifest: quoted strings and bare
+// identifiers inside the [...] list, both accepted (mirrors silverc-rs).
+public string[] manifestForbiddenFlags(string manifest) {
+    string[] result = [];
+    int keyPos = cliFindSubstring(manifest, "forbidden_flags", 0);
+    if (keyPos < 0) { return result; }
+    int open = keyPos;
+    while (open < manifest.length && manifest[open] != '[') { open++; }
+    if (open >= manifest.length) { return result; }
+    int close = open + 1;
+    while (close < manifest.length && manifest[close] != ']') { close++; }
+    int end = close;
+    if (end >= manifest.length) { end = manifest.length; }
+    int i = open + 1;
+    while (i < end) {
+        char c = manifest[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ',') { i++; continue; }
+        if (c == '"') {
+            int s = i + 1;
+            int e = s;
+            while (e < end && manifest[e] != '"') { e++; }
+            cliAddUnique(result, cliSlice(manifest, s, e));
+            i = e + 1;
+        } else {
+            int s = i;
+            while (i < end && manifest[i] != ',' && manifest[i] != ']'
+                && manifest[i] != ' ' && manifest[i] != '\t' && manifest[i] != '\r' && manifest[i] != '\n') { i++; }
+            cliAddUnique(result, cliSlice(manifest, s, i));
+        }
+    }
+    return result;
+}
+
+// Numeric value of `key: 123` inside the precompile block (seconds for
+// frequency, kilobytes for project_size_limit); -1 when absent. Custom
+// settings replace the automatic watcher defaults entirely.
+public int precompileNumericValue(string manifest, string key) {
+    int pos = cliFindSubstring(manifest, "precompile", 0);
+    if (pos < 0) { return -1; }
+    int searchEnd = manifest.length;
+    int brace = pos;
+    while (brace < manifest.length && manifest[brace] != '{' && manifest[brace] != '\n') { brace++; }
+    if (brace < manifest.length && manifest[brace] == '{') {
+        int depth = 1;
+        int p = brace + 1;
+        while (p < manifest.length && depth > 0) {
+            if (manifest[p] == '{') { depth++; }
+            elif (manifest[p] == '}') { depth--; }
+            p++;
+        }
+        searchEnd = p;
+    }
+    int keyPos = cliFindSubstring(manifest, key, pos);
+    if (keyPos < 0 || keyPos >= searchEnd) { return -1; }
+    int colon = keyPos + key.length;
+    while (colon < searchEnd && manifest[colon] != ':') { colon++; }
+    if (colon >= searchEnd) { return -1; }
+    colon++;
+    while (colon < searchEnd && (manifest[colon] == ' ' || manifest[colon] == '\t')) { colon++; }
+    int v = 0;
+    int digits = 0;
+    while (colon < searchEnd && manifest[colon] >= '0' && manifest[colon] <= '9') {
+        v = v * 10 + (manifest[colon] - '0');
+        digits++;
+        colon++;
+    }
+    if (digits == 0) { return -1; }
+    return v;
+}
+
+private string cliSlice(string s, int start, int end) {
+    string r = "";
+    for (int i = start; i < end; i++) { r = r + s[i]; }
+    return r;
+}
+
+private int cliFindSubstring(string hay, string needle, int start) {
+    if (needle.length == 0) { return start; }
+    for (int i = start; i + needle.length <= hay.length; i++) {
+        bool hit = true;
+        for (int j = 0; j < needle.length; j++) {
+            if (hay[i + j] != needle[j]) { hit = false; break; }
+        }
+        if (hit) { return i; }
+    }
+    return -1;
+}
+
+private void cliAddUnique(string[] arr, string v) {
+    if (v.length == 0) { return; }
+    for (int i = 0; i < arr.length; i++) {
+        if (cliEq(arr[i], v)) { return; }
+    }
+    arr.add(v);
+}
+
+private bool cliEq(string a, string b) {
+    if (a.length != b.length) { return false; }
+    for (int i = 0; i < a.length; i++) {
+        if (a[i] != b[i]) { return false; }
+    }
+    return true;
+}
+
+// Parse raw args (excluding argv[0]) into validated CliFlags. Never null:
+// failures land in flags.error for the caller to print and abort on.
+public CliFlags parseCliArgs(string[] args) {
+    CliFlags o = new CliFlags();
+    string[] modeOrder = [];
+    int want = 0;
+    for (int i = 1; i < args.length; i++) {
+        string arg = args[i];
+        if (want == 1) {
+            o.output = arg;
+            want = 0;
+            continue;
+        }
+        if (want == 2) {
+            if (!cliDigits(arg)) {
+                o.error = "Error: --threads expects a number, got '" + arg + "'";
+                return o;
+            }
+            o.threadsSet = true;
+            o.threadsN = cliUnsigned(arg);
+            want = 0;
+            continue;
+        }
+        if (want == 3) {
+            o.input = arg;
+            want = 0;
+            continue;
+        }
+        if (cliEq(arg, "--aot")) {
+            o.mode = 0;
+            modeOrder.add("aot");
+        } elif (cliEq(arg, "--jit")) {
+            o.mode = 1;
+            modeOrder.add("jit");
+        } elif (cliEq(arg, "--runtime")) {
+            o.mode = 2;
+            modeOrder.add("runtime");
+        } elif (cliEq(arg, "--optimize")) {
+            o.optimize = true;
+        } elif (cliEq(arg, "--cache-bytecode")) {
+            o.cacheBytecode = true;
+        } elif (cliEq(arg, "--watch")) {
+            o.watch = true;
+        } elif (cliEq(arg, "--threads")) {
+            want = 2;
+        } elif (cliEq(arg, "-o") || cliEq(arg, "--output")) {
+            want = 1;
+        } elif (cliEq(arg, "-i") || cliEq(arg, "--input")) {
+            want = 3;
+        } else {
+            if (arg.length > 1 && arg[0] == '-') {
+                o.error = "Error: unknown flag '" + arg + "'";
+                return o;
+            }
+            if (o.input.length > 0) {
+                // Legacy two-position form `silverc in.sr out.exe` stays
+                // valid; only a third bare argument is unexpected.
+                if (o.output.length == 0) {
+                    o.output = arg;
+                } else {
+                    o.error = "Error: unexpected extra argument '" + arg + "'";
+                    return o;
+                }
+            }
+            if (o.input.length == 0) {
+                o.input = arg;
+            }
+        }
+    }
+    if (modeOrder.length > 1) {
+        string joined = "";
+        for (int m = 0; m < modeOrder.length; m++) {
+            if (m > 0) { joined = joined + ", "; }
+            joined = joined + modeOrder[m];
+        }
+        o.error = "Error: only one of --aot/--jit/--runtime may be passed (got " + joined + ")";
+        return o;
+    }
+    if (o.input.length == 0) {
+        o.error = "Error: no input file given";
+        return o;
+    }
+    return o;
+}
+
+private bool cliDigits(string s) {
+    if (s.length == 0) { return false; }
+    for (int i = 0; i < s.length; i++) {
+        char c = s[i];
+        if (c < '0' || c > '9') { return false; }
+    }
+    return true;
+}
+
+private int cliUnsigned(string s) {
+    int v = 0;
+    for (int i = 0; i < s.length; i++) {
+        v = v * 10 + (s[i] - '0');
+    }
+    return v;
+}
