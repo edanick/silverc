@@ -1,0 +1,97 @@
+mod export progress;
+
+import * from win32.kernel32;
+
+// Compilation progress reporting (ported from silverc-rs src/progress.rs,
+// commit 74a3fe4). Prints one STDERR line per module processed so the user
+// sees how far a compile has advanced: files done / files total, percentage
+// complete, and an estimated time remaining. STDERR is used on purpose —
+// stdout stays clean for program output (`print`, `threads.length`, ...).
+//
+// `total` is discovered up front (entry + transitively resolved imports) by a
+// counting pass that mirrors the same import-resolution used by the real
+// collection, so the counts are exact and the last line always reads 100%.
+
+class ProgressReporter {
+    private prop int total;
+    private prop int processed;
+    private prop int startTick;
+    private prop bool enabled;
+
+    construct (int total) {
+        this.total = total;
+        this.processed = 0;
+        this.startTick = GetTickCount();
+        this.enabled = true;
+    }
+
+    // How many modules have been recorded so far.
+    public int processedCount() {
+        return this.processed;
+    }
+
+    // Record one module as processed and (when enabled) print its line.
+    public void moduleDone(string name) {
+        this.processed = this.processed + 1;
+        if (this.enabled) {
+            this.printLine(name);
+        }
+    }
+
+    // Final "<pct>% done" line after the last module.
+    public void finish() {
+        if (!this.enabled) { return; }
+        int total = this.total;
+        if (total < this.processed) { total = this.processed; }
+        eprintln(this.percentOf(total).toString() + "% done");
+    }
+
+    private void printLine(string name) {
+        int total = this.total;
+        if (total < this.processed) { total = this.processed; }
+        int pct = this.percentOf(total);
+        if (this.processed >= total) {
+            eprintln("[" + this.processed.toString() + "/" + total.toString() + "] module " + name + " 100% done");
+        } elif (this.processed == 0) {
+            eprintln("[" + this.processed.toString() + "/" + total.toString() + "] module " + name + " " + pct.toString() + "% ~estimating... left");
+        } else {
+            eprintln("[" + this.processed.toString() + "/" + total.toString() + "] module " + name + " " + pct.toString() + "% ~" + this.eta() + " left");
+        }
+    }
+
+    // Estimated time remaining: `elapsed / processed * remaining`, formatted
+    // as a human duration.
+    public string eta() {
+        int elapsedMs = GetTickCount() - this.startTick;
+        if (elapsedMs < 0) { elapsedMs = 0; }
+        int remaining = this.total - this.processed;
+        if (remaining < 0) { remaining = 0; }
+        if (this.processed == 0 || remaining == 0) {
+            return "estimating...";
+        }
+        int etaSecs = (elapsedMs * remaining / this.processed + 500) / 1000;
+        return formatDuration(etaSecs);
+    }
+
+    // 0..100 percent, rounded to the nearest whole number and capped at 100.
+    public int percentOf(int total) {
+        if (total <= 0) { return 100; }
+        int pct = this.processed * 100 / total;
+        int rem = (this.processed * 100) % total;
+        if (rem * 2 >= total) { pct = pct + 1; }
+        if (pct > 100) { pct = 100; }
+        return pct;
+    }
+}
+
+// Human duration: `<1s`, `45s`, `3m 12s`, `1h 5m`.
+public string formatDuration(int secs) {
+    if (secs == 0) { return "<1s"; }
+    if (secs < 60) { return secs.toString() + "s"; }
+    int minutes = secs / 60;
+    int seconds = secs % 60;
+    if (minutes < 60) { return minutes.toString() + "m " + seconds.toString() + "s"; }
+    int hours = minutes / 60;
+    int remMinutes = minutes % 60;
+    return hours.toString() + "h " + remMinutes.toString() + "m";
+}

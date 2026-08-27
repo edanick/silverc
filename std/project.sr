@@ -4,6 +4,7 @@ mod export project;
 
 import * from fs;
 import * from string;
+import * from progress;
 
 bool projectHasSuffix(string path, string suffix) {
     if (path.length < suffix.length) { return false; }
@@ -510,7 +511,7 @@ string projectCacheMarker(string path) {
     return "//@@SILVER_FILE@@ " + norm + "\n";
 }
 
-string projectCollect(string path, string root, string[] sourceDirs, string[] visited, bool emitMarkers) {
+string projectCollect(string path, string root, string[] sourceDirs, string[] visited, bool emitMarkers, ProgressReporter progress) {
     if (projectVisited(visited, path)) { return ""; }
     visited.add(path);
     string source = file.readString(path);
@@ -526,14 +527,42 @@ string projectCollect(string path, string root, string[] sourceDirs, string[] vi
         if (moduleName.length > 0 && !projectBuiltin(moduleName)) {
             string importPath = projectSourcePath(root, sourceDirs, moduleName);
             if (!cliArgEq(importPath, "")) {
-                result = result + projectCollect(importPath, root, sourceDirs, visited, emitMarkers) + "\n";
+                result = result + projectCollect(importPath, root, sourceDirs, visited, emitMarkers, progress) + "\n";
             }
         }
         cursor = semi + 1;
     }
     string marker = "";
     if (emitMarkers) { marker = projectCacheMarker(path); }
+    if (progress != null) { progress.moduleDone(path); }
     return result + marker + source + "\n";
+}
+
+// Count how many project source files `projectCollect` would collect for the
+// given entry (1 for the entry plus its transitive imports). Mirrors
+// `projectCollect`'s resolution logic exactly so the total is precise.
+int projectCountCollect(string path, string root, string[] sourceDirs, string[] visited) {
+    if (projectVisited(visited, path)) { return 0; }
+    visited.add(path);
+    string source = file.readString(path);
+    int sub = 0;
+    int cursor = 0;
+    while (cursor < source.length) {
+        int importPos = projectFind(source, "import", cursor);
+        if (importPos < 0) { break; }
+        int semi = projectFind(source, ";", importPos + 6);
+        if (semi < 0) { break; }
+        string statement = projectSlice(source, importPos + 6, semi);
+        string moduleName = projectImportModule(statement);
+        if (moduleName.length > 0 && !projectBuiltin(moduleName)) {
+            string importPath = projectSourcePath(root, sourceDirs, moduleName);
+            if (!cliArgEq(importPath, "")) {
+                sub = sub + projectCountCollect(importPath, root, sourceDirs, visited);
+            }
+        }
+        cursor = semi + 1;
+    }
+    return 1 + sub;
 }
 
 string projectCollectionEscape(string value) {
@@ -669,8 +698,14 @@ string projectBuildSource(string projectPath, bool emitMarkers) {
     string collections = projectManifestValue(manifest, "collections");
 
     string entryPath = projectJoin(root, entry);
+    // Progress (STDERR): pre-count the module files (entry + transitive
+    // imports) so the lines show an exact `[processed/total]` and a real ETA.
+    string[] countVisited = [];
+    int moduleCount = projectCountCollect(entryPath, root, sources, countVisited);
+    ProgressReporter progress = new ProgressReporter(moduleCount);
     string[] visited = [];
-    string collected = projectCollect(entryPath, root, sources, visited, emitMarkers);
+    string collected = projectCollect(entryPath, root, sources, visited, emitMarkers, progress);
+    progress.finish();
     string body = projectStripDirectives(collected);
 
     // `.qs` libraries listed under `imports` are not auto-imported; declaring

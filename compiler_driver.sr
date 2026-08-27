@@ -15,6 +15,7 @@ import * from cli_flags;
 import * from optimizer;
 import * from bcache;
 import * from watcher;
+import * from progress;
 import * from win32.kernel32;
 
 // Per-file cache markers: when --cache-bytecode is active the aggregate
@@ -125,6 +126,16 @@ string findModulePath(string name, string inputFile) {
     candidates.add("..\\silverc\\std\\" + name + ".sr");
     candidates.add("..\\..\\std\\" + name + ".sr");
     candidates.add("..\\..\\silverc\\std\\" + name + ".sr");
+    // Compiler-internal modules (e.g. progress.sr) live under compiler/.
+    // stdlib modules that import them (project -> progress) must resolve them
+    // for standalone compiles, not just .srp builds. std/ stays ahead so
+    // stdlib names never get shadowed by a same-named compiler module.
+    candidates.add("compiler\\" + name + ".sr");
+    candidates.add("silverc\\compiler\\" + name + ".sr");
+    candidates.add("..\\compiler\\" + name + ".sr");
+    candidates.add("..\\silverc\\compiler\\" + name + ".sr");
+    candidates.add("..\\..\\compiler\\" + name + ".sr");
+    candidates.add("..\\..\\silverc\\compiler\\" + name + ".sr");
     candidates.add("..\\silveri\\src\\" + name + ".sr");
     candidates.add("silveri\\src\\" + name + ".sr");
     candidates.add("..\\..\\silveri\\src\\" + name + ".sr");
@@ -154,7 +165,8 @@ string cacheMarkerLine(string path) {
 // the parser ignores import statements and `mod export` at the top level).
 // With emitMarkers set, one cache-marker comment line precedes each file's
 // content so the aggregate can be split per file again (--cache-bytecode).
-string collectModule(string name, string inputFile, string[] visited, bool emitMarkers) {
+// When progress is non-null, one progress line is printed per module.
+string collectModule(string name, string inputFile, string[] visited, bool emitMarkers, ProgressReporter progress) {
     for (int i = 0; i < visited.length; i++) {
         if (cliArgEq(visited[i], name)) { return ""; }
     }
@@ -175,14 +187,47 @@ string collectModule(string name, string inputFile, string[] visited, bool emitM
         if (depName.length > 0) {
             string depPath = findModulePath(depName, inputFile);
             if (depPath.length > 0) {
-                result = result + collectModule(depName, inputFile, visited, emitMarkers);
+                result = result + collectModule(depName, inputFile, visited, emitMarkers, progress);
             }
         }
         cursor = semi + 1;
     }
     string marker = "";
     if (emitMarkers) { marker = cacheMarkerLine(modPath); }
+    if (progress != null) { progress.moduleDone(modPath); }
     return result + marker + modSrc + "\n";
+}
+
+// Count how many non-builtin modules `collectModule` would collect for a given
+// module name (1 for the module itself plus its transitive imports). Mirrors
+// `collectModule`'s resolution logic exactly so the total is precise.
+int countModule(string name, string inputFile, string[] visited) {
+    for (int i = 0; i < visited.length; i++) {
+        if (cliArgEq(visited[i], name)) { return 0; }
+    }
+    visited.add(name);
+    string modPath = findModulePath(name, inputFile);
+    if (modPath.length == 0) { return 0; }
+    string modSrc = tryReadFile(modPath);
+    if (modSrc.length == 0) { return 0; }
+    int sub = 0;
+    int cursor = 0;
+    while (cursor < modSrc.length) {
+        int importPos = projectFind(modSrc, "import", cursor);
+        if (importPos < 0) { break; }
+        int semi = projectFind(modSrc, ";", importPos + 6);
+        if (semi < 0) { break; }
+        string statement = projectSlice(modSrc, importPos + 6, semi);
+        string depName = projectImportModule(statement);
+        if (depName.length > 0) {
+            string depPath = findModulePath(depName, inputFile);
+            if (depPath.length > 0) {
+                sub = sub + countModule(depName, inputFile, visited);
+            }
+        }
+        cursor = semi + 1;
+    }
+    return 1 + sub;
 }
 
 // Known built-in module names used for did-you-mean suggestions on imports.
@@ -216,7 +261,7 @@ bool importIsWin32(string name) {
     return name[0] == 'w' && name[1] == 'i' && name[2] == 'n' && name[3] == '3' && name[4] == '2';
 }
 
-string collectImports(string source, string inputFile, string ignored, string[] errs, bool emitMarkers) {
+string collectImports(string source, string inputFile, string ignored, string[] errs, bool emitMarkers, ProgressReporter progress) {
     string[] visited = [];
     string result = "";
     int cursor = 0;
@@ -282,7 +327,7 @@ string collectImports(string source, string inputFile, string ignored, string[] 
                     errs.add("unknown module \"" + moduleName + "\" was found at line " + loc[0].toString() + ", column " + loc[1].toString() + ". module either doesn't exist or not installed.");
                 }
             } else {
-                result = result + collectModule(moduleName, inputFile, visited, emitMarkers);
+                result = result + collectModule(moduleName, inputFile, visited, emitMarkers, progress);
             }
         }
         cursor = semi + 1;
@@ -293,6 +338,66 @@ string collectImports(string source, string inputFile, string ignored, string[] 
     }
     if (result.length > 0) { return result + source; }
     return source;
+}
+
+// Count how many modules (1 entry + all transitively resolved imports)
+// `collectImports` would collect, using the same resolution logic so the
+// total is exact. The counting pass never builds source strings; it only
+// walks the import graph.
+int countModuleImports(string source, string inputFile, string ignored) {
+    string[] visited = [];
+    int count = 1;
+    int cursor = 0;
+    while (cursor < source.length) {
+        int importPos = projectFind(source, "import", cursor);
+        if (importPos < 0) { break; }
+        // Only treat a line-leading `import` as an import statement.
+        bool lineLeading = true;
+        for (int bi = importPos - 1; bi >= 0; bi--) {
+            char bc = source[bi];
+            if (bc == '\n') { break; }
+            if (bc != ' ' && bc != '\t' && bc != '\r') { lineLeading = false; break; }
+        }
+        if (!lineLeading) {
+            cursor = importPos + 6;
+            continue;
+        }
+        // Whole-word check: reject matches glued to identifier characters.
+        bool importWord = true;
+        if (importPos + 6 < source.length) {
+            char inc = source[importPos + 6];
+            if (inc != ' ' && inc != '\t' && inc != '\r' && inc != '\n' && inc != '{' && inc != '*') {
+                importWord = false;
+            }
+        }
+        if (!importWord) {
+            cursor = importPos + 6;
+            continue;
+        }
+        int semi = projectFind(source, ";", importPos + 6);
+        if (semi < 0) { break; }
+        string statement = projectSlice(source, importPos + 6, semi);
+        string moduleName = projectImportModule(statement);
+        if (moduleName.length > 0 && !projectBuiltin(moduleName) && !importIsWin32(moduleName) && !cliArgEq(moduleName, "project")) {
+            bool prepended = cliArgEq(moduleName, "llmai") || cliArgEq(moduleName, "LLMAI")
+                || cliArgEq(moduleName, "exception") || cliArgEq(moduleName, "bom")
+                || cliArgEq(moduleName, "process") || cliArgEq(moduleName, "notifications")
+                || cliArgEq(moduleName, "env") || cliArgEq(moduleName, "url")
+                || cliArgEq(moduleName, "hash") || cliArgEq(moduleName, "path")
+                || cliArgEq(moduleName, "console") || cliArgEq(moduleName, "math")
+                || cliArgEq(moduleName, "http") || cliArgEq(moduleName, "os");
+            string depProbe = "";
+            if (!prepended) { depProbe = findModuleSource(moduleName, inputFile); }
+            if (!prepended && depProbe.length == 0) {
+                // Unknown module: the real collectImports pass reports it and
+                // aborts; the count is irrelevant when the compile fails.
+            } else {
+                count = count + countModule(moduleName, inputFile, visited);
+            }
+        }
+        cursor = semi + 1;
+    }
+    return count;
 }
 
 // ---------------------------------------------------------------------------
@@ -620,14 +725,20 @@ int compileOnce(CliFlags flags, string outputFile) {
         // file next to the input, under std/, or under silveri/src is
         // collected the same way. Native modules (fs/json/yaml/os + the
         // special-cased std libs above) are never read from disk.
+        // Progress (STDERR): pre-count the modules (entry + imports) so the
+        // lines show an exact `[processed/total]` and a real ETA.
         string[] moduleErrors = [];
-        source = collectImports(source, inputFile, "", moduleErrors, flags.cacheBytecode);
+        int moduleCount = countModuleImports(source, inputFile, "");
+        ProgressReporter progress = new ProgressReporter(moduleCount);
+        progress.moduleDone(inputFile);
+        source = collectImports(source, inputFile, "", moduleErrors, flags.cacheBytecode, progress);
         if (moduleErrors.length > 0) {
             for (int meI = 0; meI < moduleErrors.length; meI++) {
                 printline(moduleErrors[meI]);
             }
             exit(1);
         }
+        progress.finish();
     }
 
     // Per-line character lengths so bracket diagnostics can point just past
