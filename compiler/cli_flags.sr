@@ -1,6 +1,7 @@
 mod export cli_flags;
 
 import * from win32.kernel32;
+import * from resource;
 
 // OVERHAUL.md — compiler CLI flags & modes.
 //
@@ -167,24 +168,24 @@ class CliFlags {
 
     // OVERHAUL.md --threads: explicit N over the CPU total aborts with the
     // exact spec message and no fallback; N == total warns about hang/lag
-    // with a margin of at least 2 recommended; the default is total - 2.
+    // with a margin of at least 2 recommended; the default is the adaptive
+    // 90% of system threads (resource::default_thread_count).
     public void resolveThreads() {
-        int total = totalCpuThreads();
         if (this.threadsSet) {
-            if (this.threadsN > total) {
+            int outcome = rsThreadsWithMargin(this.threadsN);
+            if (outcome < 0) {
                 this.error = "you have tried more threads than what your cpu has";
                 return;
             }
-            if (this.threadsN == total) {
-                this.threadCount = total;
+            if (outcome == 0) {
+                this.threadCount = rsCpuThreadCount();
                 this.warnAllThreads = true;
                 return;
             }
-            this.threadCount = this.threadsN;
-            if (this.threadCount < 1) { this.threadCount = 1; }
+            this.threadCount = outcome;
             return;
         }
-        this.threadCount = total - 2;
+        this.threadCount = rsDefaultThreadCount();
         if (this.threadCount < 1) { this.threadCount = 1; }
     }
 

@@ -1,0 +1,129 @@
+mod export resource;
+
+import * from win32.kernel32;
+import * from win32.msvcrt;
+
+// ---------------------------------------------------------------------------
+// Adaptive resource layer — auto-adjust to the host machine.
+//
+// The compiler scales to whatever system it runs on: big machines (many CPU
+// threads, lots of RAM) or small ones (less). Every size decision derives
+// from live system state queried through the Windows API below — there are
+// no hardcoded assumptions about machine size. Targets ~90% of system
+// resources with a 10% safety margin, never overcommitting.
+//
+// Win32 struct buffers (SYSTEM_INFO, MEMORYSTATUSEX) are queried through
+// preallocated writable string buffers: strings lower to dense char buffers
+// on every backend, so an index reads one raw byte and a bare call passes
+// the buffer pointer straight across the boundary.
+// ---------------------------------------------------------------------------
+
+private int64 LOW_MEMORY_FLOOR = 1073741824; // 1 GiB
+
+// Writable string buffer of n bytes (spaces) for Win32 struct queries.
+private string rsBuf(int n) {
+    string r = "";
+    for (int i = 0; i < n; i++) { r = r + " "; }
+    return r;
+}
+
+// Little-endian DWORD at byte offset `off` in a string buffer.
+private int rsDword(string buf, int off) {
+    int v = 0;
+    for (int i = 0; i < 4; i++) {
+        int b = buf[off + i];
+        v = v + (b << (i * 8));
+    }
+    return v;
+}
+
+// Logical processor count from GetSystemInfo (dwNumberOfProcessors).
+public int rsCpuThreadCount() {
+    string buf = rsBuf(48);
+    GetSystemInfo(buf);
+    int n = rsDword(buf, 32);
+    if (n < 1) { n = 1; }
+    return n;
+}
+
+// One physical-RAM field of MEMORYSTATUSEX at byte offset `startOff`
+// (ullTotalPhys at 8, ullAvailPhys at 16), read as a little-endian QWORD.
+// The dwLength member is primed to sizeof(MEMORYSTATUSEX) == 64 before the
+// call; a failing call yields 0.
+private int64 rsRamField(int startOff) {
+    string buf = rsBuf(64);
+    memset(buf, 0, 64);
+    lstrcpyA(buf, "@");
+    int ok = GlobalMemoryStatusEx(buf);
+    if (ok == 0) { return 0; }
+    int64 v = 0;
+    for (int i = 0; i < 8; i++) {
+        int64 b = buf[startOff + i];
+        v = v + (b << (i * 8));
+    }
+    return v;
+}
+
+// Bytes of physical RAM currently available (ullAvailPhys).
+public int64 rsAvailableRamBytes() {
+    return rsRamField(16);
+}
+
+// Total physical RAM bytes (ullTotalPhys).
+public int64 rsTotalRamBytes() {
+    return rsRamField(8);
+}
+
+// Default worker count: 90% of logical processors, never exceeding total
+// and never below 1. On very small machines (e.g. 2 threads → 1.8 → 2)
+// the clamp ensures total is never exceeded.
+public int rsDefaultThreadCount() {
+    int total = rsCpuThreadCount();
+    float scaled = float(total) * 0.9 + 0.5;
+    int n = int(scaled);
+    if (n < 1) { n = 1; }
+    if (n > total) { n = total; }
+    return n;
+}
+
+// Check a manually requested thread count against the host's logical
+// processor count:
+// - returns -1 when requested > total (caller must abort, exact message)
+// - returns 0 when requested == total (caller warns about the missing margin)
+// - returns the effective count (>= 1) when requested < total
+public int rsThreadsWithMargin(int requested) {
+    int total = rsCpuThreadCount();
+    if (requested > total) { return -1; }
+    if (requested == total) { return 0; }
+    if (requested < 1) { return 1; }
+    return requested;
+}
+
+// 90% of currently available physical RAM (10% safety margin).
+public int64 rsMemoryBudgetBytes() {
+    int64 avail = rsAvailableRamBytes();
+    float scaled = float(avail) * 0.9;
+    return int64(scaled);
+}
+
+// True when the host is memory-constrained (available RAM < 1 GiB).
+public bool rsIsLowMemory() {
+    return rsAvailableRamBytes() < LOW_MEMORY_FLOOR;
+}
+
+// Memory-budget-aware chunk size for parallel partitioning.
+// `hint` is the caller's preferred per-worker item count. The result is
+// clamped so the total concurrent working set of all active workers stays
+// within the adaptive memory budget: each worker holds at most
+// budget / threads / 1024 items' worth of memory, never below 1.
+public int rsAdaptiveChunkSize(int hint) {
+    int threads = rsDefaultThreadCount();
+    if (threads < 1) { threads = 1; }
+    int64 budget = rsMemoryBudgetBytes();
+    int64 perWorker = budget / threads / 1024;
+    if (perWorker < 1) { perWorker = 1; }
+    int cap = int(perWorker);
+    if (hint < 1) { hint = 1; }
+    if (hint < cap) { return hint; }
+    return cap;
+}
