@@ -95,29 +95,49 @@ class CliFlags {
         return low;
     }
 
-    private bool isProtectedStem(string stem) {
+    // Protected stems split per silverc-rs check_self_protection():
+    // compiler builds (silverc / compiler_driver / silverv) reject --jit,
+    // --runtime and --watch; the interpreter build (silveri) rejects --jit
+    // and --watch but ACCEPTS --runtime — OVERHAUL.md "Building the
+    // interpreter with these flags" documents `--runtime` as the intended
+    // way to give the interpreter the full Silver GC and allocator.
+    private bool isCompilerStem(string stem) {
         return this.eqStr(stem, "silverc") || this.eqStr(stem, "compiler_driver")
-            || this.eqStr(stem, "silveri") || this.eqStr(stem, "silverv");
+            || this.eqStr(stem, "silverv");
     }
 
-    // Hard-coded self-protection layer (OVERHAUL.md): refuse --jit, --runtime
-    // and --watch when the input or output identifies a compiler or
-    // interpreter build, regardless of any manifest setting. Returns "" when
-    // the invocation may proceed.
+    private bool isInterpreterStem(string stem) {
+        return this.eqStr(stem, "silveri");
+    }
+
+    // Hard-coded self-protection layer (OVERHAUL.md): refuse dangerous
+    // modes when the input or output identifies a compiler or interpreter
+    // build, regardless of any manifest setting. The interpreter is the
+    // documented --runtime exception. Returns "" when the invocation may
+    // proceed.
     public string selfProtectionError() {
         string target = "";
+        bool interpreter = false;
         string inputStem = this.fileStem(this.input);
-        if (this.isProtectedStem(inputStem)) {
+        if (this.isCompilerStem(inputStem)) {
             target = inputStem;
+        } elif (this.isInterpreterStem(inputStem)) {
+            target = inputStem;
+            interpreter = true;
         } elif (this.output.length > 0) {
             string outStem = this.fileStem(this.output);
-            if (this.isProtectedStem(outStem)) { target = outStem; }
+            if (this.isCompilerStem(outStem)) {
+                target = outStem;
+            } elif (this.isInterpreterStem(outStem)) {
+                target = outStem;
+                interpreter = true;
+            }
         }
         if (target.length == 0) { return ""; }
         string[] active = this.activeFlagNames();
         string[] dangerous = [];
         dangerous.add("jit");
-        dangerous.add("runtime");
+        if (!interpreter) { dangerous.add("runtime"); }
         dangerous.add("watch");
         for (int d = 0; d < dangerous.length; d++) {
             for (int a = 0; a < active.length; a++) {
