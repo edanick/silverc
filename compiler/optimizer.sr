@@ -26,11 +26,25 @@ import * from mini_asm;
 //    place, so labels and relocations stay valid.
 
 class Optimizer {
-    // Names referenced anywhere in the program (DCE pass 1).
-    private prop string[] refs;
+    // DCE candidates: top-level functions that may be dropped. The old
+    // design collected every referenced name into one array and scanned it
+    // linearly per identifier — O(references x distinctNames) on large
+    // aggregates, which stalled --optimize builds for hours. Candidates are
+    // instead grouped into (first-char class, length) buckets so each name
+    // node compares only against the few candidates that could match, and
+    // one single walk marks them live.
+    private prop string[] candNames;
+    private prop int[] candLive;
+    private prop int[] candOrder;
+    private prop int[] bucketStart;
+    private prop int[] candIndexOfItem;
 
     construct () {
-        this.refs = [];
+        this.candNames = [];
+        this.candLive = [];
+        this.candOrder = [];
+        this.bucketStart = [];
+        this.candIndexOfItem = [];
     }
 
     private bool eqStr(string a, string b) {
@@ -41,19 +55,20 @@ class Optimizer {
         return true;
     }
 
-    private void markRef(string name) {
-        if (name.length == 0) { return; }
-        for (int i = 0; i < this.refs.length; i++) {
-            if (this.eqStr(this.refs[i], name)) { return; }
-        }
-        this.refs.add(name);
+    // 64 first-character classes: a-z, A-Z, 0-9, '_', other.
+    private int nameCharClass(char c) {
+        if (c >= 'a' && c <= 'z') { return c - 'a'; }
+        if (c >= 'A' && c <= 'Z') { return c - 'A' + 26; }
+        if (c >= '0' && c <= '9') { return c - '0' + 52; }
+        if (c == '_') { return 62; }
+        return 63;
     }
 
-    private bool isReferenced(string name) {
-        for (int i = 0; i < this.refs.length; i++) {
-            if (this.eqStr(this.refs[i], name)) { return true; }
-        }
-        return false;
+    private int bucketKey(string name) {
+        if (name.length == 0) { return 63 * 65; }
+        int len = name.length;
+        if (len > 64) { len = 64; }
+        return this.nameCharClass(name[0]) * 65 + len;
     }
 
     // Entry point: fold constants across the whole program, then drop dead
@@ -62,6 +77,7 @@ class Optimizer {
         for (int i = 0; i < program.length; i++) {
             this.foldNode(program[i]);
         }
+        this.buildCandidates(program);
         for (int i = 0; i < program.length; i++) {
             this.collectRefs(program[i]);
         }
@@ -69,13 +85,9 @@ class Optimizer {
         for (int k = 0; k < program.length; k++) {
             Node item = program[k];
             bool keep = true;
-            if (item.kind == 100) {
-                if (!this.eqStr(item.name, "main")
-                    && !this.eqStr(this.sliceStr(item.name, 0, 2), "__")
-                    && item.childCount() >= 2
-                    && !this.isReferenced(item.name)) {
-                    keep = false;
-                }
+            int ci = this.candIndexOfItem[k];
+            if (ci >= 0 && this.candLive[ci] == 0) {
+                keep = false;
             }
             if (keep) {
                 program[w] = item;
@@ -85,10 +97,63 @@ class Optimizer {
         truncateItems(program, w);
     }
 
-    private string sliceStr(string s, int start, int end) {
-        string r = "";
-        for (int i = start; i < end && i < s.length; i++) { r = r + s[i]; }
-        return r;
+    // Register the droppable top-level functions (everything except main,
+    // __-prefixed runtime helpers, and declarations without a body) and
+    // index them by bucket. candIndexOfItem maps each program slot to its
+    // candidate (-1 when the item is automatically kept).
+    private void buildCandidates(Node[] program) {
+        this.candNames = [];
+        this.candLive = [];
+        this.candIndexOfItem = [];
+        int nb = 64 * 65 + 1;
+        int[] counts = [];
+        for (int b = 0; b < nb; b++) { counts.add(0); }
+        for (int k = 0; k < program.length; k++) {
+            Node item = program[k];
+            int ci = -1;
+            if (item.kind == 100
+                && !this.eqStr(item.name, "main")
+                && !(item.name.length >= 2 && item.name[0] == '_' && item.name[1] == '_')
+                && item.childCount() >= 2) {
+                this.candNames.add(item.name);
+                this.candLive.add(0);
+                ci = this.candNames.length - 1;
+                int bk = this.bucketKey(item.name);
+                counts[bk] = counts[bk] + 1;
+            }
+            this.candIndexOfItem.add(ci);
+        }
+        // Counting sort of candidate indices by bucket; bucketStart[b] ..
+        // bucketStart[b + 1] is the scan range for bucket b.
+        this.bucketStart = [];
+        int running = 0;
+        for (int b2 = 0; b2 < nb; b2++) {
+            this.bucketStart.add(running);
+            running += counts[b2];
+        }
+        this.bucketStart.add(running);
+        this.candOrder = [];
+        for (int c2 = 0; c2 < this.candNames.length; c2++) { this.candOrder.add(0); }
+        int[] fill = [];
+        for (int b3 = 0; b3 < nb; b3++) { fill.add(this.bucketStart[b3]); }
+        for (int c3 = 0; c3 < this.candNames.length; c3++) {
+            int bk2 = this.bucketKey(this.candNames[c3]);
+            this.candOrder[fill[bk2]] = c3;
+            fill[bk2] = fill[bk2] + 1;
+        }
+    }
+
+    // Mark every candidate whose name appears here live. Overloads share a
+    // name, so all equal names in the bucket are marked (no early break).
+    private void markRef(string name) {
+        if (name.length == 0 || this.candNames.length == 0) { return; }
+        int b = this.bucketKey(name);
+        for (int j = this.bucketStart[b]; j < this.bucketStart[b + 1]; j++) {
+            int ci = this.candOrder[j];
+            if (this.candLive[ci] == 0 && this.eqStr(this.candNames[ci], name)) {
+                this.candLive[ci] = 1;
+            }
+        }
     }
 
     // ------------------------------------------------------------------

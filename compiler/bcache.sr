@@ -100,14 +100,17 @@ class CacheSession {
     // Public API
     // ------------------------------------------------------------------
 
-    // Return cached tokens for absPath when its contents are unchanged and
-    // the stored bytecode decodes; otherwise lex source fresh, store the new
-    // bytecode, and return those tokens.
-    public Token[] tokensFor(string absPath, string source) {
-        if (!this.ok) { return bcLex(source); }
+    // Return cached tokens for the source range [start, end) of aggSource
+    // when its contents are unchanged and the stored bytecode decodes;
+    // otherwise materialize the body (hop file first, char-copy fallback),
+    // lex it fresh, store the new bytecode, and return those tokens. Range
+    // hashing means full-project cache hits never slice the aggregate at
+    // all — the O(bodyLen^2) slice is paid only per actual miss.
+    public Token[] tokensForRange(string absPath, string aggSource, int start, int end, string hopPath) {
+        if (!this.ok) { return bcLex(bcSliceSlow(aggSource, start, end)); }
         string key = this.relKey(absPath);
-        if (key.length == 0) { return bcLex(source); }
-        int64 hash = bcFnv1(source);
+        if (key.length == 0) { return bcLex(bcSliceSlow(aggSource, start, end)); }
+        int64 hash = bcFnv1Range(aggSource, start, end);
         int size = bcFileSize(absPath);
         string hashKey = bcIntToStr(hash);
         string sizeKey = size.toString();
@@ -120,8 +123,11 @@ class CacheSession {
                 }
             }
         }
-        // Re-cache this file: lex now, encode, mark dirty.
-        Token[] tokens = bcLex(source);
+        // Re-cache this file: materialize the body, lex, encode, mark dirty.
+        string body = "";
+        if (hopPath.length > 0) { body = bcSliceViaFile(hopPath, start, end - start); }
+        if (body.length == 0) { body = bcSliceSlow(aggSource, start, end); }
+        Token[] tokens = bcLex(body);
         int stamp = bcNowMillis();
         if (this.encodable(tokens)) {
             this.storeSrbc(absPath, tokens, stamp, hashKey, sizeKey);
@@ -141,6 +147,11 @@ class CacheSession {
             this.dirtyCount++;
         }
         return tokens;
+    }
+
+    // Whole-string variant kept for direct callers with an in-memory file.
+    public Token[] tokensFor(string absPath, string source) {
+        return this.tokensForRange(absPath, source, 0, source.length, "");
     }
 
     // Drop records whose sources vanished and rewrite the record files once
@@ -174,69 +185,49 @@ class CacheSession {
 
         this.sortRecords();
 
-        string indexText = "created " + bcIntToStr(this.createdStamp) + "\n";
-        indexText = indexText + "name " + this.projectName + "\n";
+        // Linear index build: one small string per line, joined once
+        // (per-line concatenation was quadratic in the record count).
+        string[] idxParts = [];
+        idxParts.add("created " + bcIntToStr(this.createdStamp) + "\n");
+        idxParts.add("name " + this.projectName + "\n");
         for (int r = 0; r < this.keys.length; r++) {
-            indexText = indexText + "f " + this.keyOf(r) + "\n";
+            idxParts.add("f " + this.keyOf(r) + "\n");
         }
+        string indexText = idxParts.join("");
         if (this.eqStr(indexText, this.oldIndexText)) { return; }
 
         ensureDirTree(this.dir);
         file.writeString(this.dir + "\\project.sbcri", indexText);
 
-        // Reference-format binary record (little-endian, see module docs).
-        // Built fully inline for the same reason as storeSrbc(): appending
-        // inside a helper cannot grow an array owned by this frame.
-        int[] outBytes = [];
-        outBytes.add(83);
-        outBytes.add(66);
-        outBytes.add(67);
-        outBytes.add(82);
-        outBytes.add(1);
-        outBytes.add(0);
-        int64 createdV = this.createdStamp;
-        for (int cb = 0; cb < 8; cb++) {
-            outBytes.add((createdV >> (cb * 8)) & 0xFF);
-        }
-        string pn = this.projectName;
-        int pnl = pn.length;
-        for (int nb = 0; nb < 4; nb++) {
-            outBytes.add((pnl >> (nb * 8)) & 0xFF);
-        }
-        for (int ni = 0; ni < pnl; ni++) {
-            outBytes.add(pn[ni] & 0xFF);
-        }
-        int kc = this.keys.length;
-        for (int kb = 0; kb < 4; kb++) {
-            outBytes.add((kc >> (kb * 8)) & 0xFF);
-        }
-        for (int rb = 0; rb < this.keys.length; rb++) {
-            string kp = this.keys[rb];
-            int kpl = kp.length;
-            for (int pb1 = 0; pb1 < 4; pb1++) {
-                outBytes.add((kpl >> (pb1 * 8)) & 0xFF);
+        // Reference-format binary record (little-endian, see module docs),
+        // streamed in bounded chunks like the .srbc artifacts.
+        BcBinWriter bw = new BcBinWriter(this.dir + "\\project.sbcr");
+        if (bw.ok()) {
+            bw.b8(83);
+            bw.b8(66);
+            bw.b8(67);
+            bw.b8(82);
+            bw.b16(1);
+            bw.b64(this.createdStamp);
+            string pn = this.projectName;
+            bw.b32(pn.length);
+            for (int ni = 0; ni < pn.length; ni++) {
+                bw.b8(pn[ni] & 0xFF);
             }
-            for (int pi = 0; pi < kpl; pi++) {
-                outBytes.add(kp[pi] & 0xFF);
-            }
-            int64 cv = decToI64(this.cTimesStr[rb]);
-            for (int c1 = 0; c1 < 8; c1++) {
-                outBytes.add((cv >> (c1 * 8)) & 0xFF);
-            }
-            int64 mv = decToI64(this.mTimesStr[rb]);
-            for (int c2 = 0; c2 < 8; c2++) {
-                outBytes.add((mv >> (c2 * 8)) & 0xFF);
-            }
-            int64 hv = decToI64(this.hashesStr[rb]);
-            for (int c3 = 0; c3 < 8; c3++) {
-                outBytes.add((hv >> (c3 * 8)) & 0xFF);
-            }
-            int64 lv = decToI64(this.cachedAtStr[rb]);
-            for (int c4 = 0; c4 < 8; c4++) {
-                outBytes.add((lv >> (c4 * 8)) & 0xFF);
+            bw.b32(this.keys.length);
+            for (int rb = 0; rb < this.keys.length; rb++) {
+                string kp = this.keys[rb];
+                bw.b32(kp.length);
+                for (int pi = 0; pi < kp.length; pi++) {
+                    bw.b8(kp[pi] & 0xFF);
+                }
+                bw.b64(decToI64(this.cTimesStr[rb]));
+                bw.b64(decToI64(this.mTimesStr[rb]));
+                bw.b64(decToI64(this.hashesStr[rb]));
+                bw.b64(decToI64(this.cachedAtStr[rb]));
             }
         }
-        file.writeBytes(this.dir + "\\project.sbcr", outBytes);
+        bw.close();
     }
 
     public int statsTotal() {
@@ -338,75 +329,110 @@ class CacheSession {
         if (path.length == 0) { return; }
         ensureDirTree(bcDirname(path));
 
-        // Reference-format binary stream (see module docs). Float literals
-        // carry all-zero bits: the self-hosted front end materializes float
-        // literals as 0.0 today. The buffer is built entirely inline — an
-        // .add() that grows a received parameter array reallocates without
-        // propagating the new pointer back to the caller, so no helper may
-        // append into an array owned by this frame.
-        int[] outBytes = [];
-        outBytes.add(83);
-        outBytes.add(82);
-        outBytes.add(66);
-        outBytes.add(67);
-        outBytes.add(1);
-        outBytes.add(0);
-        int64 hv2 = decToI64(hashKey);
-        for (int hb = 0; hb < 8; hb++) {
-            outBytes.add((hv2 >> (hb * 8)) & 0xFF);
-        }
-        int64 sv = stamp;
-        for (int sb = 0; sb < 8; sb++) {
-            outBytes.add((sv >> (sb * 8)) & 0xFF);
-        }
-        int tc = tokens.length;
-        for (int cb = 0; cb < 4; cb++) {
-            outBytes.add((tc >> (cb * 8)) & 0xFF);
-        }
-        for (int ib = 0; ib < tokens.length; ib++) {
-            Token tb = tokens[ib];
-            int tag = tagOf(tb);
-            outBytes.add(tag & 0xFF);
-            outBytes.add((tag >> 8) & 0xFF);
-            if (tag == 200) {
-                int64 tv = tb.intVal;
-                for (int tb2 = 0; tb2 < 8; tb2++) {
-                    outBytes.add((tv >> (tb2 * 8)) & 0xFF);
+        // Reference-format binary stream (see module docs), flushed in
+        // bounded chunks straight to disk — never materialized as one
+        // string or one whole-file array. Float literals carry all-zero
+        // bits: the self-hosted front end materializes float literals as
+        // 0.0 today.
+        BcBinWriter bw = new BcBinWriter(path);
+        if (bw.ok()) {
+            bw.b8(83);
+            bw.b8(82);
+            bw.b8(66);
+            bw.b8(67);
+            bw.b16(1);
+            bw.b64(decToI64(hashKey));
+            int64 sv = stamp;
+            bw.b64(sv);
+            bw.b32(tokens.length);
+            for (int ib = 0; ib < tokens.length; ib++) {
+                Token tb = tokens[ib];
+                int tag = tagOf(tb);
+                bw.b16(tag);
+                if (tag == 200) {
+                    bw.b64(tb.intVal);
+                } elif (tag == 201) {
+                    bw.b64(0);
+                } elif (tag == 203) {
+                    int ccv = tb.charVal;
+                    bw.b32(ccv);
+                } elif (tag == 202 || tag == 204 || tag == 205) {
+                    string sv2 = tb.strVal;
+                    bw.b32(sv2.length);
+                    for (int si3 = 0; si3 < sv2.length; si3++) {
+                        bw.b8(sv2[si3] & 0xFF);
+                    }
                 }
-            } elif (tag == 201) {
-                for (int zb = 0; zb < 8; zb++) { outBytes.add(0); }
-            } elif (tag == 203) {
-                int ccv = tb.charVal;
-                for (int cb2 = 0; cb2 < 4; cb2++) {
-                    outBytes.add((ccv >> (cb2 * 8)) & 0xFF);
-                }
-            } elif (tag == 202 || tag == 204 || tag == 205) {
-                string sv2 = tb.strVal;
-                int sl = sv2.length;
-                for (int cb3 = 0; cb3 < 4; cb3++) {
-                    outBytes.add((sl >> (cb3 * 8)) & 0xFF);
-                }
-                for (int si3 = 0; si3 < sl; si3++) {
-                    outBytes.add(sv2[si3] & 0xFF);
-                }
-            }
-            int ln = tb.line;
-            for (int lb = 0; lb < 4; lb++) {
-                outBytes.add((ln >> (lb * 8)) & 0xFF);
-            }
-            int cl = tb.col;
-            for (int pb = 0; pb < 4; pb++) {
-                outBytes.add((cl >> (pb * 8)) & 0xFF);
+                bw.b32(tb.line);
+                bw.b32(tb.col);
             }
         }
-        file.writeBytes(path, outBytes);
+        bw.close();
 
-        // NUL-free text companion (authoritative read side).
-        string txt = hashKey + " " + stamp.toString() + " " + tokens.length.toString() + "\n";
-        for (int i = 0; i < tokens.length; i++) {
-            txt = txt + tokenLine(tokens[i]);
+        // NUL-free text companion (authoritative read side), streamed the
+        // same way; hex payloads spill in bounded windows so no line is
+        // ever built with per-char concatenation.
+        BcTextWriter tw = new BcTextWriter(path + ".t");
+        if (tw.ok()) {
+            tw.put(hashKey);
+            tw.put(" ");
+            tw.put(stamp.toString());
+            tw.put(" ");
+            tw.put(tokens.length.toString());
+            tw.put("\n");
+            for (int i = 0; i < tokens.length; i++) {
+                this.writeTokenLine(tw, tokens[i]);
+            }
         }
-        file.writeString(path + ".t", txt);
+        tw.close();
+    }
+
+    // One token as one companion line: <tag> <line> <col> <payload>
+    // (payload "-" for unit tags, decimal for int/char, "<byteLen>:<hex>"
+    // for string payloads). Identical bytes to the previous one-shot
+    // tokenLine(); emitted piecewise into the streaming writer.
+    private void writeTokenLine(BcTextWriter t, Token tok) {
+        int tag = tagOf(tok);
+        t.put(tag.toString());
+        t.put(" ");
+        t.put(tok.line.toString());
+        t.put(" ");
+        t.put(tok.col.toString());
+        if (tag == 200) {
+            t.put(" ");
+            t.put(bcIntToStr(tok.intVal));
+            t.put("\n");
+            return;
+        }
+        if (tag == 201) {
+            t.put(" 0\n");
+            return;
+        }
+        if (tag == 203) {
+            int cvEnc = tok.charVal;
+            t.put(" ");
+            t.put(cvEnc.toString());
+            t.put("\n");
+            return;
+        }
+        if (tag == 202 || tag == 204 || tag == 205) {
+            t.put(" ");
+            string s = tok.strVal;
+            t.put(s.length.toString());
+            t.put(":");
+            string hex = "";
+            for (int i = 0; i < s.length; i++) {
+                hex = hex + bcHexDigits(s[i] & 0xFF);
+                if (hex.length >= 64) {
+                    t.put(hex);
+                    hex = "";
+                }
+            }
+            t.put(hex);
+            t.put("\n");
+            return;
+        }
+        t.put(" -\n");
     }
 
     private Token[] loadSrbcText(string absPath) {
@@ -414,27 +440,24 @@ class CacheSession {
         if (path.length == 0) { return []; }
         string text = tryReadText(path + ".t");
         if (text.length == 0) { return []; }
-        int pos = 0;
-        string header = "";
-        while (pos < text.length && text[pos] != '\n') {
-            header = header + text[pos];
-            pos++;
+        // Header line: <hash> <stamp> <count> — parsed in place, no slices.
+        int he = 0;
+        while (he < text.length && text[he] != '\n') { he++; }
+        int hp = 0;
+        int fieldsSeen = 0;
+        while (hp < he && fieldsSeen < 2) {
+            if (text[hp] == ' ') { fieldsSeen++; }
+            hp++;
         }
-        pos++;
-        // header: <hash> <stamp> <count>
-        string countStr = wordAt(header, 2);
-        if (countStr.length == 0) { return []; }
-        int count = strToInt(countStr);
+        int count = bcUintRange(text, hp, he);
         if (count <= 0) { return []; }
+        int pos = he + 1;
         Token[] tokens = [];
         for (int i = 0; i < count && pos < text.length; i++) {
-            string line = "";
-            while (pos < text.length && text[pos] != '\n') {
-                line = line + text[pos];
-                pos++;
-            }
-            pos++;
-            Token t = tokenFromLine(line);
+            int le = pos;
+            while (le < text.length && text[le] != '\n') { le++; }
+            Token t = tokenFromRange(text, pos, le);
+            pos = le + 1;
             if (t == null) { return []; }
             tokens.add(t);
         }
@@ -473,9 +496,219 @@ class CacheSession {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming writers (memory bounds for --cache-bytecode).
+//
+// String concatenation allocates a fresh buffer on every `+` and the
+// runtime never frees the old one, so accumulating a whole artifact with
+// `s = s + piece` is quadratic in both time and peak memory. These sinks
+// keep only a bounded chunk resident and push bytes to disk with direct
+// kernel32 writes:
+//
+//   BcBinWriter  — .srbc/.sbcr bytes: a bounded int[] chunk staged through
+//                  a scratch file (file.writeBytes) and appended to the
+//                  artifact with a direct WriteFile of the exact byte
+//                  count. The full stream never exists as one string or
+//                  one whole-file array.
+//   BcTextWriter — NUL-free text (.srbc.t / project.sbcri): a preallocated
+//                  writable string buffer appended in place with lstrcatA
+//                  and flushed with WriteFile, reset in place with
+//                  lstrcpyA("") — the same buffer mechanism bcEnvValue
+//                  relies on, so no per-piece allocation at all.
+// ---------------------------------------------------------------------------
+
+class BcBinWriter {
+    public prop string path;
+    public prop int handle;
+    public prop int[] buf;
+    public prop string scratch;
+    public prop int failed;
+
+    construct (string outPath) {
+        this.path = outPath;
+        this.buf = [];
+        this.failed = 0;
+        this.scratch = outPath + ".part";
+        ensureDirTree(bcDirname(outPath));
+        // CREATE_ALWAYS: every artifact is rewritten whole on change.
+        this.handle = CreateFileA(outPath, 0x40000000, 0, null, 2, 0x80, 0);
+        if (this.handle == -1 || this.handle == 0) {
+            this.handle = 0;
+            this.failed = 1;
+        }
+    }
+
+    public bool ok() {
+        return this.failed == 0;
+    }
+
+    public void b8(int64 v) {
+        this.buf.add(v & 0xFF);
+        if (this.buf.length >= 8192) { this.flush(); }
+    }
+
+    public void b16(int64 v) {
+        this.b8(v);
+        this.b8(v >> 8);
+    }
+
+    public void b32(int64 v) {
+        for (int i = 0; i < 4; i++) { this.b8((v >> (i * 8)) & 0xFF); }
+    }
+
+    public void b64(int64 v) {
+        for (int i = 0; i < 8; i++) { this.b8((v >> (i * 8)) & 0xFF); }
+    }
+
+    public void flush() {
+        int n = this.buf.length;
+        if (n > 0 && this.failed == 0) {
+            // Chunk staging through a scratch file keeps this portable
+            // across bootstrap stages: file.writeBytes compacts the array's
+            // low bytes in place on the self-hosted backend but copies to a
+            // separate heap buffer on the Rust bootstrap, so the array
+            // itself must never be handed to WriteFile. The round trip
+            // (write dense bytes, read them back into a heap buffer, append
+            // with an explicit byte count) is byte-exact on both, NULs
+            // included — the carrier's strlen-based .length is never
+            // consulted.
+            file.writeBytes(this.scratch, this.buf);
+            if (bcFileSize(this.scratch) == n) {
+                string carrier = file.readString(this.scratch);
+                int w = 0;
+                WriteFile(this.handle, carrier, n, &w, null);
+            } else {
+                this.failed = 1;
+            }
+        }
+        // pop() only drops the length slot; the buffer and its capacity
+        // stay alive so the next chunk reuses them without reallocation.
+        while (this.buf.length > 0) { this.buf.pop(); }
+    }
+
+    public void close() {
+        this.flush();
+        if (this.handle != 0) {
+            CloseHandle(this.handle);
+            this.handle = 0;
+        }
+        if (file.exists(this.scratch)) { file.delete(this.scratch); }
+    }
+}
+
+class BcTextWriter {
+    public prop string path;
+    public prop int handle;
+    public prop string buf;
+
+    construct (string outPath) {
+        this.path = outPath;
+        this.handle = 0;
+        this.buf = "";
+        ensureDirTree(bcDirname(outPath));
+        int h = CreateFileA(outPath, 0x40000000, 0, null, 2, 0x80, 0);
+        if (h == -1 || h == 0) { return; }
+        this.handle = h;
+        // Heap-allocated capacity buffer (never a literal: lstrcatA writes
+        // through the pointer), emptied in place so appends stay within it.
+        this.buf = bcSpaces(4096);
+        lstrcpyA(this.buf, "");
+    }
+
+    public bool ok() {
+        return this.handle != 0;
+    }
+
+    // NUL-free text only: the buffer is a plain C string, so lstrcatA
+    // appends in place and .length stays truthful.
+    public void put(string s) {
+        if (s.length == 0 || this.handle == 0) { return; }
+        if (s.length >= 4000) {
+            this.flush();
+            int w2 = 0;
+            WriteFile(this.handle, s, s.length, &w2, null);
+            return;
+        }
+        if (this.buf.length + s.length > 4000) { this.flush(); }
+        lstrcatA(this.buf, s);
+    }
+
+    public void flush() {
+        if (this.handle == 0 || this.buf.length == 0) { return; }
+        int w = 0;
+        WriteFile(this.handle, this.buf, this.buf.length, &w, null);
+        lstrcpyA(this.buf, "");
+    }
+
+    public void close() {
+        this.flush();
+        if (this.handle != 0) {
+            CloseHandle(this.handle);
+            this.handle = 0;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Module-level helpers. Free-function names carry a bc prefix: every module
 // flattens into one program namespace, so duplicates would collide.
 // ---------------------------------------------------------------------------
+
+// Heap string of n spaces built with one join (linear) — the writable
+// buffer primitive for BcTextWriter and range reads.
+public string bcSpaces(int n) {
+    if (n <= 0) { return ""; }
+    string unit = "                    ";
+    string[] parts = [];
+    int full = n / 20;
+    for (int i = 0; i < full; i++) { parts.add(unit); }
+    int rem = n - full * 20;
+    if (rem > 0) { parts.add(sliceRange(unit, 0, rem)); }
+    return parts.join("");
+}
+
+// FNV-1 over a character range of the aggregate, so cache hits hash a
+// chunk in place without ever materializing its text.
+public int64 bcFnv1Range(string data, int start, int end) {
+    int64 hash = -3750763034362895579;
+    if (end > data.length) { end = data.length; }
+    if (start < 0) { start = 0; }
+    for (int i = start; i < end; i++) {
+        hash = hash * 1099511628211;
+        int64 b = data[i];
+        hash = hash ^ b;
+    }
+    return hash;
+}
+
+// Byte-range slice through a temp copy of the aggregate: seek + ReadFile
+// into a preallocated buffer sized exactly for the range, so the buffer's
+// own NUL terminator lands right after the bytes read.
+public string bcSliceViaFile(string hopPath, int start, int len) {
+    if (len <= 0 || hopPath.length == 0) { return ""; }
+    int h = CreateFileA(hopPath, 0x80000000, 3, null, 3, 0x80, 0);
+    if (h == -1 || h == 0) { return ""; }
+    string r = "";
+    int seeked = SetFilePointer(h, start, null, 0);
+    if (seeked != -1) {
+        string buf = bcSpaces(len);
+        int got = 0;
+        int okR = ReadFile(h, buf, len, &got, null);
+        if (okR != 0 && got == len) { r = buf; }
+    }
+    CloseHandle(h);
+    return r;
+}
+
+// Fallback slice for tiny ranges and hop failures: plain per-char copy,
+// correct for any size but quadratic on large bodies — used only when the
+// bounded paths above are unavailable.
+public string bcSliceSlow(string s, int start, int end) {
+    if (end > s.length) { end = s.length; }
+    if (start < 0) { start = 0; }
+    string r = "";
+    for (int i = start; i < end; i++) { r = r + s[i]; }
+    return r;
+}
 
 public bool bcFileExists(string path) {
     return file.exists(path);
@@ -517,17 +750,12 @@ public int bcModifiedMs(string path) {
     return bcFileSize(path);
 }
 
-// FNV-1 64-bit hash of the source text (spec: "FNV-1 hash of the contents").
-// Compiled int64 arithmetic wraps in two's complement, matching the
-// reference's u64 wrapping bit for bit.
+// FNV-1 64-bit hash (spec: "FNV-1 hash of the contents"). Compiled int64
+// arithmetic wraps in two's complement, matching the reference's u64
+// wrapping bit for bit. bcFnv1Range below is the range form the cache
+// actually hashes with.
 public int64 bcFnv1(string data) {
-    int64 hash = -3750763034362895579;
-    for (int i = 0; i < data.length; i++) {
-        hash = hash * 1099511628211;
-        int64 b = data[i];
-        hash = hash ^ b;
-    }
-    return hash;
+    return bcFnv1Range(data, 0, data.length);
 }
 
 public string bcSanitize(string name) {
@@ -619,10 +847,6 @@ private bool startsWith(string s, string prefix) {
     return true;
 }
 
-private string wordAt(string s, int which) {
-    return wordAtSep(s, which, ' ');
-}
-
 private string wordAtSep(string s, int which, char sep) {
     int idx = 0;
     int i = 0;
@@ -636,16 +860,6 @@ private string wordAtSep(string s, int which, char sep) {
         }
     }
     return "";
-}
-
-private int strToInt(string s) {
-    int v = 0;
-    for (int i = 0; i < s.length; i++) {
-        char c = s[i];
-        if (c < '0' || c > '9') { return -1; }
-        v = v * 10 + (c - '0');
-    }
-    return v;
 }
 
 private int64 decToI64(string s) {
@@ -837,7 +1051,7 @@ private Token? tokenFromParts(int tag, string payload, int64 iv, int cv) {
         t.kind = 4;
         t.charVal = char(cv);
         char tc = t.charVal;
-        t.text = "" + tc;
+        t.text = charToString(tc);
         return t;
     }
     if (tag == 204) {
@@ -872,68 +1086,55 @@ private int bcHexVal(char c) {
     return -1;
 }
 
-// One-line text encoding of a token for the NUL-free .srbc.t companion:
-//   <tag> <line> <col> <payload>
-// where payload is "-" for unit tags, a decimal number for int/char, or
-// "<byteLen>:<lowercase hex>" for string payloads.
-private string tokenLine(Token t) {
-    int tag = tagOf(t);
-    string head = tag.toString() + " " + t.line.toString() + " " + t.col.toString();
-    if (tag == 200) {
-        return head + " " + bcIntToStr(t.intVal) + "\n";
+// Rebuild a token from the companion-line bytes in [start, end) of text,
+// parsing every numeric field in place (the old version sliced each field
+// out with per-char concatenation, which leaked quadratically on large
+// caches). Returns null on any malformation, forcing a re-lex.
+private Token? tokenFromRange(string text, int start, int end) {
+    int p = start;
+    int tag = 0;
+    int ln = 0;
+    int cl = 0;
+    int f = 0;
+    while (f < 3) {
+        int v = bcUintRange(text, p, end);
+        if (v < 0) { return null; }
+        if (f == 0) { tag = v; }
+        elif (f == 1) { ln = v; }
+        else { cl = v; }
+        while (p < end && text[p] >= '0' && text[p] <= '9') { p++; }
+        while (p < end && text[p] == ' ') { p++; }
+        f++;
     }
-    if (tag == 201) {
-        return head + " 0\n";
-    }
-    if (tag == 203) {
-        int cvEnc = t.charVal;
-        return head + " " + cvEnc.toString() + "\n";
-    }
-    if (tag == 202 || tag == 204 || tag == 205) {
-        string s = t.strVal;
-        string hex = "";
-        for (int i = 0; i < s.length; i++) {
-            hex = hex + bcHexDigits(s[i] & 0xFF);
-        }
-        return head + " " + s.length.toString() + ":" + hex + "\n";
-    }
-    return head + " -\n";
-}
-
-private Token? tokenFromLine(string line) {
-    string t1 = wordAt(line, 0);
-    string t2 = wordAt(line, 1);
-    string t3 = wordAt(line, 2);
-    string t4 = wordAt(line, 3);
-    if (t4.length == 0) { return null; }
-    int tag = strToInt(t1);
-    int ln = strToInt(t2);
-    int cl = strToInt(t3);
-    if (tag < 0 || ln < 0 || cl < 0) { return null; }
+    if (p >= end) { return null; }
     string payload = "";
     int64 iv = 0;
     int cv = 32;
     if (tag == 200) {
-        iv = decToI64(t4);
+        iv = bcDecRangeSigned(text, p, end);
     } elif (tag == 201) {
         iv = 0;
     } elif (tag == 203) {
-        cv = strToInt(t4);
+        cv = bcUintRange(text, p, end);
         if (cv < 0) { return null; }
     } elif (tag == 202 || tag == 204 || tag == 205) {
-        // <byteLen>:<hex>
-        int colon = 0;
-        while (colon < t4.length && t4[colon] != ':') { colon++; }
-        if (colon >= t4.length) { return null; }
-        int blen = strToInt(sliceRange(t4, 0, colon));
-        string hex = sliceRange(t4, colon + 1, t4.length);
-        if (blen < 0 || hex.length < blen * 2) { return null; }
-        for (int b = 0; b < blen; b++) {
-            int hi = bcHexVal(hex[b * 2]);
-            int lo = bcHexVal(hex[b * 2 + 1]);
-            if (hi < 0 || lo < 0) { return null; }
-            char pb = char(hi * 16 + lo);
-            payload = payload + pb;
+        // <byteLen>:<hex> — decoded into an exact-size buffer appended in
+        // place, so payload cost is linear with no per-char quadratic copy.
+        int colon = p;
+        while (colon < end && text[colon] != ':') { colon++; }
+        if (colon >= end) { return null; }
+        int blen = bcUintRange(text, p, colon);
+        if (blen < 0 || end - (colon + 1) < blen * 2) { return null; }
+        int hexStart = colon + 1;
+        if (blen > 0) {
+            payload = bcSpaces(blen);
+            lstrcpyA(payload, "");
+            for (int b = 0; b < blen; b++) {
+                int hi = bcHexVal(text[hexStart + b * 2]);
+                int lo = bcHexVal(text[hexStart + b * 2 + 1]);
+                if (hi < 0 || lo < 0) { return null; }
+                lstrcatA(payload, charToString(char(hi * 16 + lo)));
+            }
         }
     }
     Token t = tokenFromParts(tag, payload, iv, cv);
@@ -941,6 +1142,39 @@ private Token? tokenFromLine(string line) {
     t.line = ln;
     t.col = cl;
     return t;
+}
+
+// Unsigned decimal in [start, end); -1 when no digits precede the next
+// non-digit character.
+private int bcUintRange(string s, int start, int end) {
+    int v = 0;
+    int i = start;
+    bool any = false;
+    while (i < end) {
+        char c = s[i];
+        if (c < '0' || c > '9') { break; }
+        v = v * 10 + (c - '0');
+        any = true;
+        i++;
+    }
+    if (!any) { return -1; }
+    return v;
+}
+
+// Signed decimal in [start, end) (leading '-' allowed).
+private int64 bcDecRangeSigned(string s, int start, int end) {
+    bool neg = false;
+    int i = start;
+    if (i < end && s[i] == '-') { neg = true; i++; }
+    int64 v = 0;
+    while (i < end) {
+        char c = s[i];
+        if (c < '0' || c > '9') { break; }
+        v = v * 10 + (c - '0');
+        i++;
+    }
+    if (neg) { v = -v; }
+    return v;
 }
 
 private string bcIntToStr(int64 v) {

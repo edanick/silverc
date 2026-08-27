@@ -331,49 +331,59 @@ int jitExecute(CliFlags flags, int[] peData, string inputPath) {
     return gotCode;
 }
 
-// Split a marked aggregate into per-file chunks (paths, texts, and the
-// aggregate 0-based line index of each chunk's first content line). Field
-// arrays grow through `this`, which every backend supports.
+// Split a marked aggregate into per-file chunks: paths, body ranges as
+// character offsets into the aggregate, and the aggregate 0-based line
+// index of each chunk's first content line. Bodies are kept as ranges —
+// slicing each file out with per-char concatenation was quadratic in the
+// file size and is what exhausted memory on large --cache-bytecode builds
+// (string `+` allocates a fresh buffer per char and the runtime never
+// frees the old ones).
 class MarkedChunks {
     public prop string[] paths;
-    public prop string[] texts;
     public prop int[] startLines;
+    public prop int[] starts;
+    public prop int[] ends;
 
     construct () {
         this.paths = [];
-        this.texts = [];
         this.startLines = [];
+        this.starts = [];
+        this.ends = [];
     }
 
     public void split(string source) {
         this.paths = [];
-        this.texts = [];
         this.startLines = [];
-        int prefixLen = cacheMarkerPrefix().length;
+        this.starts = [];
+        this.ends = [];
+        string prefix = cacheMarkerPrefix();
+        int prefixLen = prefix.length;
         int pos = 0;
         int lineStart = 0;
         int aggLine = 0;
         string curPath = "";
-        bool havePath = true;
+        bool havePath = false;
         int bodyStart = 0;
         int bodyLine = 0;
         while (pos <= source.length) {
             bool atEnd = pos == source.length;
             if (atEnd || source[pos] == '\n') {
-                string line = projectSlice(source, lineStart, pos);
-                bool isMarker = line.length > prefixLen;
+                // Marker check in place: only marker lines are ever sliced
+                // (short path strings), never whole file bodies.
+                bool isMarker = pos - lineStart > prefixLen;
                 if (isMarker) {
                     for (int k = 0; k < prefixLen; k++) {
-                        if (line[k] != cacheMarkerPrefix()[k]) { isMarker = false; break; }
+                        if (source[lineStart + k] != prefix[k]) { isMarker = false; break; }
                     }
                 }
                 if (isMarker) {
                     if (havePath && pos > bodyStart) {
                         this.paths.add(curPath);
-                        this.texts.add(projectSlice(source, bodyStart, pos));
                         this.startLines.add(bodyLine);
+                        this.starts.add(bodyStart);
+                        this.ends.add(pos);
                     }
-                    curPath = projectSlice(line, prefixLen, line.length);
+                    curPath = projectSlice(source, lineStart + prefixLen, pos);
                     havePath = true;
                     bodyStart = pos + 1;
                     bodyLine = aggLine + 1;
@@ -386,8 +396,9 @@ class MarkedChunks {
         }
         if (havePath && source.length > bodyStart) {
             this.paths.add(curPath);
-            this.texts.add(projectSlice(source, bodyStart, source.length));
             this.startLines.add(bodyLine);
+            this.starts.add(bodyStart);
+            this.ends.add(source.length);
         }
     }
 }
@@ -649,13 +660,24 @@ int compileOnce(CliFlags flags, string outputFile) {
     } else {
         // OVERHAUL.md --cache-bytecode: lex each collected file separately,
         // going through the persistent bytecode cache; only files whose hash
-        // or mtime changed are re-lexed and re-cached.
+        // or mtime changed are re-lexed and re-cached. Chunk bodies are kept
+        // as ranges into the aggregate and materialized lazily through a
+        // temp hop copy of it (seek + ReadFile), so unchanged files are
+        // never sliced out of the aggregate at all.
         MarkedChunks chunks = new MarkedChunks();
         chunks.split(source);
         sess = new CacheSession(bcDirname(inputFile), cacheSessionName(inputFile, inputIsProject));
         if (sess.ok && chunks.paths.length > 0) {
+            string hopBase = bcEnvValue("TEMP");
+            if (hopBase.length == 0) { hopBase = bcEnvValue("TMP"); }
+            if (hopBase.length == 0) { hopBase = "."; }
+            string hopPath = hopBase + "\\silverc-hop\\hop_" + GetCurrentProcessId().toString() + ".tmp";
+            ensureDirTree(bcDirname(hopPath));
+            file.writeString(hopPath, source);
             for (int ci2 = 0; ci2 < chunks.paths.length; ci2++) {
-                Token[] part = sess.tokensFor(bcReplaceAll(chunks.paths[ci2], "/", "\\"), chunks.texts[ci2]);
+                Token[] part = sess.tokensForRange(
+                    bcReplaceAll(chunks.paths[ci2], "/", "\\"),
+                    source, chunks.starts[ci2], chunks.ends[ci2], hopPath);
                 int off = chunks.startLines[ci2];
                 for (int tj = 0; tj < part.length; tj++) {
                     Token t = part[tj];
@@ -667,6 +689,7 @@ int compileOnce(CliFlags flags, string outputFile) {
                 }
             }
             tokens.add(new Token(0, "", 1, 1));
+            if (file.exists(hopPath)) { file.delete(hopPath); }
         } else {
             Lexer lexer = new Lexer(source);
             tokens = lexer.tokenize();
