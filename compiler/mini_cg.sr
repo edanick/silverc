@@ -119,6 +119,11 @@ class MiniCg {
     public prop int[] refCalleeParams;
     public prop string[] refParams;
 
+    // Optional codegen progress reporter: when non-null the driver calls
+    // codegenTick after each function body is generated so long compiles
+    // show movement.
+    public prop ProgressReporter progress;
+
     construct (MiniAsm asm) {
         this.asm = asm;
         this.strings = [];
@@ -208,6 +213,7 @@ class MiniCg {
         this.refCalleeNames = [];
         this.refCalleeParams = [];
         this.refParams = [];
+        this.progress = null;
     }
 
     public void collectClassLayouts(Node[] program) {
@@ -1112,10 +1118,27 @@ int strIdx = this.stringPatchIndices[i];
                 }
             }
         }
+        // Phase-B progress: total function bodies this program will emit
+        // (free functions + class methods) so the driver can print
+        // `codegen: N/M functions` ticks during long compiles.
+        int fnTotal = 0;
+        for (int i = 0; i < program.length; i++) {
+            Node item = program[i];
+            if (item.kind == 100) { fnTotal = fnTotal + 1; }
+            if (item.kind == 102) {
+                for (int j = 0; j < item.childCount(); j++) {
+                    Node member = item.child(j);
+                    if (member.kind == 100) { fnTotal = fnTotal + 1; }
+                }
+            }
+        }
+        int fnDone = 0;
         for (int i = 0; i < program.length; i++) {
             Node pi3 = program[i];
             if (pi3.kind == 100) {
                 this.emitFunction(pi3);
+                fnDone = fnDone + 1;
+                this.reportFnProgress(fnDone, fnTotal);
             }
         }
 
@@ -1126,6 +1149,8 @@ int strIdx = this.stringPatchIndices[i];
                     Node member = pi4.child(j);
                     if (member.kind == 100) {
                         this.emitMethod(member, pi4.name);
+                        fnDone = fnDone + 1;
+                        this.reportFnProgress(fnDone, fnTotal);
                     }
                 }
             }
@@ -1153,6 +1178,14 @@ int strIdx = this.stringPatchIndices[i];
         if (this.runtimeMode) {
             this.emitRuntimeFunctions();
             this.emitRuntimeEntryStub();
+        }
+    }
+
+    // Phase-B progress: bump the emitted-function counter and forward it to
+    // the driver's reporter (when installed) so long compiles show movement.
+    private void reportFnProgress(int done, int total) {
+        if (this.progress != null) {
+            this.progress.codegenTick(done, total);
         }
     }
 

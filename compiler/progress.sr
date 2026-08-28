@@ -17,12 +17,18 @@ class ProgressReporter {
     private prop int processed;
     private prop int startTick;
     private prop bool enabled;
+    // When the parsing phase finished (all per-module lines printed); used so
+    // the codegen start line can report how long the parse phase took.
+    private prop int parseDoneTick;
+    private prop bool parseDoneSet;
 
     construct (int total) {
         this.total = total;
         this.processed = 0;
         this.startTick = GetTickCount();
         this.enabled = true;
+        this.parseDoneTick = 0;
+        this.parseDoneSet = false;
     }
 
     // How many modules have been recorded so far.
@@ -54,6 +60,63 @@ class ProgressReporter {
         int total = this.total;
         if (total < this.processed) { total = this.processed; }
         eprintln(this.percentOf(total).toString() + "% done");
+    }
+
+    // Mark the parsing phase as finished. The codegen start line reports how
+    // long parsing took so the fast phase and the heavy phases are visually
+    // separated.
+    public void parseDone() {
+        if (!this.parseDoneSet) {
+            this.parseDoneSet = true;
+            this.parseDoneTick = GetTickCount();
+        }
+    }
+
+    // Phase B start: `codegen: emitting native code...` plus the parse-phase
+    // duration when it is known.
+    public void phaseCodegen() {
+        if (!this.enabled) { return; }
+        if (this.parseDoneSet) {
+            int elapsedMs = this.parseDoneTick - this.startTick;
+            if (elapsedMs < 0) { elapsedMs = 0; }
+            eprintln("codegen: emitting native code... (parsing took " + formatDuration(elapsedMs / 1000) + ")");
+        } else {
+            eprintln("codegen: emitting native code...");
+        }
+    }
+
+    // Phase B tick: called after each function has been emitted; prints
+    // `codegen: N/M functions` every 500 functions (and on the final one) —
+    // but only once the program is large enough for the line to carry
+    // information, so small compiles stay quiet.
+    public void codegenTick(int done, int total) {
+        if (!this.enabled) { return; }
+        if (total >= 500 && (done == total || done % 500 == 0)) {
+            eprintln("codegen: " + done.toString() + "/" + total.toString() + " functions");
+        }
+    }
+
+    // Phase C start: printed right before the PE image is written out.
+    public void phaseEmit() {
+        if (this.enabled) {
+            eprintln("writing executable...");
+        }
+    }
+
+    // Cache-flush phase start: printed before the bytecode cache session is
+    // flushed (`--cache-bytecode`).
+    public void phaseCache() {
+        if (this.enabled) {
+            eprintln("syncing bytecode cache...");
+        }
+    }
+
+    // Cache-flush phase end: `cache: K/M files re-cached` — K files whose
+    // bytecode was rewritten this run, M files the cache tracks in total.
+    public void cacheDone(int recached, int total) {
+        if (this.enabled) {
+            eprintln("cache: " + recached.toString() + "/" + total.toString() + " files re-cached");
+        }
     }
 
     private void printLine(string name) {

@@ -635,6 +635,11 @@ int compileOnce(CliFlags flags, string outputFile) {
     string inputFile = flags.input;
     bool inputIsProject = projectHasSuffix(inputFile, ".srp");
     int moduleCount = 1;
+    // Phase reporter shared across the whole pipeline (module collection +
+    // codegen + emission + cache flush). Standalone sources create it during
+    // import collection; project builds create it once the module count is
+    // known so the codegen/emission phases can report too.
+    ProgressReporter progress = null;
 
     string manifest = "";
     if (inputIsProject) {
@@ -665,6 +670,7 @@ int compileOnce(CliFlags flags, string outputFile) {
         string[] pSources = projectManifestSources(manifest);
         ProjectVisited pVisited = new ProjectVisited();
         moduleCount = projectCountCollect(projectJoin(pRoot, pEntry), pRoot, pSources, pVisited);
+        progress = new ProgressReporter(moduleCount);
         source = projectBuildSource(inputFile, flags.cacheBytecode);
     } else {
         // `.col` declarations require a project manifest with a configured
@@ -766,7 +772,7 @@ int compileOnce(CliFlags flags, string outputFile) {
         string[] moduleErrors = [];
         int moduleCountImports = countModuleImports(source, inputFile, "");
         moduleCount = moduleCountImports;
-        ProgressReporter progress = new ProgressReporter(moduleCountImports);
+        progress = new ProgressReporter(moduleCountImports);
         progress.moduleDone(inputFile);
         source = collectImports(source, inputFile, "", moduleErrors, flags.cacheBytecode, progress);
         if (moduleErrors.length > 0) {
@@ -889,6 +895,13 @@ int compileOnce(CliFlags flags, string outputFile) {
     cg.threadCount = flags.threadCount;
     cg.runtimeMode = flags.mode == 2;
 
+    // Phase B/C reporting: the parse/typecheck frontend is done, native
+    // emission begins, and the executable + cache flush must both complete
+    // before the final success line prints.
+    if (progress != null) { progress.parseDone(); }
+    if (progress != null) { progress.phaseCodegen(); }
+    cg.progress = progress;
+
     cg.genProgram(ast);
     cg.getStringData();
 
@@ -977,25 +990,38 @@ int compileOnce(CliFlags flags, string outputFile) {
     pe.globalAreaSize = cg.globalAreaSize;
     int[] peData = pe.build(finalCode, stringData, versionData);
 
-    // OVERHAUL.md --cache-bytecode: persist the record file after a full
-    // compilation (stale entries dropped too).
-    if (sess != null) {
-        sess.flush();
-    }
-
     if (flags.mode == 1) {
         // OVERHAUL.md --jit: run the emitted image as a direct child process
         // and propagate its exit code. Standalone outputs keep the requested
         // binary on disk (legacy parity); projects leave nothing behind.
+        if (progress != null) { progress.phaseEmit(); }
         if (!inputIsProject) {
             file.writeBytes(outputFile, peData);
+        }
+        // OVERHAUL.md --cache-bytecode: flush the session before the success
+        // line so the compile is only reported done once every artifact is on
+        // disk.
+        if (sess != null) {
+            if (progress != null) { progress.phaseCache(); }
+            sess.flush();
+            if (progress != null) { progress.cacheDone(sess.statsDirty(), sess.statsTotal()); }
         }
         // Compilation succeeded before the image executes.
         drvReportSuccess(outputFile, moduleCount, startTick);
         return jitExecute(flags, peData, inputFile);
     }
 
+    // Phase C: announce the write, then persist the bytecode cache (stale
+    // entries dropped too) BEFORE the success line so the compile is only
+    // reported done once every artifact is on disk.
+    if (progress != null) { progress.phaseEmit(); }
     file.writeBytes(outputFile, peData);
+    eprintln("Generated: " + outputFile);
+    if (sess != null) {
+        if (progress != null) { progress.phaseCache(); }
+        sess.flush();
+        if (progress != null) { progress.cacheDone(sess.statsDirty(), sess.statsTotal()); }
+    }
     drvReportSuccess(outputFile, moduleCount, startTick);
     return 0;
 }
