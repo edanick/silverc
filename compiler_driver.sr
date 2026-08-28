@@ -18,6 +18,16 @@ import * from watcher;
 import * from progress;
 import * from win32.kernel32;
 
+// Print the final success line on STDERR (alongside the progress lines) once
+// a compile has produced its output: `<output> (N modules, Xs)`. `moduleCount`
+// is the number of modules (entry + collected imports/sources) processed and
+// `startTick` when the compile pass started.
+void drvReportSuccess(string outputFile, int moduleCount, int startTick) {
+    int elapsedMs = GetTickCount() - startTick;
+    if (elapsedMs < 0) { elapsedMs = 0; }
+    eprintln("compilation successful: " + outputFile + " (" + moduleCount.toString() + " modules, " + formatDuration(elapsedMs / 1000) + ")");
+}
+
 // Per-file cache markers: when --cache-bytecode is active the aggregate
 // source carries one marker comment line before each collected file so the
 // driver can split it back into per-file chunks and route each through the
@@ -621,23 +631,40 @@ void main() {
 // failure; in --jit mode the compiled program runs as a child and its exit
 // code propagates.
 int compileOnce(CliFlags flags, string outputFile) {
+    int startTick = GetTickCount();
     string inputFile = flags.input;
     bool inputIsProject = projectHasSuffix(inputFile, ".srp");
+    int moduleCount = 1;
 
+    string manifest = "";
     if (inputIsProject) {
-        string manifest = file.readString(inputFile);
+        manifest = file.readString(inputFile);
         string projectType = projectManifestValue(manifest, "type");
         if (cliArgEq(projectType, "quicksilver")) {
             // `type: quicksilver` (DOCS/226): emit a QuickSilver (.qs) library
-            // bundle instead of an executable.
+            // bundle instead of an executable. Count the modules from the
+            // manifest entries for the success line.
+            string root = projectDirname(inputFile);
+            string qEntry = projectManifestValue(manifest, "entry");
+            string[] qSources = projectManifestSources(manifest);
+            ProjectVisited qVisited = new ProjectVisited();
+            moduleCount = projectCountCollect(projectJoin(root, qEntry), root, qSources, qVisited);
             int[] bundle = projectBuildBundle(inputFile);
             file.writeBytes(outputFile, bundle);
+            drvReportSuccess(outputFile, moduleCount, startTick);
             return 0;
         }
     }
 
     string source = file.readString(inputFile);
     if (inputIsProject) {
+        // Count the project modules (entry + transitively collected imports)
+        // for the final success line; projectBuildSource runs the same pass.
+        string pRoot = projectDirname(inputFile);
+        string pEntry = projectManifestValue(manifest, "entry");
+        string[] pSources = projectManifestSources(manifest);
+        ProjectVisited pVisited = new ProjectVisited();
+        moduleCount = projectCountCollect(projectJoin(pRoot, pEntry), pRoot, pSources, pVisited);
         source = projectBuildSource(inputFile, flags.cacheBytecode);
     } else {
         // `.col` declarations require a project manifest with a configured
@@ -737,8 +764,9 @@ int compileOnce(CliFlags flags, string outputFile) {
         // Progress (STDERR): pre-count the modules (entry + imports) so the
         // lines show an exact `[processed/total]` and a real ETA.
         string[] moduleErrors = [];
-        int moduleCount = countModuleImports(source, inputFile, "");
-        ProgressReporter progress = new ProgressReporter(moduleCount);
+        int moduleCountImports = countModuleImports(source, inputFile, "");
+        moduleCount = moduleCountImports;
+        ProgressReporter progress = new ProgressReporter(moduleCountImports);
         progress.moduleDone(inputFile);
         source = collectImports(source, inputFile, "", moduleErrors, flags.cacheBytecode, progress);
         if (moduleErrors.length > 0) {
@@ -962,10 +990,13 @@ int compileOnce(CliFlags flags, string outputFile) {
         if (!inputIsProject) {
             file.writeBytes(outputFile, peData);
         }
+        // Compilation succeeded before the image executes.
+        drvReportSuccess(outputFile, moduleCount, startTick);
         return jitExecute(flags, peData, inputFile);
     }
 
     file.writeBytes(outputFile, peData);
+    drvReportSuccess(outputFile, moduleCount, startTick);
     return 0;
 }
 
