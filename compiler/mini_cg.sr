@@ -111,6 +111,13 @@ class MiniCg {
     public prop int[] heapAllocPatchPos;
     public prop int rtStateDataOff;
     public prop int rtPtrSlotDataOff;
+    // Reference parameters (DOCS/34, `&arg` call sites). refCalleeNames/
+    // refCalleeParams record (callee name, param index) for every call that
+    // passes a `&arg`; refParams holds the current function's ref-bound param
+    // names so reads dereference and writes store through the caller's slot.
+    public prop string[] refCalleeNames;
+    public prop int[] refCalleeParams;
+    public prop string[] refParams;
 
     construct (MiniAsm asm) {
         this.asm = asm;
@@ -198,6 +205,9 @@ class MiniCg {
         this.heapAllocPatchPos = [];
         this.rtStateDataOff = 0;
         this.rtPtrSlotDataOff = 0;
+        this.refCalleeNames = [];
+        this.refCalleeParams = [];
+        this.refParams = [];
     }
 
     public void collectClassLayouts(Node[] program) {
@@ -1088,6 +1098,23 @@ int strIdx = this.stringPatchIndices[i];
         for (int i = 0; i < program.length; i++) {
             Node pi3 = program[i];
             if (pi3.kind == 100) {
+                this.scanRefCalls(pi3);
+            }
+        }
+        for (int i = 0; i < program.length; i++) {
+            Node pi4c = program[i];
+            if (pi4c.kind == 102) {
+                for (int j = 0; j < pi4c.childCount(); j++) {
+                    Node member = pi4c.child(j);
+                    if (member.kind == 100) {
+                        this.scanRefCalls(member);
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < program.length; i++) {
+            Node pi3 = program[i];
+            if (pi3.kind == 100) {
                 this.emitFunction(pi3);
             }
         }
@@ -1127,6 +1154,57 @@ int strIdx = this.stringPatchIndices[i];
             this.emitRuntimeFunctions();
             this.emitRuntimeEntryStub();
         }
+    }
+
+    public void scanRefCalls(Node func) {
+        // Walk the function body (child 1) for call sites that pass `&arg`.
+        // Record (callee name, param index) so emitFunction knows which
+        // parameters are bound by reference and must be dereferenced on every
+        // read and written-through on every store.
+        if (func.childCount() > 1) {
+            this.scanRefTree(func.child(1));
+        }
+    }
+
+    public void scanRefTree(Node node) {
+        // Check every call node for arguments that are `&expr` (kind 8, op 3).
+        if ((node.kind == 9 || node.kind == 10) && node.childCount() > 0) {
+            int argStart = 0;
+            if (node.isMember) { argStart = 1; }
+            for (int ai = argStart; ai < node.childCount(); ai++) {
+                Node arg = node.child(ai);
+                if (arg.kind == 8 && arg.op == 3) {
+                    this.refCalleeNames.add(node.name);
+                    this.refCalleeParams.add(ai - argStart);
+                }
+            }
+        }
+        for (int i = 0; i < node.childCount(); i++) {
+            this.scanRefTree(node.child(i));
+        }
+    }
+
+    public void collectRefParams(Node func) {
+        // Populate this.refParams with the names of the current function's
+        // parameters that some call site passes as `&arg`.
+        this.refParams = [];
+        if (func.childCount() < 1) { return; }
+        Node params = func.child(0);
+        for (int ri = 0; ri < this.refCalleeNames.length; ri++) {
+            if (this.strEq(this.refCalleeNames[ri], func.name)) {
+                int idx = this.refCalleeParams[ri];
+                if (idx >= 0 && idx < params.childCount()) {
+                    this.refParams.add(params.child(idx).name);
+                }
+            }
+        }
+    }
+
+    public bool isRefParam(string name) {
+        for (int ri = 0; ri < this.refParams.length; ri++) {
+            if (this.strEq(this.refParams[ri], name)) { return true; }
+        }
+        return false;
     }
 
     // Register one of the embedded --runtime helper functions in the function
@@ -1452,6 +1530,7 @@ int strIdx = this.stringPatchIndices[i];
     this.allocLocal("this");
     int[] paramRegs = [1, 2, 8, 9];
     int numParams = 0;
+    this.collectRefParams(func);
     if (func.childCount() > 0) {
         Node params = func.child(0);
         numParams = params.childCount();
@@ -1487,6 +1566,7 @@ int strIdx = this.stringPatchIndices[i];
     this.localTypes = [];
     this.stackSize = 0;
     this.currentClassName = "";
+    this.collectRefParams(func);
     this.asm.label(func.name);
     this.asm.pushR64(5);
     this.asm.movRR64(5, 4);
@@ -1605,6 +1685,13 @@ int strIdx = this.stringPatchIndices[i];
                 this.genBlock(body);
             } elif (body.kind == 61) {
                 this.genStmt(body);
+            } else {
+                // Return-shortcut body (`int f(int x) << expr;`): the parser
+                // stores the bare expression as the body. Evaluate it (result
+                // in RAX) and jump to the return label so the value is
+                // propagated to the caller.
+                this.genExpr(body);
+                this.emitReturnJump();
             }
             if (this.stackSize != initialStackSize) {
                 this.stackSize = ((this.stackSize + 15) / 16) * 16;
@@ -1706,7 +1793,14 @@ int strIdx = this.stringPatchIndices[i];
             this.localTypes.add("");
         }
             if (this.localTypes.length > 0) {
-                this.localTypes[this.localTypes.length - 1] = node.typeHint;
+                string declType = node.typeHint;
+                // `var x = expr;` has no declared type; infer it from the
+                // initializer so `x.length` / `x.pop()` / `x.map()` dispatch
+                // to array codegen instead of an unresolvable user call.
+                if ((this.strEq(declType, "") || this.strEq(declType, "var")) && node.childCount() > 0) {
+                    declType = this.inferExprType(node.child(0));
+                }
+                this.localTypes[this.localTypes.length - 1] = declType;
                 if (node.childCount() > 0 && node.child(0).kind == 66) {
                     this.localTypes[this.localTypes.length - 1] = "dict<string,int>";
                 }
@@ -2296,6 +2390,10 @@ int strIdx = this.stringPatchIndices[i];
         int kind = expr.kind;
         if (kind == 0) {
             this.asm.emitImm64(0, expr.intVal);
+        } elif (kind == 1) {
+            // Float literal: intVal holds the IEEE-754 double bit pattern (the
+            // self-hosted backend carries floats as their raw bits).
+            this.asm.emitImm64(0, expr.intVal);
         } elif (kind == 2) {
             int strIdx = this.addString(expr.strVal);
             int sp = this.asm.buf.length;
@@ -2583,6 +2681,9 @@ int strIdx = this.stringPatchIndices[i];
             int off = this.findLocal(expr.name);
             if (off != 0) {
                 this.asm.movRMBase(0, 5, off);
+                if (this.isRefParam(expr.name)) {
+                    this.asm.movRMBase(0, 0, 0);
+                }
             } else {
                 int gi = this.findGlobal(expr.name);
                 if (gi >= 0) {
@@ -3030,6 +3131,9 @@ int strIdx = this.stringPatchIndices[i];
         if (expr.kind == 0) {
             return "int";
         }
+        if (expr.kind == 1) {
+            return "float64";
+        }
         if (expr.kind == 2) {
             return "string";
         }
@@ -3128,7 +3232,8 @@ int strIdx = this.stringPatchIndices[i];
                     return "string[]";
                 }
                 if (this.strEq(cname, "toInt64") || this.strEq(cname, "toInt") || this.strEq(cname, "toNumber")) { return "int64"; }
-                if (this.strEq(cname, "toString") && (this.strEq(recvType, "string") || this.strEq(recvType, "char") || this.strEq(recvType, "int") || this.strEq(recvType, "int64") || this.strEq(recvType, "bool"))) {
+                if ((this.strEq(cname, "toFloat") || this.strEq(cname, "toFloat64")) && (this.strEq(recvType, "float") || this.strEq(recvType, "float64") || this.strEq(recvType, "double") || this.strEq(recvType, "int") || this.strEq(recvType, "int32") || this.strEq(recvType, "int64") || this.strEq(recvType, "uint") || this.strEq(recvType, "bool") || this.strEq(recvType, "char"))) { return "float64"; }
+                if (this.strEq(cname, "toString") && (this.strEq(recvType, "string") || this.strEq(recvType, "char") || this.strEq(recvType, "int") || this.strEq(recvType, "int32") || this.strEq(recvType, "int64") || this.strEq(recvType, "uint") || this.strEq(recvType, "bool") || this.strEq(recvType, "float64"))) {
                     return "string";
                 }
                 if ((this.strEq(cname, "trim") || this.strEq(cname, "trimEnd") || this.strEq(cname, "trimStart") || this.strEq(cname, "trimLeft") || this.strEq(cname, "trimRight")) && this.strEq(recvType, "string")) {
@@ -3165,6 +3270,7 @@ int strIdx = this.stringPatchIndices[i];
                     return "bool";
                 }
                 if (this.strEq(cname, "replace") && this.strEq(recvType, "string")) { return "string"; }
+                if (this.strEq(cname, "join") && expr.childCount() > 0 && expr.child(0).kind == 6 && this.strEq(expr.child(0).name, "string")) { return "string"; }
                 if (this.strEq(cname, "any") || this.strEq(cname, "all")) {
 
                     if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
@@ -3232,7 +3338,19 @@ int strIdx = this.stringPatchIndices[i];
                 if (this.strEq(lt, "string") || this.strEq(rt, "string")) {
                     return "string";
                 }
+                if (this.strEq(lt, "float") || this.strEq(lt, "float64") || this.strEq(lt, "double")
+                    || this.strEq(rt, "float") || this.strEq(rt, "float64") || this.strEq(rt, "double")) {
+                    return "float64";
+                }
                 return "int";
+            }
+            if (expr.op >= 2 && expr.op <= 4) {
+                string lt = this.inferExprType(expr.child(0));
+                string rt = this.inferExprType(expr.child(1));
+                if (this.strEq(lt, "float") || this.strEq(lt, "float64") || this.strEq(lt, "double")
+                    || this.strEq(rt, "float") || this.strEq(rt, "float64") || this.strEq(rt, "double")) {
+                    return "float64";
+                }
             }
             // Comparisons (==, !=, <, <=, >, >=, &&, ||) yield bool; every
             // other arithmetic/bitwise op yields int. Without these cases,
@@ -5181,6 +5299,15 @@ int strIdx = this.stringPatchIndices[i];
             this.genArrayUnique(call);
         } elif (call.isMember && call.childCount() > 1 && this.strEq(name, "join") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArrayJoin(call);
+        } elif (call.isMember && call.childCount() > 2 && this.strEq(name, "join") && call.child(0).kind == 6 && this.strEq(call.child(0).name, "string")) {
+            // Static string form `string.join(sep, parts)` (DOCS/88): reorder
+            // the args into (array, sep) and reuse the member-join emitter.
+            Node joinCall = new Node();
+            joinCall.kind = call.kind;
+            joinCall.name = call.name;
+            joinCall.children.add(call.child(2));
+            joinCall.children.add(call.child(1));
+            this.genArrayJoin(joinCall);
 } elif ((call.isMember && this.strEq(name, "add") && call.childCount() > 0) || (call.isMember && this.strEq(name, "push") && call.childCount() > 0) || (call.isMember && this.strEq(name, "append") && call.childCount() > 0)) {
               string addRecvType = this.inferExprType(call.child(0));
               if (addRecvType.length >= 2 && addRecvType[addRecvType.length - 2] == '[' && addRecvType[addRecvType.length - 1] == ']') {
@@ -6753,7 +6880,7 @@ public void genNewCall(Node call) {
         string name = call.name;
         string recvType = this.inferExprType(call.child(0));
         if (this.strEq(name, "toString")) {
-            if (this.strEq(recvType, "string") || this.strEq(recvType, "char") || this.strEq(recvType, "int") || this.strEq(recvType, "int64") || this.strEq(recvType, "bool") || this.strEq(recvType, "float64")) {
+            if (this.strEq(recvType, "string") || this.strEq(recvType, "char") || this.strEq(recvType, "int") || this.strEq(recvType, "int32") || this.strEq(recvType, "int64") || this.strEq(recvType, "uint") || this.strEq(recvType, "bool") || this.strEq(recvType, "float64")) {
                 return true;
             }
         }
@@ -6769,7 +6896,9 @@ public void genNewCall(Node call) {
             }
         }
         if (this.strEq(name, "toFloat") || this.strEq(name, "toFloat64")) {
-            if (this.strEq(recvType, "float") || this.strEq(recvType, "float64")) {
+            if (this.strEq(recvType, "float") || this.strEq(recvType, "float64")
+                || this.strEq(recvType, "int") || this.strEq(recvType, "int32") || this.strEq(recvType, "int64")
+                || this.strEq(recvType, "uint") || this.strEq(recvType, "bool") || this.strEq(recvType, "char")) {
                 return true;
             }
         }
@@ -6795,6 +6924,8 @@ public void genNewCall(Node call) {
                 this.genExpr(recv);
             } elif (this.strEq(recvType, "char")) {
                 this.genCharToString(recv);
+            } elif (this.strEq(recvType, "float") || this.strEq(recvType, "float64") || this.strEq(recvType, "double")) {
+                this.genFloatToString(recv);
             } elif (call.childCount() >= 2 && call.child(1).kind == 2) {
                 this.genIntToStringRadix(recv, call.child(1).strVal);
             } else {
@@ -6811,6 +6942,13 @@ public void genNewCall(Node call) {
         if (this.strEq(name, "toFloat") || this.strEq(name, "toFloat64")) {
             if (this.strEq(recvType, "float") || this.strEq(recvType, "float64")) {
                 this.genExpr(recv);
+                return;
+            }
+            if (this.strEq(recvType, "int") || this.strEq(recvType, "int32") || this.strEq(recvType, "int64") || this.strEq(recvType, "uint") || this.strEq(recvType, "bool") || this.strEq(recvType, "char")) {
+                // int -> double: cvtsi2sd xmm0, rax; movq rax, xmm0.
+                this.genExpr(recv);
+                this.asm.cvtsi2sdXMM(0, 0);
+                this.asm.movqR64XMM(0, 0);
                 return;
             }
         }
@@ -8152,6 +8290,32 @@ public void genNewCall(Node call) {
         this.funcCallArgCount = scratchBase;
     }
 
+    public void genFloatBinary(Node bin) {
+        // Float arithmetic (+, -, *, /) on IEEE-754 double bits carried in GP
+        // registers.  Operands are loaded into XMM0/XMM1, computed with SSE2
+        // scalar-double instructions, and the result bits returned in RAX.
+        // Integer operands are widened with cvtsi2sd (int -> double).
+        int fop = bin.op;
+        int lOff = this.allocLocal("__fbin_l");
+        int rOff = this.allocLocal("__fbin_r");
+        bool lFlt = this.isFloatLike(bin.child(0));
+        bool rFlt = this.isFloatLike(bin.child(1));
+        this.genExpr(bin.child(0));
+        if (lFlt) { this.asm.movMBaseR(5, 0, lOff); }
+        else { this.asm.cvtsi2sdXMM(0, 0); this.asm.movsdBaseXMM(5, 0, lOff); }
+        this.genExpr(bin.child(1));
+        if (rFlt) { this.asm.movMBaseR(5, 0, rOff); }
+        else { this.asm.cvtsi2sdXMM(0, 0); this.asm.movsdBaseXMM(5, 0, rOff); }
+        this.asm.movsdXMMBase(0, 5, lOff);
+        this.asm.movsdXMMBase(1, 5, rOff);
+        if (fop == 1) { this.asm.addsdXMM(0, 1); }
+        elif (fop == 2) { this.asm.subsdXMM(0, 1); }
+        elif (fop == 3) { this.asm.mulsdXMM(0, 1); }
+        elif (fop == 4) { this.asm.divsdXMM(0, 1); }
+        this.asm.movsdBaseXMM(5, 0, lOff);
+        this.asm.movqR64XMM(0, 0);
+    }
+
     public void genBinary(Node bin) {
         if (bin.childCount() < 2) { return; }
         int op = bin.op;
@@ -8282,6 +8446,15 @@ public void genNewCall(Node call) {
             this.asm.bindLabel(dOr);
             return;
         }
+        // Float arithmetic: when either operand is a float, lower +, -, *, /
+        // through SSE2 scalar-double instructions instead of the integer ALU
+        // (which would combine the raw IEEE-754 bit patterns).
+        if (op >= 1 && op <= 4) {
+            if (this.isFloatLike(bin.child(0)) || this.isFloatLike(bin.child(1))) {
+                this.genFloatBinary(bin);
+                return;
+            }
+        }
         this.genExpr(bin.child(0));
         this.asm.pushR64(0);
         this.genExpr(bin.child(1));
@@ -8354,7 +8527,16 @@ public void genNewCall(Node call) {
                 string lt = this.getLocalType(lhs.name);
                 if (this.strEq(lt, "string")) {
                     this.genStringConcat(bin);
-                    if (off != 0) { this.asm.movMBaseR(5, 0, off); }
+                    if (off != 0) {
+                        if (this.isRefParam(lhs.name)) {
+                            this.asm.pushR64(0);
+                            this.asm.movRMBase(0, 5, off);
+                            this.asm.popR64(1);
+                            this.asm.movMBaseR(0, 1, 0);
+                        } else {
+                            this.asm.movMBaseR(5, 0, off);
+                        }
+                    }
                     elif (gi >= 0) { this.genGlobalStore(gi); }
                     elif (fieldOff >= 0) {
                         int thisOff = this.findLocal("this");
@@ -8384,6 +8566,9 @@ public void genNewCall(Node call) {
                 }
             }
             else { this.asm.movRMBase(0, 5, 0); }
+            if (this.isRefParam(lhs.name)) {
+                this.asm.movRMBase(0, 0, 0);
+            }
             this.asm.pushR64(0);
             this.genExpr(rhs);
             this.asm.movRR64(1, 0);
@@ -8398,7 +8583,16 @@ public void genNewCall(Node call) {
             elif (op == 32) { this.asm.xorRR64(0, 1); }
             elif (op == 33) { this.asm.movRR64(11, 1); this.asm.shlRCl64(0); }
             elif (op == 34) { this.asm.movRR64(11, 1); this.asm.shrRCl64(0); }
-            if (off != 0) { this.asm.movMBaseR(5, 0, off); }
+            if (off != 0) {
+                if (this.isRefParam(lhs.name)) {
+                    this.asm.pushR64(0);
+                    this.asm.movRMBase(0, 5, off);
+                    this.asm.popR64(1);
+                    this.asm.movMBaseR(0, 1, 0);
+                } else {
+                    this.asm.movMBaseR(5, 0, off);
+                }
+            }
             elif (gi >= 0) { this.genGlobalStore(gi); }
             elif (fieldOff >= 0) {
                 int thisOff = this.findLocal("this");
@@ -8595,7 +8789,15 @@ public void genNewCall(Node call) {
                 this.genExpr(rhs);
             }
             if (off != 0) {
-                this.asm.movMBaseR(5, 0, off);
+                if (this.isRefParam(lhs.name)) {
+                    // Write through the reference to the caller's slot.
+                    this.asm.pushR64(0);
+                    this.asm.movRMBase(0, 5, off);
+                    this.asm.popR64(1);
+                    this.asm.movMBaseR(0, 1, 0);
+                } else {
+                    this.asm.movMBaseR(5, 0, off);
+                }
             } elif (gi >= 0) {
                 this.genGlobalStore(gi);
             } else if (!this.strEq(this.currentClassName, "")) {
@@ -8769,10 +8971,18 @@ public void genNewCall(Node call) {
             int gi = this.findGlobal(lhs.name);
             if (off != 0) {
                 this.asm.movRMBase(0, 5, off);
+                if (this.isRefParam(lhs.name)) { this.asm.movRMBase(0, 0, 0); }
                 this.asm.pushR64(0);
                 if (plus) { this.asm.addRI32(0, 1); }
                 else { this.asm.subRI32(0, 1); }
-                this.asm.movMBaseR(5, 0, off);
+                if (this.isRefParam(lhs.name)) {
+                    this.asm.pushR64(0);
+                    this.asm.movRMBase(0, 5, off);
+                    this.asm.popR64(1);
+                    this.asm.movMBaseR(0, 1, 0);
+                } else {
+                    this.asm.movMBaseR(5, 0, off);
+                }
                 this.asm.popR64(0);
                 return;
             }
@@ -9011,6 +9221,69 @@ public void genNewCall(Node call) {
         return false;
     }
 
+    public bool isFloatLike(Node expr) {
+        // True for expressions that evaluate to a float64/float/double: float
+        // literals (kind 1), float locals/fields, and arithmetic on floats.
+        // These must be printed with %g (the IEEE-754 bits travel in the same
+        // GP register as an integer; the shadow stack lets printf read them as
+        // a double), matching silverc-rs's "varargs FP in the positional GP
+        // register" convention.
+        if (expr.kind == 1) { return true; }
+        if (expr.kind == 6) {
+            string t = this.getLocalType(expr.name);
+            if (this.strEq(t, "float") || this.strEq(t, "float64") || this.strEq(t, "double")) { return true; }
+            for (int ci = 0; ci < this.constNames.length; ci++) {
+                if (this.strEq(this.constNames[ci], expr.name)) {
+                    if (ci < this.constIsString.length && this.constIsString[ci] == 1) { return false; }
+                    return false;
+                }
+            }
+            return false;
+        }
+        if (expr.kind == 13) {
+            string t = this.inferMemberAccessType(expr);
+            return this.strEq(t, "float") || this.strEq(t, "float64") || this.strEq(t, "double");
+        }
+        if (expr.kind == 24) {
+            string t = this.inferExprType(expr);
+            return this.strEq(t, "float") || this.strEq(t, "float64") || this.strEq(t, "double");
+        }
+        if (expr.kind == 7) {
+            int fop = expr.op;
+            if (fop == 1 || fop == 2 || fop == 3 || fop == 4 || fop == 13) {
+                if (this.isFloatLike(expr.child(0))) { return true; }
+                if (this.isFloatLike(expr.child(1))) { return true; }
+            }
+        }
+        if (expr.kind == 23) {
+            if (expr.childCount() > 0) { return this.isFloatLike(expr.child(0)); }
+        }
+        if (expr.kind == 10 || expr.kind == 9) {
+            string cn = expr.name;
+            if ((this.strEq(cn, "toFloat") || this.strEq(cn, "toFloat64")) && expr.isMember && expr.childCount() > 0) {
+                string crt = this.inferExprType(expr.child(0));
+                if (this.strEq(crt, "float") || this.strEq(crt, "float64") || this.strEq(crt, "double")
+                    || this.strEq(crt, "int") || this.strEq(crt, "int32") || this.strEq(crt, "int64")
+                    || this.strEq(crt, "uint") || this.strEq(crt, "bool") || this.strEq(crt, "char")) {
+                    return true;
+                }
+            }
+            // Free function / member call whose declared return type is a
+            // float (e.g. the interpreter's valueToFloat / floatStrToF64):
+            // the result travels as IEEE-754 bits and must be printed with %g.
+            for (int ri = 0; ri < this.funcNames.length; ri++) {
+                if (this.strEq(this.funcNames[ri], cn) && this.strEq(this.funcClasses[ri], "")) {
+                    string frt = this.funcRetTypes[ri];
+                    if (this.strEq(frt, "float") || this.strEq(frt, "float64") || this.strEq(frt, "double")) {
+                        return true;
+                    }
+                    break;
+                }
+            }
+        }
+        return false;
+    }
+
     public void genPrintCall(Node call, bool newline) {
         if (call.childCount() < 1) { return; }
         Node arg = call.child(0);
@@ -9042,6 +9315,7 @@ public void genNewCall(Node call) {
                     }
                 } else {
                     if (this.isStringLike(part)) { fmt = fmt + "%s"; }
+                    elif (this.isFloatLike(part)) { fmt = fmt + "%g"; }
                     else { fmt = fmt + "%lld"; }
                     exprs.add(part);
                 }
@@ -9083,10 +9357,15 @@ public void genNewCall(Node call) {
             this.genExpr(arg);
             this.asm.pushR64(0);
             bool strLike = this.isStringLike(arg);
+            bool fltLike = this.isFloatLike(arg);
             if (newline) {
-                if (strLike) { this.addFormatStr("%s\n"); } else { this.addFormatStr("%lld\n"); }
+                if (strLike) { this.addFormatStr("%s\n"); }
+                elif (fltLike) { this.addFormatStr("%g\n"); }
+                else { this.addFormatStr("%lld\n"); }
             } else {
-                if (strLike) { this.addFormatStr("%s"); } else { this.addFormatStr("%lld"); }
+                if (strLike) { this.addFormatStr("%s"); }
+                elif (fltLike) { this.addFormatStr("%g"); }
+                else { this.addFormatStr("%lld"); }
             }
             this.asm.popR64(2);
         }
@@ -9198,6 +9477,7 @@ public void genNewCall(Node call) {
                 }
             } else {
                 if (this.isStringLike(part)) { fmt = fmt + "%s"; }
+                elif (this.isFloatLike(part)) { fmt = fmt + "%g"; }
                 else { fmt = fmt + "%lld"; }
                 exprs.add(part);
             }
@@ -9302,6 +9582,35 @@ public void genNewCall(Node call) {
         this.asm.movRMBase(0, 5, bufOff);
     }
 
+    public void genFloatToString(Node expr) {
+        // float64/float/double .toString(): sprintf(buf, "%g", bits) where the
+        // IEEE-754 bits travel in R8 (varargs FP in the positional GP register,
+        // matching silverc-rs).  Returns the buffer pointer in RAX.
+        this.genExpr(expr);
+        int valOff = this.allocLocal("__f2s_val");
+        this.asm.movMBaseR(5, 0, valOff);
+        this.asm.movRI64(1, 64);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int bufOff = this.allocLocal("__f2s_buf");
+        this.asm.movMBaseR(5, 0, bufOff);
+        this.addFormatStr("%g");
+        this.asm.movRMBase(8, 5, valOff);
+        this.asm.movRR64(2, 1);
+        this.asm.movRMBase(1, 5, bufOff);
+        this.addImportPatch("msvcrt.dll", "sprintf");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(0, 5, bufOff);
+    }
+
     public void genStringRepeat(Node bin) {
         // lhs ... count: repeat lhs string count times, return new string.
         this.genExpr(bin.child(1));
@@ -9376,8 +9685,9 @@ public void genNewCall(Node call) {
     public void genStringConcat(Node bin) {
         if (bin.childCount() < 2) { return; }
         string rt = this.inferExprType(bin.child(1));
+        bool rtNullableChar = this.strEq(rt, "char?") || this.strEq(rt, "char");
 
-        if (this.strEq(rt, "char")) {
+        if (rtNullableChar) {
             this.genCharToString(bin.child(1));
         } elif (this.strEq(rt, "string")) {
             this.genExpr(bin.child(1));
@@ -9387,7 +9697,8 @@ public void genNewCall(Node call) {
         int rhsOff = this.allocLocal("__cc_rhs");
         this.asm.movMBaseR(5, 0, rhsOff);
         string lt = this.inferExprType(bin.child(0));
-        if (this.strEq(lt, "char")) {
+        bool ltNullableChar = this.strEq(lt, "char?") || this.strEq(lt, "char");
+        if (ltNullableChar) {
             this.genCharToString(bin.child(0));
         } elif (this.strEq(lt, "string")) {
             this.genExpr(bin.child(0));
@@ -10721,10 +11032,8 @@ public void genNewCall(Node call) {
         this.asm.movMBaseR(5, 0, hfileOff);
 
         // CreateFileA returns INVALID_HANDLE_VALUE (-1) when the path does
-        // not exist. Return the empty string in that case instead of throwing
-        // FileNotFoundException, mirroring the managed fs.readString in
-        // std/fs.sr. A missing file must never surface as an unhandled
-        // exception in user programs.
+        // not exist. Throw FileNotFoundException ("file not found"), matching
+        // silverc-rs gen_read_string and the managed fs.readString.
         int rsEmpty = this.newLabel();
         int rsDone = this.newLabel();
         int rsCont = this.newLabel();
@@ -10806,7 +11115,7 @@ public void genNewCall(Node call) {
         this.asm.movRMBase(0, 5, bufOff);
         this.asm.jmpLabel(rsDone);
         this.asm.bindLabel(rsEmpty);
-        this.emitLlmaiStringLiteral("");
+        this.emitThrowException("file not found");
         this.asm.bindLabel(rsDone);
     }
 

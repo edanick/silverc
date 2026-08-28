@@ -301,52 +301,18 @@ private void truncateItems(Node[] arr, int keep) {
 // ---------------------------------------------------------------------------
 // 3. Peephole pass over the emitted machine code
 //
-// Only in-place rewrites are made (redundant instructions become NOPs), so
-// every label, jump displacement, and relocation stays byte identical:
-//
-//   push X; pop X        ->  nop nop      (2 bytes)
-//   mov R, R  (same reg) ->  nop nop nop  (3 bytes)
-//
-// A window is only rewritten when no label points strictly inside it, so a
-// jump landing mid-pattern still lands on valid instructions.
+// NOTE: DISABLED — the byte-scanning implementation matched the
+// `push r; pop r` / `mov r, r` patterns without decoding instruction
+// boundaries, so it falsely matched those byte sequences inside instruction
+// immediates (e.g. an 8-byte `movabs` address containing the bytes 0x50 0x58)
+// and NOP'd them out, corrupting the machine code. Large programs reliably hit
+// such false matches, producing a compiler that AVs (0xC0000005) at runtime.
+// The redundant pairs are pure no-ops, so removing the pass costs nothing
+// functionally. The silverc-rs peephole was disabled for the same reason.
 // ---------------------------------------------------------------------------
 public void peepholeOptimize(MiniAsm asm) {
-    int[] buf = asm.buf;
-    int len = buf.length;
-    int i = 0;
-    while (i < len) {
-        int consumed = 0;
-        if (i + 2 <= len) {
-            int b0 = buf[i];
-            int b1 = buf[i + 1];
-            // push r/r (50+r) followed by pop same r (58+r)
-            if (b0 >= 0x50 && b0 <= 0x57 && b1 == b0 + 8) {
-                consumed = 2;
-            }
-            // REX.W 89 /r with mod=11 and reg==rm: mov R,R
-            elif ((b0 == 0x48 || b0 == 0x49 || b0 == 0x4C || b0 == 0x4D)
-                && b1 == 0x89 && i + 3 <= len) {
-                int modrm = buf[i + 2];
-                if ((modrm & 0xC0) == 0xC0 && ((modrm >> 3) & 7) == (modrm & 7)) {
-                    consumed = 3;
-                }
-            }
-        }
-        if (consumed == 0 || labelInside(asm, i, consumed)) {
-            i++;
-            continue;
-        }
-        for (int b = 0; b < consumed; b++) {
-            buf[i + b] = 0x90;
-        }
-        i += consumed;
-    }
 }
 
 private bool labelInside(MiniAsm asm, int pos, int width) {
-    for (int li = 0; li < asm.labelPositions.length; li++) {
-        int p = asm.labelPositions[li];
-        if (p > pos && p < pos + width) { return true; }
-    }
     return false;
 }

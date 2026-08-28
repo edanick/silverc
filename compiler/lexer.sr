@@ -426,7 +426,7 @@ class Lexer {
             } elif (base == 16 && ((ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F'))) {
                 s = s + ch; this.advance();
             } elif (ch == '.' && !isFloat) {
-                if (this.peek() == '.') { break; }
+                if (this.peekNext() == '.' || this.peekNext() == null) { break; }
                 isFloat = true; s = s + "."; this.advance();
             } elif (ch == 'e' || ch == 'E') {
                 isFloat = true; s = s + ch; this.advance();
@@ -440,7 +440,7 @@ if (this.pos < this.srcLen) {
         }
         Token tok = new Token(1, s, ln, cl);
         if (isFloat) {
-            tok.intVal = 0;
+            tok.intVal = this.parseFloatBits(s);
         } else {
             // Parse the digit string manually.  The toInt64 / toInt64FromBase
             // builtin methods are not dispatched by every backend, so compute
@@ -457,6 +457,130 @@ if (this.pos < this.srcLen) {
             tok.intVal = val;
         }
         return tok;
+    }
+
+    // Convert a decimal float literal text ("3.14", "1e5", "-2.5e-3") into the
+    // IEEE-754 double bit pattern, computed with integer arithmetic only (the
+    // self-hosted backend has no SSE float ops).  The value is stored as
+    // num/denom and converted to binary via long division.
+    private int64 parseFloatBits(string s) {
+        int len = s.length;
+        int p = 0;
+        int64 signBits = 0;
+        int sc = s[p];
+        if (sc == 45) { signBits = 0x8000000000000000; p = p + 1; }
+        elif (sc == 43) { p = p + 1; }
+        int64 intPart = 0;
+        while (p < len) {
+            int dc = s[p];
+            if (dc >= 48 && dc <= 57) { intPart = intPart * 10 + (dc - 48); p = p + 1; }
+            else { break; }
+        }
+        int64 fracPart = 0;
+        int fracLen = 0;
+        if (p < len && s[p] == 46) {
+            p = p + 1;
+            while (p < len) {
+                int fc = s[p];
+                if (fc >= 48 && fc <= 57) { fracPart = fracPart * 10 + (fc - 48); fracLen = fracLen + 1; p = p + 1; }
+                else { break; }
+            }
+        }
+        int64 exp = 0;
+        if (p < len && (s[p] == 101 || s[p] == 69)) {
+            p = p + 1;
+            int64 esign = 1;
+            if (p < len && s[p] == 45) { esign = -1; p = p + 1; }
+            elif (p < len && s[p] == 43) { p = p + 1; }
+            while (p < len) {
+                int ec = s[p];
+                if (ec >= 48 && ec <= 57) { exp = exp * 10 + (ec - 48); p = p + 1; }
+                else { break; }
+            }
+            exp = exp * esign;
+        }
+        int64 denom = 1;
+        for (int i = 0; i < fracLen; i = i + 1) { denom = denom * 10; }
+        int64 num = intPart * denom + fracPart;
+        if (num == 0) { return signBits; }
+        if (exp > 0) {
+            for (int i = 0; i < exp && num < 0x0CCCCCCCCCCCCCCC; i = i + 1) { num = num * 10; }
+        } elif (exp < 0) {
+            int64 neg = -exp;
+            for (int i = 0; i < neg && denom < 0x0CCCCCCCCCCCCCCC; i = i + 1) { denom = denom * 10; }
+        }
+        // Integer part (may be zero) and remainder; find the binary exponent.
+        int64 ip = num / denom;
+        int64 rem = num % denom;
+        int64 expo = 0;
+        if (ip > 0) {
+            int64 t = ip;
+            expo = 0;
+            while (t >= 2) { t = t / 2; expo = expo + 1; }
+        } else {
+            // Pure fraction: scale the remainder until its leading bit lands
+            // at 2^expo.  Each doubling moves one binary place down.
+            int64 guard = 0;
+            while (rem > 0 && rem < denom && guard < 1200) {
+                rem = rem * 2;
+                expo = expo - 1;
+                guard = guard + 1;
+            }
+            if (rem == 0) { return signBits; }
+            rem = rem - denom;
+            ip = 1;
+        }
+        // Build the 52-bit fraction after the leading 1.
+        int64 frac = 0;
+        int have = 0;
+        if (ip > 1) {
+            // Fraction bits already present in the integer part (below the
+            // leading bit).  Shift them out, most-significant first.
+            int64 hi = 1;
+            int64 t2 = ip;
+            while (t2 >= 2) { t2 = t2 / 2; hi = hi * 2; }
+            int64 mask = hi / 2;
+            while (mask > 0) {
+                if (have >= 52) { break; }
+                if ((ip & mask) != 0) { frac = frac * 2 + 1; }
+                else { frac = frac * 2; }
+                have = have + 1;
+                mask = mask / 2;
+            }
+        }
+        // Remaining fraction bits from the remainder via long division.
+        int64 fr = rem;
+        while (have < 52 && fr > 0) {
+            fr = fr * 2;
+            if (fr >= denom) {
+                frac = frac * 2 + 1;
+                fr = fr - denom;
+            } else {
+                frac = frac * 2;
+            }
+            have = have + 1;
+        }
+        while (have < 52) { frac = frac * 2; have = have + 1; }
+        // Round-to-nearest on the 53rd bit; if it carries past 2^52, bump the
+        // exponent (the fraction becomes zero).
+        if (ip > 0) {
+            int64 extra = 0;
+            if (fr > 0) {
+                fr = fr * 2;
+                if (fr >= denom) { extra = 1; }
+            }
+            if (extra == 1) {
+                frac = frac + 1;
+                if (frac >= 0x0010000000000000) {
+                    frac = 0;
+                    expo = expo + 1;
+                }
+            }
+        }
+        int64 biased = expo + 1023;
+        if (biased <= 0) { return signBits; }
+        if (biased >= 2047) { return signBits | 0x7FF0000000000000; }
+        return signBits | (biased << 52) | frac;
     }
 
     private Token readIdent() {

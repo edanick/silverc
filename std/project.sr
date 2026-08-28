@@ -511,8 +511,36 @@ string projectCacheMarker(string path) {
     return "//@@SILVER_FILE@@ " + norm + "\n";
 }
 
-string projectCollect(string path, string root, string[] sourceDirs, string[] visited, bool emitMarkers, ProgressReporter progress) {
-    if (projectVisited(visited, path)) { return ""; }
+// Visited-path tracker for project source collection.
+//
+// The self-hosted stage-2 backend has a code-generation edge case where a
+// mutable array passed into a helper and grown there leaves the caller's
+// length slot stale (silently truncating growth at 8 elements), which broke
+// module dedup in `projectCollect`/`projectCountCollect` and re-collected the
+// same files over and over. Class property arrays grow correctly, so the
+// visited set is held in an object and mutated through methods instead of
+// being passed as a bare `string[]` parameter.
+class ProjectVisited {
+    public prop string[] paths;
+
+    construct () {
+        this.paths = [];
+    }
+
+    public void add(string p) {
+        this.paths.add(p);
+    }
+
+    public bool contains(string p) {
+        for (int i = 0; i < this.paths.length; i = i + 1) {
+            if (cliArgEq(this.paths[i], p)) { return true; }
+        }
+        return false;
+    }
+}
+
+string projectCollect(string path, string root, string[] sourceDirs, ProjectVisited visited, bool emitMarkers, ProgressReporter progress) {
+    if (visited.contains(path)) { return ""; }
     visited.add(path);
     string source = file.readString(path);
     string result = "";
@@ -541,8 +569,8 @@ string projectCollect(string path, string root, string[] sourceDirs, string[] vi
 // Count how many project source files `projectCollect` would collect for the
 // given entry (1 for the entry plus its transitive imports). Mirrors
 // `projectCollect`'s resolution logic exactly so the total is precise.
-int projectCountCollect(string path, string root, string[] sourceDirs, string[] visited) {
-    if (projectVisited(visited, path)) { return 0; }
+int projectCountCollect(string path, string root, string[] sourceDirs, ProjectVisited visited) {
+    if (visited.contains(path)) { return 0; }
     visited.add(path);
     string source = file.readString(path);
     int sub = 0;
@@ -700,10 +728,10 @@ string projectBuildSource(string projectPath, bool emitMarkers) {
     string entryPath = projectJoin(root, entry);
     // Progress (STDERR): pre-count the module files (entry + transitive
     // imports) so the lines show an exact `[processed/total]` and a real ETA.
-    string[] countVisited = [];
+    ProjectVisited countVisited = new ProjectVisited();
     int moduleCount = projectCountCollect(entryPath, root, sources, countVisited);
     ProgressReporter progress = new ProgressReporter(moduleCount);
-    string[] visited = [];
+    ProjectVisited visited = new ProjectVisited();
     string collected = projectCollect(entryPath, root, sources, visited, emitMarkers, progress);
     progress.finish();
     string body = projectStripDirectives(collected);
@@ -734,7 +762,7 @@ string projectBuildSource(string projectPath, bool emitMarkers) {
     if (!cliArgEq(name, "")) { metadata = metadata + "const string APP_NAME = \"" + name + "\";\n"; }
     if (!cliArgEq(version, "")) { metadata = metadata + "const string APP_VERSION = \"" + version + "\";\n"; }
     if (!cliArgEq(license, "")) { metadata = metadata + "const string APP_LICENSE = \"" + license + "\";\n"; }
-    metadata = metadata + "const string LANG_VERSION = \"0.4.5\";\n";
+    metadata = metadata + "const string LANG_VERSION = \"0.5.1\";\n";
     metadata = metadata + "const string APP_COPYRIGHT = \"Edan M. © 2025\";\n";
     // DOCS/253 -- expose the project type so Silver code can branch on it.
     // A missing `type` (or the legacy `exe` spelling) means `console`.
@@ -808,7 +836,7 @@ int[] projectBuildBundle(string projectPath) {
     bundle.add('B' - 'a' + 97);
     bundle.add('2' - 'a' + 97);
     bundle.add(1); bundle.add(1); bundle.add(1); bundle.add(1);  // flags (reserved)
-    string metaText = version + "\n" + description + "\n" + author + "\n0.4.5\n" + copyright;
+    string metaText = version + "\n" + description + "\n" + author + "\n0.5.1\n" + copyright;
     bundle.add((metaText.length / 16581375) + 1);
     bundle.add(((metaText.length / 65025) % 255) + 1);
     bundle.add(((metaText.length / 255) % 255) + 1);

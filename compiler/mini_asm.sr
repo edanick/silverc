@@ -693,4 +693,121 @@ class MiniAsm {
         this.emitU8(0xE8);
         this.emitU32(rel32);
     }
+
+    // ---- SSE2 scalar double (float64) support -----------------------------
+    // XMM registers use the same 0-15 numbering as the GP registers.  No
+    // REX.W for scalar-double SSE2 (64-bit is implicit); REX.R extends the
+    // ModRM.reg field (XMM 8-15) and REX.B the ModRM.rm/base field.
+
+    private void emitSseMemModRM(int reg, int base, int disp) {
+        // ModRM with reg=field (destination XMM), rm=base memory operand.
+        if (base == 5 || base == 13) {
+            this.emitU8(0x85 | ((reg & 7) << 3) | (base & 7));
+            this.emitU32(disp);
+        } elif (base == 4 || base == 12) {
+            if (disp >= -128 && disp <= 127) {
+                this.emitU8(0x44 | ((reg & 7) << 3));
+                this.emitU8(0x24);
+                this.emitU8(disp & 0xFF);
+            } else {
+                this.emitU8(0x84 | ((reg & 7) << 3));
+                this.emitU8(0x24);
+                this.emitU32(disp);
+            }
+        } else {
+            if (disp == 0 && base != 5 && base != 13) {
+                this.emitU8(((reg & 7) << 3) | (base & 7));
+            } elif (disp >= -128 && disp <= 127) {
+                this.emitU8(0x40 | ((reg & 7) << 3) | (base & 7));
+                this.emitU8(disp & 0xFF);
+            } else {
+                this.emitU8(0x80 | ((reg & 7) << 3) | (base & 7));
+                this.emitU32(disp);
+            }
+        }
+    }
+
+    private void emitSseOp(int prefix, int xmmReg, int opReg, int opRm) {
+        // x86-64 prefix order: legacy SIMD prefix (66/F2/F3) first, then REX.
+        this.emitU8(prefix);
+        int rex = 0;
+        if (xmmReg > 7) { rex = rex | 0x04; }
+        if (opRm > 7) { rex = rex | 0x01; }
+        if (rex != 0) { this.emitU8(0x40 | rex); }
+        this.emitU8(0x0F);
+    }
+
+    // movsd xmm, [base+disp]  (F2 0F 10 /r)
+    public void movsdXMMBase(int xmm, int base, int disp) {
+        this.emitSseOp(0xF2, xmm, 0, base);
+        this.emitU8(0x10);
+        this.emitSseMemModRM(xmm, base, disp);
+    }
+
+    // movsd [base+disp], xmm  (F2 0F 11 /r)
+    public void movsdBaseXMM(int base, int xmm, int disp) {
+        this.emitSseOp(0xF2, xmm, 0, base);
+        this.emitU8(0x11);
+        this.emitSseMemModRM(xmm, base, disp);
+    }
+
+    // addsd xmm_dst, xmm_src  (F2 0F 58 /r; dest in reg, src in rm)
+    public void addsdXMM(int dst, int src) {
+        this.emitSseOp(0xF2, dst, 0, src);
+        this.emitU8(0x58);
+        this.emitU8(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+
+    // subsd xmm_dst, xmm_src  (F2 0F 5C /r)
+    public void subsdXMM(int dst, int src) {
+        this.emitSseOp(0xF2, dst, 0, src);
+        this.emitU8(0x5C);
+        this.emitU8(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+
+    // mulsd xmm_dst, xmm_src  (F2 0F 59 /r)
+    public void mulsdXMM(int dst, int src) {
+        this.emitSseOp(0xF2, dst, 0, src);
+        this.emitU8(0x59);
+        this.emitU8(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+
+    // divsd xmm_dst, xmm_src  (F2 0F 5E /r)
+    public void divsdXMM(int dst, int src) {
+        this.emitSseOp(0xF2, dst, 0, src);
+        this.emitU8(0x5E);
+        this.emitU8(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+
+    // movq xmm, r64  (66 0F 6E /r): bit-pattern copy GP reg -> XMM
+    public void movqXMMR64(int xmm, int r64) {
+        this.emitSseOp(0x66, xmm, 0, r64);
+        this.emitU8(0x6E);
+        this.emitU8(0xC0 | ((xmm & 7) << 3) | (r64 & 7));
+    }
+
+    // cvtsi2sd xmm, r64  (F2 0F 2A /r): signed 64-bit int -> double
+    public void cvtsi2sdXMM(int xmm, int r64) {
+        this.emitSseOp(0xF2, xmm, 0, r64);
+        this.emitU8(0x2A);
+        this.emitU8(0xC0 | ((xmm & 7) << 3) | (r64 & 7));
+    }
+
+    // ucomisd xmm_dst, xmm_src  (66 0F 2E /r): compare doubles, set flags
+    public void ucomisdXMM(int dst, int src) {
+        this.emitSseOp(0x66, dst, 0, src);
+        this.emitU8(0x2E);
+        this.emitU8(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+
+    // movq r64, xmm  (66 48 0F 7E /r): bit-pattern copy XMM -> GP reg
+    // Prefix order: 66 (legacy) then REX (48 + extensions) then 0F 7E.
+    public void movqR64XMM(int r64, int xmm) {
+        this.emitU8(0x66);
+        int rex = 0x48 | ((xmm > 7) ? 0x04 : 0) | ((r64 > 7) ? 0x01 : 0);
+        this.emitU8(rex);
+        this.emitU8(0x0F);
+        this.emitU8(0x7E);
+        this.emitU8(0xC0 | ((xmm & 7) << 3) | (r64 & 7));
+    }
 }
