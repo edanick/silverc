@@ -16,6 +16,7 @@ import * from optimizer;
 import * from bcache;
 import * from watcher;
 import * from progress;
+import * from visibility;
 import * from win32.kernel32;
 
 // Print the final success line on STDERR (alongside the progress lines) once
@@ -873,6 +874,23 @@ int compileOnce(CliFlags flags, string outputFile) {
             printline(parser.diagErrors[deI]);
         }
         exit(1);
+    }
+
+    // DOCS/258 -- `internal` project-boundary enforcement. A standalone
+    // compile's project is the entry file itself; every module resolved from
+    // outside it is external and its internal items are off limits to the
+    // entry's code. `.srp` projects compile their whole source set as one
+    // project, so nothing external exists there and the pass is skipped
+    // (mirrors silverc-rs, which enforces on the single-file path).
+    if (!inputIsProject) {
+        VisibilityChecker vis = new VisibilityChecker(inputFile);
+        vis.run();
+        if (vis.errors.length > 0) {
+            for (int veI = 0; veI < vis.errors.length; veI++) {
+                printline(vis.errors[veI]);
+            }
+            exit(1);
+        }
     }
 
     MemoryGuard guard = new MemoryGuard();

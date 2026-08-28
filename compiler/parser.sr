@@ -40,6 +40,14 @@ class Parser {
     private bool win32AllModules;
     private string[] win32OpenModules;
     private string[] win32GrantNames;
+    // `mod export NAME;` declarations and inline `mod NAME { ... }` blocks:
+    // names plus their `internal` flag (DOCS/258). The flattened program
+    // drops these containers, so the visibility pass reads them from here.
+    public string[] modExportNames;
+    public bool[] modExportInternal;
+    // `internal:` section marker active inside the class body being parsed
+    // (reset by `public:`/`private:` and at the start of every class).
+    private bool classSectionInternal;
 
     construct (Token[] toks) {
         this.tokens = toks;
@@ -58,6 +66,9 @@ class Parser {
         this.win32AllModules = false;
         this.win32OpenModules = [];
         this.win32GrantNames = [];
+        this.modExportNames = [];
+        this.modExportInternal = [];
+        this.classSectionInternal = false;
     }
 
     // Provide per-line character lengths so bracket diagnostics can point
@@ -126,6 +137,7 @@ class Parser {
         cands.add("catch"); cands.add("finally"); cands.add("throw"); cands.add("to");
         cands.add("in"); cands.add("break"); cands.add("continue"); cands.add("switch");
         cands.add("case"); cands.add("typealias"); cands.add("loop");
+        cands.add("internal");
         return cands;
     }
 
@@ -204,6 +216,11 @@ class Parser {
 
     private void registerDeclaredType(string name) {
         if (!this.isDeclaredTypeName(name)) { this.declaredTypes.add(name); }
+    }
+
+    private void recordModExport(string name, bool isInternal) {
+        this.modExportNames.add(name);
+        if (isInternal) { this.modExportInternal.add(true); } else { this.modExportInternal.add(false); }
     }
 
     // Can the token kind continue an identifier as a real expression or
@@ -847,6 +864,7 @@ class Parser {
         if (kind == 164) { return "protected"; }
         if (kind == 165) { return "typealias"; }
         if (kind == 166) { return "loop"; }
+        if (kind == 167) { return "internal"; }
         if (kind == 149) { return "$"; }
         if (kind == 150) { return "local"; }
         if (kind == 151) { return "alias"; }
@@ -878,9 +896,11 @@ class Parser {
                     mainSeen = true;
                 }
                 if (item.kind == 112) {
-                    // Inline module block: hoist its items to top level.
+                    // Inline module block: hoist its items to top level. An
+                    // `internal mod` block marks everything inside it internal.
                     for (int mi = 0; mi < item.childCount(); mi++) {
                         Node inner = item.child(mi);
+                        if (item.isInternal) { inner.isInternal = true; }
                         if (inner.kind == 100 && this.strEq(inner.name, "main")) {
                             mainSeen = true;
                         }
@@ -933,8 +953,11 @@ class Parser {
         return items;
     }    private Node? parseItem() {
         // Skip access modifiers preceding a top-level declaration
-        // (`public const int X = 1;`, `private void helper() { ... }`).
-        while (this.check(44) || this.check(45) || this.check(164) || this.check(46)) {
+        // (`public const int X = 1;`, `private void helper() { ... }`),
+        // recording `internal` (DOCS/258) for the item about to be parsed.
+        bool internalItem = false;
+        while (this.check(44) || this.check(45) || this.check(164) || this.check(46) || this.check(167)) {
+            if (this.check(167)) { internalItem = true; }
             this.advance();
         }
         if (this.check(35)) {
@@ -946,19 +969,24 @@ class Parser {
                 // Inline module block `mod name { ... }`: lift the inner items
                 // to top level so `name.f()` qualified calls resolve to global
                 // functions.  Returns a kind-112 container that parseProgram
-                // flattens (mirrors silverc-rs flatten_inline_modules).
+                // flattens (mirrors silverc-rs flatten_inline_modules); an
+                // `internal` block marks every hoisted item internal.
                 this.advance();
                 Node modNode = new Node();
                 modNode.kind = 112;
                 modNode.name = modName;
+                modNode.isInternal = internalItem;
+                this.recordModExport(modName, internalItem);
                 while (!this.check(103) && !this.check(0)) {
                     Node? inner = this.parseItem();
                     if (inner != null) {
                         if (inner.kind == 112) {
                             for (int mi = 0; mi < inner.childCount(); mi++) {
+                                if (modNode.isInternal) { inner.child(mi).isInternal = true; }
                                 modNode.children.add(inner.child(mi));
                             }
                         } else {
+                            if (modNode.isInternal) { inner.isInternal = true; }
                             modNode.children.add(inner);
                         }
                     }
@@ -967,15 +995,16 @@ class Parser {
                 return modNode;
             }
             this.expect(106);
+            this.recordModExport(modName, internalItem);
             return null;
         }
-		if (this.check(36)) { return this.parseImport(); }
-        if (this.check(165)) { return this.parseTypeAlias(); }
-        if (this.check(40)) { return this.parseConst(); }
+        if (this.check(36)) { return this.parseImport(); }
+        if (this.check(165)) { return this.flagInternal(this.parseTypeAlias(), internalItem); }
+        if (this.check(40)) { return this.flagInternal(this.parseConst(), internalItem); }
         if (this.check(32)) { return this.parseDef(); }
         if (this.check(34)) { return this.parseCollect(); }
         if (this.check(29)) { return this.parseStruct(); }
-        if (this.check(30)) { return this.parseClass(); }
+        if (this.check(30)) { return this.flagInternal(this.parseClass(), internalItem); }
         if (this.check(31)) { return this.parseEnum(); }
         // Unknown keyword at top level (e.g. a typo like `impor`), with a
         // did-you-mean suggestion when it resembles a real keyword.  Recovery
@@ -1028,18 +1057,28 @@ class Parser {
                 while (scan + 1 < this.tokens.length && this.tokens[scan].kind == 104 && this.tokens[scan + 1].kind == 105) { scan = scan + 2; }
                 if (scan < this.tokens.length && this.tokens[scan].kind == 123) { scan = scan + 1; }
                 if (scan + 1 < this.tokens.length && this.tokens[scan].kind == 7 && this.tokens[scan + 1].kind == 100) {
-                    return this.parseFunction();
+                    return this.flagInternal(this.parseFunction(), internalItem);
                 }
-                return this.parseStmt();
+                return this.flagInternal(this.parseStmt(), internalItem);
             }
-            return this.parseStmt();
+            return this.flagInternal(this.parseStmt(), internalItem);
         }
-        return this.parseFunction();
+        return this.flagInternal(this.parseFunction(), internalItem);
+    }
+
+    // Attach the recorded `internal` flag to a freshly parsed top-level item
+    // (function, class, const, or `internal int x = 2;` global declaration).
+    private Node? flagInternal(Node? item, bool internalItem) {
+        if (item != null && internalItem) { item.isInternal = true; }
+        return item;
     }
 
     private Node parseImport() {
         Node node = new Node();
         node.kind = 105;
+        Token kwTok = this.peek();
+        node.line = kwTok.line;
+        node.col = kwTok.col;
         this.expect(36);
         if (this.check(113)) {
             this.advance();
@@ -1203,6 +1242,7 @@ class Parser {
             node.parentClass = this.advance().text;
         }
         this.expect(102);
+        this.classSectionInternal = false;
         while (!this.check(103) && !this.check(0)) {
             Node member = this.parseClassMember();
             if (member != null) { node.children.add(member); }
@@ -1233,13 +1273,32 @@ class Parser {
     }
 
     private Node? parseClassMember() {
-        if (this.check(44) || this.check(45) || this.check(164)) { this.advance(); }
-        if (this.check(46)) { this.advance(); }
-        if (this.check(164)) { this.advance(); }
+        // `internal:` / `public:` / `private:` section markers (DOCS/258):
+        // a bare modifier followed by `:` toggles the default visibility for
+        // the rest of the class body instead of declaring a member.
+        if (this.check(167) && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 109) {
+            this.advance();
+            this.advance();
+            this.classSectionInternal = true;
+            return null;
+        }
+        if ((this.check(44) || this.check(45)) && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 109) {
+            this.advance();
+            this.advance();
+            this.classSectionInternal = false;
+            return null;
+        }
+        bool memberInternal = false;
+        while (this.check(44) || this.check(45) || this.check(164) || this.check(46) || this.check(167)) {
+            if (this.check(167)) { memberInternal = true; }
+            this.advance();
+        }
+        if (this.classSectionInternal) { memberInternal = true; }
         if (this.check(48)) {
             Node ctor = new Node();
             ctor.kind = 100;
             ctor.name = "construct";
+            ctor.isInternal = memberInternal;
             this.advance();
             this.expect(100);
             Node params = new Node();
@@ -1319,6 +1378,7 @@ class Parser {
             if (this.check(123)) { this.advance(); ft = ft + "?"; }
             field.typeHint = ft;
             field.name = this.advance().text;
+            field.isInternal = memberInternal;
             this.expect(106);
             return field;
         }
@@ -1338,6 +1398,7 @@ class Parser {
                 field.kind = 50;
                 field.typeHint = ft;
                 field.name = this.advance().text;
+                field.isInternal = memberInternal;
                 this.expect(106);
                 return field;
             }
@@ -1349,12 +1410,15 @@ class Parser {
                 field.kind = 50;
                 field.typeHint = ft;
                 field.name = this.advance().text;
+                field.isInternal = memberInternal;
                 if (this.check(106)) { this.advance(); }
                 return field;
             }
             this.pos = savedPos;
         }
-        return this.parseFunction();
+        Node method = this.parseFunction();
+        method.isInternal = memberInternal;
+        return method;
     }
 
     // Kinds that can begin a parameter's type inside a `( ... )` list.
@@ -1368,7 +1432,10 @@ class Parser {
     private Node parseFunction() {
         Node node = new Node();
         node.kind = 100;
-        if (this.check(44) || this.check(45) || this.check(46)) { this.advance(); }
+        while (this.check(44) || this.check(45) || this.check(46) || this.check(164) || this.check(167)) {
+            if (this.check(167)) { node.isInternal = true; }
+            this.advance();
+        }
         string retType = this.advance().text;
         if (this.check(120)) {
             while (!this.check(121) && !this.check(106) && !this.check(103)) {
@@ -2370,6 +2437,8 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             Node ctor = new Node();
             ctor.kind = 10;
             ctor.name = this.advance().text;
+            ctor.line = t.line;
+            ctor.col = t.col;
             if (this.check(104)) {
                 // new T[n]: native array allocation.  A zero/omitted size
                 // produces an empty array; a positive constant size produces

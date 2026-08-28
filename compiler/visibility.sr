@@ -1,0 +1,711 @@
+mod export visibility;
+
+import * from lexer;
+import * from token;
+import * from parser;
+import * from node;
+import * from string;
+
+// One parsed source file: its top-level items plus the `mod export` names
+// recorded by the parser (the flattened program drops those containers).
+class VisFile {
+    public prop string path;
+    public prop Node[] items;
+    public prop string[] exportNames;
+    public prop bool[] exportInternal;
+
+    construct (string p) {
+        this.path = p;
+        this.items = [];
+        this.exportNames = [];
+        this.exportInternal = [];
+    }
+}
+
+// Per-function walk context: every name bound anywhere in the function
+// (params, locals, pattern bindings, lambda parameters) with the declared
+// class type where known. Over-approximated to the whole function, which can
+// only make enforcement more permissive, never wrong.
+class VisCtx {
+    public prop string[] localNames;
+    public prop string[] localTypes;
+
+    construct () {
+        this.localNames = [];
+        this.localTypes = [];
+    }
+
+    public void addLocal(string name) {
+        this.localNames.add(name);
+        this.localTypes.add("");
+    }
+
+    public void setType(string name, string typeName) {
+        for (int i = 0; i < this.localNames.length; i++) {
+            if (cliArgEq(this.localNames[i], name)) {
+                this.localTypes[i] = typeName;
+                return;
+            }
+        }
+    }
+
+    public bool hasLocal(string name) {
+        for (int i = 0; i < this.localNames.length; i++) {
+            if (cliArgEq(this.localNames[i], name)) { return true; }
+        }
+        return false;
+    }
+
+    public string typeOf(string name) {
+        for (int i = 0; i < this.localNames.length; i++) {
+            if (cliArgEq(this.localNames[i], name)) { return this.localTypes[i]; }
+        }
+        return "";
+    }
+}
+
+// Project-boundary enforcement for the `internal` visibility modifier
+// (DOCS/258). A single-file compile's project is the entry `.sr` file; every
+// module resolved from outside it is external, and its internal items are
+// off limits to project code. Usages inside external files are never
+// checked: only the entry file's code is walked. `.srp` projects compile
+// their whole source set as one project, so the driver only runs this pass
+// for standalone compiles (mirrors silverc-rs, where the visibility walk
+// lives on the single-file path).
+class VisibilityChecker {
+    public prop string[] errors;
+
+    private prop string entryPath;
+
+    // Flat declaration table: name, kind (0 fn, 1 global, 2 const, 3 class),
+    // internal flag, origin path, owner display name.
+    private prop string[] declNames;
+    private prop int[] declKinds;
+    private prop bool[] declInternal;
+    private prop string[] declOrigins;
+    private prop string[] declOwners;
+
+    // Module origins keyed by lowercase name: display name + origin path.
+    private prop string[] moduleKeys;
+    private prop string[] moduleDisplays;
+    private prop string[] modulePaths;
+    // Lowercase names usable as `mod.fn()` receivers.
+    private prop string[] moduleReceivers;
+
+    // External class name -> comma-joined internal member names.
+    private prop string[] extClassNames;
+    private prop string[] extClassMembers;
+
+    private prop string[] allClassNames;
+    private prop string[] allFnNames;
+    private prop string[] allGlobalNames;
+    private prop string[] projectDeclNames;
+
+    private prop string[] visitedPaths;
+    private prop VisFile[] loadedFiles;
+
+    construct (string entry) {
+        this.errors = [];
+        this.entryPath = entry;
+        this.declNames = [];
+        this.declKinds = [];
+        this.declInternal = [];
+        this.declOrigins = [];
+        this.declOwners = [];
+        this.moduleKeys = [];
+        this.moduleDisplays = [];
+        this.modulePaths = [];
+        this.moduleReceivers = [];
+        this.extClassNames = [];
+        this.extClassMembers = [];
+        this.allClassNames = [];
+        this.allFnNames = [];
+        this.allGlobalNames = [];
+        this.projectDeclNames = [];
+        this.visitedPaths = [];
+        this.loadedFiles = [];
+    }
+
+    public void run() {
+        VisFile entry = this.loadFile(this.entryPath);
+        if (entry == null) { return; }
+        this.collectExternals(entry);
+        for (int i = 0; i < this.loadedFiles.length; i++) {
+            this.registerFile(this.loadedFiles[i], false);
+        }
+        this.registerFile(entry, true);
+        this.checkEntryImports(entry);
+        this.walkProjectFile(entry);
+    }
+
+    // ------------------------------------------------------------------
+    // File loading and module resolution
+    // ------------------------------------------------------------------
+
+    private VisFile? loadFile(string path) {
+        for (int i = 0; i < this.visitedPaths.length; i++) {
+            if (cliArgEq(this.visitedPaths[i], path)) { return null; }
+        }
+        string src = visTryReadFile(path);
+        if (src.length == 0) { return null; }
+        this.visitedPaths.add(path);
+        Lexer lexer = new Lexer(src + "\n");
+        Token[] toks = lexer.tokenize();
+        Parser parser = new Parser(toks);
+        VisFile f = new VisFile(path);
+        f.items = parser.parseProgram();
+        for (int i = 0; i < parser.modExportNames.length; i++) {
+            f.exportNames.add(parser.modExportNames[i]);
+            f.exportInternal.add(parser.modExportInternal[i]);
+        }
+        this.loadedFiles.add(f);
+        return f;
+    }
+
+    // Recursively load every external module the project's imports reach:
+    // the entry file's imports first, then each loaded module's own imports.
+    // External bodies are registered but never checked.
+    private void collectExternals(VisFile file) {
+        for (int i = 0; i < file.items.length; i++) {
+            Node item = file.items[i];
+            if (item.kind != 105) { continue; }
+            string moduleName = item.typeHint;
+            if (moduleName.length == 0) { moduleName = item.name; }
+            if (moduleName.length == 0 || visIsWin32(moduleName) || visBuiltinModule(moduleName)) { continue; }
+            string path = visFindModulePath(moduleName, this.entryPath);
+            if (path.length == 0) { continue; }
+            if (cliArgEq(path, this.entryPath)) { continue; }
+            VisFile loaded = this.loadFile(path);
+            if (loaded != null) {
+                this.collectExternals(loaded);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Registration
+    // ------------------------------------------------------------------
+
+    private void registerFile(VisFile f, bool isProject) {
+        string stem = visFileStem(f.path);
+        this.moduleOriginsSet(visLower(stem), stem, f.path);
+        for (int e = 0; e < f.exportNames.length; e++) {
+            this.moduleOriginsSet(visLower(f.exportNames[e]), f.exportNames[e], f.path);
+            this.moduleReceiversAdd(visLower(f.exportNames[e]));
+        }
+        for (int i = 0; i < f.items.length; i++) {
+            this.registerItem(f.items[i], f, stem, isProject);
+        }
+    }
+
+    private void registerItem(Node item, VisFile f, string stem, bool isProject) {
+        if (item.kind == 100) {
+            this.registerDecl(item.name, 0, item.isInternal, f.path, stem, isProject);
+            this.allFnNames.add(item.name);
+            if (cliArgEq(item.name, "main") && item.childCount() > 1) {
+                Node body = item.child(1);
+                for (int b = 0; b < body.childCount(); b++) {
+                    Node stmt = body.child(b);
+                    if (stmt.kind == 50) {
+                        this.registerDecl(stmt.name, 1, stmt.isInternal, f.path, stem, isProject);
+                        this.allGlobalNames.add(stmt.name);
+                    }
+                }
+            }
+        } elif (item.kind == 104) {
+            this.registerDecl(item.name, 2, item.isInternal, f.path, stem, isProject);
+            this.allGlobalNames.add(item.name);
+        } elif (item.kind == 50) {
+            this.registerDecl(item.name, 1, item.isInternal, f.path, stem, isProject);
+            this.allGlobalNames.add(item.name);
+        } elif (item.kind == 102) {
+            this.registerDecl(item.name, 3, item.isInternal, f.path, stem, isProject);
+            this.allClassNames.add(item.name);
+            if (!isProject) {
+                for (int m = 0; m < item.childCount(); m++) {
+                    Node member = item.child(m);
+                    if ((member.kind == 50 || member.kind == 100) && member.isInternal) {
+                        this.extClassMemberAdd(item.name, member.name);
+                    }
+                }
+            }
+        } elif (item.kind == 105) {
+            string src = item.typeHint;
+            if (src.length > 0 && !visIsWin32(src) && !visBuiltinModule(src)) {
+                this.moduleReceiversAdd(visLower(src));
+            }
+        }
+    }
+
+    private void registerDecl(string name, int kind, bool isInternal, string origin, string owner, bool isProject) {
+        this.declNames.add(name);
+        this.declKinds.add(kind);
+        this.declInternal.add(isInternal);
+        this.declOrigins.add(origin);
+        this.declOwners.add(owner);
+        if (isProject) { this.projectDeclNames.add(name); }
+    }
+
+    private void moduleOriginsSet(string key, string display, string path) {
+        for (int i = 0; i < this.moduleKeys.length; i++) {
+            if (cliArgEq(this.moduleKeys[i], key)) {
+                this.moduleDisplays[i] = display;
+                this.modulePaths[i] = path;
+                return;
+            }
+        }
+        this.moduleKeys.add(key);
+        this.moduleDisplays.add(display);
+        this.modulePaths.add(path);
+    }
+
+    private string modulePathForKey(string key) {
+        for (int i = 0; i < this.moduleKeys.length; i++) {
+            if (cliArgEq(this.moduleKeys[i], key)) { return this.modulePaths[i]; }
+        }
+        return "";
+    }
+
+    private void moduleReceiversAdd(string key) {
+        for (int i = 0; i < this.moduleReceivers.length; i++) {
+            if (cliArgEq(this.moduleReceivers[i], key)) { return; }
+        }
+        this.moduleReceivers.add(key);
+    }
+
+    private void extClassMemberAdd(string className, string member) {
+        for (int i = 0; i < this.extClassNames.length; i++) {
+            if (cliArgEq(this.extClassNames[i], className)) {
+                this.extClassMembers[i] = this.extClassMembers[i] + "," + member;
+                return;
+            }
+        }
+        this.extClassNames.add(className);
+        this.extClassMembers.add(member);
+    }
+
+    private bool extClassMemberHas(string className, string member) {
+        for (int i = 0; i < this.extClassNames.length; i++) {
+            if (!cliArgEq(this.extClassNames[i], className)) { continue; }
+            string joined = "," + this.extClassMembers[i] + ",";
+            if (projectFind(joined, "," + member + ",", 0) >= 0) { return true; }
+            return false;
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // Import-site checks
+    // ------------------------------------------------------------------
+
+    private void checkEntryImports(VisFile entry) {
+        for (int i = 0; i < entry.items.length; i++) {
+            Node item = entry.items[i];
+            if (item.kind != 105) { continue; }
+            string src = item.typeHint;
+            if (visIsWin32(src)) { continue; }
+            if (item.isStatic && src.length > 0) {
+                // `import * from mod;` pulls every top-level name of mod into
+                // scope, so any internal declaration of an external mod is an
+                // error right at the import site.
+                string path = visFindModulePath(src, this.entryPath);
+                if (path.length == 0 || cliArgEq(path, this.entryPath)) { continue; }
+                for (int d = 0; d < this.declNames.length; d++) {
+                    if (this.declInternal[d] && cliArgEq(this.declOrigins[d], path)) {
+                        this.err(this.declNames[d], this.declOwners[d], item);
+                    }
+                }
+            } elif (src.length > 0) {
+                // Named import `import {a, b} from mod;` / `import a from mod;`
+                string path = this.modulePathForKey(visLower(src));
+                if (path.length == 0 || cliArgEq(path, this.entryPath)) { continue; }
+                this.checkNamedImport(item.name, path, item);
+                for (int c = 0; c < item.childCount(); c++) {
+                    this.checkNamedImport(item.child(c).name, path, item);
+                }
+            } else {
+                // `import name;`: the name resolves as a module file; a module
+                // that self-declares `internal mod export name;` is off limits.
+                string barePath = visFindModulePath(item.name, this.entryPath);
+                if (barePath.length == 0 || cliArgEq(barePath, this.entryPath)) { continue; }
+                if (this.declaresInternalModule(item.name, barePath)) {
+                    this.err(item.name, visFileStem(barePath), item);
+                }
+                for (int c2 = 0; c2 < item.childCount(); c2++) {
+                    string extra = item.child(c2).name;
+                    string extraPath = visFindModulePath(extra, this.entryPath);
+                    if (extraPath.length == 0 || cliArgEq(extraPath, this.entryPath)) { continue; }
+                    if (this.declaresInternalModule(extra, extraPath)) {
+                        this.err(extra, visFileStem(extraPath), item);
+                    }
+                }
+            }
+        }
+    }
+
+    private void checkNamedImport(string name, string path, Node at) {
+        for (int i = 0; i < this.declNames.length; i++) {
+            if (this.declInternal[i] && cliArgEq(this.declOrigins[i], path) && cliArgEq(this.declNames[i], name)) {
+                this.err(name, this.declOwners[i], at);
+                return;
+            }
+        }
+    }
+
+    private bool declaresInternalModule(string name, string path) {
+        for (int f = 0; f < this.loadedFiles.length; f++) {
+            if (!cliArgEq(this.loadedFiles[f].path, path)) { continue; }
+            VisFile file = this.loadedFiles[f];
+            for (int i = 0; i < file.exportNames.length; i++) {
+                if (cliArgEq(file.exportNames[i], name)) { return file.exportInternal[i]; }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // Usage walk
+    // ------------------------------------------------------------------
+
+    private void walkProjectFile(VisFile entry) {
+        for (int i = 0; i < entry.items.length; i++) {
+            Node item = entry.items[i];
+            if (item.kind == 100) {
+                this.walkFunction(item);
+            } elif (item.kind == 102) {
+                for (int m = 0; m < item.childCount(); m++) {
+                    Node member = item.child(m);
+                    if (member.kind == 100) {
+                        this.walkFunction(member);
+                    }
+                }
+            } elif ((item.kind == 104 || item.kind == 50) && item.childCount() > 0) {
+                VisCtx ctx = new VisCtx();
+                this.walkNode(item.child(0), ctx);
+            }
+        }
+    }
+
+    private void walkFunction(Node fn) {
+        VisCtx ctx = new VisCtx();
+        if (fn.childCount() > 0) {
+            Node params = fn.child(0);
+            for (int p = 0; p < params.childCount(); p++) {
+                Node param = params.child(p);
+                ctx.addLocal(param.name);
+                string cls = visClassOf(param.typeHint);
+                if (cls.length > 0) { ctx.setType(param.name, cls); }
+            }
+        }
+        if (fn.childCount() > 1) {
+            this.collectLocals(fn.child(1), ctx);
+            this.walkNode(fn.child(1), ctx);
+        }
+    }
+
+    private void collectLocals(Node n, VisCtx ctx) {
+        if (n.kind == 50 || n.kind == 73) {
+            ctx.addLocal(n.name);
+            string cls = visClassOf(n.typeHint);
+            if (cls.length > 0) { ctx.setType(n.name, cls); }
+        } elif (n.kind == 71) {
+            for (int i = 0; i + 1 < n.childCount(); i++) {
+                ctx.addLocal(n.child(i).name);
+            }
+        } elif (n.kind == 79) {
+            string elemCls = visClassOf(n.typeHint);
+            for (int i = 0; i + 1 < n.childCount(); i++) {
+                ctx.addLocal(n.child(i).name);
+                if (elemCls.length > 0) { ctx.setType(n.child(i).name, elemCls); }
+            }
+        } elif (n.kind == 59 && n.name.length > 0) {
+            ctx.addLocal(n.name);
+            string catchCls = visClassOf(n.typeHint);
+            if (catchCls.length > 0) { ctx.setType(n.name, catchCls); }
+        } elif (n.kind == 80) {
+            for (int i = 0; i + 1 < n.childCount(); i++) {
+                ctx.addLocal(n.child(i).name);
+            }
+        } elif (n.kind == 21 && n.childCount() > 0) {
+            this.collectPatternLocals(n.child(0), ctx);
+        }
+        for (int i = 0; i < n.childCount(); i++) {
+            this.collectLocals(n.child(i), ctx);
+        }
+    }
+
+    private void collectPatternLocals(Node p, VisCtx ctx) {
+        if (p.kind == 0 && p.name.length > 0 && !cliArgEq(p.name, "_")) {
+            ctx.addLocal(p.name);
+        }
+        for (int i = 0; i < p.childCount(); i++) {
+            this.collectPatternLocals(p.child(i), ctx);
+        }
+    }
+
+    private void walkNode(Node n, VisCtx ctx) {
+        if (n.kind == 6) {
+            this.checkIdentifier(n, ctx);
+        } elif (n.kind == 10) {
+            if (n.isMember && n.childCount() > 0 && n.child(0).kind == 6) {
+                this.checkReceiver(n.child(0).name, n.name, n, ctx);
+            } elif (!n.isMember) {
+                this.checkPlainCall(n, ctx);
+            }
+        } elif (n.kind == 13 && n.childCount() > 0 && n.child(0).kind == 6) {
+            this.checkReceiver(n.child(0).name, n.name, n.child(0), ctx);
+        }
+        if (n.kind == 74) {
+            // Struct literal `{name: value, ...}`: keys are field names, not
+            // identifier uses; only the values are walked.
+            for (int i = 0; i < n.childCount(); i++) {
+                Node pair = n.child(i);
+                if (pair.childCount() > 1) {
+                    this.walkNode(pair.child(1), ctx);
+                }
+            }
+            return;
+        }
+        for (int i = 0; i < n.childCount(); i++) {
+            this.walkNode(n.child(i), ctx);
+        }
+    }
+
+    private void checkIdentifier(Node n, VisCtx ctx) {
+        if (ctx.hasLocal(n.name)) { return; }
+        string owner = this.internalExternal(n.name, 1);
+        if (owner.length > 0) {
+            this.err(n.name, owner, n);
+            return;
+        }
+        owner = this.internalExternal(n.name, 2);
+        if (owner.length > 0) {
+            this.err(n.name, owner, n);
+        }
+    }
+
+    private void checkPlainCall(Node n, VisCtx ctx) {
+        string owner = this.internalExternal(n.name, 0);
+        if (owner.length > 0) {
+            this.err(n.name, owner, n);
+            return;
+        }
+        // Bare `ClassName(...)` and `new ClassName(...)` are constructor
+        // calls: an internal class of an external module cannot be
+        // instantiated from project code.
+        if (!this.nameIn(this.allFnNames, n.name)) {
+            owner = this.internalExternal(n.name, 3);
+            if (owner.length > 0) {
+                this.err(n.name, owner, n);
+            }
+        }
+    }
+
+    // One identifier receiver used as a module namespace (`mod.fn()` /
+    // `mod.CONST`), a class static (`Class.method()`), or a locally bound
+    // instance (`v.internalProp`). Mirrors codegen's receiver dispatch
+    // order: locals and globals are value receivers, then user modules,
+    // then classes.
+    private void checkReceiver(string recv, string member, Node at, VisCtx ctx) {
+        if (ctx.hasLocal(recv)) {
+            string cls = ctx.typeOf(recv);
+            if (cls.length > 0) {
+                this.checkInstanceMember(cls, member, at);
+            }
+            return;
+        }
+        if (this.nameIn(this.allGlobalNames, recv)) { return; }
+        string lc = visLower(recv);
+        if (this.nameIn(this.moduleReceivers, lc)) {
+            string path = this.modulePathForKey(lc);
+            if (path.length > 0 && !cliArgEq(path, this.entryPath)) {
+                string owner = this.internalInModule(member, path);
+                if (owner.length > 0) {
+                    this.err(member, owner, at);
+                }
+            }
+            return;
+        }
+        if (this.nameIn(this.allClassNames, recv)) {
+            this.checkInstanceMember(recv, member, at);
+        }
+    }
+
+    private void checkInstanceMember(string cls, string member, Node at) {
+        for (int i = 0; i < this.declNames.length; i++) {
+            if (this.declKinds[i] != 3 || !cliArgEq(this.declNames[i], cls)) { continue; }
+            if (!cliArgEq(this.declOrigins[i], this.entryPath) && this.extClassMemberHas(cls, member)) {
+                this.err(member, this.declOwners[i], at);
+            }
+            return;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Lookups
+    // ------------------------------------------------------------------
+
+    private string internalExternal(string name, int kind) {
+        string owner = "";
+        for (int i = 0; i < this.declNames.length; i++) {
+            if (this.declKinds[i] != kind || !this.declInternal[i]) { continue; }
+            if (!cliArgEq(this.declNames[i], name)) { continue; }
+            if (cliArgEq(this.declOrigins[i], this.entryPath)) { continue; }
+            owner = this.declOwners[i];
+        }
+        if (this.nameIn(this.projectDeclNames, name)) { return ""; }
+        return owner;
+    }
+
+    private string internalInModule(string name, string path) {
+        for (int i = 0; i < this.declNames.length; i++) {
+            if (this.declInternal[i] && cliArgEq(this.declOrigins[i], path) && cliArgEq(this.declNames[i], name)) {
+                return this.declOwners[i];
+            }
+        }
+        return "";
+    }
+
+    private bool nameIn(string[] names, string name) {
+        for (int i = 0; i < names.length; i++) {
+            if (cliArgEq(names[i], name)) { return true; }
+        }
+        return false;
+    }
+
+    private void err(string name, string owner, Node at) {
+        this.errors.add("`" + name + "` is internal to project `" + owner + "` and cannot be used here, at line " + at.line.toString() + ", column " + at.col.toString());
+    }
+}
+
+// ----------------------------------------------------------------------
+// Free helpers
+// ----------------------------------------------------------------------
+
+string visTryReadFile(string path) {
+    string result = "";
+    try {
+        result = file.readString(path);
+    } catch (int e) {
+        result = "";
+    }
+    return result;
+}
+
+// `win32.<module>` imports name native DLL access, never Silver sources
+// (DOCS/213).
+bool visIsWin32(string name) {
+    if (name.length < 5) { return false; }
+    return name[0] == 'w' && name[1] == 'i' && name[2] == 'n' && name[3] == '3' && name[4] == '2';
+}
+
+// Native builtin modules and the source-level stdlib the driver prepends by
+// hand: they never resolve to project-external files on disk.
+bool visBuiltinModule(string name) {
+    return cliArgEq(name, "fs") || cliArgEq(name, "json") || cliArgEq(name, "yaml")
+        || cliArgEq(name, "llmai") || cliArgEq(name, "LLMAI") || cliArgEq(name, "os")
+        || cliArgEq(name, "project")
+        || cliArgEq(name, "exception") || cliArgEq(name, "bom")
+        || cliArgEq(name, "process") || cliArgEq(name, "notifications")
+        || cliArgEq(name, "env") || cliArgEq(name, "url")
+        || cliArgEq(name, "hash") || cliArgEq(name, "path")
+        || cliArgEq(name, "console") || cliArgEq(name, "math")
+        || cliArgEq(name, "http");
+}
+
+// Locate a source-level module by name, returning its path (or "" when the
+// module is native/builtin or cannot be found). Mirrors the driver's
+// findModulePath resolution exactly so enforcement sees the same files the
+// aggregate compile collects.
+string visFindModulePath(string name, string inputFile) {
+    if (visBuiltinModule(name)) { return ""; }
+    if ( cliArgEq(name, "mini_asm")
+        || cliArgEq(name, "mini_cg") || cliArgEq(name, "mini_pe")
+        || cliArgEq(name, "parser") || cliArgEq(name, "node")) { return ""; }
+    string[] candidates = [];
+    int lastSep = -1;
+    for (int ci = 0; ci < inputFile.length; ci++) {
+        if (inputFile[ci] == '\\' || inputFile[ci] == '/') { lastSep = ci; }
+    }
+    if (lastSep >= 0) {
+        candidates.add(projectSlice(inputFile, 0, lastSep + 1) + name + ".sr");
+    }
+    candidates.add(name + ".sr");
+    candidates.add("std\\" + name + ".sr");
+    candidates.add("silverc\\std\\" + name + ".sr");
+    candidates.add("..\\std\\" + name + ".sr");
+    candidates.add("..\\silverc\\std\\" + name + ".sr");
+    candidates.add("..\\..\\std\\" + name + ".sr");
+    candidates.add("..\\..\\silverc\\std\\" + name + ".sr");
+    candidates.add("compiler\\" + name + ".sr");
+    candidates.add("silverc\\compiler\\" + name + ".sr");
+    candidates.add("..\\compiler\\" + name + ".sr");
+    candidates.add("..\\silverc\\compiler\\" + name + ".sr");
+    candidates.add("..\\..\\compiler\\" + name + ".sr");
+    candidates.add("..\\..\\silverc\\compiler\\" + name + ".sr");
+    candidates.add("..\\silveri\\src\\" + name + ".sr");
+    candidates.add("silveri\\src\\" + name + ".sr");
+    candidates.add("..\\..\\silveri\\src\\" + name + ".sr");
+    for (int i = 0; i < candidates.length; i++) {
+        string src = visTryReadFile(candidates[i]);
+        if (src.length > 0) { return candidates[i]; }
+    }
+    return "";
+}
+
+// File stem of a path: characters after the last separator, extension
+// removed.
+string visFileStem(string path) {
+    int last = -1;
+    for (int i = 0; i < path.length; i++) {
+        if (path[i] == '\\' || path[i] == '/') { last = i; }
+    }
+    string name = path;
+    if (last >= 0) { name = projectSlice(path, last + 1, path.length); }
+    int dot = -1;
+    for (int j = name.length - 1; j >= 0; j--) {
+        if (name[j] == '.') { dot = j; break; }
+    }
+    if (dot > 0) { return projectSlice(name, 0, dot); }
+    return name;
+}
+
+string visLower(string s) {
+    string out = "";
+    for (int i = 0; i < s.length; i++) {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z') {
+            out = out + charToString(char(c + 32));
+        } else {
+            out = out + charToString(c);
+        }
+    }
+    return out;
+}
+
+// Base class name of a declared type: nullable suffix, array suffixes and
+// generic arguments are stripped (`Node?`/`Node[]`/`dict<string,Node>` ->
+// the element/base name only when it is a plain named type; arrays yield ""
+// just like Rust's Type::Array).
+string visClassOf(string t) {
+    if (t.length == 0) { return ""; }
+    int end = t.length;
+    if (t[end - 1] == '?') { end = end - 1; }
+    int start = 0;
+    for (int i = 0; i < end; i++) {
+        char c = t[i];
+        if (c == '[' || c == '<' || c == '{') {
+            end = i;
+            break;
+        }
+    }
+    if (end <= start) { return ""; }
+    string base = projectSlice(t, start, end);
+    if (cliArgEq(base, "int") || cliArgEq(base, "int32") || cliArgEq(base, "int64")
+        || cliArgEq(base, "float") || cliArgEq(base, "float64") || cliArgEq(base, "double")
+        || cliArgEq(base, "bool") || cliArgEq(base, "char") || cliArgEq(base, "string")
+        || cliArgEq(base, "byte") || cliArgEq(base, "uint") || cliArgEq(base, "var")
+        || cliArgEq(base, "tuple") || cliArgEq(base, "void")) { return ""; }
+    return base;
+}
