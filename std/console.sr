@@ -1,6 +1,45 @@
-import * from win32.kernel32;
+import * from os;
+import * from console_win;
 
 mod export console;
+
+// DOCS -- public `console` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is
+// the unified, portable front of the console library. It contains ZERO win32
+// imports: every kernel32 call moved verbatim into the internal Windows
+// backend std/console_win.sr, and every DLL-backed entry below routes through
+// the OS gate `if (osType() == OSTypes.WINDOWS)` before touching it.
+//
+// The gate uses osType() (std/os.sr) instead of the native `os.type` query
+// because the self-hosted backend's builtin `os` dispatch covers only
+// os.name/os.version/os.build today -- `os.type` miscompiles there in both
+// spellings (property access yields a null string, the call form falls into
+// builtin dispatch and returns garbage). osType() is plain Silver: it
+// returns the OSTypes.WINDOWS contract value on every implementation without
+// needing native support, and it can be switched to the native query once
+// mini_cg learns a `type` branch.
+//
+// The else branch of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
+// a future non-Windows backend the fallbacks follow the module's existing
+// failure style: the three attribute writers become silent no-ops. The
+// remaining entries are NOT gated on purpose: setTitle/getTitle/clear,
+// rgb/bgRgb and the color-tag helpers are pure Silver -- ANSI control
+// sequences and string building through the print/printline builtins with no
+// DLL backing -- so they work unchanged on any ANSI terminal and keep their
+// original shape (DOCS/245: ANSI is safe for redirected output).
+//
+// DISPATCH NOTE (per compiler, unchanged by this split): silverc-rs answers
+// console calls with its native builtin (src/stdlib/console.rs
+// gen_console_call) before any module source is consulted, and it never
+// collects this file (console is in main.rs's builtin_modules_set), so the
+// wrapper bodies below are dead code there -- including the constants, which
+// stdlib::console::constant mirrors natively. The self-hosted compiler has no
+// native console-call builtins and dispatches those calls to these globals,
+// which forward into the internal backend. The `console.title` property is
+// the one native sliver on the self-hosted side too: mini_cg answers a read
+// with the documented empty-string fallback and rewrites a write into a
+// setTitle call that lands on this file, exactly as before the split. Both
+// paths produce the same behavior as the pre-split module.
 
 public const int Black = 0;
 public const int DarkBlue = 1;
@@ -22,15 +61,21 @@ public const int BrightGreen = 10;
 public const int BrightRed = 12;
 
 public void setForeground(int color) {
-    SetConsoleTextAttribute(GetStdHandle(-11), color & 0x0F);
+    if (osType() == OSTypes.WINDOWS) {
+        consoleWinSetForeground(color);
+    }
 }
 
 public void setBackground(int color) {
-    SetConsoleTextAttribute(GetStdHandle(-11), (color & 0x0F) << 4);
+    if (osType() == OSTypes.WINDOWS) {
+        consoleWinSetBackground(color);
+    }
 }
 
 public void reset() {
-    SetConsoleTextAttribute(GetStdHandle(-11), 7);
+    if (osType() == OSTypes.WINDOWS) {
+        consoleWinReset();
+    }
 }
 
 public void foreground(int color) { setForeground(color); }
