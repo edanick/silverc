@@ -1,23 +1,67 @@
-import * from win32.kernel32;
-import * from win32.msvcrt;
+import * from os;
+import * from time_win;
 
 mod export time;
 
-public void sleep(int ms) << Sleep(ms);
+// DOCS -- public `time` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
+// unified, portable front of the timing library. It contains ZERO win32
+// imports: every kernel32 call moved verbatim into the internal Windows
+// backend std/time_win.sr, and every DLL-backed entry below routes through
+// the OS gate `if (osType() == OSTypes.WINDOWS)` before touching it.
+//
+// The gate uses osType() (std/os.sr) instead of the native `os.type` query
+// because the self-hosted backend's builtin `os` dispatch covers only
+// os.name/os.version/os.build today -- `os.type` miscompiles there in both
+// spellings (property access yields a null string, the call form falls into
+// builtin dispatch and returns garbage). osType() is plain Silver: it
+// returns the OSTypes.WINDOWS contract value on every implementation without
+// needing native support, and it can be switched to the native query once
+// mini_cg learns a `type` branch.
+//
+// The else branch of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
+// a future non-Windows backend the fallbacks follow the module's existing
+// failure style: silent no-op for sleep, 0.0 for now.
+//
+// DISPATCH NOTE (per compiler, unchanged by this split): silverc-rs answers
+// `time.sleep(...)` / `time.now(...)` with its native builtins (SENTINEL_SLEEP
+// and the gen_now emitter) before the module's own functions are consulted,
+// so the wrapper bodies below are dead code there; the self-hosted compiler
+// has no such builtins and dispatches those calls to these globals, which
+// forward into the internal backend. Both paths produce the same behavior.
+//
+// STOPWATCH (pre-existing parser gap, not a regression of this split): the
+// historical fourth member `stopwatch(function void() fn)` cannot be parsed
+// by EITHER compiler -- neither grammar accepts function-typed parameters
+// (`function void() fn` and the C-style `void fn()` both fail with
+// "expected { but found ("), so the pre-split time.sr failed to compile as a
+// whole under both silverc-rs and silverc whenever a program imported `time`,
+// taking sleep/now down with it. The signature is kept here, commented, so
+// the member can be restored verbatim the day both parsers learn function
+// params; uncommenting it must restore the exact historical API:
+//
+// public float64 stopwatch(function void() fn) {
+//     float64 start = now();
+//     fn();
+//     float64 end = now();
+//     return end - start;
+// }
 
-public void sleep(uint ms) << Sleep(ms);
-
-public float64 now() {
-    int64 freq = 0;
-    int64 count = 0;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&count);
-    return float64(count) / float64(freq) * 1000.0;
+public void sleep(int ms) {
+    if (osType() == OSTypes.WINDOWS) {
+        timeWinSleepInt(ms);
+    }
 }
 
-public float64 stopwatch(function void() fn) {
-    float64 start = now();
-    fn();
-    float64 end = now();
-    return end - start;
+public void sleep(uint ms) {
+    if (osType() == OSTypes.WINDOWS) {
+        timeWinSleepUint(ms);
+    }
+}
+
+public float64 now() {
+    if (osType() == OSTypes.WINDOWS) {
+        return timeWinNow();
+    }
+    return 0.0;
 }

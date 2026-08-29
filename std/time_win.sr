@@ -1,0 +1,50 @@
+import { Sleep as timeWinRawSleep, QueryPerformanceCounter as timeWinRawQPC, QueryPerformanceFrequency as timeWinRawQPF } from win32.kernel32;
+
+internal mod export time_win;
+
+// DOCS -- INTERNAL Windows backend of the public `time` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). Every kernel32 DLL call the time module
+// needs lives here and nowhere else: the public wrapper (std/time.sr) contains
+// zero win32 imports and reaches this code only behind the OS gate
+// `if (osType() == OSTypes.WINDOWS)` (see std/os.sr for why the gate calls
+// the plain-Silver osType() stand-in instead of the native os.type query).
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects (enforced by compiler/visibility.sr on single-file compiles;
+// .srp projects compile their whole source set as one project). A user file
+// that tries `import * from time_win;` fails with the standard internal-
+// visibility error.
+//
+// KERNEL32 IMPORT ALIASING: the DLL exports are bound through explicit
+// `X as Y` import aliases rather than a full-table `import * from
+// win32.kernel32;` grant, so only the three functions below are granted, the
+// grants answer to the local timeWin-prefixed names, and the PE import keeps
+// the real export (mirrors std/net_win.sr and std/http_win.sr; see those
+// files for why one flat compile namespace makes local-name keying the safe
+// default). The pre-split time.sr also imported win32.msvcrt, but no CRT
+// function was ever called from it -- that vestigial import is not carried
+// over, so this backend grants exactly what it uses.
+//
+// BEHAVIOR NOTES (bodies below are moved verbatim from the pre-split time.sr
+// implementations so behavior is unchanged): the sleep pair forwards the
+// millisecond count to kernel32!Sleep, keeping the public API's exact int and
+// uint overloads instead of funnelling both through one typed parameter, and
+// now() derives a millisecond double from QueryPerformanceCounter scaled by
+// QueryPerformanceFrequency.
+
+internal void timeWinSleepInt(int ms) {
+    timeWinRawSleep(ms);
+}
+
+internal void timeWinSleepUint(uint ms) {
+    timeWinRawSleep(ms);
+}
+
+internal float64 timeWinNow() {
+    int64 freq = 0;
+    int64 count = 0;
+    timeWinRawQPF(&freq);
+    timeWinRawQPC(&count);
+    return float64(count) / float64(freq) * 1000.0;
+}
