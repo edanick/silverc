@@ -1,0 +1,70 @@
+import { GetEnvironmentVariableA as envWinRawGetVariable, SetEnvironmentVariableA as envWinRawSetVariable, GetEnvironmentStringsA as envWinRawGetStrings, FreeEnvironmentStringsA as envWinRawFreeStrings } from win32.kernel32;
+
+internal mod export env_win;
+
+// DOCS -- INTERNAL Windows backend of the public `env` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). Every kernel32 DLL call the env module
+// needs lives here and nowhere else: the public wrapper (std/env.sr) contains
+// zero win32 imports and reaches this code only behind the OS gate
+// `if (osType() == OSTypes.WINDOWS)` (see std/os.sr for why the gate calls
+// the plain-Silver osType() stand-in instead of the native os.type query).
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects (enforced by compiler/visibility.sr on single-file compiles;
+// .srp projects compile their whole source set as one project). A user file
+// that tries `import * from env_win;` fails with the standard internal-
+// visibility error.
+//
+// KERNEL32 IMPORT ALIASING: the DLL exports are bound through explicit
+// `X as Y` import aliases rather than a full-table `import * from
+// win32.kernel32;` grant, so only the four functions below are granted, the
+// grants answer to the local envWin-prefixed names, and the PE import keeps
+// the real export (mirrors std/time_win.sr and std/net_win.sr; see those
+// files for why one flat compile namespace makes local-name keying the safe
+// default).
+//
+// BEHAVIOR NOTES (bodies below are moved from the pre-split env.sr
+// implementations so behavior is unchanged): get() sizes the value with a
+// (key, null, 0) call -- 0 means the variable is unset and yields "" -- then
+// fills a heap buffer with the value. One mechanical adjustment mirrors
+// std/fs_win.sr: the old `char buf[size];` fixed-declaration became
+// `byte[] buf = new byte[size];` (the codebase-standard allocation idiom)
+// because the fixed-declaration form does not survive the visibility pass's
+// standalone parse of this module, which every direct `import * from
+// env_win;` triggers. set() forwards to kernel32!SetEnvironmentVariableA.
+// keys() walks the double-NUL-terminated GetEnvironmentStringsA block,
+// keeping the "NAME=VALUE" entries' name halves until the block's empty
+// entry terminates the walk, then frees the block with
+// FreeEnvironmentStringsA.
+
+internal string envWinGet(string key) {
+    int size = envWinRawGetVariable(key, null, 0);
+    if (size == 0) { return ""; }
+    byte[] buf = new byte[size];
+    envWinRawGetVariable(key, buf, size);
+    string r = "";
+    foreach (byte b in buf) { if (b != 0) { r += char(b); } }
+    return r;
+}
+
+internal void envWinSet(string key, string val) {
+    envWinRawSetVariable(key, val);
+}
+
+internal string[] envWinKeys() {
+    string block = envWinRawGetStrings();
+    string[] result = [];
+    int start = 0;
+    for (int i = 0; i < block.length(); i++) {
+        if (block[i] == '\0') {
+            string entry = block.substr(start, i - start);
+            if (entry.length() == 0) { break; }
+            int eq = entry.indexOf("=");
+            if (eq >= 0) { result.add(entry.substr(0, eq)); }
+            start = i + 1;
+        }
+    }
+    envWinRawFreeStrings(block);
+    return result;
+}
