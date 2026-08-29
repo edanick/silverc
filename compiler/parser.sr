@@ -578,6 +578,12 @@ class Parser {
         if (this.strEq(name, "GetWindowThreadProcessId") || this.strEq(name, "OpenProcess")) { return true; }
         if (this.strEq(name, "QueryFullProcessImageNameA") || this.strEq(name, "CloseHandle")) { return true; }
         if (this.strEq(name, "getFocusedProcessDataNative")) { return true; }
+        // UNIFIED_CORE_LIBRARY.md phase 2 -- std/os.sr's plain-Silver
+        // `osType()` gate helper. The `os` module is builtin-reserved in the
+        // self-hosted compiler, so the source defining osType is never
+        // collected; the backend mirrors silverc-rs's native os.type
+        // contract instead (compile-time OSTypes.WINDOWS constant).
+        if (this.strEq(name, "osType")) { return true; }
         if (this.strEq(name, "__binaryMetadataStatus") || this.strEq(name, "__binaryMetadataField")) { return true; }
         if (this.strEq(name, "__binaryMetadataStatusNative") || this.strEq(name, "__binaryMetadataFieldNative")) { return true; }
         if (this.strEq(name, "nativeToastShow") || this.strEq(name, "loadIcon")) { return true; }
@@ -1085,21 +1091,23 @@ class Parser {
             node.isStatic = true;
         } elif (this.check(102)) {
             this.advance();
-            node.name = this.advance().text;
+            Node first = this.parseImportNameNode();
+            node.name = first.name;
+            node.isAlias = first.isAlias;
+            node.strVal = first.strVal;
             while (this.check(107)) {
                 this.advance();
-                Node extra = new Node();
-                extra.name = this.advance().text;
-                node.children.add(extra);
+                node.children.add(this.parseImportNameNode());
             }
             this.expect(103);
         } else {
-            node.name = this.advance().text;
+            Node first = this.parseImportNameNode();
+            node.name = first.name;
+            node.isAlias = first.isAlias;
+            node.strVal = first.strVal;
             while (this.check(107)) {
                 this.advance();
-                Node extra = new Node();
-                extra.name = this.advance().text;
-                node.children.add(extra);
+                node.children.add(this.parseImportNameNode());
             }
         }
         if (this.check(37)) {
@@ -1111,11 +1119,54 @@ class Parser {
             }
             node.typeHint = src;
         }
+        // UNIFIED_CORE_LIBRARY.md phase 2 -- `X as Y` import aliasing. An
+        // alias binds a DLL export under a different local call name, which
+        // only carries meaning on win32 imports; on a Silver-module import
+        // it would silently rebind the module's own symbols, so reject it.
+        if (this.importHasAlias(node) && !this.importSourceIsWin32(node.typeHint)) {
+            this.recordError("aliased import names (X as Y) are only allowed on win32 imports, at line " + node.line.toString() + ", column " + node.col.toString());
+        }
         // Remember win32 grants for the post-parse unknown-method walk
         // (DOCS/213): free Win32 calls resolve only through these imports.
         this.recordWin32ImportGrant(node);
         this.expectSemi();
         return node;
+    }
+
+    // One name inside an import list: `export` or `export as local`
+    // (UNIFIED_CORE_LIBRARY.md phase 2). The alias local rides on the
+    // node's strVal with isAlias set, keeping the import node shape
+    // unchanged for every other consumer.
+    private Node parseImportNameNode() {
+        Node nameNode = new Node();
+        nameNode.name = this.advance().text;
+        if (this.check(38)) {
+            this.advance();
+            nameNode.isAlias = true;
+            nameNode.strVal = this.advance().text;
+        }
+        return nameNode;
+    }
+
+    private bool importHasAlias(Node node) {
+        if (node.isAlias) { return true; }
+        for (int i = 0; i < node.childCount(); i++) {
+            if (node.child(i).isAlias) { return true; }
+        }
+        return false;
+    }
+
+    private bool importSourceIsWin32(string src) {
+        if (this.strEq(src, "win32")) { return true; }
+        if (src.length > 6 && this.strEq(this.sliceStr(src, 0, 6), "win32.")) { return true; }
+        return false;
+    }
+
+    // The name an import grant answers to: the alias local for `X as Y`,
+    // the plain name otherwise.
+    private string importLocalName(Node nameNode) {
+        if (nameNode.isAlias && nameNode.strVal.length > 0) { return nameNode.strVal; }
+        return nameNode.name;
     }
 
     // Mirror of MiniCg.registerWin32Import, kept in the parser so the
@@ -1136,9 +1187,12 @@ class Parser {
                 this.win32OpenModules.add(module);
                 return;
             }
-            this.win32GrantNames.add(node.name);
+            // Aliased grants answer only to the LOCAL name (the alias), so
+            // the diagnostics walk must accept the alias, never the export
+            // (UNIFIED_CORE_LIBRARY.md phase 2).
+            this.win32GrantNames.add(this.importLocalName(node));
             for (int j2 = 0; j2 < node.childCount(); j2++) {
-                this.win32GrantNames.add(node.child(j2).name);
+                this.win32GrantNames.add(this.importLocalName(node.child(j2)));
             }
         }
     }
@@ -2442,7 +2496,11 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             if (this.check(104)) {
                 // new T[n]: native array allocation.  A zero/omitted size
                 // produces an empty array; a positive constant size produces
-                // that many zeroed slots.
+                // that many zeroed slots.  A non-literal size expression
+                // marks an op=2 runtime-sized allocation node (child 0 = the
+                // size expression) that codegen lowers through the same
+                // HeapAlloc shape silverc-rs emits — net_win.sr's
+                // `new int[slots]` buffers depend on it.
                 this.advance();
                 Node sizeExpr = this.parseExpr(0);
                 this.expect(105);
@@ -2456,6 +2514,10 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                         Node zero = new Node(); zero.kind = 0; zero.intVal = 0;
                         arr.children.add(zero);
                     }
+                }
+                if (sizeExpr.kind != 0) {
+                    arr.op = 2;
+                    arr.children.add(sizeExpr);
                 }
                 return arr;
             }

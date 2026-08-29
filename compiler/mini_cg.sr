@@ -46,6 +46,14 @@ class MiniCg {
     // imported and the driver must abort.
     public prop string[] win32Dlls;
     public prop string[] win32Grants;
+    // UNIFIED_CORE_LIBRARY.md phase 2 -- aliased single-export grants
+    // (`import { X as Y } from win32.<mod>;`) as parallel arrays. A grant
+    // answers to the LOCAL call name only; the PE import keeps the real
+    // export. Aliased exports never enter win32Grants, so they cannot
+    // widen access to the rest of the DLL.
+    public prop string[] win32AliasLocals;
+    public prop string[] win32AliasExports;
+    public prop string[] win32AliasDlls;
     public prop bool win32Error;
     public prop string win32ErrorMessage;
     public prop int[] loopStartStack;
@@ -155,6 +163,9 @@ class MiniCg {
         this.importFuncs = [];
         this.win32Dlls = [];
         this.win32Grants = [];
+        this.win32AliasLocals = [];
+        this.win32AliasExports = [];
+        this.win32AliasDlls = [];
         this.win32Error = false;
         this.win32ErrorMessage = "";
         this.loopStartStack = [];
@@ -590,6 +601,31 @@ class MiniCg {
         this.win32Grants.add(grant);
     }
 
+    // UNIFIED_CORE_LIBRARY.md phase 2 -- aliased single-export grant: the
+    // DLL export `exportName` becomes callable under the local name
+    // `localName` only. Keyed by the local name, never the export, so a
+    // user symbol sharing the export's real name never collides with the
+    // DLL call.
+    public void win32AddGrantAlias(string dll, string exportName, string localName) {
+        if (dll.length == 0 || exportName.length == 0 || localName.length == 0) { return; }
+        if (this.strEq(exportName, localName)) { this.win32AddGrant(dll, exportName); return; }
+        for (int i = 0; i < this.win32AliasLocals.length; i++) {
+            if (this.strEq(this.win32AliasLocals[i], localName) && this.strEq(this.win32AliasExports[i], exportName) && this.strEq(this.win32AliasDlls[i], dll)) { return; }
+        }
+        this.win32AliasLocals.add(localName);
+        this.win32AliasExports.add(exportName);
+        this.win32AliasDlls.add(dll);
+    }
+
+    // Register one import-list name node: `X` or `X as Y`.
+    public void win32AddGrantNamed(string dll, Node nameNode) {
+        if (nameNode.isAlias && nameNode.strVal.length > 0) {
+            this.win32AddGrantAlias(dll, nameNode.name, nameNode.strVal);
+            return;
+        }
+        this.win32AddGrant(dll, nameNode.name);
+    }
+
     // True when `fn` may be called as a free function targeting `dll`.
     public bool win32Allowed(string dll, string fn) {
         for (int i = 0; i < this.win32Dlls.length; i++) {
@@ -643,9 +679,9 @@ class MiniCg {
             this.win32AddDll(dll);
             return;
         }
-        this.win32AddGrant(dll, node.name);
+        this.win32AddGrantNamed(dll, node);
         for (int j = 0; j < node.childCount(); j++) {
-            this.win32AddGrant(dll, node.child(j).name);
+            this.win32AddGrantNamed(dll, node.child(j));
         }
     }
 
@@ -2484,13 +2520,67 @@ int strIdx = this.stringPatchIndices[i];
             // that encoded size for the header; treating it as an empty
             // literal makes every subsequent index fail its bounds check.
             if (expr.op == 1 && expr.intVal >= 0) { count = expr.intVal; }
+            // UNIFIED_CORE_LIBRARY.md phase 2 -- runtime-sized allocation
+            // (`new int[slots]`, size not a literal constant). Lowered
+            // exactly like silverc-rs codegen: HeapAlloc(GetProcessHeap(),
+            // HEAP_ZERO_MEMORY, (max(n, 8) + 2) * 8), header [0] = capacity,
+            // [8] = logical length n, and the array variable receives the
+            // element-0 address (alloc + 16).
+            bool isDynNew = expr.op == 2 && expr.childCount() == 1;
+            if (isDynNew) {
+                this.genExpr(expr.child(0));
+                int sizeOff = this.allocLocal("__na_size");
+                this.asm.movMBaseR(5, 0, sizeOff);
+                int ge8 = this.newLabel();
+                int capDone = this.newLabel();
+                this.asm.movRMBase(0, 5, sizeOff);
+                this.asm.cmpRI32(0, 8);
+                this.asm.jgeLabel(ge8);
+                this.asm.movRI64(0, 8);
+                this.asm.jmpLabel(capDone);
+                this.asm.bindLabel(ge8);
+                this.asm.movRMBase(0, 5, sizeOff);
+                this.asm.bindLabel(capDone);
+                int capOff = this.allocLocal("__na_cap");
+                this.asm.movMBaseR(5, 0, capOff);
+                this.asm.movRMBase(0, 5, capOff);
+                this.asm.addRI32(0, 2);
+                this.asm.shlR64Imm(0, 3);
+                this.asm.movRR64(8, 0);
+                this.asm.emitCallSetup(0);
+                this.addImportPatch("kernel32.dll", "GetProcessHeap");
+                this.asm.emitImm64(0, 0);
+                this.asm.movRMBase(0, 0, 0);
+                this.asm.callR64(0);
+                this.asm.emitCallTeardown();
+                this.asm.movRR64(1, 0);
+                this.asm.movRI64(2, 8);
+                this.asm.emitCallSetup(0);
+                this.addImportPatch("kernel32.dll", "HeapAlloc");
+                this.asm.emitImm64(0, 0);
+                this.asm.movRMBase(0, 0, 0);
+                this.asm.callR64(0);
+                this.asm.emitCallTeardown();
+                int arrOff = this.allocLocal("__na_arr");
+                this.asm.movMBaseR(5, 0, arrOff);
+                this.asm.movRMBase(0, 5, capOff);
+                this.asm.movRMBase(1, 5, arrOff);
+                this.asm.movMBaseR(1, 0, 0);
+                this.asm.movRMBase(0, 5, sizeOff);
+                this.asm.movRMBase(1, 5, arrOff);
+                this.asm.movMBaseR(1, 0, 8);
+                this.asm.movRMBase(0, 5, arrOff);
+                this.asm.addRI32(0, 16);
+            }
             // Check for spread elements (`...arr`).  When present, the total
             // element count is only known at runtime (DOCS/116).
             bool hasSpread = false;
             for (int si = 0; si < count; si++) {
                 if (expr.child(si).kind == 77) { hasSpread = true; }
             }
-            if (hasSpread) {
+            if (isDynNew) {
+                // handled above
+            } elif (hasSpread) {
                 // Spread path: evaluate every spread source, accumulate
                 // lengths, allocate, then copy elements in order.
                 int staticCount = 0;
@@ -3012,6 +3102,17 @@ int strIdx = this.stringPatchIndices[i];
                     }
                 }
             }
+        }
+        // UNIFIED_CORE_LIBRARY.md phase 2 -- std/os.sr's OSTypes enum is
+        // unreachable to the self-hosted compiler (the `os` module is
+        // builtin-reserved, so the source defining it is never collected).
+        // Mirror the documented enum contract (WINDOWS=0, LINUX=1, MACOS=2,
+        // UNKNOWN=3) exactly as the collected enum would evaluate.
+        if (obj.kind == 6 && this.strEq(obj.name, "OSTypes")) {
+            if (this.strEq(fieldName, "WINDOWS")) { this.asm.emitImm64(0, 0); return; }
+            if (this.strEq(fieldName, "LINUX")) { this.asm.emitImm64(0, 1); return; }
+            if (this.strEq(fieldName, "MACOS")) { this.asm.emitImm64(0, 2); return; }
+            if (this.strEq(fieldName, "UNKNOWN")) { this.asm.emitImm64(0, 3); return; }
         }
         // os.name / os.version / os.build - builtin OS detection fields
         if (obj.kind == 6 && this.strEq(obj.name, "console") && this.strEq(fieldName, "title")) {
@@ -6462,6 +6563,29 @@ public void genNewCall(Node call) {
         this.asm.bindLabel(done);
     }
 
+    // UNIFIED_CORE_LIBRARY.md phase 2 -- true when a bare call to `name`
+    // resolves as an imported win32 export: the export sits in a fully
+    // imported DLL's table, or a single-export grant (plain or aliased by
+    // its local name) covers it. Mirrors silverc-rs gen_call, where
+    // win32::resolve runs BEFORE the bare static-method fallback so a
+    // same-named class method (net.sr's socket.send / listener.accept)
+    // never hijacks another module's ws2_32 call.
+    public bool win32CallResolves(string name) {
+        for (int i = 0; i < this.win32Dlls.length; i++) {
+            if (this.win32TableHas(this.win32Dlls[i], name)) { return true; }
+            if (this.strEq(name, "CreateProcess") && this.win32TableHas(this.win32Dlls[i], "CreateProcessA")) { return true; }
+        }
+        for (int g = 0; g < this.win32Grants.length; g++) {
+            string grant = this.win32Grants[g];
+            if (grant.length > name.length + 1 && this.strEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') { return true; }
+            if (this.strEq(name, "CreateProcess") && this.strEq(grant, "kernel32.dll|CreateProcessA")) { return true; }
+        }
+        for (int a = 0; a < this.win32AliasLocals.length; a++) {
+            if (this.strEq(this.win32AliasLocals[a], name)) { return true; }
+        }
+        return false;
+    }
+
     public void genUserCall(Node call) {
         string name = call.name;
         // Module-qualified call (e.g. json_runtime.get(x, "y") inside a class
@@ -6534,6 +6658,12 @@ public void genNewCall(Node call) {
         if (funcIdx < 0) {
             for (int i = 0; i < this.funcNames.length; i++) {
                 if (this.strEq(this.funcNames[i], name)) {
+                    // UNIFIED_CORE_LIBRARY.md phase 2 -- a bare call that
+                    // resolves as an imported win32 export must reach the
+                    // DLL (silverc-rs checks win32::resolve before the bare
+                    // static-method fallback), never a same-named class
+                    // method from another module of the aggregate.
+                    if (!this.strEq(this.funcClasses[i], "") && this.win32CallResolves(name)) { continue; }
                     funcIdx = i;
                 }
             }
@@ -6751,6 +6881,17 @@ public void genNewCall(Node call) {
             this.asm.emitCallTeardown();
             return;
         }
+        // UNIFIED_CORE_LIBRARY.md phase 2 -- std/os.sr's plain-Silver
+        // `osType()` gate helper. The `os` module is builtin-reserved in the
+        // self-hosted compiler, so the source defining osType is never
+        // collected; mirror silverc-rs's native os.type contract instead:
+        // the compile-time constant OSTypes.WINDOWS (0) on this Windows-only
+        // backend.
+        if (this.strEq(name, "osType")) {
+            this.asm.xorRR64(0, 0);
+            this.asm.emitCallTeardown();
+            return;
+        }
         bool isWin32 = false;
         string win32Dll = "";
         if (this.strEq(name, "FindFirstFileA") || this.strEq(name, "FindNextFileA") || this.strEq(name, "FindClose") || this.strEq(name, "GetFileTime") || this.strEq(name, "DeleteFileA") || this.strEq(name, "MoveFileA") || this.strEq(name, "GetFileAttributesA") || this.strEq(name, "CreateDirectoryA") || this.strEq(name, "RemoveDirectoryA") || this.strEq(name, "SetCurrentDirectoryA") || this.strEq(name, "CreateProcessA") || this.strEq(name, "WaitForSingleObject") || this.strEq(name, "GetStdHandle") || this.strEq(name, "SetConsoleTextAttribute") || this.strEq(name, "GetConsoleScreenBufferInfo") || this.strEq(name, "SetConsoleCursorPosition") || this.strEq(name, "GetModuleHandleA") || this.strEq(name, "LoadLibraryA") || this.strEq(name, "GetProcAddress") || this.strEq(name, "Sleep") || this.strEq(name, "GetTickCount") || this.strEq(name, "GetLastError") || this.strEq(name, "GetCurrentDirectoryA") || this.strEq(name, "WriteConsoleA") || this.strEq(name, "ReadConsoleA") || this.strEq(name, "GetConsoleMode") || this.strEq(name, "SetConsoleMode") || this.strEq(name, "CreatePipe") || this.strEq(name, "GetExitCodeProcess") || this.strEq(name, "CreateFileA") || this.strEq(name, "GetFileSize") || this.strEq(name, "ReadFile") || this.strEq(name, "WriteFile") || this.strEq(name, "CloseHandle") || this.strEq(name, "GetFileAttributesW") || this.strEq(name, "SetFilePointer") || this.strEq(name, "GetCurrentProcessId") || this.strEq(name, "GetCurrentProcess") || this.strEq(name, "GetCurrentThreadId") || this.strEq(name, "GetCurrentThread") || this.strEq(name, "GetEnvironmentVariableA") || this.strEq(name, "GetEnvironmentVariableW") || this.strEq(name, "SetEnvironmentVariableA") || this.strEq(name, "SetEnvironmentVariableW") || this.strEq(name, "ExpandEnvironmentStringsA") || this.strEq(name, "GetEnvironmentStringsA") || this.strEq(name, "FreeEnvironmentStringsA") || this.strEq(name, "GetTempPathA") || this.strEq(name, "GetComputerNameA") || this.strEq(name, "GetUserNameA") || this.strEq(name, "CopyFileA") || this.strEq(name, "SetFileAttributesA") || this.strEq(name, "GetFullPathNameA") || this.strEq(name, "GetModuleFileNameA") || this.strEq(name, "QueryPerformanceCounter") || this.strEq(name, "QueryPerformanceFrequency") || this.strEq(name, "GetTickCount64") || this.strEq(name, "TerminateProcess") || this.strEq(name, "OpenProcess") || this.strEq(name, "GetProcessId") || this.strEq(name, "FlushFileBuffers") || this.strEq(name, "GetFileSizeEx") || this.strEq(name, "CreateProcessW") || this.strEq(name, "CreateProcess") || this.strEq(name, "GetVersionExA") || this.strEq(name, "GetSystemDirectoryA") || this.strEq(name, "GetWindowsDirectoryA") || this.strEq(name, "GetLocalTime") || this.strEq(name, "GetSystemTime") || this.strEq(name, "OutputDebugStringA") || this.strEq(name, "IsDebuggerPresent") || this.strEq(name, "GetCommandLineA") || this.strEq(name, "GlobalAlloc") || this.strEq(name, "GlobalFree") || this.strEq(name, "VirtualAlloc") || this.strEq(name, "VirtualFree") || this.strEq(name, "HeapFree") || this.strEq(name, "GetProcessHeap") || this.strEq(name, "lstrlenA") || this.strEq(name, "lstrcpyA") || this.strEq(name, "lstrcatA") || this.strEq(name, "lstrcmpA") || this.strEq(name, "SetThreadPriority") || this.strEq(name, "QueryFullProcessImageNameA")) {
@@ -6805,13 +6946,43 @@ public void genNewCall(Node call) {
         // the ANSI import so source like std/process.sr links and runs.
         string importName = name;
         if (this.strEq(name, "CreateProcess")) { importName = "CreateProcessA"; }
+        // UNIFIED_CORE_LIBRARY.md phase 2 -- aliased win32 grants. Resolution
+        // order mirrors silverc-rs win32::resolve: full-DLL tables and plain
+        // single-export grants answer first, aliased grants second, matched
+        // by the LOCAL call name only. The PE import keeps the real export,
+        // so aliasing one export never grants the rest of the DLL.
+        bool plainWin32Allowed = false;
+        if (isWin32) { plainWin32Allowed = this.win32Allowed(win32Dll, importName); }
+        string aliasDll = "";
+        string aliasExport = "";
+        if (!plainWin32Allowed) {
+            for (int g = 0; g < this.win32AliasLocals.length; g++) {
+                if (this.strEq(this.win32AliasLocals[g], name)) {
+                    aliasDll = this.win32AliasDlls[g];
+                    aliasExport = this.win32AliasExports[g];
+                }
+            }
+        }
         if (isWin32) {
-            if (!this.win32Allowed(win32Dll, importName)) {
+            if (!plainWin32Allowed) {
+                if (aliasDll.length > 0) {
+                    this.addImportPatch(aliasDll, aliasExport);
+                    this.asm.emitImm64(0, 0);
+                    this.asm.movRMBase(0, 0, 0);
+                    this.asm.callR64(0);
+                    this.asm.emitCallTeardown();
+                    return;
+                }
                 // DOCS/213 -- the owning win32 module was not imported.
                 printline("Error: Win32 function '" + name + "' used without importing its module (add: import * from win32." + this.win32ModuleOf(win32Dll) + ";)");
                 exit(1);
             }
             this.addImportPatch(win32Dll, importName);
+            this.asm.emitImm64(0, 0);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.callR64(0);
+        } elif (aliasDll.length > 0) {
+            this.addImportPatch(aliasDll, aliasExport);
             this.asm.emitImm64(0, 0);
             this.asm.movRMBase(0, 0, 0);
             this.asm.callR64(0);
