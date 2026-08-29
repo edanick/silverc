@@ -134,6 +134,7 @@ class MiniCg {
     // absolute-VA placeholder patched at layout time. Bodies may queue
     // further anonymous functions, so the queue drains until empty.
     public prop int anonCounter;
+    public prop bool inAnonBody;
     public prop string[] pendingAnonNames;
     public prop int[] pendingAnonLabels;
     public prop Node[] pendingAnonBodies;
@@ -245,6 +246,7 @@ class MiniCg {
         this.refParams = [];
         this.progress = null;
         this.anonCounter = 0;
+        this.inAnonBody = false;
         this.pendingAnonNames = [];
         this.pendingAnonLabels = [];
         this.pendingAnonBodies = [];
@@ -757,6 +759,37 @@ class MiniCg {
             }
         }
         return -1;
+    }
+
+    // Parity with silverc-rs type_checker.rs check_assignment_target: an
+    // assignment to a plain name must resolve to a declared local, a
+    // declared file-scope global, or (inside a class method) a bare field
+    // of the current class.  The old miss fallback silently stored through
+    // [rbp+0], corrupting the frame.  Writes to declared globals are
+    // rejected by the MemoryGuard before codegen runs; this check only
+    // catches names that resolve to nothing at all.
+    public void requireResolvableAssignTarget(Node lhs) {
+        if (lhs.name.length == 0) { return; }
+        if (this.findLocal(lhs.name) != 0) { return; }
+        if (this.findGlobal(lhs.name) >= 0) { return; }
+        if (!this.strEq(this.currentClassName, "")) {
+            if (this.findFieldOffset(this.currentClassName, lhs.name) >= 0) { return; }
+        }
+        printline(lhs.line.toString() + ":" + lhs.col.toString() + ": Undefined variable '" + lhs.name + "'");
+        exit(1);
+    }
+
+    // Parity with silverc-rs: anonymous function bodies are isolated scopes
+    // (DOCS/259) and file-scope globals are not writable from any function
+    // body.  The MemoryGuard cannot see into an anonymous body, so codegen
+    // enforces the same rule here with the Guard's global-write wording.
+    public void rejectGlobalWriteInAnonBody(Node lhs) {
+        if (!this.inAnonBody) { return; }
+        if (lhs.name.length == 0) { return; }
+        if (this.findLocal(lhs.name) != 0) { return; }
+        if (this.findGlobal(lhs.name) < 0) { return; }
+        printline("GuardError: InvalidAssignment at line " + lhs.line.toString() + ", column " + lhs.col.toString() + ": " + lhs.name + ": cannot write to a global or const");
+        exit(1);
     }
 
     public void genGlobalLoad(int gi) {
@@ -3054,10 +3087,13 @@ int strIdx = this.stringPatchIndices[i];
         f.children.add(params);
         f.children.add(body);
         this.scanRefCalls(f);
+        bool savedAnon = this.inAnonBody;
+        this.inAnonBody = true;
         this.asm.bindLabel(labelId);
         this.asm.pushR64(5);
         this.asm.movRR64(5, 4);
         this.emitFunctionBody(f);
+        this.inAnonBody = savedAnon;
     }
 
     // DOCS/259 -- invoke a function-typed parameter: load the stored function
@@ -8976,6 +9012,8 @@ public void genNewCall(Node call) {
         Node lhs = bin.child(0);
         Node rhs = bin.child(1);
         if (lhs.kind == 6) {
+            this.requireResolvableAssignTarget(lhs);
+            this.rejectGlobalWriteInAnonBody(lhs);
             int off = this.findLocal(lhs.name);
             int gi = this.findGlobal(lhs.name);
             int fieldOff = -1;
@@ -9238,6 +9276,8 @@ public void genNewCall(Node call) {
             }
         }
         if (lhs.kind == 6) {
+            this.requireResolvableAssignTarget(lhs);
+            this.rejectGlobalWriteInAnonBody(lhs);
             int off = this.findLocal(lhs.name);
             int gi = this.findGlobal(lhs.name);
             if (rhs.kind == 74) {
@@ -9428,6 +9468,8 @@ public void genNewCall(Node call) {
         // on the runtime stack before the store and restored into RAX after.
         Node lhs = bin.child(0);
         if (lhs.kind == 6) {
+            this.requireResolvableAssignTarget(lhs);
+            this.rejectGlobalWriteInAnonBody(lhs);
             int off = this.findLocal(lhs.name);
             int gi = this.findGlobal(lhs.name);
             if (off != 0) {
