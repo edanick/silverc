@@ -1,6 +1,35 @@
-import * from win32.ws2_32;
+import * from os;
+import * from net_win;
 
 mod export net;
+
+// DOCS -- public `net` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
+// unified, portable front of the TCP library. It contains ZERO win32 imports:
+// every ws2_32 call moved into the internal Windows backend std/net_win.sr,
+// and every DLL-backed entry below routes through the OS gate
+// `if (osType() == OSTypes.WINDOWS)` before touching it. See net_win.sr for
+// why the ws2_32 calls there are bound through `X as Y` import aliases (the
+// public class `socket` and free functions `connect`/`listen` collide with
+// ws2_32 export names in the flat compile namespace) and for the packed
+// int[] sockaddr / payload conventions.
+//
+// The else branch of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For a
+// future non-Windows backend the fallbacks follow the module's existing
+// failure style: empty string / null / false / silent no-op.
+//
+// BEHAVIOR NOTES relative to the pre-split net.sr (which never compiled under
+// either compiler -- `struct sockaddr_in` is not a supported syntax and its
+// phantom EncryptMessage/DecryptMessage/toBytes calls exist in no compiler):
+//   - WSAStartup is now issued by the backend before the first socket
+//     creation (previously never called; winsock stayed uninitialized).
+//   - tls_client keeps its exact public surface. Its connect() opened a plain
+//     TCP socket and stored it as the context, so send/receive now carry that
+//     traffic over the same raw socket primitives (the phantom encryption
+//     calls had no implementation to preserve). The unused SCHANNEL_CRED
+//     field is gone (the type exists nowhere); setCA/setCert still store
+//     their paths.
+//   - listener.listen backlog stays at the original hard-coded 10.
 
 class socket {
     private int fd;
@@ -8,20 +37,23 @@ class socket {
     construct(int fd) { this.fd = fd; }
 
     public void send(string data) {
-        byte[] bytes = data.toBytes();
-        send(this.fd, bytes, bytes.length, 0);
+        if (osType() == OSTypes.WINDOWS) {
+            netWinSend(this.fd, data);
+        }
     }
 
     public string receive(int maxLen) {
-        byte[] buf = new byte[maxLen];
-        int n = recv(this.fd, buf, maxLen, 0);
-        if (n <= 0) { return ""; }
-        string result = "";
-        for (int i = 0; i < n; i++) { result += char(buf[i]); }
-        return result;
+        if (osType() == OSTypes.WINDOWS) {
+            return netWinReceive(this.fd, maxLen);
+        }
+        return "";
     }
 
-    public void close() { closesocket(this.fd); }
+    public void close() {
+        if (osType() == OSTypes.WINDOWS) {
+            netWinClose(this.fd);
+        }
+    }
 }
 
 class listener {
@@ -30,12 +62,19 @@ class listener {
     construct(int fd) { this.fd = fd; }
 
     public socket accept() {
-        int client = accept(this.fd, null, null);
-        if (client < 0) { return null; }
-        return new socket(client);
+        if (osType() == OSTypes.WINDOWS) {
+            int client = netWinAccept(this.fd);
+            if (client < 0) { return null; }
+            return new socket(client);
+        }
+        return null;
     }
 
-    public void close() { closesocket(this.fd); }
+    public void close() {
+        if (osType() == OSTypes.WINDOWS) {
+            netWinClose(this.fd);
+        }
+    }
 }
 
 class tls_client {
@@ -43,65 +82,61 @@ class tls_client {
     private int port;
     private string caPath;
     private string certPath;
-    private SCHANNEL_CRED creds;
     private int context;
 
     construct(string host, int port) {
         this.host = host;
         this.port = port;
+        this.context = -1;
     }
 
     public void setCA(string path) { this.caPath = path; }
     public void setCert(string path) { this.certPath = path; }
 
     public bool connect() {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) { return false; }
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_port = (this.port & 0xFF) << 8 | (this.port >> 8) & 0xFF;
-        addr.sin_addr.s_addr = inet_addr(this.host);
-        if (connect(sock, &addr, 16) < 0) { closesocket(sock); return false; }
-        this.context = sock;
-        return true;
+        if (osType() == OSTypes.WINDOWS) {
+            int sock = netWinConnect(this.host, this.port);
+            if (sock < 0) { return false; }
+            this.context = sock;
+            return true;
+        }
+        return false;
     }
 
     public void send(string data) {
-        byte[] bytes = data.toBytes();
-        EncryptMessage(this.context, 0, bytes, bytes.length);
+        if (osType() == OSTypes.WINDOWS) {
+            netWinSend(this.context, data);
+        }
     }
 
     public string receive() {
-        byte[] buf = new byte[8192];
-        int n = DecryptMessage(this.context, buf, 8192);
-        if (n <= 0) { return ""; }
-        string result = "";
-        for (int i = 0; i < n; i++) { result += char(buf[i]); }
-        return result;
+        if (osType() == OSTypes.WINDOWS) {
+            return netWinReceive(this.context, 8192);
+        }
+        return "";
     }
 
-    public void close() { closesocket(this.context); }
+    public void close() {
+        if (osType() == OSTypes.WINDOWS) {
+            netWinClose(this.context);
+        }
+    }
 }
 
 public socket connect(string host, int port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) { return null; }
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = (port & 0xFF) << 8 | (port >> 8) & 0xFF;
-    addr.sin_addr.s_addr = inet_addr(host);
-    if (connect(sock, &addr, 16) < 0) { closesocket(sock); return null; }
-    return new socket(sock);
+    if (osType() == OSTypes.WINDOWS) {
+        int sock = netWinConnect(host, port);
+        if (sock < 0) { return null; }
+        return new socket(sock);
+    }
+    return null;
 }
 
 public listener listen(int port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) { return null; }
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = 0;
-    addr.sin_port = (port & 0xFF) << 8 | (port >> 8) & 0xFF;
-    if (bind(sock, &addr, 16) < 0) { closesocket(sock); return null; }
-    listen(sock, 10);
-    return new listener(sock);
+    if (osType() == OSTypes.WINDOWS) {
+        int sock = netWinListen(port);
+        if (sock < 0) { return null; }
+        return new listener(sock);
+    }
+    return null;
 }
