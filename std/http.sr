@@ -1,94 +1,43 @@
+import * from os;
+import * from http_win;
+
 mod export http;
 
+// DOCS -- public `http` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
+// unified, portable front of the HTTP client. It contains ZERO win32
+// references: every winhttp.dll call moved into the internal Windows backend
+// std/http_win.sr, and every entry below routes through the OS gate
+// `if (osType() == OSTypes.WINDOWS)` before touching it. See http_win.sr for
+// why the winhttp calls there are bound through `X as Y` import aliases and
+// for the behavior notes carried over from the pre-split implementation.
+//
+// The else branch of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For a
+// future non-Windows backend the fallbacks follow the module's existing
+// failure style: empty string.
+//
+// PUBLIC API (unchanged from the pre-split std/http.sr): get(url),
+// post(url, body), delete(url). The extractHost/extractPort/extractPath
+// helpers were private and moved into the backend under httpWin-prefixed
+// names (see http_win.sr).
+
 public string get(string url) {
-    int session = WinHttpOpen("Silver/1.0", 0, null, null, 0);
-    if (session == 0) { return ""; }
-    int conn = WinHttpConnect(session, extractHost(url), extractPort(url), 0);
-    if (conn == 0) { WinHttpCloseHandle(session); return ""; }
-    int req = WinHttpOpenRequest(conn, "GET", extractPath(url), null, null, null, 0);
-    if (req == 0) { WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
-    bool sent = WinHttpSendRequest(req, null, 0, null, 0, 0, 0);
-    if (!sent) { WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
-    bool recvd = WinHttpReceiveResponse(req, null);
-    if (!recvd) { WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
-    string result = "";
-    byte[] buf = new byte[4096];
-    int read = 0;
-    while (WinHttpReadData(req, buf, 4096, &read) && read > 0) {
-        for (int i = 0; i < read; i++) { result += char(buf[i]); }
+    if (osType() == OSTypes.WINDOWS) {
+        return httpWinGet(url);
     }
-    WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session);
-    return result;
+    return "";
 }
 
 public string post(string url, string body) {
-    int session = WinHttpOpen("Silver/1.0", 0, null, null, 0);
-    if (session == 0) { return ""; }
-    int conn = WinHttpConnect(session, extractHost(url), extractPort(url), 0);
-    if (conn == 0) { WinHttpCloseHandle(session); return ""; }
-    int req = WinHttpOpenRequest(conn, "POST", extractPath(url), null, null, null, 0);
-    if (req == 0) { WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
-    byte[] bodyBytes = body.toBytes();
-    bool sent = WinHttpSendRequest(req, "Content-Type: application/json\r\n", -1, bodyBytes, bodyBytes.length, bodyBytes.length, 0);
-    if (!sent) { WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
-    bool recvd = WinHttpReceiveResponse(req, null);
-    if (!recvd) { WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
-    string result = "";
-    byte[] buf = new byte[4096];
-    int read = 0;
-    while (WinHttpReadData(req, buf, 4096, &read) && read > 0) {
-        for (int i = 0; i < read; i++) { result += char(buf[i]); }
+    if (osType() == OSTypes.WINDOWS) {
+        return httpWinPost(url, body);
     }
-    WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session);
-    return result;
+    return "";
 }
 
 public string delete(string url) {
-    int session = WinHttpOpen("Silver/1.0", 0, null, null, 0);
-    if (session == 0) { return ""; }
-    int conn = WinHttpConnect(session, extractHost(url), extractPort(url), 0);
-    if (conn == 0) { WinHttpCloseHandle(session); return ""; }
-    int req = WinHttpOpenRequest(conn, "DELETE", extractPath(url), null, null, null, 0);
-    if (req == 0) { WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
-    bool sent = WinHttpSendRequest(req, null, 0, null, 0, 0, 0);
-    if (!sent) { WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
-    bool recvd = WinHttpReceiveResponse(req, null);
-    if (!recvd) { WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
-    string result = "";
-    byte[] buf = new byte[4096];
-    int read = 0;
-    while (WinHttpReadData(req, buf, 4096, &read) && read > 0) {
-        for (int i = 0; i < read; i++) { result += char(buf[i]); }
+    if (osType() == OSTypes.WINDOWS) {
+        return httpWinDelete(url);
     }
-    WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session);
-    return result;
-}
-
-private string extractHost(string url) {
-    int start = url.indexOf("://");
-    if (start >= 0) { start += 3; } else { start = 0; }
-    int end = url.indexOf(":", start);
-    if (end < 0) { end = url.indexOf("/", start); }
-    if (end < 0) { end = url.length(); }
-    return url.substr(start, end - start);
-}
-
-private int extractPort(string url) {
-    int start = url.indexOf("://");
-    if (start >= 0) { start += 3; } else { start = 0; }
-    int colon = url.indexOf(":", start);
-    if (colon < 0) {
-        if (url.substr(0, 5) == "https") { return 443; }
-        return 80;
-    }
-    int slash = url.indexOf("/", colon);
-    if (slash < 0) { slash = url.length(); }
-    return int(url.substr(colon + 1, slash - colon - 1));
-}
-
-private string extractPath(string url) {
-    int start = url.indexOf("://");
-    if (start >= 0) { start = url.indexOf("/", start + 3); }
-    if (start < 0) { return "/"; }
-    return url.substr(start);
+    return "";
 }

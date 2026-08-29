@@ -1,0 +1,140 @@
+import { WinHttpOpen as httpWinOpen, WinHttpConnect as httpWinConnect, WinHttpOpenRequest as httpWinOpenRequest, WinHttpSendRequest as httpWinSendRequest, WinHttpReceiveResponse as httpWinReceiveResponse, WinHttpReadData as httpWinReadData, WinHttpCloseHandle as httpWinCloseHandle } from win32.winhttp;
+
+internal mod export http_win;
+
+// DOCS -- INTERNAL Windows backend of the public `http` module
+// (UNIFIED_CORE_LIBRARY.md phase 2). Every winhttp.dll DLL call the http
+// module needs lives here and nowhere else: the public wrapper (std/http.sr)
+// contains zero win32 references and reaches this code only behind the OS
+// gate `if (osType() == OSTypes.WINDOWS)` (see std/os.sr for why the gate
+// calls the plain-Silver osType() stand-in instead of the native os.type
+// query).
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects (enforced by compiler/visibility.sr on single-file compiles;
+// .srp projects compile their whole source set as one project). A user file
+// that tries `import * from http_win;` fails with the standard internal-
+// visibility error.
+//
+// WINHTTP IMPORT ALIASING: the DLL exports are bound through explicit
+// `X as Y` import aliases rather than a full-table `import * from
+// win32.winhttp;` grant, so only the seven functions below are granted, the
+// grants answer to the local httpWin* names, and the PE import keeps the real
+// export (mirrors std/net_win.sr; see that file for why one flat compile
+// namespace makes local-name keying the safe default). The private URL
+// helpers moved here from the pre-split http.sr under httpWin-prefixed names:
+// they were private and used only by the request functions, so the public
+// API is unchanged.
+//
+// BEHAVIOR NOTES (bodies below are moved verbatim from the pre-split
+// std/http.sr, with the DLL call sites renamed to the alias locals):
+//   - Responses still accumulate with `result += char(buf[i])` loops.
+//     char(int) semantics currently differ between compilers (silverc-rs was
+//     aligned with silveri in commit 886e1a7; the self-host is a known
+//     outlier), so the shapes are preserved as-is to keep each compiler's
+//     behavior exactly where it was.
+//   - The read loop hands the DLL a `byte[]`, whose slots are qwords, so a
+//     raw byte stream written by WinHttpReadData only lines up with `buf[i]`
+//     for the first eight bytes; net_win.sr's int[] shift packing is the
+//     layout-safe idiom a future parity pass should apply here.
+//   - post() still serializes with body.toBytes(), which neither compiler
+//     implements as a real builtin (the self-host parses it but silently
+//     miscompiles the call); preserved verbatim for the reasons above.
+//   - The helpers' `url.length()` call sites became the `.length` property
+//     form (the only string-length spelling used by the std sources that
+//     actually compile, e.g. net_win.sr); the pre-split file never compiled
+//     under either compiler, so the original spelling was untested.
+
+internal string httpWinGet(string url) {
+    int session = httpWinOpen("Silver/1.0", 0, null, null, 0);
+    if (session == 0) { return ""; }
+    int conn = httpWinConnect(session, httpWinExtractHost(url), httpWinExtractPort(url), 0);
+    if (conn == 0) { httpWinCloseHandle(session); return ""; }
+    int req = httpWinOpenRequest(conn, "GET", httpWinExtractPath(url), null, null, null, 0);
+    if (req == 0) { httpWinCloseHandle(conn); httpWinCloseHandle(session); return ""; }
+    bool sent = httpWinSendRequest(req, null, 0, null, 0, 0, 0);
+    if (!sent) { httpWinCloseHandle(req); httpWinCloseHandle(conn); httpWinCloseHandle(session); return ""; }
+    bool recvd = httpWinReceiveResponse(req, null);
+    if (!recvd) { httpWinCloseHandle(req); httpWinCloseHandle(conn); httpWinCloseHandle(session); return ""; }
+    string result = "";
+    byte[] buf = new byte[4096];
+    int read = 0;
+    while (httpWinReadData(req, buf, 4096, &read) && read > 0) {
+        for (int i = 0; i < read; i++) { result += char(buf[i]); }
+    }
+    httpWinCloseHandle(req); httpWinCloseHandle(conn); httpWinCloseHandle(session);
+    return result;
+}
+
+internal string httpWinPost(string url, string body) {
+    int session = httpWinOpen("Silver/1.0", 0, null, null, 0);
+    if (session == 0) { return ""; }
+    int conn = httpWinConnect(session, httpWinExtractHost(url), httpWinExtractPort(url), 0);
+    if (conn == 0) { httpWinCloseHandle(session); return ""; }
+    int req = httpWinOpenRequest(conn, "POST", httpWinExtractPath(url), null, null, null, 0);
+    if (req == 0) { httpWinCloseHandle(conn); httpWinCloseHandle(session); return ""; }
+    byte[] bodyBytes = body.toBytes();
+    bool sent = httpWinSendRequest(req, "Content-Type: application/json\r\n", -1, bodyBytes, bodyBytes.length, bodyBytes.length, 0);
+    if (!sent) { httpWinCloseHandle(req); httpWinCloseHandle(conn); httpWinCloseHandle(session); return ""; }
+    bool recvd = httpWinReceiveResponse(req, null);
+    if (!recvd) { httpWinCloseHandle(req); httpWinCloseHandle(conn); httpWinCloseHandle(session); return ""; }
+    string result = "";
+    byte[] buf = new byte[4096];
+    int read = 0;
+    while (httpWinReadData(req, buf, 4096, &read) && read > 0) {
+        for (int i = 0; i < read; i++) { result += char(buf[i]); }
+    }
+    httpWinCloseHandle(req); httpWinCloseHandle(conn); httpWinCloseHandle(session);
+    return result;
+}
+
+internal string httpWinDelete(string url) {
+    int session = httpWinOpen("Silver/1.0", 0, null, null, 0);
+    if (session == 0) { return ""; }
+    int conn = httpWinConnect(session, httpWinExtractHost(url), httpWinExtractPort(url), 0);
+    if (conn == 0) { httpWinCloseHandle(session); return ""; }
+    int req = httpWinOpenRequest(conn, "DELETE", httpWinExtractPath(url), null, null, null, 0);
+    if (req == 0) { httpWinCloseHandle(conn); httpWinCloseHandle(session); return ""; }
+    bool sent = httpWinSendRequest(req, null, 0, null, 0, 0, 0);
+    if (!sent) { httpWinCloseHandle(req); httpWinCloseHandle(conn); httpWinCloseHandle(session); return ""; }
+    bool recvd = httpWinReceiveResponse(req, null);
+    if (!recvd) { httpWinCloseHandle(req); httpWinCloseHandle(conn); httpWinCloseHandle(session); return ""; }
+    string result = "";
+    byte[] buf = new byte[4096];
+    int read = 0;
+    while (httpWinReadData(req, buf, 4096, &read) && read > 0) {
+        for (int i = 0; i < read; i++) { result += char(buf[i]); }
+    }
+    httpWinCloseHandle(req); httpWinCloseHandle(conn); httpWinCloseHandle(session);
+    return result;
+}
+
+internal string httpWinExtractHost(string url) {
+    int start = url.indexOf("://");
+    if (start >= 0) { start += 3; } else { start = 0; }
+    int end = url.indexOf(":", start);
+    if (end < 0) { end = url.indexOf("/", start); }
+    if (end < 0) { end = url.length; }
+    return url.substr(start, end - start);
+}
+
+internal int httpWinExtractPort(string url) {
+    int start = url.indexOf("://");
+    if (start >= 0) { start += 3; } else { start = 0; }
+    int colon = url.indexOf(":", start);
+    if (colon < 0) {
+        if (url.substr(0, 5) == "https") { return 443; }
+        return 80;
+    }
+    int slash = url.indexOf("/", colon);
+    if (slash < 0) { slash = url.length; }
+    return int(url.substr(colon + 1, slash - colon - 1));
+}
+
+internal string httpWinExtractPath(string url) {
+    int start = url.indexOf("://");
+    if (start >= 0) { start = url.indexOf("/", start + 3); }
+    if (start < 0) { return "/"; }
+    return url.substr(start);
+}
