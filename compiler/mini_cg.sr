@@ -3343,6 +3343,7 @@ int strIdx = this.stringPatchIndices[i];
                     }
                 }
             }
+            if (!expr.isMember && this.strEq(cname, "char")) { return "char"; }
             string recvType = "";
             if (expr.isMember && expr.childCount() > 0) {
                 recvType = this.inferExprType(expr.child(0));
@@ -7126,7 +7127,7 @@ public void genNewCall(Node call) {
         if (this.strEq(name, "toString")) {
             if (this.strEq(recvType, "string")) {
                 this.genExpr(recv);
-            } elif (this.strEq(recvType, "char")) {
+            } elif (this.isCharExpr(recv)) {
                 this.genCharToString(recv);
             } elif (this.strEq(recvType, "float") || this.strEq(recvType, "float64") || this.strEq(recvType, "double")) {
                 this.genFloatToString(recv);
@@ -9425,6 +9426,27 @@ public void genNewCall(Node call) {
         return false;
     }
 
+    public bool isCharExpr(Node expr) {
+        if (expr.kind == 3) { return true; }
+        if (expr.kind == 6) {
+            string t = this.getLocalType(expr.name);
+            return this.strEq(t, "char") || this.strEq(t, "char?");
+        }
+        if (expr.kind == 24) {
+            if (expr.childCount() > 0) { return this.strEq(this.inferExprType(expr.child(0)), "string"); }
+            return false;
+        }
+        if (expr.kind == 23) {
+            if (expr.childCount() > 0) { return this.isCharExpr(expr.child(0)); }
+            return false;
+        }
+        if (expr.kind == 10) {
+            if (!expr.isMember && this.strEq(expr.name, "char")) { return true; }
+            return this.strEq(this.inferExprType(expr), "char");
+        }
+        return false;
+    }
+
     public bool isFloatLike(Node expr) {
         // True for expressions that evaluate to a float64/float/double: float
         // literals (kind 1), float locals/fields, and arithmetic on floats.
@@ -9559,16 +9581,20 @@ public void genNewCall(Node call) {
             this.asm.emitCallTeardown();
         } else {
             this.genExpr(arg);
+            bool charLike = this.isCharExpr(arg);
+            if (charLike) { this.asm.andRImm(0, 0xFF); }
             this.asm.pushR64(0);
             bool strLike = this.isStringLike(arg);
             bool fltLike = this.isFloatLike(arg);
             if (newline) {
                 if (strLike) { this.addFormatStr("%s\n"); }
                 elif (fltLike) { this.addFormatStr("%g\n"); }
+                elif (charLike) { this.addFormatStr("%c\n"); }
                 else { this.addFormatStr("%lld\n"); }
             } else {
                 if (strLike) { this.addFormatStr("%s"); }
                 elif (fltLike) { this.addFormatStr("%g"); }
+                elif (charLike) { this.addFormatStr("%c"); }
                 else { this.addFormatStr("%lld"); }
             }
             this.asm.popR64(2);
@@ -9889,7 +9915,7 @@ public void genNewCall(Node call) {
     public void genStringConcat(Node bin) {
         if (bin.childCount() < 2) { return; }
         string rt = this.inferExprType(bin.child(1));
-        bool rtNullableChar = this.strEq(rt, "char?") || this.strEq(rt, "char");
+        bool rtNullableChar = this.isCharExpr(bin.child(1));
 
         if (rtNullableChar) {
             this.genCharToString(bin.child(1));
@@ -9901,7 +9927,7 @@ public void genNewCall(Node call) {
         int rhsOff = this.allocLocal("__cc_rhs");
         this.asm.movMBaseR(5, 0, rhsOff);
         string lt = this.inferExprType(bin.child(0));
-        bool ltNullableChar = this.strEq(lt, "char?") || this.strEq(lt, "char");
+        bool ltNullableChar = this.isCharExpr(bin.child(0));
         if (ltNullableChar) {
             this.genCharToString(bin.child(0));
         } elif (this.strEq(lt, "string")) {
