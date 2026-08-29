@@ -1,12 +1,70 @@
-import * from win32.kernel32;
+import * from os;
+import * from datetime_win;
 
 mod export datetime;
+
+// DOCS -- public `datetime` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is
+// the unified, portable front of the date/time library. It contains ZERO
+// win32 imports: every kernel32 call moved into the internal Windows backend
+// std/datetime_win.sr, and every DLL-backed entry below routes through the
+// OS gate `if (osType() == OSTypes.WINDOWS)` before touching it.
+//
+// The gate uses osType() (std/os.sr) instead of the native `os.type` query
+// because the self-hosted backend's builtin `os` dispatch covers only
+// os.name/os.version/os.build today -- `os.type` miscompiles there in both
+// spellings (see std/time.sr for the full notes). osType() is plain Silver:
+// it returns the OSTypes.WINDOWS contract value on every implementation
+// without needing native support.
+//
+// The else side of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
+// a future non-Windows backend the fallbacks follow the module's failure
+// style: a default-constructed `now` keeps zero fields. unix()/diff() are
+// pure arithmetic over whatever fields the instance holds and need no gate.
+//
+// OPERATOR NOTE: the pre-split file declared the difference operation as
+// `public duration operator-(now other)`. Silver has no operator overloading
+// -- SPEC.md defines no `operatorX` member syntax and no compiler ever
+// accepted that line (it has failed to parse since the file's initial
+// commit, so no runtime behavior existed to preserve). The operation now
+// lives under its legal name `diff`, body unchanged: `a.diff(b)` yields
+// a's epoch minus b's epoch in milliseconds (negative when b is later),
+// exactly what the pre-split operator body computed.
+//
+// UNIX NOTE: the pre-split unix() sketched GetSystemTime +
+// SystemTimeToFileTime + epoch arithmetic, but SystemTimeToFileTime exists
+// in neither compiler's kernel32 export table (and that body never compiled
+// anywhere either). unix() is now pure Silver: it applies the standard
+// civil-date algorithm (days_from_civil) to the instance's own fields --
+// which is also what the module's only caller expected, since `diff`
+// subtracts the two RECEIVERS rather than two wall-clock reads. Every
+// intermediate stays positive for any SYSTEMTIME year (wYear >= 1601), so
+// truncating division behaves like floor division and the result is seconds
+// since 1970-01-01T00:00:00 UTC with the instance fields read as UTC.
+//
+// CONSTRUCTOR NOTE: the pre-split file declared two constructors per class
+// (`construct()` + a parameterized one). Both compiler backends lower every
+// constructor of a class to the single symbol `<Class>__construct` -- the
+// last-declared overload wins and a zero-argument `new X()` then calls it
+// with garbage arguments (verified with minimal probes on both compilers),
+// so overloaded constructors cannot express this API. Instead each class
+// declares ONE constructor with trailing default parameters (a supported
+// mechanism -- codegen materializes missing trailing args for `new`):
+// `new now()` still means "current local time" (the -1 sentinel selects the
+// gated GetLocalTime path) and `new now(y,m,d,h,mi,s)` a fixed moment.
+// Every field is assigned on every path because the self-hosted backend
+// does not zero fresh object memory (unset fields read as garbage there).
+//
+// FORMAT NOTE: the specifier pads use if/else locals instead of the
+// string ternary `(cond ? "0" : "") + field`: the self-hosted backend
+// garbles string-typed ternaries concatenated with an int field (probe:
+// the ternary arm collapses to "" and the field value is lost), while the
+// if/else shape compiles identically on both backends.
 
 class duration {
     private int64 totalMs;
 
-    construct() { this.totalMs = 0; }
-    construct(int64 ms) { this.totalMs = ms; }
+    construct(int64 ms = 0) { this.totalMs = ms; }
 
     public int64 days() { return this.totalMs / 86400000; }
     public int64 hours() { return this.totalMs / 3600000; }
@@ -24,21 +82,35 @@ class now {
     public int second;
     public int millisecond;
 
-    construct() {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        this.year = st.wYear;
-        this.month = st.wMonth;
-        this.day = st.wDay;
-        this.hour = st.wHour;
-        this.minute = st.wMinute;
-        this.second = st.wSecond;
-        this.millisecond = st.wMilliseconds;
-    }
-
-    construct(int y, int m, int d, int h, int mi, int s) {
-        this.year = y; this.month = m; this.day = d;
-        this.hour = h; this.minute = mi; this.second = s;
+    construct(int y = -1, int m = 0, int d = 0, int h = 0, int mi = 0, int s = 0) {
+        if (y == -1) {
+            if (osType() == OSTypes.WINDOWS) {
+                int[] f = datetimeWinLocalFields();
+                this.year = f[0];
+                this.month = f[1];
+                this.day = f[2];
+                this.hour = f[3];
+                this.minute = f[4];
+                this.second = f[5];
+                this.millisecond = f[6];
+            } else {
+                this.year = 0;
+                this.month = 0;
+                this.day = 0;
+                this.hour = 0;
+                this.minute = 0;
+                this.second = 0;
+                this.millisecond = 0;
+            }
+        } else {
+            this.year = y;
+            this.month = m;
+            this.day = d;
+            this.hour = h;
+            this.minute = mi;
+            this.second = s;
+            this.millisecond = 0;
+        }
     }
 
     public string format(string fmt) {
@@ -46,13 +118,31 @@ class now {
         for (int i = 0; i < fmt.length(); i++) {
             if (fmt[i] == '%' && i + 1 < fmt.length()) {
                 char c = fmt[i + 1]; i++;
-                if (c == 'Y') { result += this.year.toString(); }
-                else if (c == 'm') { result += (this.month < 10 ? "0" : "") + this.month; }
-                else if (c == 'd') { result += (this.day < 10 ? "0" : "") + this.day; }
-                else if (c == 'H') { result += (this.hour < 10 ? "0" : "") + this.hour; }
-                else if (c == 'M') { result += (this.minute < 10 ? "0" : "") + this.minute; }
-                else if (c == 'S') { result += (this.second < 10 ? "0" : "") + this.second; }
-                else { result += c; }
+                if (c == 'Y') {
+                    result += this.year.toString();
+                } else if (c == 'm') {
+                    string pad = "";
+                    if (this.month < 10) { pad = "0"; }
+                    result += pad + this.month;
+                } else if (c == 'd') {
+                    string pad = "";
+                    if (this.day < 10) { pad = "0"; }
+                    result += pad + this.day;
+                } else if (c == 'H') {
+                    string pad = "";
+                    if (this.hour < 10) { pad = "0"; }
+                    result += pad + this.hour;
+                } else if (c == 'M') {
+                    string pad = "";
+                    if (this.minute < 10) { pad = "0"; }
+                    result += pad + this.minute;
+                } else if (c == 'S') {
+                    string pad = "";
+                    if (this.second < 10) { pad = "0"; }
+                    result += pad + this.second;
+                } else {
+                    result += c;
+                }
             } else {
                 result += fmt[i];
             }
@@ -61,17 +151,22 @@ class now {
     }
 
     public int64 unix() {
-        SYSTEMTIME st;
-        GetSystemTime(&st);
-        FILETIME ft;
-        SystemTimeToFileTime(&st, &ft);
-        int64 epochDiff = 116444736000000000;
-        return (ft.dwHighDateTime << 32 | ft.dwLowDateTime - epochDiff) / 10000000;
+        int64 y = this.year;
+        int64 m = this.month;
+        int64 d = this.day;
+        if (m <= 2) { y = y - 1; }
+        int64 era = y / 400;
+        int64 yoe = y - era * 400;
+        int64 mp = (m + 9) % 12;
+        int64 doy = (153 * mp + 2) / 5 + d - 1;
+        int64 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        int64 days = era * 146097 + doe - 719468;
+        return days * 86400 + this.hour * 3600 + this.minute * 60 + this.second;
     }
 
-    public duration operator-(now other) {
-        int64 diff = (this.unix() - other.unix()) * 1000;
-        return new duration(diff);
+    public duration diff(now other) {
+        int64 ms = (this.unix() - other.unix()) * 1000;
+        return new duration(ms);
     }
 }
 
@@ -80,11 +175,13 @@ public now now() {
 }
 
 public now utcNow() {
-    SYSTEMTIME st;
-    GetSystemTime(&st);
     now n = new now();
-    n.year = st.wYear; n.month = st.wMonth; n.day = st.wDay;
-    n.hour = st.wHour; n.minute = st.wMinute; n.second = st.wSecond;
+    if (osType() == OSTypes.WINDOWS) {
+        int[] f = datetimeWinUtcFields();
+        n.year = f[0]; n.month = f[1]; n.day = f[2];
+        n.hour = f[3]; n.minute = f[4]; n.second = f[5];
+        n.millisecond = f[6];
+    }
     return n;
 }
 
