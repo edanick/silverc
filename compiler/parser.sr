@@ -48,6 +48,18 @@ class Parser {
     // `internal:` section marker active inside the class body being parsed
     // (reset by `public:`/`private:` and at the start of every class).
     private bool classSectionInternal;
+    // DOCS/259 -- function-typed parameters (`void () name`) of the function
+    // whose body the call-diagnostics walk is currently inside. A zero-arg
+    // call to one of these names invokes the stored address instead of a
+    // declared function, so the unknown-call check must accept it.
+    private string[] fnPtrCallScope;
+    // DOCS/259 -- top-level variable names, collected before the diagnostics
+    // walk. Anonymous function bodies are isolated scopes: their identifier
+    // uses resolve against their own locals, these globals, and the file's
+    // known symbols -- never against the enclosing function's locals.
+    private string[] anonKnownGlobals;
+    // Depth of anonymous-function bodies the diagnostics walk is inside.
+    private int anonWalkDepth;
 
     construct (Token[] toks) {
         this.tokens = toks;
@@ -69,6 +81,9 @@ class Parser {
         this.modExportNames = [];
         this.modExportInternal = [];
         this.classSectionInternal = false;
+        this.fnPtrCallScope = [];
+        this.anonKnownGlobals = [];
+        this.anonWalkDepth = 0;
     }
 
     // Provide per-line character lengths so bracket diagnostics can point
@@ -445,12 +460,57 @@ class Parser {
     // VALUE_EXCEPTION.md — filesystem calls receiving a URL or an unusable
     // path literal where a file path is required.
     public void checkCallDiagnostics(Node[] ast) {
+        // DOCS/259 -- top-level variable declarations are the globals an
+        // anonymous body may legally reference (its enclosing function's
+        // locals may not).
+        this.anonKnownGlobals = [];
+        for (int g = 0; g < ast.length; g++) {
+            if (ast[g].kind == 50) { this.anonKnownGlobals.add(ast[g].name); }
+        }
         for (int i = 0; i < ast.length; i++) {
             this.walkCallDiagnostics(ast[i]);
         }
     }
 
     private void walkCallDiagnostics(Node n) {
+        if (n.kind == 100) {
+            // DOCS/259 -- the enclosing function's fn-typed parameters are
+            // invocable as zero-arg calls within its body only. The scope is
+            // extended on a copy so the saved array stays untouched.
+            string[] savedScope = this.fnPtrCallScope;
+            string[] extended = [];
+            for (int sc = 0; sc < savedScope.length; sc++) { extended.add(savedScope[sc]); }
+            if (n.childCount() > 0) {
+                Node fnParams = n.child(0);
+                for (int fp = 0; fp < fnParams.childCount(); fp++) {
+                    if (this.strEq(fnParams.child(fp).typeHint, "void ()")) {
+                        extended.add(fnParams.child(fp).name);
+                    }
+                }
+            }
+            this.fnPtrCallScope = extended;
+            for (int fc = 0; fc < n.childCount(); fc++) {
+                this.walkCallDiagnostics(n.child(fc));
+            }
+            this.fnPtrCallScope = savedScope;
+            return;
+        }
+        if (n.kind == 85) {
+            // DOCS/259 -- an anonymous function body is an isolated scope:
+            // enclosing fn-typed parameters and locals are not visible, so
+            // its identifier uses are validated against its own locals, the
+            // file's globals, and the known symbol table.
+            string[] savedScope = this.fnPtrCallScope;
+            this.fnPtrCallScope = [];
+            this.anonWalkDepth = this.anonWalkDepth + 1;
+            Node anonBody = n.child(0);
+            string[] anonLocals = [];
+            this.collectAnonBodyLocals(anonBody, anonLocals);
+            this.checkAnonBodyIdentifiers(anonBody, anonLocals);
+            this.anonWalkDepth = this.anonWalkDepth - 1;
+            this.fnPtrCallScope = savedScope;
+            return;
+        }
         if (n.kind == 10 && n.line > 0) {
             // Recovery-built call nodes carry no source position and already
             // reported their own syntax error.
@@ -470,6 +530,17 @@ class Parser {
     private void checkPlainCallTarget(Node call) {
         string name = call.name;
         if (name.length == 0) { return; }
+        // DOCS/259 -- invoking a function-typed parameter of the enclosing
+        // function: allowed for zero-arg calls only (the stored address is
+        // called, arguments cannot be passed).
+        if (this.anonWalkDepth == 0 && call.childCount() == 0 && this.fnPtrCallScopeHas(name)) { return; }
+        if (this.anonWalkDepth > 0) {
+            // DOCS/259 -- inside an isolated anonymous body an unresolved
+            // call is reported with the reference checker's wording.
+            if (this.isKnownCallableName(name)) { return; }
+            this.recordError(call.line.toString() + ":" + call.col.toString() + ": Undefined function '" + name + "'");
+            return;
+        }
         if (this.isKnownCallableName(name)) { return; }
         string sugg = diagClosestMatch(name, this.callableCandidates());
         if (sugg.length > 0) {
@@ -477,6 +548,88 @@ class Parser {
         } else {
             this.recordError("unknown method \"" + name + "\", at line " + call.line.toString() + ", column " + call.col.toString());
         }
+    }
+
+    // DOCS/259 -- declared names inside an anonymous body (its own locals).
+    private void collectAnonBodyLocals(Node n, string[] locals) {
+        if (n.kind == 50 && n.name.length > 0) { locals.add(n.name); }
+        if (n.kind == 73 && n.name.length > 0) { locals.add(n.name); }
+        if (n.kind == 21 && n.childCount() > 0) {
+            // Match-arm binding patterns introduce a local in the arm body.
+            Node pat = n.child(0);
+            if (pat.kind == 6 && pat.name.length > 0 && !this.strEq(pat.name, "_")) { locals.add(pat.name); }
+        }
+        for (int i = 0; i < n.childCount(); i++) {
+            this.collectAnonBodyLocals(n.child(i), locals);
+        }
+    }
+
+    // DOCS/259 -- validate identifier uses inside an anonymous body against
+    // its own locals and the file-level symbol table. Enclosing locals are
+    // deliberately NOT consulted: the body compiles to a standalone function.
+    private void checkAnonBodyIdentifiers(Node n, string[] locals) {
+        if (n.kind == 74) {
+            // Struct literal keys are field names, not identifier uses.
+            for (int i = 0; i < n.childCount(); i++) {
+                Node pair = n.child(i);
+                if (pair.childCount() > 1) { this.checkAnonBodyIdentifiers(pair.child(1), locals); }
+            }
+            return;
+        }
+        if (n.kind == 21 && n.childCount() > 0) {
+            // Match-arm patterns bind, they do not use.
+            for (int i = 1; i < n.childCount(); i++) {
+                this.checkAnonBodyIdentifiers(n.child(i), locals);
+            }
+            return;
+        }
+        if (n.kind == 6) {
+            string name = n.name;
+            if (name.length > 0 && !this.strEq(name, "this") && !this.strEq(name, "null")) {
+                if (!this.anonIdentResolves(name, locals)) {
+                    this.recordError(n.line.toString() + ":" + n.col.toString() + ": Undefined variable '" + name + "'");
+                }
+            }
+        }
+        for (int i = 0; i < n.childCount(); i++) {
+            this.checkAnonBodyIdentifiers(n.child(i), locals);
+        }
+    }
+
+    private bool anonIdentResolves(string name, string[] locals) {
+        for (int i = 0; i < locals.length; i++) {
+            if (this.strEq(locals[i], name)) { return true; }
+        }
+        for (int g = 0; g < this.anonKnownGlobals.length; g++) {
+            if (this.strEq(this.anonKnownGlobals[g], name)) { return true; }
+        }
+        if (this.knownIdentName(name)) { return true; }
+        for (int s = 0; s < this.sigNames.length; s++) {
+            if (this.strEq(this.sigNames[s], name)) { return true; }
+        }
+        if (this.isDeclaredTypeName(name)) { return true; }
+        // Module receivers (`time.now()` inside the body): the aggregate's
+        // declared modules resolve like silverc-rs's module_names set.
+        for (int m = 0; m < this.modExportNames.length; m++) {
+            if (this.strEq(this.modExportNames[m], name)) { return true; }
+        }
+        if (this.win32Resolvable(name)) { return true; }
+        if (name.length > 0) {
+            bool allCaps = true;
+            for (int c = 0; c < name.length; c++) {
+                char ch = name[c];
+                if (!((ch >= 'A' && ch <= 'Z') || ch == '_')) { allCaps = false; }
+            }
+            if (allCaps) { return true; }
+        }
+        return false;
+    }
+
+    private bool fnPtrCallScopeHas(string name) {
+        for (int i = 0; i < this.fnPtrCallScope.length; i++) {
+            if (this.strEq(this.fnPtrCallScope[i], name)) { return true; }
+        }
+        return false;
     }
 
     private bool isKnownCallableName(string name) {
@@ -1527,6 +1680,13 @@ class Parser {
             // A `{` (or any token that cannot start a type) before the closing
             // parenthesis means the `)` itself is missing.
             if (!this.tokenStartsParam(this.peek().kind)) { break; }
+            // DOCS/259 -- the C-style `function` keyword does not exist in
+            // Silver; report it verbatim where a parameter type is expected.
+            if (this.rejectCStyleFunctionParam()) {
+                this.skipDamagedFunction();
+                this.registerDamagedSignature(node.name);
+                return node;
+            }
             Node param = new Node();
             string pt = this.advance().text;
             if (this.check(120)) {
@@ -1537,6 +1697,24 @@ class Parser {
             }
             if (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } pt = pt + "[]"; }
             if (this.check(123)) { this.advance(); pt = pt + "?"; }
+            if (this.check(100)) {
+                // DOCS/259 -- function-typed parameter suffix: `void () name`
+                // stores an 8-byte function address in the parameter slot.
+                // Only the supported `void ()` shape is accepted; any other
+                // shape (parameters, non-void return types) is rejected.
+                if (this.strEq(pt, "void") && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 101) {
+                    this.advance();
+                    this.advance();
+                    pt = "void ()";
+                } else {
+                    Token ftTok = this.peek();
+                    this.recordError(ftTok.line.toString() + ":" + ftTok.col.toString() + ": Unexpected token '(: function-typed parameters support only `void () name`; other shapes are not supported yet (see DOCS/259)'");
+                    this.skipBalancedParens();
+                    this.skipDamagedFunction();
+                    this.registerDamagedSignature(node.name);
+                    return node;
+                }
+            }
             if (this.check(147)) {
                 // Variadic tail `Type ... name`: the callee receives an array
                 // of the element type (DOCS/112).
@@ -2566,6 +2744,34 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         }
 
         if (kind == 100) {
+            // DOCS/259 -- anonymous function argument. The supported form is
+            // `(void () { ... })`; the lookahead is `void` `(` `)` `{`.
+            if (this.check(17) && this.pos + 3 < this.tokens.length
+                && this.tokens[this.pos + 1].kind == 100
+                && this.tokens[this.pos + 2].kind == 101
+                && this.tokens[this.pos + 3].kind == 102) {
+                this.advance();
+                this.advance();
+                this.advance();
+                Node anonBody = this.parseBlock();
+                this.expect(101);
+                Node anon = new Node();
+                anon.kind = 85;
+                anon.line = t.line;
+                anon.col = t.col;
+                anon.children.add(anonBody);
+                return anon;
+            }
+            // DOCS/259 -- an anonymous-function attempt whose shape is not the
+            // supported `void ()`: a type keyword, `(`, a balanced parameter
+            // list, then `{`. Reported instead of a generic parse failure.
+            if (this.isUnsupportedAnonFnAhead()) {
+                this.recordError(t.line.toString() + ":" + t.col.toString() + ": Unexpected token '(: only `void ()` anonymous functions are supported; parameters and non-void return types in function types are not supported yet (see DOCS/259)'");
+                this.skipAnonFnShapedTokens();
+                Node unsupportedNul = new Node();
+                unsupportedNul.kind = 5;
+                return unsupportedNul;
+            }
             // C-style casts used by legacy/runtime modules, e.g. `(int) c`.
             // Integer and character values share the native scalar
             // representation, so the self-hosted backend can lower these
@@ -2696,6 +2902,21 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             return bad;
         }
 
+        if (kind == 17) {
+            // DOCS/259: an anonymous function argument must be wrapped in
+            // parentheses — `void () { ... }` alone is not a value. Recovery
+            // consumes the anon-shaped tokens so the damaged region reports
+            // only this error.
+            if (this.check(100)) {
+                this.recordError(t.line.toString() + ":" + t.col.toString() + ": Unexpected token 'void: the anonymous function must be wrapped in parentheses — write (void () { ... }) (see DOCS/259)'");
+                this.skipBalancedParens();
+                if (this.check(102)) { this.skipBalancedBraces(); }
+                Node wrapNul = new Node();
+                wrapNul.kind = 5;
+                return wrapNul;
+            }
+        }
+
         Node ident = new Node(); ident.kind = 6; ident.name = t.text;
         return ident;
     }
@@ -2743,6 +2964,148 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             n.children.add(tn);
         }
         return n;
+    }
+
+    // ---- DOCS/259 helpers ---------------------------------------------------
+
+    // Reject the C-style `function` keyword at the point a parameter type is
+    // expected. `function` is not a Silver keyword (it lexes as an
+    // identifier), so the check matches the identifier's text.
+    private bool rejectCStyleFunctionParam() {
+        Token t = this.peek();
+        if (t.kind == 7 && this.strEq(t.text, "function")) {
+            this.recordError(t.line.toString() + ":" + t.col.toString() + ": Unexpected token 'function: function-typed parameters are declared `void () name` and passed as `(void () { ... })` — C-style `function` keyword is not Silver (see DOCS/259)'");
+            return true;
+        }
+        return false;
+    }
+
+    // After a verbatim DOCS/259 rejection: consume the damaged function's
+    // remaining tokens (rest of the parameter list, optional arrow/return
+    // type, body) so the report contains exactly the one error.
+    private void skipDamagedFunction() {
+        int depth = 1;
+        while (!this.check(0)) {
+            if (this.check(100)) {
+                depth = depth + 1;
+                this.advance();
+            } elif (this.check(101)) {
+                depth = depth - 1;
+                this.advance();
+                if (depth == 0) { break; }
+            } else {
+                this.advance();
+            }
+        }
+        if (this.check(145)) {
+            while (!this.check(0) && !this.check(102) && !this.check(106)) { this.advance(); }
+            if (this.check(106)) { this.advance(); }
+        }
+        if (this.check(141) || this.check(140)) {
+            this.advance();
+            while (!this.check(0) && !this.check(106) && !this.check(103)) { this.advance(); }
+            if (this.check(106)) { this.advance(); }
+        } elif (this.check(102)) {
+            this.skipBalancedBraces();
+            if (this.check(106)) { this.advance(); }
+        }
+    }
+
+    // DOCS/259 -- register a rejected function's name as a known (empty)
+    // signature so call sites in the remaining program text do not produce
+    // follow-on unknown-method noise.
+    private void registerDamagedSignature(string name) {
+        this.sigNames.add(name);
+        this.sigTypes.add("");
+        this.sigParams.add("");
+        this.sigVariadic.add(0);
+    }
+
+    // DOCS/259 -- after the outer `(` of a parenthesized expression has been
+    // consumed, decide whether what follows is an anonymous-function attempt
+    // whose shape is not the supported `void ()`: a type keyword, `(`, a
+    // balanced parameter list, then `{`.
+    private bool isUnsupportedAnonFnAhead() {
+        bool typeKw = this.check(17) || this.check(18) || this.check(19) || this.check(20)
+            || this.check(22) || this.check(23) || this.check(25) || this.check(26) || this.check(27);
+        if (!typeKw) {
+            // uint/byte/double/long lex as identifiers in this grammar.
+            if (this.check(7)) {
+                string w = this.peek().text;
+                typeKw = this.strEq(w, "uint") || this.strEq(w, "byte") || this.strEq(w, "double")
+                    || this.strEq(w, "long") || this.strEq(w, "boolean");
+            }
+        }
+        if (!typeKw) { return false; }
+        if (this.pos + 1 >= this.tokens.length || this.tokens[this.pos + 1].kind != 100) { return false; }
+        int depth = 0;
+        int i = this.pos + 1;
+        while (i < this.tokens.length) {
+            int k = this.tokens[i].kind;
+            if (k == 100) {
+                depth = depth + 1;
+                i = i + 1;
+            } elif (k == 101) {
+                depth = depth - 1;
+                i = i + 1;
+                if (depth == 0) { break; }
+            } elif (k == 0) {
+                return false;
+            } else {
+                i = i + 1;
+            }
+        }
+        if (i >= this.tokens.length) { return false; }
+        return this.tokens[i].kind == 102;
+    }
+
+    // Consume the rejected `( Type ( ... ) { ... } )` shape so the damaged
+    // region produces no follow-on errors. The outer `(` is already consumed
+    // when this runs.
+    private void skipAnonFnShapedTokens() {
+        this.skipBalancedParens();
+        if (this.check(102)) { this.skipBalancedBraces(); }
+        if (this.check(101)) { this.advance(); }
+    }
+
+    // From the current token, consume a balanced `(...)` run including the
+    // opening parenthesis. A leading `)` that would take the depth negative
+    // is left in place (mirrors the reference lookahead walker).
+    private void skipBalancedParens() {
+        int depth = 0;
+        bool started = false;
+        while (!this.check(0)) {
+            if (this.check(100)) {
+                depth = depth + 1;
+                started = true;
+                this.advance();
+            } elif (this.check(101)) {
+                if (!started) { return; }
+                depth = depth - 1;
+                this.advance();
+                if (depth == 0) { return; }
+            } else {
+                this.advance();
+            }
+        }
+    }
+
+    // From the current token (expected to be `{`), consume through the
+    // matching closing brace.
+    private void skipBalancedBraces() {
+        int depth = 0;
+        while (!this.check(0)) {
+            if (this.check(102)) {
+                depth = depth + 1;
+                this.advance();
+            } elif (this.check(103)) {
+                depth = depth - 1;
+                this.advance();
+                if (depth == 0) { return; }
+            } else {
+                this.advance();
+            }
+        }
     }
 
     private Node parsePattern() {

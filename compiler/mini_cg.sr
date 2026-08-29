@@ -127,6 +127,25 @@ class MiniCg {
     public prop int[] refCalleeParams;
     public prop string[] refParams;
 
+    // DOCS/259 -- anonymous function arguments `(void () { ... })`. Each
+    // expression occurrence queues a standalone generated function (name,
+    // label, body block) that is emitted after all program functions; the
+    // expression itself evaluates to the generated function's address via an
+    // absolute-VA placeholder patched at layout time. Bodies may queue
+    // further anonymous functions, so the queue drains until empty.
+    public prop int anonCounter;
+    public prop string[] pendingAnonNames;
+    public prop int[] pendingAnonLabels;
+    public prop Node[] pendingAnonBodies;
+    // (label id, imm64 patch position) pairs for `mov rax, <anon address>`
+    // placeholders, patched to IMAGE_BASE + text_rva + label position.
+    public prop int[] anonRelocLabelIds;
+    public prop int[] anonRelocPatchOffsets;
+    // Function-typed parameters (`void () name`) of the function currently
+    // being emitted; invoking one emits an indirect call through the
+    // parameter slot's stored address.
+    public prop string[] fnPtrParamNames;
+
     // Optional codegen progress reporter: when non-null the driver calls
     // codegenTick after each function body is generated so long compiles
     // show movement.
@@ -225,6 +244,13 @@ class MiniCg {
         this.refCalleeParams = [];
         this.refParams = [];
         this.progress = null;
+        this.anonCounter = 0;
+        this.pendingAnonNames = [];
+        this.pendingAnonLabels = [];
+        this.pendingAnonBodies = [];
+        this.anonRelocLabelIds = [];
+        this.anonRelocPatchOffsets = [];
+        this.fnPtrParamNames = [];
     }
 
     public void collectClassLayouts(Node[] program) {
@@ -1191,6 +1217,9 @@ int strIdx = this.stringPatchIndices[i];
                 }
             }
         }
+        // DOCS/259: emit queued anonymous function bodies as standalone
+        // functions and patch their address placeholders to absolute VAs.
+        this.drainAnonFunctions();
         if (this.globalNames.length > 0) {
             this.emitGlobalInitStub();
         }
@@ -1600,12 +1629,17 @@ int strIdx = this.stringPatchIndices[i];
     int[] paramRegs = [1, 2, 8, 9];
     int numParams = 0;
     this.collectRefParams(func);
+    this.fnPtrParamNames = [];
     if (func.childCount() > 0) {
         Node params = func.child(0);
         numParams = params.childCount();
         for (int i = 0; i < params.childCount(); i++) {
             this.allocLocal(params.child(i).name);
             this.localTypes[this.localTypes.length - 1] = params.child(i).typeHint;
+            if (this.strEq(params.child(i).typeHint, "void ()")) {
+                // DOCS/259: an 8-byte function address, stored like an int.
+                this.fnPtrParamNames.add(params.child(i).name);
+            }
         }
     }
     this.emitFunctionBody(func);
@@ -1636,6 +1670,7 @@ int strIdx = this.stringPatchIndices[i];
     this.stackSize = 0;
     this.currentClassName = "";
     this.collectRefParams(func);
+    this.fnPtrParamNames = [];
     this.asm.label(func.name);
     this.asm.pushR64(5);
     this.asm.movRR64(5, 4);
@@ -1644,6 +1679,10 @@ int strIdx = this.stringPatchIndices[i];
         for (int i = 0; i < paramsFn.childCount(); i++) {
             this.allocLocal(paramsFn.child(i).name);
             this.localTypes[this.localTypes.length - 1] = paramsFn.child(i).typeHint;
+            if (this.strEq(paramsFn.child(i).typeHint, "void ()")) {
+                // DOCS/259: an 8-byte function address, stored like an int.
+                this.fnPtrParamNames.add(paramsFn.child(i).name);
+            }
         }
     }
 
@@ -2927,7 +2966,108 @@ int strIdx = this.stringPatchIndices[i];
                     this.genExpr(addrChild);
                 }
             }
+        } elif (kind == 85) {
+            // DOCS/259: `(void () { ... })` lowers to a standalone generated
+            // `void ()` function emitted after all program functions (see
+            // drainAnonFunctions); the expression's value is that function's
+            // address, placed here as a placeholder patched at layout time.
+            this.genAnonFunctionArg(expr);
         }
+    }
+
+    // DOCS/259 -- queue one anonymous function body for standalone emission
+    // and evaluate the expression to its (patched) address in RAX.
+    public void genAnonFunctionArg(Node anon) {
+        string enclosing = this.currentFunctionName;
+        if (enclosing.length == 0) { enclosing = "top"; }
+        string name = "__anon_" + enclosing + "_" + this.anonCounter.toString();
+        this.anonCounter = this.anonCounter + 1;
+        int lbl = this.asm.createLabel();
+        this.pendingAnonNames.add(name);
+        this.pendingAnonLabels.add(lbl);
+        this.pendingAnonBodies.add(anon.child(0));
+        int sp = this.asm.buf.length;
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEF00D);
+        this.anonRelocLabelIds.add(lbl);
+        this.anonRelocPatchOffsets.add(sp + 2);
+    }
+
+    // DOCS/259 -- emit every queued anonymous function body as a standalone
+    // `void ()` function. Runs after all program functions and methods so
+    // forward calls inside a body resolve to already-known offsets. Bodies
+    // may contain further anonymous functions, so the queue drains until
+    // empty, then the recorded address placeholders are patched to the
+    // generated functions' absolute VAs (code is placed at text_rva).
+    public void drainAnonFunctions() {
+        while (this.pendingAnonNames.length > 0) {
+            string[] names = this.pendingAnonNames;
+            int[] labels = this.pendingAnonLabels;
+            Node[] bodies = this.pendingAnonBodies;
+            this.pendingAnonNames = [];
+            this.pendingAnonLabels = [];
+            this.pendingAnonBodies = [];
+            for (int i = 0; i < names.length; i++) {
+                this.emitAnonFunction(names[i], labels[i], bodies[i]);
+            }
+        }
+        for (int r = 0; r < this.anonRelocLabelIds.length; r++) {
+            int target = this.asm.getLabelOffset(this.anonRelocLabelIds[r]);
+            int64 va = 0x140000000 + 0x1000 + target;
+            int pos = this.anonRelocPatchOffsets[r];
+            this.asm.buf[pos] = va & 0xFF;
+            this.asm.buf[pos + 1] = (va >> 8) & 0xFF;
+            this.asm.buf[pos + 2] = (va >> 16) & 0xFF;
+            this.asm.buf[pos + 3] = (va >> 24) & 0xFF;
+            this.asm.buf[pos + 4] = (va >> 32) & 0xFF;
+            this.asm.buf[pos + 5] = (va >> 40) & 0xFF;
+            this.asm.buf[pos + 6] = (va >> 48) & 0xFF;
+            this.asm.buf[pos + 7] = (va >> 56) & 0xFF;
+        }
+    }
+
+    // Emit one anonymous function body: a plain prologue + block + epilogue
+    // at the label bound at the expression site. No parameters, no return
+    // value -- exactly the standalone function whose address the argument
+    // expression evaluates to.
+    public void emitAnonFunction(string name, int labelId, Node body) {
+        this.currentFunctionName = name;
+        this.localOffsets = [];
+        this.localNames = [];
+        this.localTypes = [];
+        this.stackSize = 0;
+        this.currentClassName = "";
+        this.fnPtrParamNames = [];
+        Node f = new Node();
+        f.kind = 100;
+        f.name = name;
+        f.typeHint = "void";
+        Node params = new Node();
+        f.children.add(params);
+        f.children.add(body);
+        this.scanRefCalls(f);
+        this.asm.bindLabel(labelId);
+        this.asm.pushR64(5);
+        this.asm.movRR64(5, 4);
+        this.emitFunctionBody(f);
+    }
+
+    // DOCS/259 -- invoke a function-typed parameter: load the stored function
+    // address from the parameter's stack slot into R10 and call through it
+    // with the standard 16-byte-aligned call setup.
+    public void genFnPtrCall(string name) {
+        int off = this.findLocal(name);
+        this.asm.movRMBase(10, 5, off);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(10);
+        this.asm.emitCallTeardown();
+        this.emitExcCheck();
+    }
+
+    public bool isFnPtrParam(string name) {
+        for (int i = 0; i < this.fnPtrParamNames.length; i++) {
+            if (this.strEq(this.fnPtrParamNames[i], name)) { return true; }
+        }
+        return false;
     }
 
     // `match` expressions: subject child(0), arms child(1..) where each arm is
@@ -5212,6 +5352,15 @@ int strIdx = this.stringPatchIndices[i];
 
     public void genCall(Node call) {
         string name = call.name;
+        // DOCS/259: invoking a function-typed parameter — load the stored
+        // function address from the parameter's stack slot and call through
+        // it with the standard 16-byte-aligned call setup. Zero-arg calls
+        // only; the parameter holds an address, not an invocable-with-args
+        // target.
+        if (!call.isMember && call.childCount() == 0 && this.isFnPtrParam(name)) {
+            this.genFnPtrCall(name);
+            return;
+        }
         int isClass = 0;
         for (int i = 0; i < this.classNames.length; i++) {
             if (this.strEq(this.classNames[i], name)) { isClass = 1; }
