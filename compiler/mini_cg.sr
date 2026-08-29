@@ -8692,6 +8692,48 @@ public void genNewCall(Node call) {
         this.asm.emitU8(0xC0);
     }
 
+    // CVTSI2SD xmm, r64 (F2 REX.W 0F 2A /r) with computed ModRM: the reg
+    // field is the destination XMM (REX.R-extendable), rm the source GP
+    // register.  Emitted inline because the asm-layer cvtsi2sdXMM omits
+    // REX.W and would read only the low 32 bits of the GP register.
+    public void emitCvtsi2sdXmmGpr(int xmm, int r64) {
+        this.asm.emitU8(0xF2);
+        int rex = 0x48;
+        if (xmm > 7) { rex = rex | 0x04; }
+        if (r64 > 7) { rex = rex | 0x01; }
+        this.asm.emitU8(rex);
+        this.asm.emitU8(0x0F);
+        this.asm.emitU8(0x2A);
+        this.asm.emitU8(0xC0 | ((xmm & 7) << 3) | (r64 & 7));
+    }
+
+    // MOVQ xmm, r64 (66 REX.W 0F 6E /r): full 64-bit GP -> XMM bit-pattern
+    // copy.  The asm-layer movqXMMR64 omits REX.W, which demotes the opcode
+    // to MOVD (low 32 bits only, zero-extended) and silently corrupts
+    // float64 bit patterns whose low dword is zero (e.g. -1.0, 1.0); mirror
+    // silverc-rs x64.rs movq_xmm_gpr, which always emits REX.W.
+    public void emitMovqXmmGpr(int xmm, int r64) {
+        this.asm.emitU8(0x66);
+        int rex = 0x48;
+        if (xmm > 7) { rex = rex | 0x04; }
+        if (r64 > 7) { rex = rex | 0x01; }
+        this.asm.emitU8(rex);
+        this.asm.emitU8(0x0F);
+        this.asm.emitU8(0x6E);
+        this.asm.emitU8(0xC0 | ((xmm & 7) << 3) | (r64 & 7));
+    }
+
+    // Unsigned conditional jump (0F 8x rel32) for ucomisd flag semantics:
+    // opcode2 0x82=jb, 0x86=jbe, 0x87=ja, 0x83=jae.  The asm layer only
+    // exposes signed variants (jl/jle/jg/jge), so emit inline with the same
+    // addReloc pattern as mini_asm's Label helpers.
+    public void emitJccRel32(int opcode2, int labelId) {
+        this.asm.emitU8(0x0F);
+        this.asm.emitU8(opcode2);
+        this.asm.addReloc(labelId, this.asm.buf.length, 1);
+        this.asm.emitU32(0);
+    }
+
     public void genFloatBinary(Node bin) {
         // Float arithmetic (+, -, *, /) on IEEE-754 double bits carried in GP
         // registers.  Operands are loaded into XMM0/XMM1, computed with SSE2
@@ -8896,15 +8938,32 @@ public void genNewCall(Node call) {
             // << : move-init value copy; the destination takes the RHS value.
             this.asm.movRR64(0, 1);
     } elif (op >= 5 && op <= 10) {
-        this.asm.cmpRR64(0, 1);
+            // Float comparisons must order by VALUE, not by IEEE-754 bit
+            // pattern: integer cmp misorders negatives with different
+            // exponents and disagrees with ucomisd's NaN flag semantics.
+            // Mirror silverc-rs codegen.rs exactly: ucomisd xmm0(lhs),
+            // xmm1(rhs), then Eq->je, Ne->jne, Lt->jb, Le->jbe, Gt->ja,
+            // Ge->jae (the unsigned jcc read CF/ZF, which ucomisd sets per
+            // the IEEE-754 unordered rules).  Integer operands on either
+            // side are widened with cvtsi2sd.
+            bool cmpFlt = this.isFloatLike(bin.child(0)) || this.isFloatLike(bin.child(1));
+            if (cmpFlt) {
+                if (this.isFloatLike(bin.child(0))) { this.emitMovqXmmGpr(0, 0); }
+                else { this.emitCvtsi2sdRax(); }
+                if (this.isFloatLike(bin.child(1))) { this.emitMovqXmmGpr(1, 1); }
+                else { this.emitCvtsi2sdXmmGpr(1, 1); }
+                this.asm.ucomisdXMM(0, 1);
+            } else {
+                this.asm.cmpRR64(0, 1);
+            }
             int t = this.newLabel();
             int e = this.newLabel();
             if (op == 5) { this.asm.jeLabel(t); }
             elif (op == 6) { this.asm.jneLabel(t); }
-            elif (op == 7) { this.asm.jlLabel(t); }
-            elif (op == 8) { this.asm.jleLabel(t); }
-            elif (op == 9) { this.asm.jgLabel(t); }
-            elif (op == 10) { this.asm.jgeLabel(t); }
+            elif (op == 7) { if (cmpFlt) { this.emitJccRel32(0x82, t); } else { this.asm.jlLabel(t); } }
+            elif (op == 8) { if (cmpFlt) { this.emitJccRel32(0x86, t); } else { this.asm.jleLabel(t); } }
+            elif (op == 9) { if (cmpFlt) { this.emitJccRel32(0x87, t); } else { this.asm.jgLabel(t); } }
+            elif (op == 10) { if (cmpFlt) { this.emitJccRel32(0x83, t); } else { this.asm.jgeLabel(t); } }
             this.asm.movRI64(0, 0);
             this.asm.jmpLabel(e);
             this.asm.bindLabel(t);
