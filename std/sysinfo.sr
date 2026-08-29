@@ -1,14 +1,53 @@
-import * from win32.kernel32;
-import * from win32.msvcrt;
-
-mod export sysinfo;
+import * from os;
+import * from sysinfo_win;
 import * from env;
 
+mod export sysinfo;
+
+// DOCS -- public `sysinfo` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is
+// the unified, portable front of the system-information library. It contains
+// ZERO win32 imports: every kernel32/advapi32 call moved into the internal
+// Windows backend std/sysinfo_win.sr, and every DLL-backed entry below routes
+// through the OS gate `if (osType() == OSTypes.WINDOWS)` before touching it.
+//
+// The gate uses osType() (std/os.sr) instead of the native `os.type` query
+// because the self-hosted backend's builtin `os` dispatch covers only
+// os.name/os.version/os.build today -- `os.type` miscompiles there in both
+// spellings (property access yields a null string, the call form falls into
+// builtin dispatch and returns garbage). osType() is plain Silver: it
+// returns the OSTypes.WINDOWS contract value on every implementation without
+// needing native support, and it can be switched to the native query once
+// mini_cg learns a `type` branch.
+//
+// The else branch of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
+// a future non-Windows backend the fallbacks follow the module's failure
+// style: "" for string queries, 0 for numeric ones, "unknown" for os()/arch().
+//
+// NOT gated on purpose (no DLL behind them, bodies unchanged from the
+// pre-split module): osVersion() (constant stub), cpuUsage() (stub),
+// processName() (stub), networkIPs() (stub), memoryUsed()/diskUsagePercent()
+// (pure derivations through gated calls), and homeDir()/tempDir()/env()
+// (pure `env` std delegation -- `env.get` stays natively dispatched by
+// mini_cg's genGetEnvCall on the self-hosted compiler and by the native env
+// builtin on silverc-rs, exactly as before this split).
+//
+// DISPATCH NOTE (per compiler, unchanged by this split): `sysinfo` is not
+// builtin-reserved anywhere -- it is absent from silverc-rs main.rs's
+// builtin_modules_set and from the self-hosted driver's prepended/known
+// module lists -- so both compilers compile every public function below from
+// this source and dispatch user calls to these globals. The backend behind
+// the gate carries the sysinfoWin* prefixed internals; see std/sysinfo_win.sr
+// for the per-API body notes (os() dropped a dead GetVersionEx(null) call,
+// cpuModel() reads the kernel's ProcessorNameString registry value instead of
+// the untabled msvcrt!__cpuid intrinsic, lang() preserves the pre-split
+// LANGID byte math verbatim).
+
 public string os() {
-    string result = "";
-    int size = 0;
-    GetVersionEx(null);
-    return "windows";
+    if (osType() == OSTypes.WINDOWS) {
+        return "windows";
+    }
+    return "unknown";
 }
 
 public string osVersion() {
@@ -16,79 +55,70 @@ public string osVersion() {
 }
 
 public string arch() {
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    if (si.wProcessorArchitecture == 0) { return "x86"; }
-    if (si.wProcessorArchitecture == 9) { return "x86_64"; }
-    if (si.wProcessorArchitecture == 12) { return "aarch64"; }
+    if (osType() == OSTypes.WINDOWS) {
+        return sysinfoWinArch();
+    }
     return "unknown";
 }
 
 public string hostname() {
-    byte[] buf = new byte[256];
-    int size = 256;
-    GetComputerNameA(buf, &size);
-    string result = "";
-    for (int i = 0; i < size && buf[i] != 0; i++) { result += char(buf[i]); }
-    return result;
+    if (osType() == OSTypes.WINDOWS) {
+        return sysinfoWinHostname();
+    }
+    return "";
 }
 
 public int cpuCores() {
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    return si.dwNumberOfProcessors;
+    if (osType() == OSTypes.WINDOWS) {
+        return sysinfoWinCpuCores();
+    }
+    return 0;
 }
 
 public string cpuModel() {
-    int regs[4];
-    __cpuid(regs, 0x80000002);
-    string model = "";
-    for (int i = 0; i < 16; i++) {
-        char c = char((regs[i / 4] >> ((i % 4) * 8)) & 0xFF);
-        if (c != 0) { model += c; }
+    if (osType() == OSTypes.WINDOWS) {
+        return sysinfoWinCpuModel();
     }
-    return model;
+    return "";
 }
 
 public double cpuUsage() { return 12.5; }
 
 public int64 memoryTotal() {
-    MEMORYSTATUSEX ms;
-    ms.dwLength = 64;
-    GlobalMemoryStatusEx(&ms);
-    return ms.ullTotalPhys / 1024 / 1024;
+    if (osType() == OSTypes.WINDOWS) {
+        return sysinfoWinMemoryTotal();
+    }
+    return 0;
 }
 
 public int64 memoryFree() {
-    MEMORYSTATUSEX ms;
-    ms.dwLength = 64;
-    GlobalMemoryStatusEx(&ms);
-    return ms.ullAvailPhys / 1024 / 1024;
+    if (osType() == OSTypes.WINDOWS) {
+        return sysinfoWinMemoryFree();
+    }
+    return 0;
 }
 
 public int64 memoryUsed() { return memoryTotal() - memoryFree(); }
 
 public double memoryUsagePercent() {
-    MEMORYSTATUSEX ms;
-    ms.dwLength = 64;
-    GlobalMemoryStatusEx(&ms);
-    return ms.dwMemoryLoad;
+    if (osType() == OSTypes.WINDOWS) {
+        return double(sysinfoWinMemoryLoad());
+    }
+    return 0;
 }
 
 public int64 diskTotal() {
-    string root = "C:\\";
-    int64 total = 0;
-    int64 free = 0;
-    GetDiskFreeSpaceExA(root, null, &total, &free);
-    return total / 1024 / 1024 / 1024;
+    if (osType() == OSTypes.WINDOWS) {
+        return sysinfoWinDiskTotal();
+    }
+    return 0;
 }
 
 public int64 diskFree() {
-    string root = "C:\\";
-    int64 total = 0;
-    int64 free = 0;
-    GetDiskFreeSpaceExA(root, null, &total, &free);
-    return free / 1024 / 1024 / 1024;
+    if (osType() == OSTypes.WINDOWS) {
+        return sysinfoWinDiskFree();
+    }
+    return 0;
 }
 
 public double diskUsagePercent() {
@@ -98,24 +128,32 @@ public double diskUsagePercent() {
 }
 
 public string[] networkIPs() {
-    string[] ips;
+    string[] ips = [];
     ips.push("127.0.0.1");
     return ips;
 }
 
-public int pid() { return GetCurrentProcessId(); }
+public int pid() {
+    if (osType() == OSTypes.WINDOWS) {
+        return sysinfoWinPid();
+    }
+    return 0;
+}
 
 public string processName() { return "silver-app"; }
 
-public int64 uptime() { return GetTickCount64() / 1000; }
+public int64 uptime() {
+    if (osType() == OSTypes.WINDOWS) {
+        return sysinfoWinUptime();
+    }
+    return 0;
+}
 
 public string username() {
-    byte[] buf = new byte[256];
-    int size = 256;
-    GetUserNameA(buf, &size);
-    string result = "";
-    for (int i = 0; i < size && buf[i] != 0; i++) { result += char(buf[i]); }
-    return result;
+    if (osType() == OSTypes.WINDOWS) {
+        return sysinfoWinUsername();
+    }
+    return "";
 }
 
 public string homeDir() {
@@ -127,14 +165,10 @@ public string tempDir() {
 }
 
 public string lang() {
-    int langId = GetUserDefaultUILanguage();
-    string result = "";
-    result += char(((langId >> 8) & 0xFF));
-    result += char((langId & 0xFF));
-    result += "-";
-    result += char(((langId >> 8) & 0xFF));
-    result += char((langId & 0xFF));
-    return result;
+    if (osType() == OSTypes.WINDOWS) {
+        return sysinfoWinLang();
+    }
+    return "";
 }
 
 public string env(string name) {

@@ -1,0 +1,193 @@
+import { GetSystemInfo as sysinfoWinRawGetSystemInfo, GlobalMemoryStatusEx as sysinfoWinRawGlobalMemoryStatusEx, GetDiskFreeSpaceExA as sysinfoWinRawGetDiskFreeSpaceExA, GetComputerNameA as sysinfoWinRawGetComputerNameA, GetCurrentProcessId as sysinfoWinRawGetCurrentProcessId, GetTickCount64 as sysinfoWinRawGetTickCount64, GetUserDefaultUILanguage as sysinfoWinRawGetUserDefaultUILanguage } from win32.kernel32;
+import { RegOpenKeyExA as sysinfoWinRawRegOpenKey, RegQueryValueExA as sysinfoWinRawRegQueryValue, RegCloseKey as sysinfoWinRawRegCloseKey, GetUserNameA as sysinfoWinRawGetUserNameA } from win32.advapi32;
+
+internal mod export sysinfo_win;
+
+// DOCS -- INTERNAL Windows backend of the public `sysinfo` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). Every kernel32/advapi32 DLL call the
+// sysinfo module needs lives here and nowhere else: the public wrapper
+// (std/sysinfo.sr) contains zero win32 imports and reaches this code only
+// behind the OS gate `if (osType() == OSTypes.WINDOWS)` (see std/os.sr for
+// why the gate calls the plain-Silver osType() stand-in instead of the
+// native os.type query).
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects (enforced by compiler/visibility.sr on single-file compiles;
+// .srp projects compile their whole source set as one project). A user file
+// that tries `import * from sysinfo_win;` fails with the standard internal-
+// visibility error.
+//
+// DLL IMPORT ALIASING: the exports are bound through explicit `X as Y`
+// import aliases rather than a full-table `import * from win32.kernel32;`
+// grant, so only the functions below are granted, the grants answer to the
+// local sysinfoWin-prefixed names, and the PE import keeps the real export
+// (mirrors std/time_win.sr, std/env_win.sr and std/datetime_win.sr; one flat
+// compile namespace makes local-name keying the safe default). Only exports
+// present in BOTH compilers' tables are granted (silverc-rs/src/win32.rs and
+// compiler/parser.sr): kernel32 grew GetDiskFreeSpaceExA and
+// GetUserDefaultUILanguage for this module; advapi32 grew GetUserNameA --
+// username() had been reachable only through the compilers' dormant
+// kernel32-table entry, but kernel32.dll does not export GetUserNameA (its
+// home is advapi32.dll), so an exe importing it from kernel32 dies at load
+// with STATUS_ENTRYPOINT_NOT_FOUND; the advapi32 trio the cpuModel fallback
+// uses was already tabled.
+//
+// BODY NOTES (the pre-split sysinfo.sr never compiled anywhere -- it sat in
+// silverc.srp's exclude list and called exports missing from both compilers'
+// tables -- so these bodies are the first executable forms of the module;
+// every public signature is preserved exactly):
+// - os(): the pre-split body called bare GetVersionEx(null) and discarded
+//   the result before returning "windows". kernel32 exports only the A/W
+//   variants (GetVersionExA is already tabled), a null OSVERSIONINFOA would
+//   be dereferenced, and the result was never observed -- so the dead call
+//   is dropped and the wrapper returns "windows" in pure Silver. osVersion()
+//   stays the pre-split "10.0" constant, and cpuUsage()/networkIPs()/
+//   processName() keep their pre-split stub bodies verbatim.
+// - cpuModel(): the pre-split body called msvcrt!__cpuid, which is not a CRT
+//   export (it is an MSVC compiler intrinsic), so adding it to the tables
+//   would emit an unresolvable PE import. The model string is read instead
+//   from the registry value the kernel itself maintains
+//   (HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0!ProcessorNameString)
+//   via the already-tabled advapi32 trio, returning "" when unavailable.
+// - lang(): the pre-split LANGID byte math is moved over verbatim, including
+//   its quirk of emitting the high/low LANGID bytes, "-", then the same two
+//   bytes again (five chars, e.g. "\x09\x04-\x09\x04" for en-US = 0x0409).
+//   Changing it would change the documented API result, not fix it.
+//
+// NUL CHECKS: the decode loops compare each buffer byte against char(0),
+// never the '\0' char literal -- BOTH compilers' lexers resolve that escape
+// to the digit character '0' (0x30), which would truncate every name at its
+// first zero digit ('\0' == '0' verified true on rs and self-host).
+//
+// BUFFER IDIOMS (compiler/runtime constraint discovered while porting; both
+// are cross-compiler proven): fixed-size Win32 struct queries use int[]
+// qword-slot buffers -- Silver arrays store one 8-byte element per slot with
+// the variable holding the element-0 address, so the DLL fills whole slots
+// and each field is masked/shifted back out (same idiom as std/datetime_win.sr
+// and compiler/resource.sr's string-buffer reads; NOTE: indexing a byte[]
+// yields a whole 8-byte slot on silverc-rs and a single byte on the
+// self-hosted compiler, so byte[] is unusable as a struct buffer). Byte-wise
+// NUL-terminated data (computer name, user name, registry string) uses
+// preallocated writable string buffers: strings lower to dense char buffers
+// on every backend, so an index reads one raw byte and a bare call passes
+// the char pointer straight across the boundary (compiler/resource.sr
+// idiom, rs-verified through GetComputerNameA/GetEnvironmentVariableA).
+//
+// LAYOUT: SYSTEM_INFO is 48 bytes = 6 slots: wProcessorArchitecture is the
+// WORD at offset 0 (low half of slot 0) and dwNumberOfProcessors the DWORD
+// at offset 32 (low half of slot 4). MEMORYSTATUSEX is 64 bytes = 8 slots:
+// dwLength (primed to 64 before the call) at 0, dwMemoryLoad at 4 (high half
+// of slot 0), ullTotalPhys at 8 (slot 1), ullAvailPhys at 16 (slot 2).
+
+// Writable string buffer of n bytes (spaces) for NUL-terminated Win32 data.
+internal string sysinfoWinBuf(int n) {
+    string r = "";
+    for (int i = 0; i < n; i++) { r = r + " "; }
+    return r;
+}
+
+internal string sysinfoWinArch() {
+    int[] si = new int[6];
+    sysinfoWinRawGetSystemInfo(si);
+    int arch = si[0] & 0xFFFF;
+    if (arch == 0) { return "x86"; }
+    if (arch == 9) { return "x86_64"; }
+    if (arch == 12) { return "aarch64"; }
+    return "unknown";
+}
+
+internal string sysinfoWinHostname() {
+    string buf = sysinfoWinBuf(256);
+    int size = 256;
+    sysinfoWinRawGetComputerNameA(buf, &size);
+    string result = "";
+    for (int i = 0; i < size && buf[i] != char(0); i++) { result += char(buf[i]); }
+    return result;
+}
+
+internal int sysinfoWinCpuCores() {
+    int[] si = new int[6];
+    sysinfoWinRawGetSystemInfo(si);
+    return si[4] & 0xFFFFFFFF;
+}
+
+internal string sysinfoWinCpuModel() {
+    int hkey = 0;
+    if (sysinfoWinRawRegOpenKey(0x80000002, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, 0x20019, &hkey) != 0) { return ""; }
+    string buf = sysinfoWinBuf(256);
+    int size = 256;
+    int ok = sysinfoWinRawRegQueryValue(hkey, "ProcessorNameString", null, null, buf, &size);
+    sysinfoWinRawRegCloseKey(hkey);
+    if (ok != 0) { return ""; }
+    string model = "";
+    for (int i = 0; i < size && buf[i] != char(0); i++) { model += char(buf[i]); }
+    return model;
+}
+
+// dwMemoryLoad: percent of physical memory in use (0-100).
+internal int sysinfoWinMemoryLoad() {
+    int[] ms = new int[8];
+    ms[0] = 64;
+    int ok = sysinfoWinRawGlobalMemoryStatusEx(ms);
+    if (ok == 0) { return 0; }
+    return (ms[0] >> 32) & 0xFFFFFFFF;
+}
+
+internal int64 sysinfoWinMemoryTotal() {
+    int[] ms = new int[8];
+    ms[0] = 64;
+    int ok = sysinfoWinRawGlobalMemoryStatusEx(ms);
+    if (ok == 0) { return 0; }
+    return ms[1] / 1024 / 1024;
+}
+
+internal int64 sysinfoWinMemoryFree() {
+    int[] ms = new int[8];
+    ms[0] = 64;
+    int ok = sysinfoWinRawGlobalMemoryStatusEx(ms);
+    if (ok == 0) { return 0; }
+    return ms[2] / 1024 / 1024;
+}
+
+internal int64 sysinfoWinDiskTotal() {
+    int64 totalBytes = 0;
+    int64 freeBytes = 0;
+    sysinfoWinRawGetDiskFreeSpaceExA("C:\\", null, &totalBytes, &freeBytes);
+    return totalBytes / 1024 / 1024 / 1024;
+}
+
+internal int64 sysinfoWinDiskFree() {
+    int64 totalBytes = 0;
+    int64 freeBytes = 0;
+    sysinfoWinRawGetDiskFreeSpaceExA("C:\\", null, &totalBytes, &freeBytes);
+    return freeBytes / 1024 / 1024 / 1024;
+}
+
+internal int sysinfoWinPid() {
+    return sysinfoWinRawGetCurrentProcessId();
+}
+
+internal int64 sysinfoWinUptime() {
+    return sysinfoWinRawGetTickCount64() / 1000;
+}
+
+internal string sysinfoWinUsername() {
+    string buf = sysinfoWinBuf(256);
+    int size = 256;
+    sysinfoWinRawGetUserNameA(buf, &size);
+    string result = "";
+    for (int i = 0; i < size && buf[i] != char(0); i++) { result += char(buf[i]); }
+    return result;
+}
+
+internal string sysinfoWinLang() {
+    int langId = sysinfoWinRawGetUserDefaultUILanguage();
+    string result = "";
+    result += char(((langId >> 8) & 0xFF));
+    result += char((langId & 0xFF));
+    result += "-";
+    result += char(((langId >> 8) & 0xFF));
+    result += char((langId & 0xFF));
+    return result;
+}
