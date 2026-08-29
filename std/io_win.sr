@@ -1,0 +1,63 @@
+import { GetStdHandle as ioWinRawStdHandle, ReadFile as ioWinRawReadFile } from win32.kernel32;
+
+internal mod export io_win;
+
+// DOCS -- INTERNAL Windows backend of the public `io` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). Every kernel32 DLL call the io module
+// needs lives here and nowhere else: the public wrapper (std/io.sr) contains
+// zero win32 imports and reaches this code only behind the OS gate
+// `if (osType() == OSTypes.WINDOWS)` (see std/os.sr for why the gate calls
+// the plain-Silver osType() stand-in instead of the native os.type query).
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects (enforced by compiler/visibility.sr on single-file compiles;
+// .srp projects compile their whole source set as one project). A user file
+// that tries `import * from io_win;` fails with the standard internal-
+// visibility error.
+//
+// KERNEL32 IMPORT ALIASING: the DLL exports are bound through explicit
+// `X as Y` import aliases rather than a full-table `import * from
+// win32.kernel32;` grant, so only the two functions below are granted, the
+// grants answer to the local ioWin-prefixed names, and the PE import keeps
+// the real export (mirrors std/console_win.sr and std/env_win.sr; see those
+// files for why one flat compile namespace makes local-name keying the safe
+// default). Both exports are present in every win32 grant table this repo
+// ships: silverc-rs's src/win32.rs kernel32 list and the self-hosted
+// compiler's parser.sr/mini_cg.sr kernel32 lists.
+//
+// BEHAVIOR NOTES (the body below is moved verbatim from the pre-split
+// io.sr readLine implementation so behavior is unchanged): ioWinReadLine
+// fetches the STD_INPUT_HANDLE pseudo-handle (GetStdHandle(-10), the exact
+// constant the pre-split module used) and then reads one byte per
+// kernel32!ReadFile call, appending chars until '\n', stripping '\r' --
+// the byte-at-a-time loop, the empty-string-on-invalid-handle early return,
+// and the stop-on-zero-bytes-read end-of-stream check are all exactly the
+// pre-split shape. The handle lands in a local first because the flat
+// compile namespace keys DLL grants by local name and nested grant calls as
+// arguments are not a shape the backends rely on. One mechanical adjustment
+// mirrors std/fs_win.sr and std/env_win.sr: the old `byte[] buf[1];`
+// fixed-declaration became `byte[] buf = new byte[1];` (the codebase-
+// standard allocation idiom) because the fixed-declaration form does not
+// survive the visibility pass's standalone parse of this module, which
+// every direct `import * from io_win;` triggers. Function names carry the
+// ioWin prefix so the flattened self-hosted compilation (which merges all
+// prepended stdlib sources into one namespace) never collides with another
+// std module.
+
+internal string ioWinReadLine() {
+    int stdin = ioWinRawStdHandle(-10);
+    if (stdin == -1) { return ""; }
+    string result = "";
+    byte[] buf = new byte[1];
+    int read = 0;
+    while (true) {
+        bool ok = ioWinRawReadFile(stdin, buf, 1, &read, null);
+        if (!ok || read == 0) { break; }
+        char c = char(buf[0]);
+        if (c == '\n') { break; }
+        if (c == '\r') { continue; }
+        result += c;
+    }
+    return result;
+}
