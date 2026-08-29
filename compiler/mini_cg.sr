@@ -2926,7 +2926,16 @@ int strIdx = this.stringPatchIndices[i];
                     this.asm.movRI64(0, 1);
                     this.asm.bindLabel(e);
                 } elif (expr.op == 0) {
-                    this.asm.negR64(0);
+                    if (expr.childCount() > 0 && this.isFloatLike(expr.child(0))) {
+                        // IEEE-754 sign-bit flip, mirroring silverc-rs's
+                        // UnOp::Neg float handling (integer neg of the raw
+                        // bits produced garbage doubles).
+                        this.asm.movRI64(1, 1);
+                        this.asm.shlR64Imm(1, 63);
+                        this.asm.xorRR64(0, 1);
+                    } else {
+                        this.asm.negR64(0);
+                    }
                 } elif (expr.op == 2) {
                     this.asm.notR64(0);
                 }
@@ -5397,8 +5406,8 @@ int strIdx = this.stringPatchIndices[i];
             }
         } elif (builtinName && (this.strEq(name, "int") || this.strEq(name, "int64") || this.strEq(name, "int32")) && !call.isMember) {
             // int(...) / int64(...) / int32(...) conversion: strings parse via
-            // strtoll, floats truncate toward zero (the self-hosted backend has
-            // no SSE; float args are already integer-valued), ints pass through.
+            // strtoll, floats truncate toward zero (cvttsd2si), ints pass
+            // through.
             if (call.childCount() > 0) {
                 Node arg = call.child(0);
                 bool isStringArg = false;
@@ -5431,17 +5440,44 @@ int strIdx = this.stringPatchIndices[i];
                     this.asm.bindLabel(toOk);
                 } else {
                     this.genExpr(arg);
+                    if (this.isFloatLike(arg)) {
+                        // Float operands truncate toward zero: movq xmm0, rax
+                        // (66 REX.W 0F 6E C0, 64-bit -- the asm helper's 32-bit
+                        // form would zero-extend only EAX) then cvttsd2si
+                        // rax, xmm0 (F2 REX.W 0F 2C C0), matching silverc-rs
+                        // gen_int_conversion.
+                        this.asm.emitU8(0x66);
+                        this.asm.emitU8(0x48);
+                        this.asm.emitU8(0x0F);
+                        this.asm.emitU8(0x6E);
+                        this.asm.emitU8(0xC0);
+                        this.asm.emitU8(0xF2);
+                        this.asm.emitU8(0x48);
+                        this.asm.emitU8(0x0F);
+                        this.asm.emitU8(0x2C);
+                        this.asm.emitU8(0xC0);
+                    }
                 }
             } else {
                 this.asm.xorRR64(0, 0);
             }
         } elif (builtinName && (this.strEq(name, "double") || this.strEq(name, "float") || this.strEq(name, "float64")) && !call.isMember) {
             // double(...) / float(...) / float64(...) conversion: integers widen
-            // to an IEEE-754 double bit pattern. The self-hosted backend has no
-            // SSE instructions, so the bit pattern is the integer value itself,
-            // which prints and compares as the same number for small integers.
+            // to an IEEE-754 double bit pattern via cvtsi2sd; float operands
+            // pass through unchanged (mirrors silverc-rs gen_double_conversion).
+            // The old pass-through stub left the raw integer in RAX, so every
+            // float64(int) value was a denormal and no-arg float producers like
+            // timeWinNow() collapsed to the same wrong value.
             if (call.childCount() > 0) {
-                this.genExpr(call.child(0));
+                Node arg = call.child(0);
+                this.genExpr(arg);
+                if (!this.isFloatLike(arg)) {
+                    // 64-bit cvtsi2sd xmm0, rax (see emitCvtsi2sdRax), then
+                    // movq rax, xmm0 to bring the bits back to the GP result
+                    // register -- mirrors silverc-rs gen_double_conversion.
+                    this.emitCvtsi2sdRax();
+                    this.asm.movqR64XMM(0, 0);
+                }
             } else {
                 this.asm.xorRR64(0, 0);
             }
@@ -7299,9 +7335,10 @@ public void genNewCall(Node call) {
                 return;
             }
             if (this.strEq(recvType, "int") || this.strEq(recvType, "int32") || this.strEq(recvType, "int64") || this.strEq(recvType, "uint") || this.strEq(recvType, "bool") || this.strEq(recvType, "char")) {
-                // int -> double: cvtsi2sd xmm0, rax; movq rax, xmm0.
+                // int -> double: 64-bit cvtsi2sd xmm0, rax (see
+                // emitCvtsi2sdRax) then movq rax, xmm0.
                 this.genExpr(recv);
-                this.asm.cvtsi2sdXMM(0, 0);
+                this.emitCvtsi2sdRax();
                 this.asm.movqR64XMM(0, 0);
                 return;
             }
@@ -8644,6 +8681,17 @@ public void genNewCall(Node call) {
         this.funcCallArgCount = scratchBase;
     }
 
+    // cvtsi2sd xmm0, rax (F2 REX.W 0F 2A C0): signed 64-bit int -> double.
+    // Emitted inline because the asm-layer cvtsi2sdXMM helper omits REX.W and
+    // would read only EAX, truncating int64 operands above 2^31.
+    public void emitCvtsi2sdRax() {
+        this.asm.emitU8(0xF2);
+        this.asm.emitU8(0x48);
+        this.asm.emitU8(0x0F);
+        this.asm.emitU8(0x2A);
+        this.asm.emitU8(0xC0);
+    }
+
     public void genFloatBinary(Node bin) {
         // Float arithmetic (+, -, *, /) on IEEE-754 double bits carried in GP
         // registers.  Operands are loaded into XMM0/XMM1, computed with SSE2
@@ -8656,10 +8704,10 @@ public void genNewCall(Node call) {
         bool rFlt = this.isFloatLike(bin.child(1));
         this.genExpr(bin.child(0));
         if (lFlt) { this.asm.movMBaseR(5, 0, lOff); }
-        else { this.asm.cvtsi2sdXMM(0, 0); this.asm.movsdBaseXMM(5, 0, lOff); }
+        else { this.emitCvtsi2sdRax(); this.asm.movsdBaseXMM(5, 0, lOff); }
         this.genExpr(bin.child(1));
         if (rFlt) { this.asm.movMBaseR(5, 0, rOff); }
-        else { this.asm.cvtsi2sdXMM(0, 0); this.asm.movsdBaseXMM(5, 0, rOff); }
+        else { this.emitCvtsi2sdRax(); this.asm.movsdBaseXMM(5, 0, rOff); }
         this.asm.movsdXMMBase(0, 5, lOff);
         this.asm.movsdXMMBase(1, 5, rOff);
         if (fop == 1) { this.asm.addsdXMM(0, 1); }
@@ -9633,8 +9681,17 @@ public void genNewCall(Node call) {
         if (expr.kind == 23) {
             if (expr.childCount() > 0) { return this.isFloatLike(expr.child(0)); }
         }
+        if (expr.kind == 8) {
+            // Unary minus of a float operand is a float (sign-bit flip),
+            // matching silverc-rs is_float_expr(UnaryOp::Neg).
+            if (expr.op == 0 && expr.childCount() > 0) { return this.isFloatLike(expr.child(0)); }
+        }
         if (expr.kind == 10 || expr.kind == 9) {
             string cn = expr.name;
+            // float(x) / float64(x) / double(x) free conversions produce an
+            // IEEE-754 double bit pattern. silverc-rs's parser normalizes all
+            // three spellings to double() and is_float_expr matches them here.
+            if (!expr.isMember && (this.strEq(cn, "float") || this.strEq(cn, "double") || this.strEq(cn, "float64"))) { return true; }
             if ((this.strEq(cn, "toFloat") || this.strEq(cn, "toFloat64")) && expr.isMember && expr.childCount() > 0) {
                 string crt = this.inferExprType(expr.child(0));
                 if (this.strEq(crt, "float") || this.strEq(crt, "float64") || this.strEq(crt, "double")
@@ -9662,6 +9719,7 @@ public void genNewCall(Node call) {
     public void genPrintCall(Node call, bool newline) {
         if (call.childCount() < 1) { return; }
         Node arg = call.child(0);
+        bool fltArg = false;
         if (arg.kind == 2) {
             string s = arg.strVal;
             if (newline) { s = s + "\n"; }
@@ -9735,6 +9793,7 @@ public void genNewCall(Node call) {
             this.asm.pushR64(0);
             bool strLike = this.isStringLike(arg);
             bool fltLike = this.isFloatLike(arg);
+            if (fltLike) { fltArg = true; }
             if (newline) {
                 if (strLike) { this.addFormatStr("%s\n"); }
                 elif (fltLike) { this.addFormatStr("%g\n"); }
@@ -9751,11 +9810,23 @@ public void genNewCall(Node call) {
         if (arg.kind != 69) {
         this.addImportPatch("msvcrt.dll", "printf");
         int s1 = 0xDEADBEEFCAFEBAD0;
-        this.asm.emitImm64(0, s1);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.emitCallSetup(0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
+        if (fltArg) {
+            // Varargs FP call: stage the printf pointer through R10 so the
+            // AL vector-count immediate cannot clobber it, then set AL=1 --
+            // mirrors silverc-rs emit_printf_call(1) byte for byte.
+            this.asm.emitImm64(0, s1);
+            this.asm.emitCallSetup(0);
+            this.asm.movRMBase(10, 0, 0);
+            this.asm.movRI64(0, 1);
+            this.asm.callR64(10);
+            this.asm.emitCallTeardown();
+        } else {
+            this.asm.emitImm64(0, s1);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+        }
         }
     }
 
@@ -10070,6 +10141,11 @@ public void genNewCall(Node call) {
             this.genCharToString(bin.child(1));
         } elif (this.strEq(rt, "string")) {
             this.genExpr(bin.child(1));
+        } elif (this.isFloatLike(bin.child(1))) {
+            // Float operands stringify with %g via sprintf (silverc-rs
+            // gen_string_concat is_float_expr -> gen_float_format); routing
+            // them through genIntToString printed the raw bit pattern.
+            this.genFloatToString(bin.child(1));
         } else {
             this.genIntToString(bin.child(1));
         }
@@ -10081,6 +10157,8 @@ public void genNewCall(Node call) {
             this.genCharToString(bin.child(0));
         } elif (this.strEq(lt, "string")) {
             this.genExpr(bin.child(0));
+        } elif (this.isFloatLike(bin.child(0))) {
+            this.genFloatToString(bin.child(0));
         } else {
             this.genIntToString(bin.child(0));
         }
