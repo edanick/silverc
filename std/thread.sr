@@ -1,24 +1,82 @@
-import * from win32.kernel32;
+import * from os;
+import * from thread_win;
 
 mod export threads;
 
+// DOCS -- public `threads` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is
+// the unified, portable front of the threading library. It contains ZERO
+// win32 imports: every kernel32 call moved verbatim into the internal
+// Windows backend std/thread_win.sr, and every DLL-backed entry below routes
+// through the OS gate `if (osType() == OSTypes.WINDOWS)` before touching it
+// (osType() is std/os.sr's plain-Silver stand-in -- see that file and
+// std/time_win.sr for why the gate does not use the native os.type query).
+//
+// The else branch of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
+// a future non-Windows backend the fallbacks follow the module's existing
+// failure style: sleep() is a silent no-op, start() leaves the handle at 0
+// so join() is a no-op too, and the spawn path reports failure through the
+// 0 handle (the Win32 failure convention this module already used).
+//
+// DISPATCH (per compiler, probed): `threads` is builtin-reserved on NEITHER
+// compiler -- silverc-rs main.rs builtin_modules_set and the self-hosted
+// std/project.sr projectBuiltin list both exclude it, and neither codegen
+// has any native `threads.*` intercept -- so on both compilers every
+// `threads.*` call resolves to the globals/classes of this collected module
+// (silverc-rs rewrites the module-qualified MethodCall to the bare-name
+// gen_call, MiniCg.genUserCall resolves it as a module call), which forward
+// into the internal backend. The self-hosted compiler intercepts the FIELD
+// read `threads.length` for its own --threads count (MiniCg.emitFieldAccess)
+// -- a pre-existing builtin, unrelated to this module's API, which defines
+// no `length` member.
+//
+// PRE-SPLIT STATE (probed against git HEAD before this split): the old
+// std/thread.sr NEVER compiled anywhere. It (a) sat in silverc.srp's exclude
+// list, (b) used the pre-DOCS/259 C-style `function void()` parameter/
+// property syntax that no longer parses (probed: both compilers reject it),
+// and (c) passed its trampoline to CreateThread as a bare function name --
+// unsupported on both compilers (silverc-rs lowers it to 0, the self-host to
+// [rbp+0]); CreateThread is also missing from both compilers' kernel32
+// tables, so its full-table import could never call it. Every signature
+// below keeps the historical name/arity/return type; where the language
+// cannot express the historical shape the closest supported form is used and
+// the gap is documented at the site:
+// - `construct (function void() fn)` / `private prop function void() fn`:
+//   fn-typed CONSTRUCTOR parameters and fn-typed PROPS do not parse on
+//   either compiler (only `void () name` parameters of global functions and
+//   methods do -- probed). The job slot is therefore `private prop object fn`
+//   and the constructor takes it as `object`; `new Thread(job)` keeps
+//   working because a `void ()` value flows into the object slot unchanged
+//   (it is an 8-byte address on both compilers).
+// - `multi(function void()[] fns)`: arrays of fn types do not parse on
+//   either compiler (probed). The parameter is `object[]`, and the elements
+//   flow into `new Thread(fn)` unchanged.
+// - `threadStart`'s historical body `Thread t = param as Thread; t.fn();`
+//   is doubly unexpressible: `as` casts do not parse on either compiler
+//   (probed: silverc-rs reports "Expected expression" at the `as`), and the
+//   `t.fn()` prop invocation needs the fn-typed prop documented above. The
+//   trampoline keeps its exact pre-split signature and returns 0; its
+//   historical work was unreachable anyway -- the spawn entry lowers to the
+//   preserved null/garbage (see std/thread_win.sr).
+
 class Thread {
-    private prop function void() fn;
+    private prop object fn;
     private prop int handle;
 
-    construct (function void() fn) {
+    construct (object fn) {
         this.fn = fn;
         this.handle = 0;
     }
 
     public void start() {
-        this.handle = CreateThread(null, 0, threadStart, this, 0, null);
+        if (osType() == OSTypes.WINDOWS) {
+            this.handle = threadWinSpawn(threadStart, this);
+        }
     }
 
     public void join() {
         if (this.handle != 0) {
-            WaitForSingleObject(this.handle, -1);
-            CloseHandle(this.handle);
+            threadWinJoin(this.handle);
             this.handle = 0;
         }
     }
@@ -35,7 +93,16 @@ class ThreadGroup {
         this.threads.add(t);
     }
 
-    public Thread at(int index) << this.threads[index];
+    // The pre-split one-liner spelling `public Thread at(int index) <<
+    // this.threads[index];` does not parse on the self-hosted compiler:
+    // `<<` single-line bodies are supported only for GLOBAL functions
+    // (probed -- even a literal-return one-liner method fails with
+    // "expected ( but found void" at the next declaration; every std file
+    // using one-liner methods sits in silverc.srp's exclude list, so the
+    // gap was invisible). Same signature, explicit body:
+    public Thread at(int index) {
+        return this.threads[index];
+    }
 
     public void startAll() {
         foreach (Thread t in this.threads) { t.start(); }
@@ -46,24 +113,34 @@ class ThreadGroup {
     }
 }
 
-public Thread start(function void() fn) {
+public Thread start(void () fn) {
     Thread t = new Thread(fn);
     t.start();
     return t;
 }
 
-public ThreadGroup multi(function void()[] fns) {
+public ThreadGroup multi(object[] fns) {
     ThreadGroup g = new ThreadGroup();
-    foreach (function void() fn in fns) {
+    foreach (object fn in fns) {
         g.add(new Thread(fn));
     }
     return g;
 }
 
-public void sleep(int ms) << Sleep(ms);
+public void sleep(int ms) {
+    if (osType() == OSTypes.WINDOWS) {
+        threadWinSleep(ms);
+    }
+}
 
 private int threadStart(object param) {
-    Thread t = param as Thread;
-    t.fn();
+    // The historical body was `Thread t = param as Thread; t.fn(); return 0;`.
+    // Neither statement can compile: `as` casts do not parse on either
+    // compiler (probed -- silverc-rs "Expected expression" at the `as`, so
+    // the pre-split line was never-reachable dead text), and `t.fn()` needs
+    // the fn-typed prop invocation documented above. The trampoline keeps
+    // its exact pre-split signature; its historical work is unreachable
+    // anyway because the spawn entry lowers to null/garbage on both
+    // compilers (see std/thread_win.sr).
     return 0;
 }
