@@ -1,0 +1,199 @@
+internal mod export math_win;
+
+// DOCS -- INTERNAL Windows backend of the public `math` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). The public wrapper (std/math.sr)
+// contains zero win32 imports and reaches this code only behind the OS gate
+// `if (osType() == OSTypes.WINDOWS)` (see std/os.sr for why the gate calls
+// the plain-Silver osType() stand-in instead of the native os.type query).
+//
+// NO DLL IMPORTS: unlike the other Phase-2 backends this file grants no
+// win32 exports at all. The pre-split math.sr imported win32.msvcrt, but no
+// CRT function was ever called from it -- every body below is pure Silver
+// arithmetic (the same policy std/time_win.sr applied to time.sr's vestigial
+// msvcrt import: a backend grants exactly what it uses, and this module uses
+// nothing). The numeric work stays pure Silver rather than moving to msvcrt
+// pow/sqrt/etc. because the two compilers dispatch math differently (see the
+// wrapper's DISPATCH NOTE): silverc-rs answers qualified math.* calls with
+// its native msvcrt-backed builtins and never reads this file, so the
+// backend only ever executes on the self-hosted compiler, where the
+// pre-split bodies ran identically. Keeping the algorithms byte-for-byte
+// preserves those results exactly -- including the pre-existing quirks of
+// the self-hosted float64 lowering (float compound assignment inside loops,
+// the bare-abs overload tie) that the A/B probes pin down.
+//
+// INTERNAL MARKER: the `internal mod export` plus `internal` on every
+// function keep the backend from leaking to user projects (enforced by
+// compiler/visibility.sr on single-file compiles; .srp projects compile
+// their whole source set as one project). A user file that tries
+// `import * from math_win;` fails with the standard internal-visibility
+// error on both compilers.
+//
+// NAMING: every function carries the mathWin prefix so the flattened
+// self-hosted compilation (which merges all collected stdlib sources into
+// one namespace) never collides with another std module, and so the backend
+// is self-contained: internal helpers (mathWinFact, mathWinExpHelper) and
+// the cross-function calls (sin -> pow/fact, expHelper -> ln, round ->
+// floor/ceil) resolve inside this file even in a .srp project build, where
+// the wrapper is excluded from the manifest.
+//
+// BARE-ABS PRESERVATION: mathWinSqrt and mathWinLn keep the pre-split
+// call shape by routing their `abs(...)` inner calls to mathWinAbsF64 --
+// the float overload. Pre-split, the bare `abs` call inside sqrt/ln
+// resolved to that float body (probed A/B: the loop's break condition
+// compares true magnitudes, which is observable in ln's iteration count),
+// so the IEEE bits traveled through the float body exactly as they do
+// here. Renaming the target to the int overload changes when the series
+// breaks and with it the observable results.
+//
+// BEHAVIOR NOTES (bodies below are moved verbatim from the pre-split
+// math.sr implementations so behavior is unchanged): the float64 results
+// travel as IEEE-754 bit patterns in GP registers end-to-end -- the extra
+// wrapper call frame does not disturb that convention (floats cross plain
+// function boundaries the same way they did when sin/cos/pow called their
+// private helpers pre-split). tan/log10/hypot were `<<` one-liner globals
+// pre-split; they keep regular bodies here (same expression) because the
+// `internal` keyword plus one-liner combination is not an established
+// backend shape.
+
+internal float64 mathWinAbsF64(float64 x) {
+    if (x < 0.0) { return -x; }
+    return x;
+}
+
+internal int mathWinAbsInt(int x) {
+    if (x < 0) { return -x; }
+    return x;
+}
+
+internal float64 mathWinFact(int n) {
+    float64 r = 1.0;
+    for (int i = 2; i <= n; i++) { r *= float64(i); }
+    return r;
+}
+
+internal float64 mathWinSin(float64 x) {
+    float64 r = 0.0;
+    int sign = 1;
+    for (int i = 0; i < 15; i++) {
+        int n = 2 * i + 1;
+        float64 term = mathWinPow(x, n) / mathWinFact(n);
+        if (sign > 0) { r += term; } else { r -= term; }
+        sign = -sign;
+    }
+    return r;
+}
+
+internal float64 mathWinCos(float64 x) {
+    float64 r = 0.0;
+    int sign = 1;
+    for (int i = 0; i < 15; i++) {
+        int n = 2 * i;
+        float64 term = mathWinPow(x, n) / mathWinFact(n);
+        if (sign > 0) { r += term; } else { r -= term; }
+        sign = -sign;
+    }
+    return r;
+}
+
+internal float64 mathWinPow(float64 base, float64 exp) {
+    if (exp == 0.0) { return 1.0; }
+    if (exp == 1.0) { return base; }
+    if (exp == 2.0) { return base * base; }
+    bool negExp = exp < 0.0;
+    if (negExp) { exp = -exp; }
+    int e = int(exp);
+    float64 frac = exp - float64(e);
+    float64 r = 1.0;
+    for (int i = 0; i < e; i++) { r *= base; }
+    if (frac > 0.0) {
+        r *= mathWinExpHelper(base, frac, 20);
+    }
+    if (negExp) { r = 1.0 / r; }
+    return r;
+}
+
+internal float64 mathWinExpHelper(float64 base, float64 exp, int terms) {
+    float64 lnBase = mathWinLn(base);
+    float64 x = lnBase * exp;
+    float64 r = 1.0;
+    float64 term = 1.0;
+    for (int i = 1; i <= terms; i++) {
+        term *= x / float64(i);
+        r += term;
+    }
+    return r;
+}
+
+internal float64 mathWinSqrt(float64 x) {
+    if (x <= 0.0) { return 0.0; }
+    float64 guess = x / 2.0;
+    for (int i = 0; i < 50; i++) {
+        float64 next = (guess + x / guess) / 2.0;
+        if (mathWinAbsF64(next - guess) < 1e-15) { break; }
+        guess = next;
+    }
+    return guess;
+}
+
+internal float64 mathWinFloor(float64 x) {
+    int n = int(x);
+    if (float64(n) > x) { return float64(n - 1); }
+    return float64(n);
+}
+
+internal float64 mathWinCeil(float64 x) {
+    int n = int(x);
+    if (float64(n) < x) { return float64(n + 1); }
+    return float64(n);
+}
+
+internal float64 mathWinRound(float64 x) {
+    float64 f = x - mathWinFloor(x);
+    if (f < 0.5) { return mathWinFloor(x); }
+    return mathWinCeil(x);
+}
+
+internal float64 mathWinMax(float64 a, float64 b) {
+    if (a > b) { return a; }
+    return b;
+}
+
+internal float64 mathWinMin(float64 a, float64 b) {
+    if (a < b) { return a; }
+    return b;
+}
+
+internal float64 mathWinRandom() {
+    int seed = 42;
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    return float64(seed) / 2147483648.0;
+}
+
+internal float64 mathWinLn(float64 x) {
+    if (x <= 0.0) { return -1e308; }
+    float64 y = (x - 1.0) / (x + 1.0);
+    float64 r = 0.0;
+    float64 term = y;
+    for (int i = 1; i < 100; i += 2) {
+        r += term / float64(i);
+        if (mathWinAbsF64(term / float64(i)) < 1e-15) { break; }
+        term *= y * y;
+    }
+    return 2.0 * r;
+}
+
+internal float64 mathWinExp(float64 x) {
+    float64 r = 1.0;
+    float64 term = 1.0;
+    for (int i = 1; i <= 30; i++) {
+        term *= x / float64(i);
+        r += term;
+    }
+    return r;
+}
+
+internal float64 mathWinSum(float64[] arr) {
+    float64 s = 0.0;
+    for (int i = 0; i < arr.length; i++) { s += arr[i]; }
+    return s;
+}
