@@ -1,7 +1,83 @@
-import * from win32.msvcrt;
-
 mod export graphql;
-import {sleep} from time;
+import * from time;
+
+// UNIFIED_CORE_LIBRARY.md Phase 2 verdict: `graphql` is a PURE SILVER, LARGELY
+// DEAD STUB module -- no Windows backend exists or is needed, so there is no
+// graphql_win.sr. Probed facts behind that verdict:
+//
+// - The pre-split `import * from win32.msvcrt;` line was VESTIGIAL: nothing in
+//   the file ever called a CRT export. It is dropped (the std/exception.sr and
+//   std/math.sr precedent), which stops msvcrt.dll being forced into every
+//   user PE's import table just for importing this module.
+// - There is NO HTTP path: the module never imports `http`, `net`, or any
+//   win32.* module beyond that vestigial msvcrt line, opens no sockets, and
+//   performs no network I/O of any kind. client.query()/client.mutate() are
+//   stubs that allocate an empty `result` and return it (query() fills
+//   `data` with the constant object literal `{users: {}, user: {}}`; mutate()
+//   leaves `data` untouched). The `url` field is stored and never read; the
+//   header()/schema.type()/server.start() bodies are empty. In short the
+//   module is shape-only today, exactly like the pre-split `async` module
+//   was; the stub bodies are preserved verbatim rather than silently
+//   redesigned into a real client.
+//
+// DISPATCH (per compiler, probed -- unchanged by this rewrite): `graphql` is
+// NOT builtin-reserved on either compiler. silverc-rs's builtin_modules_set
+// (src/main.rs) lists fs/json/yaml/env/url/hash/path/bom/console/math/http
+// only, and the self-hosted compiler neither hand-prepends graphql (its
+// compiler_driver prepend list is llmai/exception/bom/process/... only) nor
+// treats it as builtin (visibility.sr visBuiltinModule). Both compilers
+// resolve `import * from graphql;` as an ORDINARY SOURCE module from disk
+// (std\graphql.sr candidates). Nothing here can shadow a native dispatch, so
+// no per-compiler call interception needed preserving.
+//
+// PARSE BLOCKER FIXED (the reason this file never compiled before): the old
+// schema.query declared its callback parameter in the C-style spelling
+// `void callback(args, ctx)`. Both compilers reject that grammar today:
+// silverc-rs errors at the file's line 31 col 49 ("Expected 'type' but found
+// 'LeftParen'"), and the self-hosted compiler reports the SAME construct as
+// line 151 col 49 ("expected { but found (") -- the self-host aggregates a
+// module's dependencies (time_win.sr + time.sr, ~120 lines) ahead of the file
+// body, which is where the historical "line ~150 parse blocker" note comes
+// from. One line was therefore ported to the DOCS/259 spelling:
+//
+//     schema.query(string name, void () callback)
+//
+// Name and arity of schema.query are preserved (2 params); the only loss is
+// the inner (args, ctx) typing of the callback slot, because no compiler
+// accepts a typed fn-parameter shape today (silverc-rs's parser hard-rejects
+// anything but `void () name`: "function-typed parameters support only
+// `void () name`; other shapes are not supported yet"). The callback was
+// never invoked by the (empty) body, so nothing behavioral changes.
+//
+// DEAD PARTS (documented, preserved, NOT silently redesigned):
+// - schema.type/schema.query bodies are empty; the constants Int/String/
+//   Float/Boolean are declared but referenced by nothing.
+// - server.start() is an empty stub; server.wait() loops `time.sleep(1000)`
+//   forever -- the same never-returning shape std/ws.sr's wait() has. It is
+//   part of the public surface and kept, but never call it from a probe or
+//   test: it blocks the process by design.
+// - client.query()/mutate() make NO network call (see above), so probes are
+//   pure and need no network bounding.
+//
+// QUALIFIED-CALL LANDMINE (self-host, see std/async.sr): wait() calls
+// `time.sleep(1000)` -- a module-qualified call. That form recurses into a
+// stack overflow only when the CURRENT module also defines the name; graphql
+// defines no `sleep` of its own, so the qualified call routes to the time
+// module correctly (the ws.sr wait() uses the identical pattern).
+//
+// IMPORT SPELLING (deviation, documented): the pre-split file opened with
+// `import {sleep} from time;`. The braced form is UNUSABLE here:
+// silverc-rs's import resolution treats every braced name as a module
+// candidate (src/main.rs maps named imports to per-name filesystem
+// resolution), so it hunted for a module literally named "sleep" and failed
+// with "unknown module \"sleep\"" (probed; `time` is not on rs's builtin
+// list, so the statement is never routed to the time module). This is the
+// exact failure std/crypto.sr's split documented for its old
+// `import {a, b} from encoding;` lines, and the fix is the same: the
+// portable star form `import * from time;` (the spelling std/ws.sr -- the
+// other time.sleep caller -- always used). graphql never calls a bare
+// `sleep(...)`, so the braced import granted nothing anyway; wait() uses the
+// module-qualified call.
 
 public const int Int = 1;
 public const int String = 2;
@@ -28,7 +104,7 @@ class result {
 
 class schema {
     public void type(string name, object fields) { }
-    public void query(string name, void callback(args, ctx)) { }
+    public void query(string name, void () callback) { }
 }
 
 class client {
