@@ -1,0 +1,174 @@
+import { socket, connect, bind, listen, accept, recv, send, closesocket, inet_addr, setsockopt, WSAStartup } from win32.ws2_32;
+
+internal mod export ftp_win;
+
+// DOCS -- INTERNAL Windows backend of the public `ftp` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). Every ws2_32 DLL call the ftp module
+// needs lives here and nowhere else: the public wrapper (std/ftp.sr) contains
+// zero win32 imports and reaches this code only behind the OS gate
+// `if (osType() == OSTypes.WINDOWS)`. See std/os.sr for why the gate calls
+// the plain-Silver osType() stand-in instead of the native os.type query.
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects. A user file that tries `import * from ftp_win;` fails with
+// the standard internal-visibility error on both compilers (same posture as
+// std/ws_win.sr / std/dns_win.sr, probed there; re-probed for ftp_win).
+//
+// IMPORT GRANTS: none of the ws2_32 exports granted here (socket/connect/
+// bind/listen/accept/recv/send/closesocket/inet_addr/setsockopt/WSAStartup)
+// collide with a name in the ftp public API (classes client/server; free
+// functions replyCode/replyComplete/pasvHost/pasvPort), so unlike
+// std/ws_win.sr no `X as rawY` aliases are needed -- the real export names
+// are granted directly, the exact treatment dns_win.sr gave its grants.
+// The class names `client` and `server` match no ws2_32 export either; the
+// client/server METHOD names (login/sendCmd/close/start/wait/...) are
+// class-scoped and never collide with the flat DLL grants (the probed
+// ws_win.sr pattern: its `send`/`recv` grants coexist with ws's socket.send
+// method).
+//
+// MEMORY LAYOUT (identical to std/ws_win.sr / std/dns_win.sr, probed there):
+// Silver arrays are [cap, len, elem...] with 8-byte elements, so an int[]
+// doubles as a packed qword buffer for DLL calls; `byte[]` must NOT cross a
+// DLL boundary as a packed buffer, so send packs payloads into an int[] and
+// receive unpacks recv's bytes out of an int[] with shifts. Strings ARE
+// packed byte buffers: data[i] reads one byte. sockaddr_in (16 bytes) is
+// packed into one int[2] via ftpWinFillSockaddr, byte-for-byte the probed
+// wsWinFillSockaddr algorithm.
+//
+// WSAStartup: issued before each socket creation; it is reference-counted,
+// so the repeated calls are harmless. The pre-split ftp.sr never called it
+// at all (winsock would have stayed uninitialized) -- a documented fix, not
+// a regression: the pre-split file never compiled anywhere (see std/ftp.sr
+// PRE-SPLIT STATE).
+//
+// DLL RETURN NORMALIZATION (see std/ws_win.sr for the general rule): the
+// self-hosted compiler ZERO-extends 32-bit DLL int returns, silverc-rs
+// sign-extends them, so SOCKET_ERROR (-1) arrives as 4294967295 on the
+// self-host and -1 on rs. Every return below that can be SOCKET_ERROR
+// (socket/connect/recv/accept; send/closesocket/setsockopt results are
+// deliberately ignored -- see each function) is normalized with the
+// two-sided check `v < 0 || v > 2147483647`, which is correct on both
+// compilers and cannot misfire: valid SOCKET handles are small positive
+// values far below 2^31.
+//
+// RECEIVE TIMEOUT: ftpWinConnect arms SO_RCVTIMEO (SOL_SOCKET 0xFFFF,
+// SO_RCVTIMEO 0x1006, 30000 ms as a DWORD in the low half of one int[]
+// qword slot) on every socket it returns, control and data channels alike.
+// The pre-split file had no timeout at all (and never ran); with the
+// timeout, every read in the public client is bounded: a peer that accepts
+// and then goes silent cannot hang a probe past 30 s per read -- the
+// read simply returns SOCKET_ERROR, which ftpWinReceive reports as "".
+// The data-channel reads inherit the same bound because they come from the
+// same connect helper.
+//
+// SCOPE: this backend is TRANSPORT ONLY. The FTP protocol itself (greeting
+// codes, USER/PASS/PASV/RETR/STOR/QUIT command text, reply completion
+// scanning, PASV host/port extraction) is pure Silver and lives in the
+// public wrapper (std/ftp.sr) -- backends exist only where real DLL-backed
+// operations exist. This file compiles standalone (primitives only, no
+// wrapper-class references).
+
+internal int ftpWinStartup() {
+    byte[] wsa = new byte[408];
+    return WSAStartup(0x0202, wsa);
+}
+
+// Packs family/port/addr into the sockaddr_in image (two qwords). `ip` is
+// the network-order u32 that inet_addr returns; 0 means INADDR_ANY.
+internal void ftpWinFillSockaddr(int[] sa, int port, int ip) {
+    int pHi = (port >> 8) & 0xFF;
+    int pLo = port & 0xFF;
+    sa[0] = 2 | (pHi << 16) | (pLo << 24) | ((ip & 0xFFFFFFFF) << 32);
+    sa[1] = 0;
+}
+
+// Opens a TCP connection to host:port and arms the receive timeout. Returns
+// the socket handle, or -1 on any failure (startup, socket, connect -- all
+// normalized per the DLL-return note above). Also used for the PASV data
+// channel, so its sockets carry the timeout for free.
+internal int ftpWinConnect(string host, int port) {
+    ftpWinStartup();
+    int sock = socket(2, 1, 0);
+    if (sock < 0 || sock > 2147483647) { return -1; }
+    int ip = inet_addr(host);
+    int[] sa = new int[2];
+    ftpWinFillSockaddr(sa, port, ip);
+    int rc = connect(sock, sa, 16);
+    if (rc < 0 || rc > 2147483647) {
+        closesocket(sock);
+        return -1;
+    }
+    int[] opt = new int[1];
+    opt[0] = 30000;
+    setsockopt(sock, 0xFFFF, 0x1006, opt, 4);
+    return sock;
+}
+
+// Binds INADDR_ANY:port and listens with backlog 5 (the pre-split hard-coded
+// value). Returns the socket handle, or -1 on failure.
+internal int ftpWinListen(int port) {
+    ftpWinStartup();
+    int sock = socket(2, 1, 0);
+    if (sock < 0 || sock > 2147483647) { return -1; }
+    int[] sa = new int[2];
+    ftpWinFillSockaddr(sa, port, 0);
+    int rc = bind(sock, sa, 16);
+    if (rc < 0 || rc > 2147483647) {
+        closesocket(sock);
+        return -1;
+    }
+    listen(sock, 5);
+    return sock;
+}
+
+// Returns the accepted raw socket handle, or -1 on failure (normalized per
+// the DLL-return note above).
+internal int ftpWinAccept(int fd) {
+    int client = accept(fd, null, null);
+    if (client < 0 || client > 2147483647) { return -1; }
+    return client;
+}
+
+// Sends the first `len` bytes of `data` (clamped to data.length): packed
+// byte-for-byte into int[] qword slots before the send() call (byte[] must
+// not cross the DLL boundary packed). The explicit length exists for the
+// server's greeting, which the pre-split wait() loop sent TRUNCATED at 20
+// of its 22 bytes ("220 FTP Server ready" without the CRLF) -- that byte
+// count is preserved verbatim by the caller. The send result (byte count or
+// SOCKET_ERROR) is deliberately ignored: the pre-split senders never
+// checked it either.
+internal void ftpWinSend(int fd, string data, int len) {
+    if (len <= 0) { return; }
+    if (len > data.length) { len = data.length; }
+    int slots = (len + 7) / 8;
+    int[] packedBuf = new int[slots];
+    for (int i = 0; i < len; i++) {
+        int b = int(data[i]);
+        packedBuf[i / 8] = packedBuf[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
+    }
+    send(fd, packedBuf, len, 0);
+}
+
+// Receives up to maxLen raw bytes; returns them as a string. Returns "" on
+// disconnect, timeout, or a zero-extended SOCKET_ERROR (see the DLL-return
+// note above) -- the caller cannot distinguish those, which is the desired
+// graceful-failure shape for every control/data read.
+internal string ftpWinReceive(int fd, int maxLen) {
+    if (maxLen <= 0) { return ""; }
+    int slots = (maxLen + 7) / 8;
+    int[] buf = new int[slots];
+    int n = recv(fd, buf, maxLen, 0);
+    if (n <= 0 || n > 2147483647) { return ""; }
+    string result = "";
+    for (int i = 0; i < n; i++) {
+        int b = (buf[i / 8] >> ((i % 8) * 8)) & 0xFF;
+        char c = char(b);
+        result += c.toString();
+    }
+    return result;
+}
+
+internal void ftpWinClose(int fd) {
+    closesocket(fd);
+}
