@@ -1,19 +1,240 @@
-import * from win32.ws2_32;
+import * from os;
+import * from ssh_win;
 
 mod export ssh;
 
-class shell {
-    private int sock;
+// DOCS -- public `ssh` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
+// unified, portable front of the SSH library. It contains ZERO win32
+// imports: every ws2_32 call moved into the internal Windows backend
+// std/ssh_win.sr, and every entry that touches the network routes through
+// the OS gate `if (osType() == OSTypes.WINDOWS)` before calling it
+// (osType() is std/os.sr's plain-Silver stand-in -- see that file for why
+// the gate does not use the native os.type query).
+//
+// The else side of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
+// a future non-Windows backend the fallbacks follow the module's failure
+// style: login/authWithKey are silent no-ops, exec() returns "",
+// isLoggedIn() stays false, getLastReply() stays "", serverVersion() stays
+// "".
+//
+// DISPATCH (per compiler, probed): `ssh` is builtin-reserved on NEITHER
+// compiler -- silverc-rs has no `ssh` anywhere in src/ (win32.rs's DLL
+// module table holds kernel32/user32/ws2_32/winhttp/wininet/msvcrt/
+// advapi32/shell32/version/registry only) and the self-hosted compiler's
+// visBuiltinModule (compiler/visibility.sr:605 lists fs/json/yaml/llmai/
+// LLMAI/os/project/exception/bom/process/notifications/env/url/hash/path/
+// console/math/http) plus its driver prepend list all exclude it. Both
+// compilers resolve `import * from ssh;` as an ORDINARY SOURCE module
+// (std/ssh.sr); no native dispatch exists to preserve. (ssh.sr's entry in
+// silverc.srp's exclude list only keeps it out of the compiler's own
+// aggregate build -- the same posture as smtp.sr/pop.sr/imap.sr; it does
+// not make `ssh` a builtin. ssh_win.sr is NOT excluded: its sshWin* names
+// collide with nothing in the aggregate namespace, exactly like
+// pop_win.sr/smtp_win.sr/imap_win.sr.)
+//
+// PRE-SPLIT STATE (probed 2026-08 against this file's git HEAD copy, fresh
+// -o names on both compilers): the old std/ssh.sr NEVER compiled under
+// either compiler. silverc-rs died with "41:9: Expected expression",
+// "unknown keyword sockaddr_in at line 41, column 16" and "unknown keyword
+// addr at line 41, column 28" (the line-41 `struct sockaddr_in addr;`
+// phantom inside exec()), exit 1; the self-hosted compiler died with the
+// same unknown keywords plus a "you forgot to put a semicolon" cascade, all
+// line 41, exit 1. The parser never reached the later phantoms, but they
+// were equally dead: `addr.sin_port = (this.port & 0xFF) << 8 | (this.port
+// >> 8) & 0xFF` rides the sockaddr_in phantom (the network-order port swap
+// it intended now lives in sshWinFillSockaddr), the bare
+// `socket`/`connect`/`recv`/`closesocket` calls were never granted (the
+// pre-split `import * from win32.ws2_32` grants names that exec() never
+// qualified or defined -- and `AF_INET`/`SOCK_STREAM` resolve to nothing on
+// both compilers: neither name is in either ws2_32 export table, they are C
+// header constants, not DLL exports), `new byte[4096]` is the byte[]
+// declaration-initializer landmine, exec()'s `char(buf[i])` scan over a
+// recv buffer never executed, and winsock was never initialized (no
+// WSAStartup anywhere). The remaining bodies (login/authWithKey/shell/
+// sftp/upload/download/close) were EMPTY no-op stubs. Every body was
+// therefore dead text -- there was NO observable pre-split behavior to
+// preserve beyond names, arities and intent.
+//
+// HONESTY NOTE -- this is NOT a full SSH implementation: real SSH needs key
+// exchange, the RFC 4253 binary packet protocol and encryption, and NONE of
+// that is implemented here (a real implementation is a separate feature
+// ticket -- none was invented, and this module does NOT deliver an
+// encrypted session). The pre-split file named only socket transport, so
+// this split delivers exactly the transport plus the one protocol framing
+// SSH defines before any crypto: the RFC 4253 version exchange -- the
+// server banner "SSH-2.0-..." is read and validated (bannerOk) and the
+// client version string "SSH-2.0-SilverSSH_1.0\r\n" is sent. login()
+// completes that version exchange and then FAILS at the authentication
+// stage -- it always ends with the connection dropped and isLoggedIn()
+// false, because there is no key exchange behind the banner to authenticate
+// over (the user/pass parameters are carried unused, exactly as the
+// pre-split empty body carried them). exec() walks the pre-split shape
+// (per-call socket, banner round-trip, one command line, one bounded reply
+// read, close) but what it returns is the raw post-banner bytes the peer
+// sent, NOT a decrypted command result -- against a real SSH server the
+// post-banner traffic is the binary packet protocol (key exchange), which
+// this module does not speak, so the raw bytes or "" come back and the
+// session ends. The class/method names (login/authWithKey/shell/sftp)
+// preserve the pre-split API surface only.
+//
+// DEAD -> LIVE (what this split made actually work, mirroring the
+// std/pop.sr / std/imap.sr / std/smtp.sr splits):
+// - The transport: socket + connect over ws2_32 with WSAStartup (the
+//   pre-split file never initialized winsock), the sockaddr_in image packed
+//   into an int[2] qword buffer (with the pre-split intended network-order
+//   port swap), and DLL returns normalized with the two-sided
+//   `v < 0 || v > 2147483647` check (the self-host zero-extends
+//   SOCKET_ERROR to 4294967295; see std/ssh_win.sr).
+// - login(): pre-split an empty no-op. It now performs the RFC 4253
+//   version exchange: connect, read and validate the server's
+//   "SSH-..." banner (bannerOk; RFC 4253 permits the server to send other
+//   lines first), send the client version string, and record what was
+//   observed in serverVersion()/getLastReply() (both ADDITIVE -- the
+//   pre-split surface had no way to report anything; same additions as
+//   std/pop.sr/std/imap.sr). The auth stage then fails gracefully: fail()
+//   drops the connection and isLoggedIn() stays false -- the honest
+//   terminal state, since no key exchange/USERAUTH exists behind the
+//   banner. Against a non-SSH listener login fails earlier and equally
+//   gracefully: the peer's junk (or "" after a silent disconnect) is
+//   surfaced through getLastReply() and the process exits cleanly. No
+//   exceptions anywhere.
+// - exec(): pre-split it sent NOTHING (its body began at socket() and the
+//   sockaddr_in phantom killed compilation before the send could even be
+//   parsed) and read one buffer blindly. It now performs the client-banner
+//   round-trip, waits for the server's "SSH-" banner line, sends
+//   `<cmd>\r\n` as a plain line and reads one bounded reply before
+//   closing, returning the raw bytes (see HONESTY NOTE; "" on any failure
+//   -- the pre-split connect-failure shape).
+// - Bounded reads: every socket gets a 30 s SO_RCVTIMEO (std/ssh_win.sr).
+//   The pre-split file had no timeout and would have hung on a silent peer;
+//   every accumulation loop below is bounded at 16 x 4096 bytes (~64 KB)
+//   until its stop condition (a complete CRLF line carrying "SSH-", or the
+//   peer going quiet) -- whichever comes first, so no path can spin
+//   forever.
+//
+// NOT INVENTED: no key exchange, no RFC 4254 binary packet protocol, no
+// cipher/HMAC of any kind, no diffie-hellman, no host key verification, no
+// USERAUTH (password or publickey -- authWithKey keeps its pre-split no-op
+// shape with the keyPath/passphrase parameters carried unused), no
+// pty/channel-open/channel-request framing, no SCP/SFTP (the sftp class
+// keeps its pre-split empty-stub methods verbatim), no keepalives, no
+// compression. shell.write/read/close remain the pre-split empty stubs (no
+// channel layer exists to attach them to); the shell/sftp factory methods
+// keep their pre-split shape (a method named exactly like its class,
+// returning a new instance -- probed working on both compilers before the
+// rewrite).
+//
+// API PRESERVATION (every public name/arity of the pre-split file,
+// unchanged): class shell -- construct(), write(string), read() -> string,
+// close(); class sftp -- construct(), list(string), get(string, string),
+// put(string, string), delete(string), close(); class client --
+// construct(string host, int port); login(string user, string pass);
+// authWithKey(string user, string keyPath); authWithKey(string user,
+// string keyPath, string passphrase) (BOTH overloads preserved -- two-arg
+// and three-arg same-name methods probed working on both compilers before
+// the rewrite); exec(string cmd) -> string; shell() -> shell; sftp() ->
+// sftp; upload(string local, string remote); download(string remote,
+// string local); close(). NO RENAMES were needed: every pre-split name
+// (shell, sftp, client, write, read, close, list, get, put, delete, login,
+// authWithKey, exec, upload, download) is keyword-free on both compilers --
+// checked against silverc-rs src/token.rs and self-host compiler/lexer.sr
+// (`from`/`to`/`match` are keywords on both and appear nowhere here).
+// ADDITIVE (the std/pop.sr/std/imap.sr precedent, documented):
+// client.getLastReply() returns the raw text of the last bytes read from
+// the peer ("" before the first read -- the graceful-failure surface);
+// client.isLoggedIn() is true only after a COMPLETED authenticated
+// session, which never happens on this build (authentication is
+// unimplemented -- see HONESTY NOTE; the getter exists so callers get the
+// same failure-reporting shape as std/pop.sr/std/imap.sr instead of having
+// to guess); client.serverVersion() returns the server's version tail
+// (everything after the literal "SSH-" prefix of the first banner line,
+// e.g. "2.0-OpenSSH_9.0"; "" when no banner was accepted); free pure
+// helpers -- clientBanner() (the client identification string this module
+// sends, WITHOUT the CRLF), bannerOk(resp) (true when `resp` carries an
+// "SSH-" sequence), bannerIndex(resp) (index of the first "SSH-"
+// sequence, -1 when absent) and versionString(banner) (the banner's tail
+// after "SSH-", "" when absent) are pure and probeable. Also additive and
+// invisible: the private lastReply/loggedIn/serverVer/sock fields, the
+// private readBanner/fail plumbing, and construct() now initializes every
+// field (sock to -1, strings to "", loggedIn to false) -- the pre-split
+// construct set only host/port, so close()'s closesocket would have derefed
+// an uninitialized handle had the file ever run.
+//
+// CALLER NOTES: instantiate the client with `var c = new client(...);` --
+// a lowercase class arriving from a star-imported module cannot be spelled
+// as a local's type on silverc-rs (per-file parsing: `client c` dies with
+// "unknown keyword"; `new mod.client()` dies on BOTH compilers; `var`
+// works on both, probed via std/ftps.sr). Strings returned across this
+// module's boundary (exec/getLastReply/serverVersion/shell.read and the
+// free helpers) should be assigned to a local before being concatenated
+// into larger expressions (silverc-rs stringifies the return pointer in
+// expression position; see std/dns.sr's RS-ONLY CALLER LANDMINE). exec()
+// returns "" on any failure; login()/authWithKey()/upload()/download() are
+// silent and close() is idempotent. The module compares server text with
+// char/int scans only -- no string == -- and callers wanting to test
+// banners should reuse bannerOk/bannerIndex rather than spelling ==.
 
+// The client identification string this module sends during the RFC 4253
+// version exchange (WITHOUT the trailing CRLF; the senders append it). The
+// pre-split file sent nothing; this names the sender honestly -- the same
+// "SSH-protoversion-softwareversion" shape any RFC 4253 identification
+// carries. Pure; probeable byte-identical on both compilers.
+public string clientBanner() {
+    return "SSH-2.0-SilverSSH_1.0";
+}
+
+// True when `resp` carries an SSH identification line: any "SSH-" sequence
+// (RFC 4253 permits the server to send other lines before it, so this is a
+// containment scan, not a prefix check). Pure; probeable.
+public bool bannerOk(string resp) {
+    return bannerIndex(resp) >= 0;
+}
+
+// Index of the first "SSH-" octet sequence in `resp` (-1 when absent).
+// Pure; probeable.
+public int bannerIndex(string resp) {
+    int n = resp.length;
+    for (int i = 0; i + 3 < n; i++) {
+        if (resp[i] == 83 && resp[i + 1] == 83 && resp[i + 2] == 72 && resp[i + 3] == 45) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// The version tail of an SSH identification string: everything after the
+// literal "SSH-" prefix (e.g. "2.0-OpenSSH_9.0" for
+// "SSH-2.0-OpenSSH_9.0"). "" when the prefix is absent. Pure; probeable.
+public string versionString(string banner) {
+    int idx = bannerIndex(banner);
+    if (idx < 0) { return ""; }
+    return sliceRange(banner, idx + 4, banner.length);
+}
+
+class shell {
     construct() { }
 
+    // Pre-split empty stub, preserved verbatim: no SSH channel layer
+    // exists behind it (see NOT INVENTED), so write remains a silent
+    // no-op -- the pre-split body carried no text and no intent beyond
+    // the name.
     public void write(string cmd) { }
+
+    // Pre-split stub, preserved verbatim: "" (no channel layer exists to
+    // read from).
     public string read() { return ""; }
+
+    // Pre-split empty stub, preserved verbatim.
     public void close() { }
 }
 
 class sftp {
     construct() { }
+
+    // The four pre-split empty stubs, preserved verbatim: no SFTP
+    // subsystem exists behind them (see NOT INVENTED) -- the names and
+    // arities are the preserved API surface.
     public void list(string path) { }
     public void get(string remote, string local) { }
     public void put(string local, string remote) { }
@@ -24,36 +245,202 @@ class sftp {
 class client {
     private string host;
     private int port;
+    private int sock;
+    private string lastReply;
+    private bool loggedIn;
+    private string serverVer;
 
     construct(string host, int port) {
         this.host = host;
         this.port = port;
+        this.sock = -1;
+        this.lastReply = "";
+        this.loggedIn = false;
+        this.serverVer = "";
     }
 
-    public void login(string user, string pass) { }
+    // ADDITIVE (the std/pop.sr/std/imap.sr precedent): the raw text of the
+    // last bytes read from the peer ("" before the first read). This is
+    // the graceful-failure surface: against a non-SSH listener it holds
+    // the junk the peer sent, or "" when the peer said nothing and closed.
+    public string getLastReply() {
+        return this.lastReply;
+    }
 
+    // ADDITIVE: true only after a COMPLETED authenticated session. Always
+    // false on this build -- authentication is unimplemented (see HONESTY
+    // NOTE); the getter exists for the std/pop.sr/std/imap.sr
+    // failure-reporting shape.
+    public bool isLoggedIn() {
+        return this.loggedIn;
+    }
+
+    // ADDITIVE: the server's version tail after the "SSH-" prefix (e.g.
+    // "2.0-OpenSSH_9.0"), "" when no banner was accepted.
+    public string serverVersion() {
+        return this.serverVer;
+    }
+
+    // The RFC 4253 version exchange, then a graceful failure at the
+    // (unimplemented) authentication stage: connect, read and validate
+    // the server's "SSH-" banner, send the client version string, then
+    // fail() drops the connection -- there is no key exchange behind the
+    // banner to authenticate over (see HONESTY NOTE). serverVersion() and
+    // getLastReply() keep what was observed; isLoggedIn() stays false.
+    // Against a non-SSH listener the banner check fails first and the
+    // outcome is equally graceful.
+    public void login(string user, string pass) {
+        if (osType() != OSTypes.WINDOWS) { return; }
+        this.sock = sshWinConnect(this.host, this.port);
+        if (this.sock < 0) {
+            this.sock = -1;
+            this.lastReply = "";
+            return;
+        }
+        this.readBanner();
+        if (!bannerOk(this.lastReply)) {
+            this.fail();
+            return;
+        }
+        this.serverVer = versionString(firstLine(this.lastReply));
+        this.sendLine(clientBanner());
+        this.fail();
+    }
+
+    // Pre-split no-op, preserved verbatim (overload 1 of 2 -- two-arg and
+    // three-arg same-name methods probed working on both compilers before
+    // the rewrite): no USERAUTH exists (see NOT INVENTED); keyPath is
+    // carried unused, as the pre-split empty body carried it.
     public void authWithKey(string user, string keyPath) { }
 
+    // Pre-split no-op, preserved verbatim (overload 2 of 2).
     public void authWithKey(string user, string keyPath, string passphrase) { }
 
+    // The pre-split exec shape, made real and bounded: a fresh per-call
+    // connection (the pre-split per-call socket intent), the client banner
+    // round-trip first, then `<cmd>\r\n` as a plain line, one bounded
+    // reply read, close. Returns the raw post-banner bytes the peer sent
+    // (NOT a decrypted result -- see HONESTY NOTE); "" on any failure
+    // (the pre-split connect-failure shape).
     public string exec(string cmd) {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_port = (this.port & 0xFF) << 8 | (this.port >> 8) & 0xFF;
-        addr.sin_addr.s_addr = inet_addr(this.host);
-        if (connect(sock, &addr, 16) < 0) { return ""; }
-        byte[] buf = new byte[4096];
-        int n = recv(sock, buf, 4096, 0);
-        string result = "";
-        for (int i = 0; i < n; i++) { result += char(buf[i]); }
-        closesocket(sock);
-        return result;
+        if (osType() != OSTypes.WINDOWS) { return ""; }
+        string banner = clientBanner();
+        int sock = sshWinConnect(this.host, this.port);
+        if (sock < 0) { return ""; }
+        sshWinSend(sock, banner + "\r\n", banner.length + 2);
+        string acc = "";
+        for (int guard = 0; guard < 16; guard++) {
+            string chunk = sshWinReceive(sock, 4096);
+            if (chunk.length <= 0) { break; }
+            acc += chunk;
+            if (bannerIndex(acc) >= 0 && lineEndIndex(acc) >= 0) { break; }
+        }
+        if (!bannerOk(acc)) {
+            sshWinClose(sock);
+            return "";
+        }
+        sshWinSend(sock, cmd + "\r\n", cmd.length + 2);
+        string reply = "";
+        for (int guard2 = 0; guard2 < 16; guard2++) {
+            string chunk2 = sshWinReceive(sock, 4096);
+            if (chunk2.length <= 0) { break; }
+            reply += chunk2;
+        }
+        sshWinClose(sock);
+        return reply;
     }
 
+    // Pre-split factory shape (a method named exactly like its class),
+    // preserved verbatim -- probed working on both compilers before the
+    // rewrite.
     public shell shell() { return new shell(); }
+
+    // Pre-split factory shape, preserved verbatim.
     public sftp sftp() { return new sftp(); }
+
+    // Pre-split empty stub, preserved verbatim (no SFTP subsystem exists
+    // behind it -- see NOT INVENTED).
     public void upload(string local, string remote) { }
+
+    // Pre-split empty stub, preserved verbatim.
     public void download(string remote, string local) { }
-    public void close() { }
+
+    // Closes the session's socket (the pre-split close() intent; the
+    // pre-split body was empty -- dead text). Silent and idempotent when
+    // no session is open.
+    public void close() {
+        if (this.sock >= 0 && osType() == OSTypes.WINDOWS) {
+            sshWinClose(this.sock);
+        }
+        this.sock = -1;
+        this.loggedIn = false;
+    }
+
+    // Sends one line with its CRLF. No-op on a dead channel -- every
+    // caller pairs it with a bounded read, so the failure surfaces there
+    // instead.
+    private void sendLine(string line) {
+        if (this.sock < 0) { return; }
+        sshWinSend(this.sock, line + "\r\n", line.length + 2);
+    }
+
+    // Accumulates reads into lastReply until a complete line carrying
+    // "SSH-" is seen, the peer goes quiet, or 16 x 4096 bytes (~64 KB)
+    // pass -- whichever comes first. Overwrites, never appends across
+    // calls: a stale reply must not leak into the next check.
+    private void readBanner() {
+        string acc = "";
+        for (int guard = 0; guard < 16; guard++) {
+            string chunk = sshWinReceive(this.sock, 4096);
+            if (chunk.length <= 0) { break; }
+            acc += chunk;
+            if (bannerIndex(acc) >= 0 && lineEndIndex(acc) >= 0) { break; }
+        }
+        this.lastReply = acc;
+    }
+
+    // Drops the connection and marks the client logged out; lastReply
+    // keeps whatever the peer last said so the caller can surface it.
+    private void fail() {
+        this.loggedIn = false;
+        if (this.sock >= 0) {
+            sshWinClose(this.sock);
+        }
+        this.sock = -1;
+    }
+}
+
+// Index of the first "\r\n" at or after `startIdx` (the \r's index; -1 when
+// absent). Private plumbing for the line-oriented scans. The parameter is
+// spelled startIdx -- `from` is a lexer keyword on both compilers (the
+// smtp/ftp RENAMED MEMBERS landmine; never a parameter name either).
+private int lineEndFrom(string s, int startIdx) {
+    for (int i = startIdx; i + 1 < s.length; i++) {
+        if (s[i] == 13 && s[i + 1] == 10) { return i; }
+    }
+    return -1;
+}
+
+private int lineEndIndex(string s) {
+    return lineEndFrom(s, 0);
+}
+
+// The text before the first "\r\n" (the whole string when no CRLF exists).
+private string firstLine(string s) {
+    int eol = lineEndIndex(s);
+    if (eol < 0) { return s; }
+    return sliceRange(s, 0, eol);
+}
+
+// Copies s[start .. end) character by character. Deliberately NOT substr:
+// rs's two-arg substr treats X as an END offset while the self-host treats
+// it as a LENGTH -- identical only when start is 0 (probed; see
+// silverc-rs/src/string_ops.rs emit_string_substring) -- and every caller
+// here slices from a nonzero offset.
+private string sliceRange(string s, int start, int end) {
+    string result = "";
+    for (int i = start; i < end; i++) {
+        result += s[i];
+    }
+    return result;
 }
