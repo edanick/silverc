@@ -1,6 +1,40 @@
-import * from win32.msvcrt;
-
 mod export project;
+
+// UNIFIED_CORE_LIBRARY.md Phase 2 verdict: `project` is a PURE SILVER module --
+// no Windows backend exists or is needed, so there is no project_win.sr.
+// Probed facts behind that verdict:
+//
+// - The pre-split `import * from win32.msvcrt;` line was VESTIGIAL: nothing in
+//   the file ever called a CRT export (the bodies use only the string module
+//   helpers projectFind/projectSlice/projectTrim/cliArgEq, fs builtins,
+//   ProgressReporter, and the printline/exit builtins). It is dropped (the
+//   std/exception.sr, std/math.sr and std/graphql.sr precedent), which stops
+//   msvcrt.dll being forced into every user PE's import table just for
+//   importing this module. Safety of the drop in the self-hosted aggregate
+//   (where win32 import lines survive projectStripDirectives as grants): the
+//   only CRT caller in the whole self-host compile set is compiler/resource.sr
+//   (memset), which carries its own `import * from win32.msvcrt;` line.
+// - Every operation the module performs is either pure string/array
+//   computation (manifest parsing, path joining, .qs bundle decoding,
+//   minification) or already routed through the unified std/builtins:
+//   file.readString/writeString/exists and folder.getFiles/getFolders (fs
+//   builtins) plus ProgressReporter (compiler/progress.sr). There is no
+//   direct DLL call left to gate behind `osType() == OSTypes.WINDOWS`, so an
+//   osType dispatch would be dead code and no *_win backend is warranted.
+//
+// DISPATCH (per compiler, probed -- unchanged by this rewrite): `project` is
+// dispatch-symmetric but NOT an ordinary source module on the self-host side:
+// - silverc-rs: builtin_modules_set (src/main.rs) lists fs/json/yaml/env/url/
+//   hash/path/bom/console/math/http only -- `project` is NOT builtin-reserved,
+//   so `import * from project;` resolves as an ORDINARY SOURCE module from
+//   disk (cwd-sensitive std\ candidates, silverc.srp `sources` walk).
+// - self-hosted silverc: visibility.sr visBuiltinModule lists "project", and
+//   the driver's findModulePath returns "" for it (baked into silverc.exe
+//   itself; standalone .sr user imports do not re-resolve from disk), while
+//   .srp builds go through projectBuildSource/projectSourcePath, which
+//   resolves "project" from the manifest's sourceDirs (projectBuiltin does
+//   not list it). Both self-host paths are untouched by this rewrite.
+// - silveri has its own copy at silveri/src/project.sr (unaffected).
 
 import * from fs;
 import * from string;
