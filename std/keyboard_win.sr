@@ -1,0 +1,76 @@
+import { keybd_event as kbWinRawKeyEvent, VkKeyScanA as kbWinRawVkKeyScan, GetKeyState as kbWinRawGetKeyState } from win32.user32;
+
+internal mod export keyboard_win;
+
+// DOCS -- INTERNAL Windows backend of the public `keyboard` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). Every user32 DLL call the keyboard
+// module needs lives here and nowhere else: the public wrapper
+// (std/keyboard.sr) contains zero win32 imports and reaches this code only
+// behind the OS gate `if (osType() == OSTypes.WINDOWS)` (see std/os.sr for
+// why the gate calls the plain-Silver osType() stand-in instead of the
+// native os.type query).
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects (enforced by compiler/visibility.sr on single-file compiles;
+// .srp projects compile their whole source set as one project). A user file
+// that tries `import * from keyboard_win;` fails with the standard internal-
+// visibility error on both compilers.
+//
+// DLL IMPORT ALIASING: the three exports are bound through explicit `X as Y`
+// import aliases rather than a full-table `import * from win32.user32;`
+// grant, so only the three functions below are granted, the grants answer to
+// the local kbWin-prefixed names, and the PE import keeps the real export
+// (mirrors std/mouse_win.sr, std/process_win.sr and std/sysinfo_win.sr; one
+// flat compile namespace makes local-name keying the safe default). All
+// three exports are present in BOTH compilers' user32 tables (silverc-rs
+// src/win32.rs USER32 list and the self-host compiler/parser.sr +
+// compiler/mini_cg.sr user32 lists), so every import resolves against a real
+// DLL export -- no invented exports, no load-time STATUS_ENTRYPOINT_NOT_FOUND
+// risk. Aliased grants bypass the tables on both backends anyway (silverc-rs
+// win32::resolve matches grants by local name with no table check; the
+// self-host alias path MiniCg.genUserCall -> addImportPatch(aliasDll,
+// aliasExport) likewise).
+//
+// SENTINEL-BYPASS MANDATE: keybd_event, VkKeyScanA and GetKeyState are
+// exactly the user32 exports whose BARE names are intercepted natively by
+// silverc-rs (codegen.rs routes them to stdlib::keyboard::gen_win32_call,
+// whose "sentinels" are just the IAT slots pushed by
+// stdlib::keyboard::emit_keyboard_imports back-patched at runtime) and by
+// the self-hosted compiler's user32 keyboard elif (mini_cg.sr -- the same
+// bypass the pre-split std/keyboard.sr relied on). This backend NEVER calls
+// the bare export names: every DLL touch goes through the kbWin-prefixed
+// aliases, so the wrapper stays portable source and both compilers lower the
+// calls through the identical direct-IAT path. MapVirtualKeyA /
+// GetAsyncKeyState / GetKeyboardState / SetKeyboardState / SendInput are also
+// on both intercept lists but the keyboard module never used them, so they
+// are not granted here.
+//
+// VESTIGIAL IMPORT DROPPED: the pre-split std/keyboard.sr carried
+// `import * from win32.ws2_32;` next to its user32 import, but never called
+// a single ws2_32 function (no socket business belongs in a keyboard
+// module). The grant existed only on paper -- no IAT entry was ever emitted
+// by either compiler, because grants without call sites resolve to nothing.
+// It is not reproduced here.
+//
+// RETURN-VALUE CONVENTIONS (cross-compiler proven idiom, see
+// std/mouse_win.sr): VkKeyScanA returns a SHORT -- -1 when the character has
+// no VK mapping, otherwise (shift << 8) | VK -- and GetKeyState returns a
+// SHORT whose upper RAX bits are undefined per the Win64 ABI. The wrapper
+// keeps the pre-split decoders on its side: `scan == -1` failure detection
+// (identical on both compilers, whose pre-split paths already ended in the
+// same raw user32 return -- the rs sentinel path back-patches the exact
+// user32!VkKeyScanA IAT slot this alias calls) and the `& 0x8000` mask for
+// GetKeyState, which keeps the undefined upper bits out of the result.
+
+internal void kbWinKeyEvent(int vk, int scan, int flags, int extra) {
+    kbWinRawKeyEvent(vk, scan, flags, extra);
+}
+
+internal int kbWinVkKeyScan(string text) {
+    return kbWinRawVkKeyScan(text);
+}
+
+internal int kbWinGetKeyState(int vk) {
+    return kbWinRawGetKeyState(vk);
+}

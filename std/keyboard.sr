@@ -1,18 +1,63 @@
-import * from win32.user32;
-import * from win32.ws2_32;
+import * from os;
+import * from keyboard_win;
 
 // ---------------------------------------------------------------------------
 // keyboard - Win32 keyboard input for the self-hosted Silver compiler.
 //
 // Mirror of silverc-rs/src/stdlib/keyboard.rs. Compiled by silverc-rs as
 // part of the bootstrap pipeline; when the silverc self-hosted compiler
-// eventually emits the .exe, it routes user calls through user32.dll
-// (keybd_event, VkKeyScanA, GetKeyState) - those identifiers are allowed
-// because compiler_driver.sr carries them on the user32.dll elif bypass
-// (see DOCS/229, near line 4618).
+// emits the .exe, user calls route through user32.dll (keybd_event,
+// VkKeyScanA, GetKeyState).
 //
-// We avoid the silverc-rs parser's `(int)` cast syntax: a one-character
-// string check translates to a direct ASCII-code comparison.
+// UNIFIED_CORE_LIBRARY.md Phase 2 -- this is the unified, portable front of
+// the keyboard library. It contains ZERO win32 imports: every user32 call
+// moved into the internal Windows backend std/keyboard_win.sr, and every
+// DLL-backed entry below routes through the OS gate
+// `if (osType() == OSTypes.WINDOWS)` before touching it (osType() is
+// std/os.sr's plain-Silver stand-in -- see that file and std/console.sr for
+// why the gate does not use the native os.type query).
+//
+// The else side of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
+// a future non-Windows backend the fallbacks follow the module's read/write
+// style: the state-changing entries (press/hold/release/send/type) become
+// silent no-ops, isDown returns false, and nameToVk (hence vk) resolves
+// through the pure keyNameToVk name table only -- its user32 VkKeyScanA
+// fallback is gated too, so unknown names report 0 instead of touching a
+// DLL. The VK_* constants and keyNameToVk are pure and stay ungated.
+//
+// DISPATCH NOTE (per compiler, unchanged by this split): the qualified
+// spellings never reach this source on silverc-rs. It answers every
+// `keyboard.<fn>()` call with its native builtin before any module source is
+// consulted (STDLIB_MODULES carries "keyboard" in src/stdlib/mod.rs;
+// codegen.rs dispatches member calls on the bare `keyboard` identifier, so
+// gen_call("keyboard.press") hits stdlib::is_stdlib_call ->
+// stdlib::keyboard::gen_keyboard_call, which natively covers press/down/
+// hold, release/up, send/type, isDown, vk/vkFor/vkForKey, setCursor/
+// setCursorImage, clipCursor and getClipCursor -- other spellings warn).
+// This source is still collected there (keyboard is NOT in rs's
+// builtin-modules skip list, main.rs builtin_modules_set), which is what
+// serves unqualified free-function calls and instance spellings. The
+// self-hosted compiler has no keyboard-specific native dispatch at all:
+// keyboard is not builtin-reserved (std/project.sr projectBuiltin) and not
+// on the driver's hand-prepend/exclude lists, so this module's source is
+// collected and every `keyboard.<fn>()` spelling resolves to the functions
+// below; the DLL touches inside them go through the backend's aliased
+// imports. Pre-split, those bare DLL names (keybd_event, VkKeyScanA,
+// GetKeyState) were answered by the self-host's generic user32 elif in
+// mini_cg.sr (NOT compiler_driver.sr, despite what this header used to
+// say) after a win32.user32 import grant; the backend's aliased grants now
+// carry the calls with the same direct-IAT lowering, so nothing changes.
+//
+// VESTIGIAL IMPORT DROPPED: the pre-split module also carried
+// `import * from win32.ws2_32;`, but no ws2_32 function was ever called --
+// a keyboard module has no socket business. Grants without call sites
+// resolve to nothing on both compilers, so dropping it is behavior-neutral.
+//
+// TESTING NOTE: press/hold/release/send/type inject real keystrokes into
+// the user's session when run, so they are verified compile-only; the
+// read-only surface (isDown, vk, keyNameToVk, nameToVk, the VK_* constants)
+// is probe-safe.
 // ---------------------------------------------------------------------------
 
 mod export keyboard;
@@ -59,6 +104,7 @@ const int KEYEVENTF_KEYUP = 0x0002;
 // keyNameToVk: shortcuts for the common KeyCode names, then a string-eq
 // fallback. We don't try stringIndex->int conversion in the silverc-rs
 // path, so single-char handling matches against literal strings.
+// Pure table -- no DLL behind it, so it stays ungated.
 // ---------------------------------------------------------------------------
 
 int keyNameToVk(string name) {
@@ -150,36 +196,51 @@ int keyNameToVk(string name) {
     return 0;
 }
 
+// The VkKeyScanA fallback is the only DLL-backed part of nameToVk; the pure
+// name table above still answers on a future non-Windows backend, unknown
+// names report 0 there.
 int nameToVk(string name) {
     int vk = keyNameToVk(name);
     if (vk != 0) { return vk; }
-    // Fallback: a single cstring is enough for VkKeyScanA.
-    int scan = VkKeyScanA(name);
-    if (scan == -1) { return 0; }
-    return scan & 0xFF;
+    if (osType() == OSTypes.WINDOWS) {
+        // Fallback: a single cstring is enough for VkKeyScanA.
+        int scan = kbWinVkKeyScan(name);
+        if (scan == -1) { return 0; }
+        return scan & 0xFF;
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
 // Core press / release helpers (no private qualifier - silverc-rs parser
-// doesn't recognize `private`).
+// doesn't recognize `private`). All key injection goes through the gated
+// backend; on a future non-Windows backend these are silent no-ops.
 // ---------------------------------------------------------------------------
 
 void press(string keyName) {
     int vk = nameToVk(keyName);
-    keybd_event(vk, 0, 0, 0);
+    if (osType() == OSTypes.WINDOWS) {
+        kbWinKeyEvent(vk, 0, 0, 0);
+    }
 }
 
 void press(int vk) {
-    keybd_event(vk, 0, 0, 0);
+    if (osType() == OSTypes.WINDOWS) {
+        kbWinKeyEvent(vk, 0, 0, 0);
+    }
 }
 
 void release(string keyName) {
     int vk = nameToVk(keyName);
-    keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+    if (osType() == OSTypes.WINDOWS) {
+        kbWinKeyEvent(vk, 0, KEYEVENTF_KEYUP, 0);
+    }
 }
 
 void release(int vk) {
-    keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+    if (osType() == OSTypes.WINDOWS) {
+        kbWinKeyEvent(vk, 0, KEYEVENTF_KEYUP, 0);
+    }
 }
 
 void hold(string keyName) { press(keyName); }
@@ -187,15 +248,17 @@ void hold(string keyName) { press(keyName); }
 void hold(int vk)         { press(vk); }
 
 void send(string text) {
-    for (int i = 0; i < text.length; i = i + 1) {
-        string one = text[i]; // char -> string for VkKeyScanA fallback
-        int vk = nameToVk(one);
-        if (vk == 0) {
-            int scan = VkKeyScanA(one);
-            vk = scan & 0xFF;
+    if (osType() == OSTypes.WINDOWS) {
+        for (int i = 0; i < text.length; i++) {
+            string one = text[i]; // char -> string for VkKeyScanA fallback
+            int vk = nameToVk(one);
+            if (vk == 0) {
+                int scan = kbWinVkKeyScan(one);
+                vk = scan & 0xFF;
+            }
+            kbWinKeyEvent(vk, 0, 0, 0);
+            kbWinKeyEvent(vk, 0, KEYEVENTF_KEYUP, 0);
         }
-        keybd_event(vk, 0, 0, 0);
-        keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
     }
 }
 
@@ -204,11 +267,17 @@ void type(string text) { send(text); }
 bool isDown(string keyName) {
     int vk = nameToVk(keyName);
     if (vk == 0) { return false; }
-    return (GetKeyState(vk) & 0x8000) != 0;
+    if (osType() == OSTypes.WINDOWS) {
+        return (kbWinGetKeyState(vk) & 0x8000) != 0;
+    }
+    return false;
 }
 
 bool isDown(int vk) {
-    return (GetKeyState(vk) & 0x8000) != 0;
+    if (osType() == OSTypes.WINDOWS) {
+        return (kbWinGetKeyState(vk) & 0x8000) != 0;
+    }
+    return false;
 }
 
 int vk(string keyName) {
