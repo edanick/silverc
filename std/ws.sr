@@ -1,50 +1,265 @@
-import * from win32.msvcrt;
-import * from win32.ws2_32;
+import * from os;
+import * from time;
+import * from ws_win;
 
 mod export ws;
-import * from time;
+
+// DOCS -- public `ws` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
+// unified, portable front of the WebSocket library. It contains ZERO win32
+// imports: every ws2_32 call moved into the internal Windows backend
+// std/ws_win.sr, and every DLL-backed entry below routes through the OS gate
+// `if (osType() == OSTypes.WINDOWS)` before touching it (osType() is
+// std/os.sr's plain-Silver stand-in -- see that file for why the gate does
+// not use the native os.type query). The frame codec below is pure Silver
+// and stays in the public module: backends exist only where real DLL-backed
+// operations exist.
+//
+// The else branch of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
+// a future non-Windows backend the fallbacks follow the module's failure
+// style: send/close/onMessage are silent no-ops, receive() returns "",
+// connect() and server accept return null.
+//
+// DISPATCH (per compiler, probed): `ws` is builtin-reserved on NEITHER
+// compiler -- silverc-rs's builtin_modules_set (src/main.rs lists
+// fs/json/yaml/env/url/hash/path/bom/console/math/http only), the self-hosted
+// compiler's visBuiltinModule (compiler/visibility.sr) and its driver
+// prepend list all exclude it. Both compilers resolve `import * from ws;`
+// as an ORDINARY SOURCE module (std\ws.sr candidates); no native dispatch
+// exists to preserve.
+//
+// PRE-SPLIT STATE (probed against this file's git HEAD before the rewrite):
+// the old std/ws.sr NEVER compiled under either compiler. silverc-rs
+// reported 14+ errors (C-style `void callback(...)` fn-parameters at lines
+// 13/17/28/57, `struct sockaddr_in addr;` locals at 59/76/100/111,
+// `byte[4096] buf;` / `byte[1024] resp;` fixed decl-inits, `&addr`
+// address-of, and the bare `socket(...)` / `connect(...)` calls colliding
+// with the file's own class and function names); the self-hosted compiler
+// died at the first fn-parameter (line 13: "expected { but found ("). Every
+// body was therefore dead text -- there was NO observable pre-split behavior
+// to preserve beyond names, arities and intent:
+//
+// - `data.toBytes()` (send/connect/encodeFrame) was a PHANTOM: no such
+//   builtin exists in either compiler (the same phantom std/encoding.sr
+//   still carries; see std/crypto.sr's BASE64 NOTE). Payload bytes now come
+//   from string indexing (data[i]), which is probed byte-identical on both
+//   compilers.
+// - encodeFrame's byte layout is preserved EXACTLY (0x81 FIN+text, 7-bit /
+//   16-bit / 64-bit big-endian length, unmasked payload) and is now probed
+//   byte-identical on fixed inputs on both compilers. Per RFC 6455
+//   client-to-server frames MUST be masked; the pre-split algorithm never
+//   masked and this split keeps it unmasked so the historical byte layout
+//   stays verifiable -- a strict RFC server would reject such frames
+//   (documented limitation, not a regression: the pre-split file never ran).
+// - decodeFrame is NEW (the pre-split file had no frame decoding at all --
+//   onMessage delivered raw TCP bytes as if they were messages). It parses
+//   one frame (opcode/FIN byte, mask bit, 7/16/64-bit length, 4-byte
+//   unmasking key when the mask bit is set) and returns the payload string;
+//   64-bit lengths use the low 32 bits (int-typed lengths).
+// - Callback parameters are ported to the DOCS/259 spelling `void () name`
+//   (the only fn-parameter shape either compiler accepts, methods included).
+//   A `void ()` parameter is invoked with ZERO arguments, so the historical
+//   payloads (onMessage's message text, onConnection's client socket) cannot
+//   be expressed; the data flows through the NEW public receive()/accept()
+//   accessors instead (mirroring std/net.sr's socket.receive/listener.accept)
+//   and the loss is documented at each site.
+// - `struct sockaddr_in` locals and `&addr` are gone: the backend packs the
+//   16-byte sockaddr image into an int[2] (std/net_win.sr idiom).
+// - connect(): URL parsing keeps the pre-split shape (independent `ws://`
+//   and `wss://` prefix strips -- the second if re-tests the stripped host,
+//   preserving the pre-split quirk; ws:// defaults to port 80, wss:// to
+//   443) with one fix: the pre-split `int(host.substr(colon + 1,
+//   slash - colon - 1))` produced a NEGATIVE length when the URL had no
+//   path (dead code, never executed); parsePort now scans digits and falls
+//   back to the scheme default on garbage. `wss://` still opens a PLAIN TCP
+//   socket on 443 (pre-split de-facto behavior -- the same posture
+//   std/net.sr's tls_client documents; no TLS stack is invoked).
+// - The HTTP-upgrade handshake keeps the pre-split request text verbatim
+//   (same fixed Sec-WebSocket-Key constant "dGhlIHNhbXBsZSBub25jZQ==") and
+//   its post-send `recv` + discard of the 101 response (no status
+//   validation, as before).
+// - server.onConnection keeps its accept loop and fires the zero-arg
+//   callback once per accepted client; the client handle is not delivered
+//   (see the callback note above) and not closed, exactly like the
+//   pre-split loop it replaces. server.accept() (new) is the functional
+//   path that returns each client as a socket.
+// - server.wait() keeps the pre-split `while (true) { time.sleep(1000); }`
+//   never-returning shape. It is part of the public surface; never call it
+//   from a probe or test: it blocks the process by design. The
+//   module-qualified `time.sleep` call is safe (this module defines no
+//   `sleep` of its own -- see std/graphql.sr's qualified-call note).
+
+// Runtime-sized byte-array allocation routed through a return statement.
+// The self-hosted compiler mis-lowers `byte[] x = new byte[expr];`
+// DECLARATION initializers as one-element byte-array literals (see
+// std/crypto_win.sr for the full probe), so every frame buffer is built
+// here and returned; the caller's `byte[] frame = wsAllocBytes(n);` init is
+// a plain call and takes the normal path. silverc-rs lowers both shapes
+// correctly; this detour is byte-for-byte equivalent there.
+private byte[] wsAllocBytes(int count) {
+    return new byte[count];
+}
 
 class socket {
     private int fd;
     private bool connected;
 
-    construct(int fd) { this.fd = fd; this.connected = true; }
+    construct(int fd) {
+        this.fd = fd;
+        this.connected = true;
+    }
 
-    public void onOpen(void callback()) {
+    // Fires the callback immediately on registration (the pre-split
+    // onOpen body was exactly `callback();` -- no state machine existed
+    // to hook into, and none is invented here).
+    public void onOpen(void () callback) {
         callback();
     }
 
-    public void onMessage(void callback(string data)) {
-        byte[4096] buf;
+    // Loop-receives frames until the peer disconnects or sends a close
+    // frame (opcode 8), firing the callback once per decoded TEXT frame
+    // (opcode 1). The historical `void callback(string data)` payload
+    // cannot be expressed (`void () name` parameters take no arguments on
+    // either compiler); the decoded payload of the LAST frame is available
+    // through receive() semantics -- call receive() directly instead of
+    // onMessage when the message text matters.
+    public void onMessage(void () callback) {
+        if (osType() != OSTypes.WINDOWS) { return; }
         while (this.connected) {
-            int n = recv(this.fd, buf, 4096, 0);
-            if (n <= 0) { this.connected = false; break; }
-            string data = "";
-            for (int i = 0; i < n; i++) { data += char(buf[i]); }
-            callback(data);
+            string raw = wsWinReceive(this.fd, 4096);
+            if (raw.length <= 0) {
+                this.connected = false;
+                break;
+            }
+            int opcode = raw[0] & 0x0F;
+            if (opcode == 8) {
+                this.connected = false;
+                break;
+            }
+            if (opcode == 1) {
+                this.decodeFrame(raw);
+                callback();
+            }
         }
     }
 
-    public void onClose(void callback()) {
+    // Fires the callback immediately on registration (pre-split body:
+    // `callback();`).
+    public void onClose(void () callback) {
         callback();
     }
 
     public void send(string data) {
-        byte[] frame = encodeFrame(data);
-        send(this.fd, frame, frame.length, 0);
+        if (osType() == OSTypes.WINDOWS) {
+            byte[] frame = this.encodeFrame(data);
+            wsWinSendBytes(this.fd, frame);
+        }
     }
 
-    public void close() { this.connected = false; closesocket(this.fd); }
+    // Receives one frame and returns its decoded payload ("" on disconnect,
+    // error, or close frame). NEW: the pre-split class had no single-shot
+    // receive; onMessage's loop was the only read path. Mirrors
+    // std/net.sr's socket.receive(maxLen).
+    public string receive(int maxLen) {
+        if (osType() == OSTypes.WINDOWS) {
+            string raw = wsWinReceive(this.fd, maxLen);
+            if (raw.length <= 0) {
+                this.connected = false;
+                return "";
+            }
+            int opcode = raw[0] & 0x0F;
+            if (opcode == 8) {
+                this.connected = false;
+                return "";
+            }
+            return this.decodeFrame(raw);
+        }
+        return "";
+    }
 
-    private byte[] encodeFrame(string data) {
-        byte[] payload = data.toBytes();
-        int len = payload.length;
-        byte[] frame;
-        if (len < 126) { frame = new byte[2 + len]; frame[0] = 0x81; frame[1] = len; }
-        else if (len < 65536) { frame = new byte[4 + len]; frame[0] = 0x81; frame[1] = 126; frame[2] = (len >> 8) & 0xFF; frame[3] = len & 0xFF; }
-        else { frame = new byte[10 + len]; frame[0] = 0x81; frame[1] = 127; for (int i = 0; i < 8; i++) { frame[2 + i] = (len >> (56 - i * 8)) & 0xFF; } }
-        for (int i = 0; i < len; i++) { frame[frame.length - len + i] = payload[i]; }
+    public void close() {
+        this.connected = false;
+        if (osType() == OSTypes.WINDOWS) {
+            wsWinClose(this.fd);
+        }
+    }
+
+    // Encodes one unmasked text frame. Private pre-split; public since this
+    // split so the frame format is probeable byte-identically (the pre-split
+    // file never compiled, so nothing could reference it either way).
+    // Byte layout is the pre-split algorithm verbatim:
+    //   len < 126   -> [0x81, len, payload...]
+    //   len < 65536 -> [0x81, 126, len>>8, len&0xFF, payload...]
+    //   otherwise   -> [0x81, 127, 8 big-endian length bytes, payload...]
+    public byte[] encodeFrame(string data) {
+        int len = data.length;
+        int header = 2;
+        if (len >= 126) { header = 4; }
+        if (len >= 65536) { header = 10; }
+        byte[] frame = wsAllocBytes(header + len);
+        frame[0] = 0x81;
+        if (len < 126) {
+            frame[1] = len;
+        } elif (len < 65536) {
+            frame[1] = 126;
+            frame[2] = (len >> 8) & 0xFF;
+            frame[3] = len & 0xFF;
+        } else {
+            frame[1] = 127;
+            for (int i = 0; i < 8; i++) {
+                frame[2 + i] = (len >> (56 - i * 8)) & 0xFF;
+            }
+        }
+        for (int i = 0; i < len; i++) {
+            frame[header + i] = data[i] & 0xFF;
+        }
         return frame;
+    }
+
+    // Decodes one WebSocket frame from the start of `raw` and returns its
+    // payload as a string ("" on truncation). Handles the mask bit with the
+    // standard 4-byte XOR key; 64-bit lengths read the low 32 bits. NEW
+    // helper (the pre-split file had no decoding -- see the header note).
+    // Transport note (probed): Silver strings cannot carry NUL bytes, so a
+    // received frame containing a zero byte truncates at it and decodes as
+    // "" -- the same string-carries-no-NUL posture std/net.sr's receive
+    // path has; NUL-free frames (the common text case) decode fully.
+    public string decodeFrame(string raw) {
+        if (raw.length < 2) { return ""; }
+        int b1 = raw[1] & 0xFF;
+        int len7 = b1 & 0x7F;
+        int header = 2;
+        int len = len7;
+        if (len7 == 126) {
+            len = ((raw[2] & 0xFF) << 8) | (raw[3] & 0xFF);
+            header = 4;
+        }
+        if (len7 == 127) {
+            len = 0;
+            for (int i = 4; i < 8; i++) {
+                len = (len << 8) | (raw[2 + i] & 0xFF);
+            }
+            header = 10;
+        }
+        bool masked = (b1 & 0x80) != 0;
+        if (masked) { header += 4; }
+        if (raw.length < header + len) { return ""; }
+        string payload = "";
+        if (masked) {
+            int keyAt = header - 4;
+            for (int j = 0; j < len; j++) {
+                int b = (raw[header + j] & 0xFF) ^ (raw[keyAt + (j % 4)] & 0xFF);
+                char c = char(b);
+                payload += c.toString();
+            }
+        } else {
+            for (int j = 0; j < len; j++) {
+                int b = raw[header + j] & 0xFF;
+                char c = char(b);
+                payload += c.toString();
+            }
+        }
+        return payload;
     }
 }
 
@@ -52,38 +267,64 @@ class server {
     private int fd;
     private int port;
 
-    construct(int port) { this.port = port; }
+    construct(int port) {
+        this.port = port;
+        this.fd = -1;
+    }
 
-    public void onConnection(void callback(socket client)) {
-        this.fd = socket(AF_INET, SOCK_STREAM, 0);
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = 0;
-        addr.sin_port = (this.port & 0xFF) << 8 | (this.port >> 8) & 0xFF;
-        bind(this.fd, &addr, 16);
-        listen(this.fd, 10);
+    // Accepts clients forever, firing the zero-arg callback once per
+    // connection. The historical `void callback(socket client)` parameter
+    // cannot be expressed (DOCS/259 params take no arguments); the accepted
+    // client handle is neither delivered nor closed, exactly like the
+    // pre-split loop. Use start() + accept() for the functional path.
+    public void onConnection(void () callback) {
+        if (osType() != OSTypes.WINDOWS) { return; }
+        if (this.fd < 0) { this.fd = wsWinListen(this.port); }
+        if (this.fd < 0) { return; }
         while (true) {
-            int client = accept(this.fd, null, null);
+            int client = wsWinAccept(this.fd);
             if (client >= 0) {
-                socket ws = new socket(client);
-                callback(ws);
+                callback();
             }
         }
     }
 
+    // Binds and listens (backlog 10, the pre-split hard-coded value).
     public void start() {
-        this.fd = socket(AF_INET, SOCK_STREAM, 0);
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = 0;
-        addr.sin_port = (this.port & 0xFF) << 8 | (this.port >> 8) & 0xFF;
-        bind(this.fd, &addr, 16);
-        listen(this.fd, 10);
+        if (osType() == OSTypes.WINDOWS) {
+            this.fd = wsWinListen(this.port);
+        }
     }
 
+    // Accepts one client and returns it as a socket (null on failure).
+    // NEW: the pre-split class had no single-shot accept; onConnection's
+    // infinite loop was the only accept path and its callback could not
+    // carry the client. Mirrors std/net.sr's listener.accept().
+    public socket accept() {
+        if (osType() == OSTypes.WINDOWS) {
+            if (this.fd < 0) { this.fd = wsWinListen(this.port); }
+            if (this.fd < 0) { return null; }
+            int client = wsWinAccept(this.fd);
+            if (client < 0) { return null; }
+            return new socket(client);
+        }
+        return null;
+    }
+
+    // Never returns (pre-split shape); blocks the process by design.
     public void wait() {
         while (true) { time.sleep(1000); }
     }
+}
+
+private int parsePort(string s) {
+    int v = 0;
+    for (int i = 0; i < s.length; i++) {
+        int c = s[i] & 0xFF;
+        if (c < 48 || c > 57) { return -1; }
+        v = v * 10 + (c - 48);
+    }
+    return v;
 }
 
 public socket connect(string url) {
@@ -91,24 +332,23 @@ public socket connect(string url) {
     int port = 80;
     if (host.indexOf("ws://") == 0) { host = host.substr(5); }
     if (host.indexOf("wss://") == 0) { host = host.substr(6); port = 443; }
-    int colon = host.indexOf(":");
     int slash = host.indexOf("/");
-    if (colon >= 0) { port = int(host.substr(colon + 1, slash - colon - 1)); host = host.substr(0, colon); }
-    else if (slash >= 0) { host = host.substr(0, slash); }
-
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = (port & 0xFF) << 8 | (port >> 8) & 0xFF;
-    addr.sin_addr.s_addr = inet_addr(host);
-    if (connect(sock, &addr, 16) < 0) { return null; }
-
-    string key = "dGhlIHNhbXBsZSBub25jZQ==";
-    string httpUpgrade = "GET / HTTP/1.1\r\nHost: " + host + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
-    byte[] reqBytes = httpUpgrade.toBytes();
-    send(sock, reqBytes, reqBytes.length, 0);
-
-    byte[1024] resp;
-    recv(sock, resp, 1024, 0);
-    return new socket(sock);
+    if (slash < 0) { slash = host.length; }
+    string hostPart = host.substr(0, slash);
+    int colon = hostPart.indexOf(":");
+    if (colon >= 0) {
+        int parsed = parsePort(hostPart.substr(colon + 1));
+        if (parsed > 0) { port = parsed; }
+        hostPart = hostPart.substr(0, colon);
+    }
+    if (osType() == OSTypes.WINDOWS) {
+        int sock = wsWinConnect(hostPart, port);
+        if (sock < 0) { return null; }
+        string key = "dGhlIHNhbXBsZSBub25jZQ==";
+        string httpUpgrade = "GET / HTTP/1.1\r\nHost: " + hostPart + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        wsWinSendString(sock, httpUpgrade);
+        wsWinReceive(sock, 1024);
+        return new socket(sock);
+    }
+    return null;
 }
