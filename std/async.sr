@@ -1,20 +1,143 @@
-import * from win32.msvcrt;
-
 mod export async;
-import {sleep} from time;
+import * from os;
+import * from async_win;
 import {Exception} from exception;
+
+// DOCS -- public `async` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
+// unified, portable front of the async library. It contains ZERO win32
+// imports: the one DLL-backed effect this module exposes -- the millisecond
+// wait behind sleep()/timeout(), a kernel32!Sleep -- lives in the internal
+// Windows backend std/async_win.sr, and every entry that touches it routes
+// through the OS gate `if (osType() == OSTypes.WINDOWS)` before calling it
+// (osType() is std/os.sr's plain-Silver stand-in -- see that file and
+// std/time_win.sr for why the gate does not use the native os.type query).
+//
+// The else branch of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
+// a future non-Windows backend the fallbacks follow the module's existing
+// failure style: sleep()/timeout() are silent no-ops (timeout still returns
+// its data), matching how the pre-split waits behaved when time's backend
+// was unreachable.
+//
+// DISPATCH (per compiler, probed -- the deciding fact of this split):
+// `async` is a RESERVED KEYWORD token on silverc-rs (token.rs maps "async" =>
+// TokenKind::Async) and the parser's module-name position only accepts
+// Identifier, so `mod export async;` and `import * from async;` are hard
+// parse errors there ("Expected 'module name' but found 'Async'"). Neither
+// compiler reserves `async` as a builtin module (silverc-rs main.rs
+// builtin_modules_set and the self-hosted parser/visibility tables have no
+// native async dispatch), so no per-compiler call interception exists to
+// preserve: on the self-hosted compiler, where `async` is an ordinary
+// identifier (the lexer's keywordKind table has no async entry), every
+// `async.*` call resolves to the collected globals/classes of this module.
+// The module is therefore SELF-HOST-ONLY, exactly as it was before this
+// split (pre-split it never compiled on silverc-rs either -- same keyword
+// rejection -- and never compiled on the self-host, see PRE-SPLIT STATE).
+//
+// WHY THE WAITS DO NOT DELEGATE TO time (deviation, documented): the
+// pre-split sleep()/timeout() called `time.sleep(ms)`. On the self-hosted
+// compiler a module-qualified call to a name the CURRENT module also defines
+// resolves to that local function and recurses into a stack overflow
+// (probed with a minimal two-module fixture: `time.now()` from a module with
+// no local `now` routes correctly, so the name collision is the trigger).
+// async defines `sleep` itself, so delegation is unexpressible there; the
+// import-alias escape (`import {sleep as timeSleep} from time;`) is
+// win32-only on the self-host ("aliased import names (X as Y) are only
+// allowed on win32 imports" -- probed). The split therefore follows the
+// thread/thread_win precedent: the module owns its kernel32!Sleep grant in
+// std/async_win.sr (see that file for the full rationale). The pre-split
+// `import * from win32.msvcrt;` line was VESTIGIAL -- nothing in the file
+// ever called a CRT export -- and is not carried over.
+//
+// PRE-SPLIT STATE (probed against git HEAD before this split): the old file
+// NEVER compiled anywhere. silverc-rs rejected the module name itself
+// (above); the self-hosted compiler rejected the body -- `private
+// void callback();` (a fn-typed prop) fails with "expected { but found ;",
+// and the old-style `void cb()` parameter on GLOBAL functions fails with
+// "expected { but found (" (both probed). The file also sat in silverc.srp's
+// exclude list. Every public name/arity below is preserved unchanged; the
+// bodies are the closest forms the CURRENT grammar accepts (probe matrix,
+// both compilers):
+//
+// - GLOBAL functions take function-typed parameters ONLY in the DOCS/259
+//   spelling `void () name` (both compilers accept it; the old `void name()`
+//   spelling is rejected on both -- probed). `run` and `task` use it, and
+//   invoking the parameter (`mainFunc()`) is probed end-to-end through the
+//   module-qualified call `async.run((void () { ... }))`.
+// - CLASS CONSTRUCTORS are the mirror image: the DOCS/259 spelling
+//   `construct(void () c)` is rejected on BOTH compilers ("expected { but
+//   found c" self-host / "Expected 'identifier' but found 'LeftParen'"
+//   silverc-rs), while the old spelling `construct(void cb())` parses and
+//   compiles on the self-host. The task constructor therefore keeps the old
+//   spelling -- the only fn-param form constructors accept.
+// - FN-TYPED PROPS do not parse on either compiler (probed), so the callback
+//   slot is `private object callback` -- the object-slot idiom std/thread.sr
+//   used; a `void ()` value flows into the object slot unchanged (an 8-byte
+//   address on both compilers).
+// - OBJECT-SLOT CALL-THROUGH is a SILENT NO-OP on the self-hosted compiler
+//   (probed): `this.callback()` compiles, exits 0, and never runs the body --
+//   the worst kind of dead. awaitResult() therefore relays the slot through
+//   a method fn-parameter (`this.runCallback(this.callback)`, body `c();`),
+//   which is probed end-to-end: ctor fn-param -> object prop -> method
+//   fn-param -> call-through fires the caller's `(void () { ... })` body.
+// - STORING A CALLBACK (task/setJob): a function-typed value cannot be
+//   declared as a global/local (bare `object x;` is rejected on the
+//   self-host; `object` is a param/prop type only), so the slot lives on the
+//   instance. The free function `task(...)` fills it through a public
+//   `setJob(void () c)` method -- an ADDITIVE member, the pre-split class had
+//   no setter -- because it is the probe-proven route (ctor-param store
+//   works only for a direct `new task((void () { ... }))` at the call site).
+//   All three working spellings (probed end-to-end, exit 0, body fires):
+//       task t = task((void () { ... }));   // free function, BARE name
+//       task t = new task((void () { ... })); t.awaitResult();
+//   and inside the module, `new task()` + `t.setJob(cb)`.
+//
+//   QUALIFIED-CALL LANDMINE (self-host, probed -- read before using):
+//   `async.task((void () { ... }))` -- the module-QUALIFIED spelling --
+//   compiles and returns an object whose plain props read back fine
+//   (isDone()/result), but the STORED callback slot is garbage and
+//   t.awaitResult() dies with 0xC0000005 (access violation) on the indirect
+//   call. The bare spelling `task((void () { ... }))` of the exact same
+//   call, against the exact same module, fires the body. A minimal
+//   two-module fixture reproduces both sides, so the trigger is the
+//   qualified call spelling combined with STORING the fn argument --
+//   `async.run((void () { ... }))` is qualified too and works, because run
+//   INVOKES the parameter directly instead of storing it. Until the
+//   self-host codegen is fixed, call the free function `task` by its bare
+//   name (the star import brings it in) or construct with `new task(...)`
+//   directly; only qualified calls that STORE the fn argument are affected.
+//
+// SEMANTICS NOTES (pre-existing, preserved): task.result is never assigned
+// anywhere -- awaitResult() runs the callback and returns the (empty) result
+// string, and `all` collects those empties; making the callback able to
+// produce a value needs a string-returning fn type (`string () name`), which
+// no compiler supports today, so the gap is documented rather than
+// redesigned. task.completed/isDone() are likewise never set -- the fields
+// exist since the pre-split file and keep their (inert) shape. Both stay so
+// the public surface keeps its pre-split names; the only additive member is
+// setJob (see STORING A CALLBACK above). TimeoutException is
+// declared-but-never-thrown, exactly as it was pre-split; it is kept because
+// it is part of the public surface.
 
 class task {
     private bool completed;
     private string result;
-    private void callback();
+    private object callback;
 
     construct() { }
     construct(void cb()) { this.callback = cb; }
 
+    private void runCallback(void () c) {
+        c();
+    }
+
     public string awaitResult() {
-        this.callback();
+        this.runCallback(this.callback);
         return this.result;
+    }
+
+    public void setJob(void () c) {
+        this.callback = c;
     }
 
     public bool isDone() { return this.completed; }
@@ -28,30 +151,36 @@ class eventLoop {
     public void run() { }
 }
 
-public task task(void cb()) {
-    return new task(cb);
+public task task(void () cb) {
+    task t = new task();
+    t.setJob(cb);
+    return t;
 }
 
 public string[] all(task t1, task t2) {
-    string[] results;
+    string[] results = [];
     results.push(t1.awaitResult());
     results.push(t2.awaitResult());
     return results;
 }
 
 public string timeout(string data, int ms) {
-    time.sleep(ms);
+    if (osType() == OSTypes.WINDOWS) {
+        asyncWinSleep(ms);
+    }
     return data;
 }
 
 public void sleep(int ms) {
-    time.sleep(ms);
+    if (osType() == OSTypes.WINDOWS) {
+        asyncWinSleep(ms);
+    }
 }
 
 public eventLoop getEventLoop() {
     return new eventLoop();
 }
 
-public void run(void mainFunc()) {
+public void run(void () mainFunc) {
     mainFunc();
 }

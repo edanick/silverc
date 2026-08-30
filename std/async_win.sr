@@ -1,0 +1,44 @@
+import { Sleep as asyncWinRawSleep } from win32.kernel32;
+
+internal mod export async_win;
+
+// DOCS -- INTERNAL Windows backend of the public `async` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). The DLL-backed effect the async module
+// exposes is the timed wait behind sleep()/timeout(): a millisecond
+// kernel32!Sleep. The public wrapper (std/async.sr) contains zero win32
+// imports and reaches this code only behind the OS gate
+// `if (osType() == OSTypes.WINDOWS)` (see std/os.sr for why the gate calls
+// the plain-Silver osType() stand-in instead of the native os.type query).
+//
+// WHY A BACKEND AT ALL (the pre-split file had no DLL calls of its own -- its
+// `import * from win32.msvcrt;` was vestigial and its waits delegated to
+// std/time.sr): delegation is unexpressible on the self-hosted compiler --
+// a module-qualified call `time.sleep(...)` made from inside a module that
+// defines its OWN `sleep` resolves to that local function and recurses into
+// a stack overflow (probed with a minimal two-module fixture: the qualified
+// `time.now()` from the same fixture, which has no local `now`, routes
+// correctly, so the collision -- not qualification itself -- is the trigger;
+// silverc-rs was never able to compile this module to compare, see
+// std/async.sr). The import-alias escape hatch is win32-only on the
+// self-host ("aliased import names (X as Y) are only allowed on win32
+// imports" -- probed), so the split follows the thread/thread_win precedent:
+// the module owns its DLL grant in an internal backend.
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects (enforced by compiler/visibility.sr on single-file compiles;
+// .srp projects compile their whole source set as one project). A user file
+// that tries `import * from async_win;` fails with the standard internal-
+// visibility error.
+//
+// KERNEL32 IMPORT ALIASING: the DLL export is bound through an explicit
+// `X as Y` import alias rather than a full-table `import * from
+// win32.kernel32;` grant, so only the one function below is granted, the
+// grant answers to the local asyncWin-prefixed name, and the PE import keeps
+// the real export name "Sleep" (present in silverc-rs src/win32.rs and the
+// self-hosted compiler/mini_cg.sr kernel32 tables; mirrors
+// std/time_win.sr and std/thread_win.sr).
+
+internal void asyncWinSleep(int ms) {
+    asyncWinRawSleep(ms);
+}
