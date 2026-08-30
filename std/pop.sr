@@ -1,6 +1,232 @@
-import * from win32.ws2_32;
+import * from os;
+import * from pop_win;
 
 mod export pop;
+
+// DOCS -- public `pop` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
+// unified, portable front of the POP3 library. It contains ZERO win32
+// imports: every ws2_32 call moved into the internal Windows backend
+// std/pop_win.sr, and every entry that touches the network routes through
+// the OS gate `if (osType() == OSTypes.WINDOWS)` before calling it
+// (osType() is std/os.sr's plain-Silver stand-in -- see that file for why
+// the gate does not use the native os.type query).
+//
+// The else side of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
+// a future non-Windows backend the fallbacks follow the module's failure
+// style: login/quit are silent no-ops, count() returns 0, list() returns [],
+// remove() returns false, retrieve() returns an empty message,
+// isLoggedIn() stays false, getLastReply() stays "".
+//
+// DISPATCH (per compiler, probed): `pop` is builtin-reserved on NEITHER
+// compiler -- silverc-rs's builtin_modules_set (src/main.rs:81 lists
+// fs/json/yaml/env/url/hash/path/bom/console/math/http only) and the
+// self-hosted compiler's visBuiltinModule (compiler/visibility.sr:605 lists
+// fs/json/yaml/llmai/LLMAI/os/project/exception/bom/process/notifications/
+// env/url/hash/path/console/math/http) plus its driver prepend list all
+// exclude it. Both compilers resolve `import * from pop;` as an ORDINARY
+// SOURCE module (std/pop.sr); no native dispatch exists to preserve.
+// (pop.sr's entry in silverc.srp's exclude list only keeps it out of the
+// compiler's own aggregate build -- the same posture as smtp.sr/ftp.sr; it
+// does not make `pop` a builtin. pop_win.sr is NOT excluded: its popWin*
+// names collide with nothing in the aggregate namespace, exactly like
+// smtp_win.sr.)
+//
+// PRE-SPLIT STATE (probed against this file's git HEAD copy before the
+// rewrite, fresh -o names on both compilers): the old std/pop.sr NEVER
+// compiled under either compiler. silverc-rs died at line 26 with
+// "26:9: Expected expression", "unknown keyword sockaddr_in at line 26,
+// column 16" and "unknown keyword addr at line 26, column 28" (the line-26
+// `struct sockaddr_in addr;` phantom); the self-hosted compiler died with
+// the same "unknown keyword sockaddr_in" plus "unknown keyword addr" and a
+// "you forgot to put a semicolon" cascade, all at line 26. The parser never
+// reached the later phantoms, but they were equally dead: `(cmd +
+// "\r\n").toBytes()` (line 39) is the phantom string method the std/ftp.sr /
+// std/smtp.sr PRE-SPLIT notes flag (and the crasher behind
+// encoding.base64Encode), `new byte[1024]` (line 44) is the byte[]
+// declaration-initializer landmine, `int(resp.substr(space + 1, space2 -
+// space - 1))` (line 59) rides the rs substr(start,X)=(start,END) vs
+// self-host substr(start,X)=(start,LENGTH) disagreement, and recvLine()'s
+// `char(buf[i])` scan over a recv buffer never executed. `AF_INET`/
+// `SOCK_STREAM` resolve to nothing (neither name is in either compiler's
+// ws2_32 export table). Every body was therefore dead text -- there was NO
+// observable pre-split behavior to preserve beyond names, arities and
+// intent.
+//
+// DEAD -> LIVE (what this split made actually work, mirroring the
+// std/smtp.sr / std/ftp.sr splits):
+// - The control channel: socket + connect over ws2_32 with WSAStartup (the
+//   pre-split file never initialized winsock), the sockaddr_in image packed
+//   into an int[2] qword buffer, and DLL returns normalized with the
+//   two-sided `v < 0 || v > 2147483647` check (the self-host zero-extends
+//   SOCKET_ERROR to 4294967295; see std/pop_win.sr).
+// - login(): pre-split it fired three unchecked read/send pairs (greeting,
+//   USER, PASS) and stayed silent about failure. Each step is now read and
+//   validated (+OK required at every step); the outcome is recorded in
+//   isLoggedIn()/getLastReply() (both ADDITIVE -- the pre-split surface had
+//   no way to report anything; same additions as std/smtp.sr/std/ftp.sr).
+//   Plain-text USER/PASS only: POP3 USER/PASS needs no base64, so the
+//   encoding.base64Encode runtime crasher (phantom string.toBytes(), 0xC0000005
+//   rs / 0xC0000409 self-host -- see std/smtp.sr's b64Encode note) is avoided
+//   entirely; no b64 was carried and the encoding import never existed here.
+//   Against a non-POP3 listener the login fails gracefully: the server's
+//   banner (or "" after a silent disconnect) is surfaced through
+//   getLastReply() and the process exits cleanly. No exceptions anywhere.
+// - count(): pre-split it parsed STAT's reply through the substr landmine
+//   and int()-casts. It now validates +OK and parses "+OK <count> <octets>"
+//   with the pure statCount() digit scan (probeable, substr-free); a
+//   malformed reply returns 0 (the pre-split malformed-reply result).
+// - retrieve(): pre-split it read exactly ONE reply line and wrapped it in a
+//   message -- the RETR status line, never the message. It now reads the
+//   full multi-line response (bounded readMulti loop until the ".\r\n"
+//   terminator) and fills sender/subject/body via the pure headerValue()/
+//   messageBody() helpers (the pre-split fields existed but were never
+//   populated -- dead). Byte-stuffed leading dots ("..") inside the body are
+//   preserved verbatim (no de-stuffing was invented); the body is the text
+//   between the first blank line and the "\r\n.\r\n" terminator.
+// - quit(): sends QUIT and closes immediately without waiting for the +OK
+//   (the std/smtp.sr/ftp.sr shape), so a dead peer cannot stall quit(); the
+//   pre-split recvLine() after QUIT is dropped (it never ran anyway -- the
+//   file never compiled).
+// - Bounded reads: every socket gets a 30 s SO_RCVTIMEO (std/pop_win.sr).
+//   The pre-split file had no timeout and would have hung on a silent peer;
+//   readReply()'s accumulation loop is bounded at 16 iterations and
+//   readMulti() at 16 x 4096 bytes (~64 KB per command -- 64x the pre-split
+//   1024-byte single recvLine()) so no path can spin forever.
+//
+// NOT INVENTED: no AUTH/APOP/STLS (the pre-split intent was plain USER/PASS;
+// APOP is an MD5 scheme and AUTH PLAIN would need base64 -- the encoding
+// crasher -- so neither was invented); no UIDL/TOP/RSET/NOOP; no TLS; no
+// server class (the pre-split file never had one and none was invented);
+// message keeps exactly its pre-split four fields -- no uid/size/msgNum
+// fields were added.
+//
+// API PRESERVATION (every public name/arity of the pre-split file,
+// unchanged): class message -- public fields sender/subject/body/raw,
+// construct(string raw); class client -- construct(string host, int port);
+// login(string user, string pass); count() -> int; retrieve(int id) ->
+// message; quit(). The private sendLine/recvLine helper names are preserved
+// (recvLine keeps its raw-bytes shape -- one bounded read; the accumulation
+// lives in the new private readReply/readMulti, the std/smtp.sr shape). NO
+// RENAMES were needed (unlike smtp's from/to): every pre-split name
+// (message, client, login, count, retrieve, quit, sendLine, recvLine and the
+// message fields) is keyword-free on both compilers -- checked against
+// silverc-rs src/token.rs and self-host compiler/lexer.sr.
+// ADDITIVE (the std/smtp.sr/std/ftp.sr precedent, documented): client.
+// isLoggedIn() is true only after a fully accepted greeting + USER + PASS
+// exchange; client.getLastReply() returns the raw text of the last server
+// reply ("" before the first read -- the graceful-failure surface);
+// client.remove(int id) issues DELE and returns true on +OK (spelled
+// `remove` -- DELE marks a message for deletion at QUIT); client.list()
+// issues LIST and returns the data lines ("id octets" strings) split on
+// "\r\n"; free helpers isOk(resp)/isErr(resp) (status-prefix checks),
+// multiLineComplete(resp) (true once the ".\r\n" terminator is present),
+// statCount(resp)/statSize(resp) (the two STAT numbers, -1 on malformed),
+// headerValue(text, name) (RFC 822 header value, "" if absent -- pass
+// "From:"/"Subject:" with the colon) and messageBody(retrResp) (text between
+// the header blank line and the ".\r\n" terminator) are pure and probeable.
+// Also additive and invisible: the private lastReply/loggedIn fields, the
+// private readReply/readMulti/fail/lineEndFrom/lineEndIndex/terminatorIndex/
+// blankLineIndex/sliceRange/statNumber plumbing, and construct() now
+// initializes every field (sock to -1, strings to "", loggedIn to false) --
+// the pre-split construct set only host/port, so quit()'s closesocket
+// would have derefed an uninitialized handle had the file ever run.
+//
+// CALLER NOTES: instantiate the client with `var c = new client(...);` --
+// a lowercase class arriving from a star-imported module cannot be spelled
+// as a local's type on silverc-rs (per-file parsing: `client c` dies with
+// "unknown keyword"; `new mod.client()` dies on BOTH compilers; `var`
+// works on both, probed via std/ftps.sr). retrieve() returns a class
+// instance across the module boundary: assign it to a `var` and read the
+// fields from there (probed byte-identical on both compilers). Strings
+// returned across this module's boundary (getLastReply and the free
+// helpers) should be assigned to a local before being concatenated into
+// larger expressions (silverc-rs stringifies the return pointer in
+// expression position; see std/dns.sr's RS-ONLY CALLER LANDMINE). count()
+// and retrieve() return 0/empty (never negative) on failure; list() returns
+// [] and remove() false.
+
+// True when `resp` starts with POP3's "+OK" success marker. Pure; probeable
+// byte-identical on both compilers.
+public bool isOk(string resp) {
+    if (resp.length < 3) { return false; }
+    return resp[0] == 43 && resp[1] == 79 && resp[2] == 75;
+}
+
+// True when `resp` starts with POP3's "-ERR" failure marker. ADDITIVE, the
+// diagnostic mirror of isOk.
+public bool isErr(string resp) {
+    if (resp.length < 4) { return false; }
+    return resp[0] == 45 && resp[1] == 69 && resp[2] == 82 && resp[3] == 82;
+}
+
+// True when `resp` already contains POP3's multi-line terminator: the
+// "\r\n.\r\n" octet sequence (a CRLF, the lone "." line, a CRLF). LIST and
+// RETR responses end this way; the wrapper's multi-line reader keeps
+// accumulating until this fires, the peer goes quiet, or the bounded loop
+// exhausts. Pure; probeable.
+public bool multiLineComplete(string resp) {
+    return terminatorIndex(resp) >= 0;
+}
+
+// First number of a STAT reply "+OK <count> <octets>" (-1 on malformed).
+// Deliberately a digit scan: the pre-split parse rode the rs
+// substr(start,X)=(start,END) vs self-host (start,LENGTH) disagreement and
+// int()-casts of substrings. Pure; probeable.
+public int statCount(string resp) {
+    return statNumber(resp, 1);
+}
+
+// Second number of a STAT reply (the total octet size; -1 on malformed).
+// Pure; probeable.
+public int statSize(string resp) {
+    return statNumber(resp, 2);
+}
+
+// Value of an RFC 822 header line inside a RETR response ("" when absent):
+// scans line by line, matches `headerName` (pass it WITH the colon, e.g.
+// "From:") at a line start, skips one space after the colon and returns the
+// rest of that line. No folding support (continuation lines are not joined).
+// Pure; probeable. ADDITIVE (the pre-split sender/subject fields existed but
+// were never populated).
+public string headerValue(string text, string headerName) {
+    int nameLen = headerName.length;
+    int pos = 0;
+    while (pos < text.length) {
+        int eol = lineEndFrom(text, pos);
+        if (eol < 0) { break; }
+        int lineLen = eol - pos;
+        if (lineLen > nameLen) {
+            bool headMatch = true;
+            for (int k = 0; k < nameLen; k++) {
+                if (int(text[pos + k]) != int(headerName[k])) { headMatch = false; }
+            }
+            if (headMatch) {
+                int valStart = pos + nameLen;
+                if (text[valStart] == 32) { valStart = valStart + 1; }
+                return sliceRange(text, valStart, eol);
+            }
+        }
+        pos = eol + 2;
+    }
+    return "";
+}
+
+// Body text of a RETR response: everything between the first blank line
+// (the RFC 822 header/body separator) and the "\r\n.\r\n" terminator
+// ("" when either is missing). Byte-stuffed ".." lines are preserved
+// verbatim. Pure; probeable. ADDITIVE (the pre-split body field existed but
+// was never populated).
+public string messageBody(string retrResp) {
+    int blank = blankLineIndex(retrResp);
+    if (blank < 0) { return ""; }
+    int bodyStart = blank + 4;
+    int bodyEnd = retrResp.length;
+    int term = terminatorIndex(retrResp);
+    if (term >= bodyStart) { bodyEnd = term; }
+    if (bodyEnd < bodyStart) { return ""; }
+    return sliceRange(retrResp, bodyStart, bodyEnd);
+}
 
 class message {
     public string sender;
@@ -15,59 +241,259 @@ class client {
     private int sock;
     private string host;
     private int port;
+    private string lastReply;
+    private bool loggedIn;
 
     construct(string host, int port) {
         this.host = host;
         this.port = port;
+        this.sock = -1;
+        this.lastReply = "";
+        this.loggedIn = false;
     }
 
+    // ADDITIVE (the std/smtp.sr/std/ftp.sr precedent): the raw text of the
+    // last server reply on the control channel ("" before the first read).
+    // This is the graceful-failure surface: against a non-POP3 listener it
+    // holds the banner the peer sent, or "" when the peer said nothing and
+    // closed.
+    public string getLastReply() {
+        return this.lastReply;
+    }
+
+    // ADDITIVE: true only after a fully accepted greeting + USER + PASS
+    // exchange.
+    public bool isLoggedIn() {
+        return this.loggedIn;
+    }
+
+    // Greeting + USER + PASS flow, every step validated (+OK required).
+    // On any mismatch fail() drops the connection and the server's last
+    // words stay in getLastReply(). Plain-text USER/PASS only (no base64 --
+    // see DEAD -> LIVE).
     public void login(string user, string pass) {
-        this.sock = socket(AF_INET, SOCK_STREAM, 0);
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_port = (this.port & 0xFF) << 8 | (this.port >> 8) & 0xFF;
-        addr.sin_addr.s_addr = inet_addr(this.host);
-        connect(this.sock, &addr, 16);
-        recvLine();
-        sendLine("USER " + user);
-        recvLine();
-        sendLine("PASS " + pass);
-        recvLine();
+        if (osType() != OSTypes.WINDOWS) { return; }
+        this.sock = popWinConnect(this.host, this.port);
+        if (this.sock < 0) {
+            this.sock = -1;
+            this.lastReply = "";
+            return;
+        }
+        this.readReply();
+        if (!isOk(this.lastReply)) {
+            this.fail();
+            return;
+        }
+        this.sendLine("USER " + user);
+        this.readReply();
+        if (!isOk(this.lastReply)) {
+            this.fail();
+            return;
+        }
+        this.sendLine("PASS " + pass);
+        this.readReply();
+        if (!isOk(this.lastReply)) {
+            this.fail();
+            return;
+        }
+        this.loggedIn = true;
     }
 
-    private void sendLine(string cmd) {
-        byte[] bytes = (cmd + "\r\n").toBytes();
-        send(this.sock, bytes, bytes.length, 0);
-    }
-
-    private string recvLine() {
-        byte[] buf = new byte[1024];
-        int n = recv(this.sock, buf, 1024, 0);
-        if (n <= 0) { return ""; }
-        string result = "";
-        for (int i = 0; i < n; i++) { result += char(buf[i]); }
-        return result;
-    }
-
+    // STAT: validated +OK, then the pure statCount() digit scan. Returns 0
+    // on any failure or malformed reply (the pre-split malformed-reply
+    // result).
     public int count() {
-        sendLine("STAT");
-        string resp = recvLine();
-        int space = resp.indexOf(" ");
-        if (space < 0) { return 0; }
-        int space2 = resp.indexOf(" ", space + 1);
-        if (space2 < 0) { return int(resp.substr(space + 1)); }
-        return int(resp.substr(space + 1, space2 - space - 1));
+        if (osType() != OSTypes.WINDOWS) { return 0; }
+        if (!this.loggedIn) { return 0; }
+        this.sendLine("STAT");
+        this.readReply();
+        if (!isOk(this.lastReply)) { return 0; }
+        int n = statCount(this.lastReply);
+        if (n < 0) { return 0; }
+        return n;
     }
 
+    // LIST (no argument): the multi-line response's data lines ("id octets"
+    // strings), split on "\r\n". Returns [] on any failure. ADDITIVE (the
+    // pre-split surface had no listing entry).
+    public string[] list() {
+        string[] empty = [];
+        if (osType() != OSTypes.WINDOWS) { return empty; }
+        if (!this.loggedIn) { return empty; }
+        this.sendLine("LIST");
+        this.readMulti();
+        int term = terminatorIndex(this.lastReply);
+        if (term < 0) { return empty; }
+        int statusEnd = lineEndIndex(this.lastReply);
+        if (statusEnd < 0 || statusEnd + 2 > term) { return empty; }
+        string data = sliceRange(this.lastReply, statusEnd + 2, term);
+        if (data.length <= 0) { return empty; }
+        return data.split("\r\n");
+    }
+
+    // RETR: reads the full multi-line response and fills the message's
+    // sender/subject/body via the pure helpers (raw keeps the whole
+    // response, status line and terminator included). On any failure the
+    // message is returned empty (raw "" -- the pre-split shape on a dead
+    // read, since its recvLine() returned "" which fed construct).
     public message retrieve(int id) {
-        sendLine("RETR " + id);
-        string resp = recvLine();
-        return new message(resp);
+        string raw = "";
+        if (osType() == OSTypes.WINDOWS && this.loggedIn) {
+            this.sendLine("RETR " + id);
+            this.readMulti();
+            if (isOk(this.lastReply)) { raw = this.lastReply; }
+        }
+        message m = new message(raw);
+        m.sender = headerValue(raw, "From:");
+        m.subject = headerValue(raw, "Subject:");
+        m.body = messageBody(raw);
+        return m;
     }
 
-    public void quit() {
-        sendLine("QUIT");
-        recvLine();
-        closesocket(this.sock);
+    // DELE: marks `id` for deletion (effective at QUIT per RFC 1939).
+    // Returns true on +OK, false on any failure. ADDITIVE (the pre-split
+    // surface had no deletion entry).
+    public bool remove(int id) {
+        if (osType() != OSTypes.WINDOWS) { return false; }
+        if (!this.loggedIn) { return false; }
+        this.sendLine("DELE " + id);
+        this.readReply();
+        return isOk(this.lastReply);
     }
+
+    // Sends QUIT and closes immediately without waiting for the +OK (the
+    // std/smtp.sr/ftp.sr shape), so a dead peer cannot stall quit(). The
+    // pre-split recvLine() after QUIT is dropped (it never ran -- the file
+    // never compiled).
+    public void quit() {
+        if (this.sock >= 0 && osType() == OSTypes.WINDOWS) {
+            this.sendLine("QUIT");
+            popWinClose(this.sock);
+        }
+        this.sock = -1;
+        this.loggedIn = false;
+    }
+
+    // Sends one command line (CRLF appended). No-op on a dead channel --
+    // every caller pairs it with a bounded read, so the failure surfaces
+    // there instead.
+    private void sendLine(string cmd) {
+        if (this.sock < 0) { return; }
+        popWinSend(this.sock, cmd + "\r\n", cmd.length + 2);
+    }
+
+    // One bounded read of the control channel (raw bytes as a string; ""
+    // on disconnect/timeout -- pre-split recvLine shape).
+    private string recvLine() {
+        if (this.sock < 0) { return ""; }
+        return popWinReceive(this.sock, 4096);
+    }
+
+    // Accumulates control-channel reads into lastReply until a full status
+    // line (the first "\r\n") is seen, the peer goes quiet, or 16 reads
+    // pass -- whichever comes first. Overwrites, never appends across
+    // commands: a stale reply must not leak into the next check.
+    private void readReply() {
+        string acc = "";
+        for (int guard = 0; guard < 16; guard++) {
+            string chunk = this.recvLine();
+            if (chunk.length <= 0) { break; }
+            acc += chunk;
+            if (lineEndIndex(acc) >= 0) { break; }
+        }
+        this.lastReply = acc;
+    }
+
+    // Accumulates control-channel reads into lastReply until the POP3
+    // ".\r\n" multi-line terminator is seen (multiLineComplete), the peer
+    // goes quiet, or 16 x 4096 bytes (~64 KB) pass -- whichever comes
+    // first. Same overwrite semantics as readReply().
+    private void readMulti() {
+        string acc = "";
+        for (int guard = 0; guard < 16; guard++) {
+            string chunk = this.recvLine();
+            if (chunk.length <= 0) { break; }
+            acc += chunk;
+            if (terminatorIndex(acc) >= 0) { break; }
+        }
+        this.lastReply = acc;
+    }
+
+    // Drops the connection and marks the client logged out; lastReply
+    // keeps whatever the server last said so the caller can surface it.
+    private void fail() {
+        this.loggedIn = false;
+        if (this.sock >= 0) {
+            popWinClose(this.sock);
+        }
+        this.sock = -1;
+    }
+}
+
+// Index of the first "\r\n" at or after `startIdx` (the \r's index; -1 when
+// absent). Private plumbing for the line-oriented scans. The parameter is
+// spelled startIdx -- `from` is a lexer keyword on both compilers (the
+// smtp/ftp RENAMED MEMBERS landmine; never a parameter name either).
+private int lineEndFrom(string s, int startIdx) {
+    for (int i = startIdx; i + 1 < s.length; i++) {
+        if (s[i] == 13 && s[i + 1] == 10) { return i; }
+    }
+    return -1;
+}
+
+private int lineEndIndex(string s) {
+    return lineEndFrom(s, 0);
+}
+
+// Index of the first "\r\n.\r\n" octet sequence in `s` (the \r's index;
+// -1 when absent) -- POP3's multi-line terminator.
+private int terminatorIndex(string s) {
+    for (int i = 0; i + 4 < s.length; i++) {
+        if (s[i] == 13 && s[i + 1] == 10 && s[i + 2] == 46 && s[i + 3] == 13 && s[i + 4] == 10) { return i; }
+    }
+    return -1;
+}
+
+// Index of the first "\r\n\r\n" (the RFC 822 header/body separator; -1 when
+// absent).
+private int blankLineIndex(string s) {
+    for (int i = 0; i + 3 < s.length; i++) {
+        if (s[i] == 13 && s[i + 1] == 10 && s[i + 2] == 13 && s[i + 3] == 10) { return i; }
+    }
+    return -1;
+}
+
+// Copies s[start .. end) character by character. Deliberately NOT substr:
+// rs's two-arg substr treats X as an END offset while the self-host treats
+// it as a LENGTH -- identical only when start is 0 (probed; see
+// silverc-rs/src/string_ops.rs emit_string_substring) -- and every caller
+// here slices from a nonzero offset.
+private string sliceRange(string s, int start, int end) {
+    string result = "";
+    for (int i = start; i < end; i++) {
+        result += s[i];
+    }
+    return result;
+}
+
+// Parses the `which`-th space-separated integer after the "+OK " prefix of
+// a STAT reply (which = 1 -> count, 2 -> octets). Returns -1 when the
+// number is missing or malformed.
+private int statNumber(string resp, int which) {
+    int i = 3;
+    for (int n = 1; n <= which; n++) {
+        while (i < resp.length && resp[i] == 32) { i++; }
+        int val = 0;
+        bool any = false;
+        while (i < resp.length) {
+            int c = resp[i] & 0xFF;
+            if (c < 48 || c > 57) { break; }
+            val = val * 10 + (c - 48);
+            i++;
+            any = true;
+        }
+        if (!any) { return -1; }
+        if (n == which) { return val; }
+    }
+    return -1;
 }
