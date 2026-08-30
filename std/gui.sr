@@ -1,5 +1,5 @@
-import * from win32.kernel32;
-import * from win32.user32;
+import * from os;
+import * from gui_win;
 
 mod export gui;
 
@@ -16,6 +16,55 @@ mod export gui;
 //
 // `handle` is the opaque native HWND (0 when the window has not been created
 // or has been closed).
+//
+// UNIFIED_CORE_LIBRARY.md Phase 2 -- this is the unified, portable front of
+// the gui library. It contains ZERO win32 imports: every kernel32/user32
+// call moved into the internal Windows backend std/gui_win.sr, and every
+// DLL-backed entry below routes through the OS gate
+// `if (osType() == OSTypes.WINDOWS)` before touching it (osType() is
+// std/os.sr's plain-Silver stand-in -- see that file and std/console.sr for
+// why the gate does not use the native os.type query).
+//
+// The else side of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
+// a future non-Windows backend the fallback follows the module's handle
+// contract: the constructor never creates a window, so `handle` stays 0,
+// which every state-changing method below already guards on (no DLL touch,
+// no crash); show/hide still maintain the `visible` flag and
+// setTitle/setIcon still record the requested title/icon string, so the
+// class behaves as a headless window record. The pure getters (getName,
+// getTitle, getWidth, getHeight, getHandle, isVisible, getIcon) are
+// field-only and stay ungated.
+//
+// DISPATCH NOTE (per compiler, unchanged by this split): on silverc-rs the
+// qualified `gui.<fn>()` spellings (gui.createWindow/show/hide/setTitle/
+// setIcon/loadIcon/close/runLoop) never reach this source -- STDLIB_MODULES
+// carries "gui" (src/stdlib/mod.rs) and stdlib::gui::gen_gui_call answers
+// them natively; the bare bridges guiCreateWindow/guiShow/guiHide/
+// guiMaximize/guiMinimize/guiSetTitle/guiClose/guiRunLoop/guiSetIcon/
+// loadIcon are likewise intercepted natively (codegen.rs), which is what
+// serves the Window class of silverc-rs/std/gui.sr. gui is NOT in rs's
+// builtin-modules skip list (main.rs builtin_modules_set), so this source
+// is still collected when resolution lands on it, serving unqualified/
+// instance spellings; its `import * from gui_win;` resolves to the sibling
+// std/gui_win.sr the same way. The self-hosted compiler has no gui-specific
+// native dispatch at all: gui is not builtin-reserved (std/project.sr
+// projectBuiltin) and not on the driver's hand-prepend/exclude lists, so
+// this module's source is collected and the Window class below IS the
+// implementation; the DLL touches inside it go through the backend's
+// aliased imports. Pre-split, those bare DLL names (GetModuleHandleA,
+// GetSystemMetrics, CreateWindowExA, SetWindowTextA, LoadImageA,
+// SendMessageA, ShowWindow, UpdateWindow, DestroyWindow) were answered by
+// the self-host's generic kernel32/user32 elifs in mini_cg.sr after this
+// file's win32.kernel32 + win32.user32 import grants; the backend's aliased
+// grants now carry the calls with the same direct-IAT lowering, so nothing
+// changes.
+//
+// TESTING NOTE: no method here pumps messages (this module has no run
+// loop), so constructing + showing + closing a Window never blocks and is
+// probe-safe; SetWindowTextA/LoadImageA/SendMessageA only fire on a live
+// handle. No screen-metrics function is exposed publicly --
+// GetSystemMetrics is constructor-internal (centering) only.
 
 class Window {
     private string name;
@@ -35,15 +84,11 @@ class Window {
         this.visible = false;
         this.icon = "";
 
-        int hinst = GetModuleHandleA(0);
-        int x = (GetSystemMetrics(0) - width) / 2;
-        int y = (GetSystemMetrics(1) - height) / 2;
-        if (x < 0) { x = 0; }
-        if (y < 0) { y = 0; }
-        // WS_OVERLAPPEDWINDOW = 0x00CF0000, with the pre-registered "STATIC"
-        // class so we do not need RegisterClassExA + a WndProc for a simple
-        // window.
-        this.handle = CreateWindowExA(0, "STATIC", title, 0x00CF0000, x, y, width, height, 0, 0, hinst, 0);
+        if (osType() == OSTypes.WINDOWS) {
+            this.handle = guiWinCreate(title, width, height);
+        }
+        // Non-Windows fallback: no window-system backend yet, `handle`
+        // stays 0 ("no window") and every method below guards on it.
     }
 
     public string getName() { return this.name; }
@@ -55,39 +100,40 @@ class Window {
 
     public void setTitle(string t) {
         this.title = t;
-        if (this.handle != 0) { SetWindowTextA(this.handle, t); }
+        if (osType() == OSTypes.WINDOWS) {
+            if (this.handle != 0) { guiWinSetTitle(this.handle, t); }
+        }
     }
 
     // Load a custom .ico asset and attach it as the window icon via
     // user32!LoadImageA (LR_LOADFROMFILE) + SendMessageA(WM_SETICON).
     public void setIcon(string path) {
         this.icon = path;
-        if (this.handle != 0) {
-            int hicon = LoadImageA(0, path, 1, 0, 0, 0x50);
-            if (hicon != 0) {
-                SendMessageA(this.handle, 0x80, 1, hicon); // ICON_BIG
-                SendMessageA(this.handle, 0x80, 0, hicon); // ICON_SMALL
-            }
+        if (osType() == OSTypes.WINDOWS) {
+            if (this.handle != 0) { guiWinSetIcon(this.handle, path); }
         }
     }
 
     public string getIcon() { return this.icon; }
 
     public void show() {
-        if (this.handle != 0) {
-            ShowWindow(this.handle, 5);   // SW_SHOW
-            UpdateWindow(this.handle);
+        if (osType() == OSTypes.WINDOWS) {
+            if (this.handle != 0) { guiWinShow(this.handle); }
         }
         this.visible = true;
     }
 
     public void hide() {
-        if (this.handle != 0) { ShowWindow(this.handle, 0); } // SW_HIDE
+        if (osType() == OSTypes.WINDOWS) {
+            if (this.handle != 0) { guiWinHide(this.handle); }
+        }
         this.visible = false;
     }
 
     public void close() {
-        if (this.handle != 0) { DestroyWindow(this.handle); }
+        if (osType() == OSTypes.WINDOWS) {
+            if (this.handle != 0) { guiWinClose(this.handle); }
+        }
         this.handle = 0;
         this.visible = false;
     }

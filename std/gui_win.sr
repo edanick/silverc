@@ -1,0 +1,100 @@
+import { GetModuleHandleA as guiWinRawGetModuleHandleA } from win32.kernel32;
+import { GetSystemMetrics as guiWinRawGetSystemMetrics, CreateWindowExA as guiWinRawCreateWindowExA, SetWindowTextA as guiWinRawSetWindowTextA, LoadImageA as guiWinRawLoadImageA, SendMessageA as guiWinRawSendMessageA, ShowWindow as guiWinRawShowWindow, UpdateWindow as guiWinRawUpdateWindow, DestroyWindow as guiWinRawDestroyWindow } from win32.user32;
+
+internal mod export gui_win;
+
+// DOCS -- INTERNAL Windows backend of the public `gui` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). Every kernel32/user32 DLL call the gui
+// module needs lives here and nowhere else: the public wrapper (std/gui.sr)
+// contains zero win32 imports and reaches this code only behind the OS gate
+// `if (osType() == OSTypes.WINDOWS)` (see std/os.sr for why the gate calls
+// the plain-Silver osType() stand-in instead of the native os.type query).
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects (enforced by compiler/visibility.sr on single-file compiles;
+// .srp projects compile their whole source set as one project). A user file
+// that tries `import * from gui_win;` fails with the standard internal-
+// visibility error on both compilers.
+//
+// DLL IMPORT ALIASING: the nine exports are bound through explicit `X as Y`
+// import aliases rather than a full-table `import * from win32.user32;`
+// grant, so only the nine functions below are granted, the grants answer to
+// the local guiWin-prefixed names, and the PE import keeps the real export
+// (mirrors std/keyboard_win.sr, std/mouse_win.sr, std/process_win.sr and
+// std/sysinfo_win.sr; one flat compile namespace makes local-name keying the
+// safe default). All nine exports are present in BOTH compilers' tables
+// (silverc-rs src/win32.rs kernel32 list line ~179 + user32 list lines
+// ~247-251; the self-host compiler/parser.sr win32DllExportTable lines
+// ~681/687 and compiler/mini_cg.sr win32ExportTable lines ~586/592), so
+// every import resolves against a real DLL export -- no invented exports, no
+// load-time STATUS_ENTRYPOINT_NOT_FOUND risk. Aliased grants bypass the
+// tables on both backends anyway (silverc-rs win32::resolve matches grants
+// by local name with no table check; the self-host alias path
+// MiniCg.genUserCall -> addImportPatch(aliasDll, aliasExport) likewise).
+//
+// SENTINEL-BYPASS MANDATE: none of the nine exports below is bare-name
+// intercepted by either compiler -- silverc-rs has no codegen.rs route for
+// the user32 window exports (only for the guiCreateWindow/guiShow/...
+// bridge names, which this backend never uses) and the self-host lowers
+// them through the generic user32/kernel32 elifs in mini_cg.sr, the same
+// bypass the pre-split std/gui.sr relied on after its win32.user32 /
+// win32.kernel32 grants. This backend NEVER calls the bare export names:
+// every DLL touch goes through the guiWin-prefixed aliases, so the wrapper
+// stays portable source and both compilers lower the calls through the
+// identical direct-IAT path. RegisterClassExA / GetMessageA /
+// TranslateMessage / DispatchMessageA / DefWindowProcA / PostQuitMessage
+// are also on the self-host user32 list but this module never needed them
+// (the "STATIC" pre-registered window class and the absence of a message
+// pump keep the Window class WndProc-free), so they are not granted here.
+//
+// BEHAVIOR PRESERVATION: each function below is a verbatim lift of the
+// pre-split inline sequence in std/gui.sr's Window methods (DOCS/248):
+//   - guiWinCreate centers the window on the primary display via
+//     GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN) and creates it with
+//     CreateWindowExA + WS_OVERLAPPEDWINDOW (0x00CF0000) on the
+//     pre-registered "STATIC" class, so no RegisterClassExA + WndProc is
+//     needed for a simple window; returns the HWND (0 on failure).
+//   - guiWinSetIcon loads the .ico via LoadImageA(LR_LOADFROMFILE |
+//     LR_DEFAULTSIZE = 0x50, IMAGE_ICON = 1) and only when that succeeded
+//     attaches it with SendMessageA(WM_SETICON = 0x80) for both ICON_BIG
+//     (1) and ICON_SMALL (0), exactly like the pre-split method.
+//   - guiWinShow is ShowWindow(SW_SHOW = 5) followed by UpdateWindow so
+//     the client area paints immediately; guiWinHide is ShowWindow
+//     (SW_HIDE = 0); guiWinClose is DestroyWindow.
+// The handle!=0 guards stay in the public wrapper (as pre-split); this
+// backend trusts its caller the same way the inline sequences did.
+
+internal int guiWinCreate(string title, int width, int height) {
+    int hinst = guiWinRawGetModuleHandleA(0);
+    int x = (guiWinRawGetSystemMetrics(0) - width) / 2;
+    int y = (guiWinRawGetSystemMetrics(1) - height) / 2;
+    if (x < 0) { x = 0; }
+    if (y < 0) { y = 0; }
+    return guiWinRawCreateWindowExA(0, "STATIC", title, 0x00CF0000, x, y, width, height, 0, 0, hinst, 0);
+}
+
+internal void guiWinSetTitle(int handle, string t) {
+    guiWinRawSetWindowTextA(handle, t);
+}
+
+internal void guiWinSetIcon(int handle, string path) {
+    int hicon = guiWinRawLoadImageA(0, path, 1, 0, 0, 0x50);
+    if (hicon != 0) {
+        guiWinRawSendMessageA(handle, 0x80, 1, hicon); // ICON_BIG
+        guiWinRawSendMessageA(handle, 0x80, 0, hicon); // ICON_SMALL
+    }
+}
+
+internal void guiWinShow(int handle) {
+    guiWinRawShowWindow(handle, 5); // SW_SHOW
+    guiWinRawUpdateWindow(handle);
+}
+
+internal void guiWinHide(int handle) {
+    guiWinRawShowWindow(handle, 0); // SW_HIDE
+}
+
+internal void guiWinClose(int handle) {
+    guiWinRawDestroyWindow(handle);
+}
