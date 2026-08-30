@@ -1,0 +1,94 @@
+import { mouse_event as mouseWinRawMouseEvent, GetCursorPos as mouseWinRawGetCursorPos, SetCursorPos as mouseWinRawSetCursorPos, GetKeyState as mouseWinRawGetKeyState } from win32.user32;
+
+internal mod export mouse_win;
+
+// DOCS -- INTERNAL Windows backend of the public `mouse` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). Every user32 DLL call the mouse module
+// needs lives here and nowhere else: the public wrapper (std/mouse.sr)
+// contains zero win32 imports and reaches this code only behind the OS gate
+// `if (osType() == OSTypes.WINDOWS)` (see std/os.sr for why the gate calls
+// the plain-Silver osType() stand-in instead of the native os.type query).
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects (enforced by compiler/visibility.sr on single-file compiles;
+// .srp projects compile their whole source set as one project). A user file
+// that tries `import * from mouse_win;` fails with the standard internal-
+// visibility error on both compilers.
+//
+// DLL IMPORT ALIASING: the four exports are bound through explicit `X as Y`
+// import aliases rather than a full-table `import * from win32.user32;`
+// grant, so only the four functions below are granted, the grants answer to
+// the local mouseWin-prefixed names, and the PE import keeps the real export
+// (mirrors std/process_win.sr and std/sysinfo_win.sr; one flat compile
+// namespace makes local-name keying the safe default). All four exports are
+// present in BOTH compilers' user32 tables (silverc-rs/src/win32.rs USER32
+// list and the self-host compiler/parser.sr + compiler/mini_cg.sr user32
+// lists), so every import resolves against a real DLL export -- no invented
+// exports, no load-time STATUS_ENTRYPOINT_NOT_FOUND risk. Aliased grants
+// bypass the tables on both backends anyway (silverc-rs win32::resolve
+// matches grants by local name with no table check; the self-host alias path
+// MiniCg.genUserCall -> addImportPatch(aliasDll, aliasExport) likewise).
+//
+// SENTINEL-BYPASS MANDATE: mouse_event, GetCursorPos, SetCursorPos and
+// GetKeyState are exactly the user32 exports whose BARE names are intercepted
+// natively by silverc-rs (codegen.rs routes them to
+// stdlib::keyboard::gen_win32_call sentinels) and by the self-hosted
+// compiler's user32 mouse/cursor elif (mini_cg.sr -- the same bypass the
+// pre-split std/mouse.sr relied on). This backend NEVER calls the bare
+// export names: every DLL touch goes through the mouseWin-prefixed aliases,
+// so the wrapper stays portable source and both compilers lower the calls
+// through the identical direct-IAT path. The pre-split module's
+// compiler-native GetCursorX/GetCursorY synthesized helpers (not raw
+// exports; rs gen_cursor_x/gen_cursor_y and self-host genCursorXCall/
+// genCursorYCall) are likewise replaced here by an aliased GetCursorPos plus
+// the buffer decode below -- same user32!GetCursorPos call, same sign-
+// extended coordinates, no dependence on the synthesized bare names.
+//
+// POINT DECODE (cross-compiler proven idiom, see std/sysinfo_win.sr): the
+// buffer is an int[] qword-slot array -- Silver arrays store one 8-byte
+// element per slot with the variable holding the element-0 address, so
+// GetCursorPos fills slot 0 with both packed int32 coordinates. X is the
+// low half (mask 0xFFFFFFFF), Y the high half (shift 32 then mask -- the
+// mask makes arithmetic vs logical shift semantics on either backend
+// irrelevant). Screen coordinates can be negative on multi-monitor setups
+// (monitors left of / above the primary), so both readers sign-extend the
+// 32-bit half by subtracting 0x100000000 when the sign bit is set -- the
+// same MOVSXD extension the native GetCursorX/GetCursorY helpers performed
+// pre-split. The slot is primed to 0 first so a (never expected) failed
+// GetCursorPos reports (0, 0) instead of uninitialized memory, matching the
+// native helpers' zero-initialized POINT.
+//
+// GetKeyState returns a SHORT whose upper bits are undefined per the Win64
+// ABI; the wrapper masks & 0x8000 exactly as the pre-split module did, so
+// the undefined upper bits never leak into a result.
+
+internal void mouseWinMouseEvent(int flags, int dx, int dy, int data, int extra) {
+    mouseWinRawMouseEvent(flags, dx, dy, data, extra);
+}
+
+internal int mouseWinCursorX() {
+    int[] pt = new int[1];
+    pt[0] = 0;
+    mouseWinRawGetCursorPos(pt);
+    int v = pt[0] & 0xFFFFFFFF;
+    if ((v & 0x80000000) != 0) { v = v - 0x100000000; }
+    return v;
+}
+
+internal int mouseWinCursorY() {
+    int[] pt = new int[1];
+    pt[0] = 0;
+    mouseWinRawGetCursorPos(pt);
+    int v = (pt[0] >> 32) & 0xFFFFFFFF;
+    if ((v & 0x80000000) != 0) { v = v - 0x100000000; }
+    return v;
+}
+
+internal void mouseWinSetCursorPos(int x, int y) {
+    mouseWinRawSetCursorPos(x, y);
+}
+
+internal int mouseWinGetKeyState(int vk) {
+    return mouseWinRawGetKeyState(vk);
+}

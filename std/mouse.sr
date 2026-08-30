@@ -1,22 +1,62 @@
-import * from win32.msvcrt;
-import * from win32.user32;
+import * from os;
+import * from mouse_win;
+
+mod export mouse;
 
 // ---------------------------------------------------------------------------
 // mouse - Win32 mouse input for the self-hosted Silver compiler.
 //
-// Companion to silverc/std/keyboard.sr. compiler_driver.sr accepts the
-// Win32 identifiers `mouse_event`, `SetCursorPos`, `GetCursorPos` (and
-// clipboard / hotkey cousins) as free functions, all routed through
-// `user32.dll` (the user32 mouse / cursor elif in compiler_driver.sr, line
-// ~4627). This file provides the documented high-level API: click/tap,
-// press/hold/release on each button, scroll, cursor position read/write
-// through a tracked local. Reading the current cursor position uses the
-// compiler's native GetCursorX/GetCursorY wrappers, which allocate and pass
-// a valid Win32 POINT internally; SetCursorPos is invoked directly because
-// it takes ints by value.
+// Companion to silverc/std/keyboard.sr. This file provides the documented
+// high-level API: click/tap, press/hold/release on each button, scroll,
+// cursor position read/write through a tracked local, and button-state
+// queries.
+//
+// UNIFIED_CORE_LIBRARY.md Phase 2 -- this is the unified, portable front of
+// the mouse library. It contains ZERO win32 imports: every user32 call moved
+// into the internal Windows backend std/mouse_win.sr, and every DLL-backed
+// entry below routes through the OS gate `if (osType() == OSTypes.WINDOWS)`
+// before touching it (osType() is std/os.sr's plain-Silver stand-in -- see
+// that file and std/console.sr for why the gate does not use the native
+// os.type query).
+//
+// The else branch of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
+// a future non-Windows backend the fallbacks follow the module's read/write
+// style: the cursor readers return 0, isMouseDown returns false, and the
+// state-changing entries (press/hold/release/click/tap/scroll, and
+// Cursor.setPosition's Win32 move) become silent no-ops -- the tracked
+// cursor locals in Cursor still update so getPosition() stays consistent.
+//
+// DISPATCH NOTE (per compiler, unchanged by this split): the qualified
+// spellings never reach this source on either compiler. silverc-rs answers
+// every `mouse.<fn>()` call with its native builtin before any module source
+// is consulted (STDLIB_MODULES carries "mouse"; codegen.rs ->
+// stdlib::keyboard::gen_mouse_call covers press/hold/release/click/tap/
+// scroll/cursorX/cursorY/getCursorX/getCursorY and the setCursor cousins),
+// so the class bodies below are dead code there for qualified calls -- the
+// module source is still collected (mouse is not in the rs builtin-modules
+// skip list), which is what serves instance-based and free-function calls.
+// The self-hosted compiler intercepts exactly the cursor readers
+// (`mouse.cursorX()` / `mouse.getCursorX()` / `mouse.cursorY()` /
+// `mouse.getCursorY()` -- mini_cg.sr's mouse member-call branches, which
+// allocate a stack POINT and call user32!GetCursorPos directly) and lets
+// every other `mouse.<fn>()` spelling resolve to the class methods below.
+// Both intercepts match the receiver NAME `mouse`, so they keep firing
+// identically after this split; the wrapper neither shadows nor blocks them.
+// Instance spellings (`new mouse()`, the module `instance` global) and the
+// free functions below execute these gated bodies on both compilers, with
+// the same observable Win32 effects as the pre-split module (one
+// user32!GetCursorPos per read, user32!SetCursorPos / user32!mouse_event /
+// user32!GetKeyState for the writes -- now via the backend's aliased
+// imports).
+//
+// Not gated on purpose (no DLL behind them): the constant and class
+// declarations below, the pure flag helpers mouseDownFlag/mouseUpFlag,
+// Cursor.setX/setY/getPosition, mouse.hold/click/tap (pure delegation to
+// gated entries), and setCursorX/setCursorY -- the pre-split bodies only
+// update the tracked Cursor locals (the Win32 move lives in
+// Cursor.setPosition).
 // ---------------------------------------------------------------------------
-
-mod export mouse;
 
 const int MOUSEEVENTF_LEFTDOWN  = 0x0002;
 const int MOUSEEVENTF_LEFTUP    = 0x0004;
@@ -66,8 +106,20 @@ class Cursor {
         this.yPos = 0;
     }
 
-    public int getX() { return GetCursorX(); }
-    public int getY() { return GetCursorY(); }
+    public int getX() {
+        if (osType() == OSTypes.WINDOWS) {
+            return mouseWinCursorX();
+        }
+        return 0;
+    }
+
+    public int getY() {
+        if (osType() == OSTypes.WINDOWS) {
+            return mouseWinCursorY();
+        }
+        return 0;
+    }
+
     public void setX(int v) { this.xPos = v; }
     public void setY(int v) { this.yPos = v; }
 
@@ -78,7 +130,9 @@ class Cursor {
     public void setPosition(int newX, int newY) {
         this.xPos = newX;
         this.yPos = newY;
-        SetCursorPos(newX, newY);
+        if (osType() == OSTypes.WINDOWS) {
+            mouseWinSetCursorPos(newX, newY);
+        }
     }
 }
 
@@ -105,7 +159,9 @@ class mouse {
     // for left/down. The 0x0002 flag is shared with right-down at bit 3, so
     // we OR with the constant MouseButtons value to pick a direction.
     public void press(int button) {
-        mouse_event(mouseDownFlag(button), 0, 0, 0, 0);
+        if (osType() == OSTypes.WINDOWS) {
+            mouseWinMouseEvent(mouseDownFlag(button), 0, 0, 0, 0);
+        }
     }
 
     public void hold(int button) {
@@ -113,7 +169,9 @@ class mouse {
     }
 
     public void release(int button) {
-        mouse_event(mouseUpFlag(button), 0, 0, 0, 0);
+        if (osType() == OSTypes.WINDOWS) {
+            mouseWinMouseEvent(mouseUpFlag(button), 0, 0, 0, 0);
+        }
     }
 
     public void click(int button) {
@@ -130,7 +188,9 @@ class mouse {
     // amounts so user code can pick its own scale (e.g. `mouse.scroll(400)`
     // in the docs is several clicks).
     public void scroll(int amount) {
-        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, amount, 0);
+        if (osType() == OSTypes.WINDOWS) {
+            mouseWinMouseEvent(MOUSEEVENTF_WHEEL, 0, 0, amount, 0);
+        }
     }
 
     // scroll(int amount, ScrollDirection direction)
@@ -144,18 +204,44 @@ class mouse {
         } else {
             if (delta < 0) { delta = -delta; }
         }
-        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0);
+        if (osType() == OSTypes.WINDOWS) {
+            mouseWinMouseEvent(MOUSEEVENTF_WHEEL, 0, 0, delta, 0);
+        }
     }
 
-    // Read live cursor X / Y from Win32. The compiler recognises
-    // `mouse.cursorX()` / `mouse.cursorY()` and emits the GetCursorPos
-    // call directly (compiler_driver.sr's genCursorXCall / genCursorYCall).
-    // We still need Silver-level wrappers so the demo source can call
-    // them as `instance.cursorX()` / `instance.cursorY()` too.
-    public int cursorX() { return GetCursorX(); }
-    public int cursorY() { return GetCursorY(); }
-    public int getCursorX() { return GetCursorX(); }
-    public int getCursorY() { return GetCursorY(); }
+    // Read live cursor X / Y from Win32. The compilers recognise the
+    // QUALIFIED spellings (`mouse.cursorX()` etc.) natively -- see the
+    // dispatch note above. These Silver-level wrappers keep the
+    // instance-based spellings (`instance.cursorX()`, `new mouse()`
+    // objects) reading the live position on both compilers, exactly as the
+    // pre-split module did.
+    public int cursorX() {
+        if (osType() == OSTypes.WINDOWS) {
+            return mouseWinCursorX();
+        }
+        return 0;
+    }
+
+    public int cursorY() {
+        if (osType() == OSTypes.WINDOWS) {
+            return mouseWinCursorY();
+        }
+        return 0;
+    }
+
+    public int getCursorX() {
+        if (osType() == OSTypes.WINDOWS) {
+            return mouseWinCursorX();
+        }
+        return 0;
+    }
+
+    public int getCursorY() {
+        if (osType() == OSTypes.WINDOWS) {
+            return mouseWinCursorY();
+        }
+        return 0;
+    }
 }
 
 mouse instance = new mouse();
@@ -165,19 +251,24 @@ mouse instance = new mouse();
 // `mouse.cursor.position`. Lets a script update position without going
 // through the mouse instance's setPosition().
 //
-// `mouse.cursorX()` / `mouse.cursorY()` are dispatched to user32
-// GetCursorPos by compiler_driver.sr's genCursorXCall / genCursorYCall
-// (which allocate a 16-byte POINT struct on the stack, call GetCursorPos,
-// and sign-extend the int32 coordinate into RAX). The free
-// `getCursorX()` / `getCursorY()` are the same implementation in the
-// silverc-rs and silveri layers; here they re-export the module-level
-// methods so the free and prefixed spellings behave identically.
+// The free `getCursorX()` / `getCursorY()` are the same live read as the
+// instance methods on both compilers (pre-split they re-exported the
+// module-level methods; now they route through the gated backend like every
+// other DLL-backed entry). `setCursorX` / `setCursorY` remain pure tracked-
+// local writers, exactly as pre-split -- the Win32 move lives in
+// Cursor.setPosition.
 int getCursorX() {
-    return GetCursorX();
+    if (osType() == OSTypes.WINDOWS) {
+        return mouseWinCursorX();
+    }
+    return 0;
 }
 
 int getCursorY() {
-    return GetCursorY();
+    if (osType() == OSTypes.WINDOWS) {
+        return mouseWinCursorY();
+    }
+    return 0;
 }
 
 void setCursorX(int v) {
@@ -189,16 +280,27 @@ void setCursorY(int v) {
 }
 
 // True if the button code (MouseButtons.LEFT/RIGHT/MIDDLE) is currently
-// pressed. Implemented via GetKeyState on the per-button virtual key.
+// pressed. Implemented via GetKeyState on the per-button virtual key
+// (backend-aliased); the & 0x8000 mask keeps the Win64-undefined upper bits
+// of the SHORT return out of the result, exactly as pre-split.
 bool isMouseDown(int buttonCode) {
     if (buttonCode == MouseButtons_LEFT) {
-        return (GetKeyState(VK_LBUTTON) & 0x8000) != 0;
+        if (osType() == OSTypes.WINDOWS) {
+            return (mouseWinGetKeyState(VK_LBUTTON) & 0x8000) != 0;
+        }
+        return false;
     }
     if (buttonCode == MouseButtons_RIGHT) {
-        return (GetKeyState(VK_RBUTTON) & 0x8000) != 0;
+        if (osType() == OSTypes.WINDOWS) {
+            return (mouseWinGetKeyState(VK_RBUTTON) & 0x8000) != 0;
+        }
+        return false;
     }
     if (buttonCode == MouseButtons_MIDDLE) {
-        return (GetKeyState(VK_MBUTTON) & 0x8000) != 0;
+        if (osType() == OSTypes.WINDOWS) {
+            return (mouseWinGetKeyState(VK_MBUTTON) & 0x8000) != 0;
+        }
+        return false;
     }
     return false;
 }
