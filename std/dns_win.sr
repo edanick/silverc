@@ -1,0 +1,108 @@
+import { getaddrinfo, freeaddrinfo, WSAStartup } from win32.ws2_32;
+import { memcpy } from win32.msvcrt;
+
+internal mod export dns_win;
+
+// DOCS -- INTERNAL Windows backend of the public `dns` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). Every ws2_32 DLL call the dns module
+// needs lives here and nowhere else: the public wrapper (std/dns.sr) contains
+// zero win32 imports and reaches this code only behind the OS gate
+// `if (osType() == OSTypes.WINDOWS)`. See std/os.sr for why the gate calls
+// the plain-Silver osType() stand-in instead of the native os.type query.
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects. A user file that tries `import * from dns_win;` fails with
+// the standard internal-visibility error on both compilers (same posture as
+// std/ws_win.sr, probed there).
+//
+// IMPORT GRANTS: getaddrinfo/freeaddrinfo (ws2_32) and WSAStartup collide
+// with nothing in the dns public API (lookup/resolveMX/resolveNS/resolveTXT/
+// reverse/resolveAsync/task), so unlike std/ws_win.sr no `X as rawY` aliases
+// are needed -- the real export names are granted directly, the exact
+// treatment ws_win.sr gave its non-colliding grants (bind/accept/recv/send/
+// closesocket/inet_addr/WSAStartup). memcpy comes from win32.msvcrt (its
+// export is in both compilers' msvcrt tables) and is the ONLY way to read
+// the DLL-allocated addrinfo chain: Silver cannot dereference a raw pointer,
+// so each 48-byte ADDRINFOA node and each 16-byte sockaddr is memcpy'd into
+// an int[] qword buffer and read from there.
+//
+// MEMORY LAYOUT (identical to std/net_win.sr / std/ws_win.sr, probed there):
+// Silver arrays are [cap, len, elem...] with 8-byte elements, so an int[]
+// doubles as a packed qword buffer for DLL calls and 64-bit pointer values
+// survive a round trip through an int slot (Silver ints are 64-bit; the
+// sockaddr packing `((ip & 0xFFFFFFFF) << 32)` in ws_win.sr relies on it).
+// Windows ADDRINFOA (x64, windows_sys.rs is the reference):
+//     ai_flags i32 @0 | ai_family i32 @4 | ai_socktype i32 @8 |
+//     ai_protocol i32 @12 | ai_addrlen usize @16 | ai_canonname @24 |
+//     ai_addr @32 | ai_next @40   (NOTE: on Windows ai_addr precedes
+//     ai_next -- POSIX order is the reverse; the walk below reads the
+//     Windows order). Total 48 bytes = int[6].
+// hints is zeroed by `new int[6]` and only two fields are set: family
+// (AF_INET = 2, the pre-split hints.ai_family = 2) in the high dword of
+// qword 0 and socktype (SOCK_STREAM = 1, pre-split hints.ai_socktype = 1)
+// in the low dword of qword 1. The family is planted with a runtime shift
+// (`family << 32`) rather than a `2 << 32` constant fold -- constant
+// constant-folding of shifts-by-32 is unproven on the self-host, while
+// runtime shifts by 32 are the probed ws_win.sr sockaddr idiom.
+// sockaddr_in (16 bytes = int[2]): sin_family u16 @0, sin_port u16 @2,
+// sin_addr u32 @4 -- the high dword of qword 0.
+//
+// WSASTARTUP: the pre-split dns.sr NEVER called it, so a standalone
+// getaddrinfo would fail with WSANOTINITIALISED unless another module (ws/
+// net) had already initialized winsock in the same process. It is issued
+// here before each lookup; it is reference-counted, so the repeated calls
+// are harmless (the same posture std/ws_win.sr documents for socket
+// creation). This is a documented behavior fix, not a regression: the
+// pre-split file never compiled anywhere (see std/dns.sr PRE-SPLIT STATE).
+//
+// DLL RETURN NORMALIZATION (see std/ws_win.sr for the general rule): the
+// self-hosted compiler ZERO-extends 32-bit DLL int returns, silverc-rs
+// sign-extends them. getaddrinfo's contract is `0 on success, otherwise a
+// positive nonzero error code` (WSA error codes are small positive DWORDs;
+// unlike socket/connect/recv it NEVER returns SOCKET_ERROR/-1), so the
+// plain `ret != 0` failure test below is already two-compiler-safe: 0 is 0
+// under both extensions and every failure code is nonzero under both. The
+// ws_win.sr note's two-sided form `v < 0 || v > 2147483647` is only needed
+// for `v < 0`-style checks on values that can be SOCKET_ERROR; ftp/ftps/
+// smtp agents copying this file should re-apply it per call site for any
+// call whose return can be -1 (getaddrinfo/freeaddrinfo/WSAStartup here
+// cannot).
+
+internal int dnsWinStartup() {
+    byte[] wsa = new byte[408];
+    return WSAStartup(0x0202, wsa);
+}
+
+// Resolves `host` to its IPv4 dotted-quad addresses (the pre-split lookup
+// intent: AF_INET hints mean every returned node is sockaddr_in, so no
+// family filter is needed when rendering). Returns [] on any failure
+// (startup, getaddrinfo error, no results) -- the pre-split failure shape.
+internal string[] dnsWinLookup(string host) {
+    dnsWinStartup();
+    int[] hints = new int[6];
+    int family = 2;
+    hints[0] = family << 32;
+    hints[1] = 1;
+    int[] res = new int[1];
+    int ret = getaddrinfo(host, null, hints, res);
+    if (ret != 0) { string[] empty = []; return empty; }
+    string[] addresses = [];
+    int node = res[0];
+    while (node != 0) {
+        int[] nodeBuf = new int[6];
+        memcpy(nodeBuf, node, 48);
+        int saPtr = nodeBuf[4];
+        int next = nodeBuf[5];
+        if (saPtr != 0) {
+            int[] sa = new int[2];
+            memcpy(sa, saPtr, 16);
+            int ip = (sa[0] >> 32) & 0xFFFFFFFF;
+            string ipStr = ((ip >> 0) & 0xFF) + "." + ((ip >> 8) & 0xFF) + "." + ((ip >> 16) & 0xFF) + "." + ((ip >> 24) & 0xFF);
+            addresses.push(ipStr);
+        }
+        node = next;
+    }
+    freeaddrinfo(res[0]);
+    return addresses;
+}
