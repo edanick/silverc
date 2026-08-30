@@ -1,0 +1,198 @@
+import { GetForegroundWindow as processWinRawGetForegroundWindow, GetWindowTextA as processWinRawGetWindowTextA, GetWindowThreadProcessId as processWinRawGetWindowThreadProcessId } from win32.user32;
+import { OpenProcess as processWinRawOpenProcess, QueryFullProcessImageNameA as processWinRawQueryFullProcessImageNameA, CloseHandle as processWinRawCloseHandle, CreatePipe as processWinRawCreatePipe, CreateProcessA as processWinRawCreateProcessA, ReadFile as processWinRawReadFile, WriteFile as processWinRawWriteFile } from win32.kernel32;
+
+internal mod export process_win;
+
+// DOCS -- INTERNAL Windows backend of the public `process` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). Every user32/kernel32 DLL call the
+// process module needs lives here and nowhere else: the public wrapper
+// (std/process.sr) contains zero win32 imports and reaches this code only
+// behind the OS gate `if (osType() == OSTypes.WINDOWS)` (see std/os.sr for
+// why the gate calls the plain-Silver osType() stand-in instead of the
+// native os.type query).
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects (enforced by compiler/visibility.sr on single-file compiles;
+// .srp projects compile their whole source set as one project). A user file
+// that tries `import * from process_win;` fails with the standard internal-
+// visibility error on both compilers.
+//
+// DLL IMPORT ALIASING: the exports are bound through explicit `X as Y`
+// import aliases rather than a full-table `import * from win32.kernel32;`
+// grant, so only the ten functions below are granted, the grants answer to
+// the local processWin-prefixed names, and the PE import keeps the real
+// export (mirrors std/sysinfo_win.sr, std/thread_win.sr and friends; one
+// flat compile namespace makes local-name keying the safe default). All ten
+// exports are present in BOTH compilers' tables (silverc-rs/src/win32.rs and
+// the self-host compiler/parser.sr + compiler/mini_cg.sr kernel32/user32
+// lists), so every import resolves against a real DLL export -- no invented
+// exports, no load-time STATUS_ENTRYPOINT_NOT_FOUND risk. Aliased grants
+// bypass the tables on both backends anyway (silverc-rs win32::resolve
+// matches grants by local name with no table check; the self-host alias path
+// MiniCg.genUserCall -> addImportPatch(aliasDll, aliasExport) likewise), and
+// the alias also steps around silverc-rs's bare-name sentinel intercept for
+// GetForegroundWindow/GetWindowTextA/GetWindowThreadProcessId/OpenProcess/
+// QueryFullProcessImageNameA (codegen.rs routes those bare names to
+// stdlib::process::gen_process_call) -- the wrapper must stay portable
+// source, so the backend never calls the bare export names.
+//
+// SELF-HOST DRIVER NOTE: the self-hosted compiler driver hand-prepends
+// std/process.sr into standalone compiles (compiler_driver.sr "from "
+// + "process" scan) and excludes "process" from disk collection; this
+// backend is NOT excluded, so the prepended wrapper's
+// `import * from process_win;` resolves here from std\ through the normal
+// collectModule flow. silverc.srp excludes the wrapper but NOT this backend,
+// so the compiler build carries it exactly like the other *_win backends.
+//
+// BUFFER IDIOMS (cross-compiler proven, see std/sysinfo_win.sr): NUL-
+// terminated Win32 string data (window title, process image path, pipe
+// bytes) uses preallocated writable string buffers -- strings lower to dense
+// char buffers on every backend, so an index reads one raw byte and a bare
+// call passes the char pointer straight across the boundary. Decode loops
+// compare against char(0), never the '\0' literal -- BOTH compilers' lexers
+// resolve that escape to the digit character '0' (0x30). Struct-free by
+// design: this module needs no int[] qword-slot buffers because none of its
+// calls take a struct (the pre-split null STARTUPINFO/PROCESS_INFORMATION
+// shape is preserved verbatim, see processWinRunCapture).
+//
+// PRESERVED PRE-SPLIT MECHANICS (probed against git HEAD before the split):
+// - Process.getFocusedProcess(): the query order and failure ladder are
+//   unchanged -- null foreground HWND leaves the whole Process zero/empty;
+//   OpenProcess failure or a failed image-name query leaves path/filename
+//   empty while handle/title/id stay set. The only mechanical change: the
+//   pre-split byte[] title/path buffers become string buffers (the documented
+//   byte-wise idiom above) and the filename slash-scan stays in the wrapper.
+// - run(): the CreatePipe/CreateProcessA call shape is preserved VERBATIM,
+//   including the null lpProcessInformation -- CreateProcessA requires a
+//   real PROCESS_INFORMATION pointer to write, so the call faults the
+//   process (0xC0000005) on the self-hosted compiler on success AND failure
+//   paths (probed pre-split: exit code -1073741819 with a breadcrumb after
+//   the call never reached). This is the preserved historical behavior, not
+//   a regression -- the pre-split API never returned on any compiler (the
+//   failure path crashed before returning, and silverc-rs users cannot even
+//   declare the lowercase `result` type outside the module: rs statement
+//   parsing only accepts lowercase type names declared in the same file).
+//   The spawn failure result ({exitCode = -1, stderr = "Failed to create
+//   process"}) is still produced through the same failure branch; it is
+//   reachable wherever the API call itself returns.
+// - pipe: the class stays as dead as pre-split -- its handles are private
+//   with an empty constructor and no binding API, so write()/read() operate
+//   on unbound handles exactly as before (probed pre-split: WriteFile/
+//   ReadFile fail on the zero handle, read() returns ""). The pre-split
+//   data.toBytes() round trip in write() is replaced by passing the string
+//   straight across the boundary (the documented string-buffer idiom; same
+//   bytes, one less unproven builtin on silverc-rs).
+//
+// PRIMITIVE-ONLY BACKEND: every function takes and returns primitives
+// (int/string/string[]). This file compiles inside silverc.srp WITHOUT the
+// wrapper (which is excluded), so it must not reference the module's
+// `result`/`Process`/`ProcessWindow` classes; the wrapper assembles those
+// objects from the primitive pieces returned here.
+
+// Writable string buffer of n bytes (spaces) for NUL-terminated Win32 data
+// and pipe reads (mirrors sysinfoWinBuf in std/sysinfo_win.sr).
+internal string processWinBuf(int n) {
+    string r = "";
+    for (int i = 0; i < n; i++) { r = r + " "; }
+    return r;
+}
+
+// Foreground window HWND (0 when none -- the Win32 failure convention the
+// pre-split body keyed its early return on).
+internal int processWinForegroundHandle() {
+    return processWinRawGetForegroundWindow();
+}
+
+// Window title text for the given HWND. GetWindowTextA returns the copied
+// length (excluding the NUL it writes), so the decode loop bounds on len and
+// stops at char(0) for safety (pre-split loop shape, string buffer instead
+// of byte[]).
+internal string processWinWindowTitle(int hwnd) {
+    string buf = processWinBuf(512);
+    int len = processWinRawGetWindowTextA(hwnd, buf, 512);
+    string result = "";
+    for (int i = 0; i < len && buf[i] != char(0); i++) { result += char(buf[i]); }
+    return result;
+}
+
+// PID owning the given window (0 when the window is gone -- pre-split left
+// the pid at its 0 initializer in exactly that case).
+internal int processWinWindowProcessId(int hwnd) {
+    int pid = 0;
+    processWinRawGetWindowThreadProcessId(hwnd, &pid);
+    return pid;
+}
+
+// Full image path of the process behind pid, "" when OpenProcess fails, the
+// name query fails, or the path is empty (pre-split returned the half-filled
+// Process in each of those cases; the wrapper maps "" to empty path AND
+// empty filename, its pre-split observable state).
+internal string processWinImagePath(int pid) {
+    int hProcess = processWinRawOpenProcess(0x1000, 0, pid);
+    if (hProcess == 0) { return ""; }
+    string buf = processWinBuf(1024);
+    int len = 1024;
+    int ok = processWinRawQueryFullProcessImageNameA(hProcess, 0, buf, &len);
+    processWinRawCloseHandle(hProcess);
+    if (ok == 0) { return ""; }
+    string result = "";
+    for (int i = 0; i < len && buf[i] != char(0); i++) { result += char(buf[i]); }
+    return result;
+}
+
+// Spawns fullCmd with an inherited stdout pipe and captures its output.
+// Returns [status, payload]: status "0" = success with payload = captured
+// stdout, status "1" = spawn failure with payload = the pre-split stderr
+// message. The pre-split bodies of both branches are preserved verbatim:
+// CreatePipe defaults, bInheritHandles = 1, and the null-heavy
+// CreateProcessA argument list (see the PRESERVED PRE-SPLIT MECHANICS note
+// above for the null lpProcessInformation consequence). On both branches the
+// pipe handles are closed exactly as the pre-split failure/success paths
+// closed them.
+internal string[] processWinRunCapture(string fullCmd) {
+    int hReadOut = 0;
+    int hWriteOut = 0;
+    processWinRawCreatePipe(&hReadOut, &hWriteOut, null, 0);
+    int created = processWinRawCreateProcessA(null, fullCmd, null, null, 1, 0, null, null, null, null);
+    if (created == 0) {
+        processWinRawCloseHandle(hWriteOut);
+        processWinRawCloseHandle(hReadOut);
+        string[] fail = [];
+        fail.add("1");
+        fail.add("Failed to create process");
+        return fail;
+    }
+    string outBuf = processWinBuf(8192);
+    int n = 0;
+    string output = "";
+    while (processWinRawReadFile(hReadOut, outBuf, 8192, &n, null) && n > 0) {
+        for (int i = 0; i < n; i++) { output += char(outBuf[i]); }
+    }
+    processWinRawCloseHandle(hWriteOut);
+    processWinRawCloseHandle(hReadOut);
+    string[] ok = [];
+    ok.add("0");
+    ok.add(output);
+    return ok;
+}
+
+// pipe.write on the unbound write handle. The pre-split byte[] conversion is
+// gone: the string is passed straight across the boundary (dense char
+// buffer), one 8-byte slot per Silver string -- WriteFile sees the same
+// bytes.
+internal void processWinPipeWrite(int handle, string data) {
+    processWinRawWriteFile(handle, data, data.length, null, null);
+}
+
+// pipe.read on the unbound read handle: pre-split 4096-byte buffer and
+// byte-wise decode, string buffer instead of byte[].
+internal string processWinPipeRead(int handle) {
+    string buf = processWinBuf(4096);
+    int n = 0;
+    processWinRawReadFile(handle, buf, 4096, &n, null);
+    if (n <= 0) { return ""; }
+    string result = "";
+    for (int i = 0; i < n; i++) { result += char(buf[i]); }
+    return result;
+}

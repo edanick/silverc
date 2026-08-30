@@ -1,7 +1,44 @@
-import * from win32.kernel32;
-import * from win32.user32;
+import * from os;
+import * from process_win;
 
 mod export process;
+
+// DOCS -- public `process` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is
+// the unified, portable front of the process library. It contains ZERO win32
+// imports: every user32/kernel32 call moved into the internal Windows backend
+// std/process_win.sr, and every DLL-backed entry below routes through the OS
+// gate `if (osType() == OSTypes.WINDOWS)` before touching it (osType() is
+// std/os.sr's plain-Silver stand-in -- see that file and std/sysinfo.sr for
+// why the gate does not use the native os.type query).
+//
+// The else branch of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
+// a future non-Windows backend the fallbacks follow the module's failure
+// style: getFocusedProcess() returns an all-zero/empty Process, run() returns
+// the zero result, pipe.read() returns "" and pipe.write() is a silent no-op.
+//
+// NOT gated on purpose (no DLL behind them): the `result`, `ProcessWindow`
+// and `Process` class declarations and constructors, pipe's declarations and
+// its flush() stub (pre-split no-op body, kept verbatim).
+//
+// DISPATCH NOTE (per compiler, probed, unchanged by this split): on
+// silverc-rs every `Process.getFocusedProcess()` / `process.getFocusedProcess()`
+// call is intercepted BEFORE this source body and emitted natively
+// (codegen.rs routes both spellings to stdlib::process::gen_focused_process,
+// whose object layout contract -- path, filename, id, window -- the class
+// below preserves exactly), so the static body below is dead code there;
+// the self-hosted compiler has no such intercept and executes it. The
+// self-hosted driver hand-prepends this file into standalone compiles when
+// the user source imports "process" (compiler_driver.sr), and excludes the
+// name from disk collection so the prepend never duplicates; the backend it
+// now imports (process_win) resolves from std\ through the normal
+// collectModule flow. Bare `run(...)` / `pipe` / `result` calls resolve to
+// this module's globals on both compilers -- although on silverc-rs a user
+// file cannot DECLARE a lowercase `result`/`pipe` typed variable (rs
+// statement parsing only accepts lowercase type names declared in the same
+// file), so the pre-split rs surface was effectively Process.getFocusedProcess
+// plus the native bare-win32 sentinel path; nothing about that surface
+// changed.
 
 class result {
     public string stdout;
@@ -32,41 +69,31 @@ class Process {
         this.window = new ProcessWindow();
     }
 
+    // Pre-split body shape preserved: null foreground HWND leaves the whole
+    // Process zero/empty; a failed OpenProcess or image-name query (both
+    // surface as "" from processWinImagePath) leaves path/filename empty
+    // while handle/title/id stay set. The filename slash-scan is pure Silver
+    // and stays here; every DLL touch is behind the gate and the backend.
     public static Process getFocusedProcess() {
         Process result = new Process();
-        int hwnd = GetForegroundWindow();
-        if (hwnd == 0) { return result; }
-        result.window.handle = hwnd;
-
-        byte[] titleBuffer = new byte[512];
-        int titleLength = GetWindowTextA(hwnd, titleBuffer, 512);
-        string title = "";
-        for (int i = 0; i < titleLength; i++) { title += char(titleBuffer[i]); }
-        result.window.title = title;
-
-        int pid = 0;
-        GetWindowThreadProcessId(hwnd, &pid);
-        result.id = pid;
-
-        int hProcess = OpenProcess(0x1000, 0, pid);
-        if (hProcess == 0) { return result; }
-        byte[] pathBuffer = new byte[1024];
-        int pathLength = 1024;
-        int ok = QueryFullProcessImageNameA(hProcess, 0, pathBuffer, &pathLength);
-        CloseHandle(hProcess);
-        if (ok == 0) { return result; }
-
-        string fullPath = "";
-        for (int i = 0; i < pathLength; i++) { fullPath += char(pathBuffer[i]); }
-        result.path = fullPath;
-        int lastSlash = -1;
-        for (int i = 0; i < fullPath.length; i++) {
-            if (fullPath[i] == '\\' || fullPath[i] == '/') { lastSlash = i; }
-        }
-        if (lastSlash >= 0) {
-            result.filename = fullPath[lastSlash + 1..fullPath.length];
-        } else {
-            result.filename = fullPath;
+        if (osType() == OSTypes.WINDOWS) {
+            int hwnd = processWinForegroundHandle();
+            if (hwnd != 0) {
+                result.window.handle = hwnd;
+                result.window.title = processWinWindowTitle(hwnd);
+                result.id = processWinWindowProcessId(hwnd);
+                string fullPath = processWinImagePath(result.id);
+                result.path = fullPath;
+                int lastSlash = -1;
+                for (int i = 0; i < fullPath.length; i++) {
+                    if (fullPath[i] == '\\' || fullPath[i] == '/') { lastSlash = i; }
+                }
+                if (lastSlash >= 0) {
+                    result.filename = fullPath[lastSlash + 1..fullPath.length];
+                } else {
+                    result.filename = fullPath;
+                }
+            }
         }
         return result;
     }
@@ -79,48 +106,42 @@ class pipe {
     construct() { }
 
     public void write(string data) {
-        byte[] bytes = data.toBytes();
-        WriteFile(this.hWrite, bytes, bytes.length, null, null);
+        if (osType() == OSTypes.WINDOWS) {
+            processWinPipeWrite(this.hWrite, data);
+        }
     }
 
     public void flush() { }
 
     public string read() {
-        byte[] buf = new byte[4096];
-        int n = 0;
-        ReadFile(this.hRead, buf, 4096, &n, null);
-        if (n <= 0) { return ""; }
-        string result = "";
-        for (int i = 0; i < n; i++) { result += char(buf[i]); }
-        return result;
+        if (osType() == OSTypes.WINDOWS) {
+            return processWinPipeRead(this.hRead);
+        }
+        return "";
     }
 }
 
 public result run(string cmd, string[] args) {
-    string fullCmd = cmd;
-    for (int i = 0; i < args.length; i++) { fullCmd += " " + args[i]; }
-    byte[] outBuf = new byte[8192];
-    int n = 0;
-    int hWriteOut = 0;
-    int hReadOut = 0;
-    CreatePipe(&hReadOut, &hWriteOut, null, 0);
-    int created = CreateProcessA(null, fullCmd, null, null, 1, 0, null, null, null, null);
-    if (created == 0) {
-        result r = new result();
-        r.exitCode = -1;
-        r.stderr = "Failed to create process";
-        CloseHandle(hWriteOut);
-        CloseHandle(hReadOut);
-        return r;
-    }
-    string output = "";
-    while (ReadFile(hReadOut, outBuf, 8192, &n, null) && n > 0) {
-        for (int i = 0; i < n; i++) { output += char(outBuf[i]); }
-    }
     result res = new result();
-    res.stdout = output;
-    res.exitCode = 0;
-    CloseHandle(hWriteOut);
-    CloseHandle(hReadOut);
+    if (osType() == OSTypes.WINDOWS) {
+        string fullCmd = cmd;
+        for (int i = 0; i < args.length; i++) { fullCmd += " " + args[i]; }
+        // [status, payload] protocol from the backend: "0" = success with the
+        // captured stdout, "1" = spawn failure with the pre-split stderr
+        // message. The pre-split exitCode contract is preserved: 0 on
+        // success, -1 on spawn failure with stderr = "Failed to create
+        // process". The backend's CreateProcessA call keeps the pre-split
+        // null lpProcessInformation shape verbatim -- see
+        // std/process_win.sr for why that call faults on the self-hosted
+        // compiler exactly as it did before the split.
+        string[] parts = processWinRunCapture(fullCmd);
+        if (parts[0] == "0") {
+            res.stdout = parts[1];
+            res.exitCode = 0;
+        } else {
+            res.exitCode = -1;
+            res.stderr = parts[1];
+        }
+    }
     return res;
 }
