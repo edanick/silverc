@@ -1,0 +1,100 @@
+import { CryptAcquireContextA as cryptoWinRawAcquireContext, CryptGenRandom as cryptoWinRawGenRandom, CryptReleaseContext as cryptoWinRawReleaseContext } from win32.advapi32;
+import { rand as cryptoWinRawRand } from win32.msvcrt;
+
+internal mod export crypto_win;
+
+// DOCS -- INTERNAL Windows backend of the public `crypto` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). This is the only place the crypto
+// module touches a DLL: the raw Win32 CryptoAPI functions that back
+// crypto.randomBytes, and the single msvcrt rand() that backs the
+// pseudo-random character picks in bcrypt/generateKey. The public wrapper
+// (std/crypto.sr) contains zero win32 imports and reaches this code only
+// behind the OS gate `if (osType() == OSTypes.WINDOWS)` (see std/os.sr for
+// why the gate calls the plain-Silver osType() stand-in instead of the
+// native os.type query).
+//
+// INTERNAL MARKER: the `internal mod export` plus `internal` on every
+// function keep the backend from leaking to user projects (enforced by
+// compiler/visibility.sr on single-file compiles; .srp projects compile
+// their whole source set as one project). A user file that tries
+// `import * from crypto_win;` fails with the standard internal-visibility
+// error on both compilers.
+//
+// DLL IMPORT ALIASING: the DLL exports are bound through explicit
+// `X as Y` import aliases rather than a full-table `import * from
+// win32.advapi32;` grant, so only the four functions below are granted,
+// the grants answer to the local cryptoWin-prefixed names, and the PE
+// import keeps the real export (mirrors std/time_win.sr, std/net_win.sr
+// and std/http_win.sr). Aliased single-export grants bypass both
+// compilers' per-DLL export tables (silverc-rs src/win32.rs resolve()
+// matches aliased grants by local name with no table check; the self-host
+// binds them through MiniCodeGen::win32AddGrantAlias, keyed by local name
+// as well), but the export names must still be REAL exports, and all four
+// are: rand lives in both compilers' msvcrt tables as well, and:
+//
+//   - CryptAcquireContextA: the pre-split source called a bare
+//     `CryptAcquireContext`, which is only a wincrypt.h macro -- advapi32
+//     exports the A/W-suffixed pair. The ANSI form is the exact same
+//     signature with LPCSTR string parameters, and the call site passes
+//     null for both, so the ANSI selection is behavior-neutral.
+//   - CryptGenRandom / CryptReleaseContext: single unsuffixed exports,
+//     exactly as the pre-split source named them.
+//
+// PRE-SPLIT STATE (why this backend makes the module compile and run for
+// the first time): pre-split crypto.sr held the randomBytes body with NO
+// import grant at all -- the raw Crypt* calls resolved nowhere -- and its
+// salt/key generation called `time.random(...)`, a function that exists
+// NOWHERE (not in std/time.sr, not as a builtin on either compiler), so
+// even with the Crypt* calls fixed the module trapped at the first keygen
+// call (self-host: silent unresolved slot, 0xC0000005 at runtime; rs:
+// "unresolved call(s) trap at runtime" warning). A user file importing
+// crypto failed on BOTH compilers before the split: silverc-rs rejected
+// crypto.sr itself (its `import {a, b} from encoding;` lines parse as
+// native-module imports per DOCS/213, so resolution failed with unknown
+// module "base64Encode"/...), and the self-hosted compiler parsed the
+// module but died in codegen with unknown method "CryptAcquireContext"/
+// "CryptGenRandom"/"CryptReleaseContext". There was therefore no
+// observable pre-split behavior to preserve beyond the documented API
+// contract (bcrypt salt drawn from the bcrypt-64 alphabet, generateKey
+// characters from its own alphabet, right lengths) and the randomBytes
+// call shape, which is kept verbatim (same arguments, same
+// acquire/gen/release sequence, same HCRYPTPROV placeholder type both
+// compilers accept as an ALL-CAPS native type, same 0xF0000000
+// CRYPT_VERIFYCONTEXT flag, provider type 1 = PROV_RSA_FULL).
+//
+// RNG POLICY: the missing range-random now routes to msvcrt rand() --
+// the CRT RNG the UNIFIED_CORE_LIBRARY.md audit already attributed to
+// this module ("crypto.sr | msvcrt | rand"). rand/srand are tabled in
+// both compilers' msvcrt exports; only rand is granted because nothing
+// here seeds it (the pre-split source never called srand either, so the
+// CRT default stream applies). Replacing the CRT rand with a stronger
+// unified RNG remains future work, exactly as the feature doc envisions,
+// but is NOT part of this behavior-preserving split.
+
+internal int cryptoWinRandomRange(int min, int max) {
+    int span = max - min + 1;
+    return min + cryptoWinRawRand() % span;
+}
+
+// Runtime-sized byte-array allocation routed through a return statement.
+// The self-hosted compiler mis-lowers `byte[] x = new byte[expr];`
+// DECLARATION initializers as one-element byte-array literals (the decl
+// path in MiniCodeGen routes kind-19 inits to genByteArrayLiteral before
+// the runtime-sized lowering in genExpr can run), so the buffer is built
+// here and returned; the caller's `byte[] r = cryptoWinAllocBytes(n);`
+// init is a plain call and takes the normal path. silverc-rs lowers both
+// shapes correctly; this detour is byte-for-byte equivalent there.
+internal byte[] cryptoWinAllocBytes(int count) {
+    return new byte[count];
+}
+
+internal byte[] cryptoWinRandomBytes(int count) {
+    byte[] result = cryptoWinAllocBytes(count);
+    HCRYPTPROV prov = 0;
+    cryptoWinRawAcquireContext(&prov, null, null, 1, 0xF0000000);
+    if (prov != 0) {
+        cryptoWinRawGenRandom(prov, count, result);
+        cryptoWinRawReleaseContext(prov, 0);
+    }
+    return result;
+}

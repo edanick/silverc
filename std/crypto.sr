@@ -1,9 +1,81 @@
-import * from win32.msvcrt;
+import * from os;
+import * from crypto_win;
 
 mod export crypto;
-import {base64Encode, base64Decode} from encoding;
-import {readString, writeString} from fs;
-import {random} from time;
+import * from fs;
+
+// DOCS -- public `crypto` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is
+// the unified, portable front of the crypto library. It contains ZERO win32
+// imports: the DLL-backed entries moved verbatim into the internal Windows
+// backend std/crypto_win.sr -- randomBytes (the Win32 CryptoAPI CSPRNG) and
+// the msvcrt rand() that feeds the pseudo-random character picks in
+// bcrypt/generateKey -- and every entry below that touches them routes
+// through the OS gate `if (osType() == OSTypes.WINDOWS)` first. Everything
+// else in this file is pure Silver and keeps its pre-split shape ungated.
+//
+// The gate uses osType() (std/os.sr) instead of the native `os.type` query
+// because the self-hosted backend's builtin `os` dispatch covers only
+// os.name/os.version/os.build today -- `os.type` miscompiles there in both
+// spellings (property access yields a null string, the call form falls into
+// builtin dispatch and returns garbage). osType() is plain Silver: it
+// returns the OSTypes.WINDOWS contract value on every implementation without
+// needing native support, and it can be switched to the native query once
+// mini_cg learns a `type` branch.
+//
+// BASE64 NOTE (deviation, documented): the pre-split file delegated its
+// aes*/rsa* payloads to encoding.base64Encode/base64Decode, but
+// std/encoding.sr is broken on BOTH compilers (its `data.toBytes()` opening
+// crashes the self-host at runtime and yields an empty/garbage string on
+// silverc-rs), and no std module or test exercises it successfully --
+// pre-split this was unreachable because importing crypto itself failed
+// everywhere (see PRE-SPLIT STATE below). Since encoding.sr is outside this
+// split's file scope, the base64 codec lives here as private pure-Silver
+// helpers (cryptoBase64Encode/cryptoBase64Decode) implementing the standard
+// RFC 4648 alphabet with '=' padding, built only from primitives probed
+// byte-identical on both compilers (string indexing, int shifts/masks,
+// string += char, char() casts) and deliberately byte[]-free -- the
+// self-hosted compiler mis-lowers `byte[] x = new byte[expr];` declaration
+// initializers (see crypto_win.sr). This restores the functions'
+// documented contract (aesEncrypt = base64("data:key"), rsaEncrypt =
+// base64(data), aesDecrypt = the "data" part of the decoded payload)
+// instead of preserving a crash; if encoding.sr is ever fixed, these
+// helpers can delegate to it again.
+//
+// RNG NOTE: the pre-split file called `time.random(...)` for salt/key
+// material -- a function that exists NOWHERE (not in std/time.sr, not as a
+// builtin on either compiler), so those calls were dead: unresolved slot on
+// the self-host (0xC0000005 the moment keygen ran), "trap at runtime" on
+// silverc-rs. The pre-split `import {random} from time;` line was part of
+// that dead wiring and is not carried over. UNIFIED_CORE_LIBRARY.md's audit
+// already attributed an msvcrt rand() to this module, so the range-random
+// now routes through the gated cryptoRandomRange helper into the backend's
+// msvcrt rand grant (see crypto_win.sr). Swapping the CRT rand for a
+// stronger unified RNG (and making bcryptHash actually hash) remains future
+// work; this split does not redesign either.
+//
+// PRE-SPLIT STATE (important for A/B baselines): before the split, a user
+// file importing crypto failed to compile on BOTH compilers -- silverc-rs
+// rejected this file's old `import {a, b} from encoding;` lines (the braced
+// form names native modules per DOCS/213, so resolution failed with unknown
+// module "base64Encode"/...), and the self-hosted compiler parsed the file
+// but died in codegen on the backend-less Crypt* calls inside randomBytes.
+// The import style below is the portable star form so BOTH compilers can
+// resolve the module; the function bodies are lifts of the pre-split
+// implementations with only the dead time.random picks rerouted and the
+// base64 delegation inlined (see BASE64 NOTE), so every deterministic
+// result -- base64 payloads, round-trip equality, key/salt lengths, the
+// bcrypt prefix/length/verify contract -- follows the documented API
+// contract. One pre-existing compiler asymmetry remains (unchanged by this
+// split, needs no compiler work here): silverc-rs cannot consume exported
+// CLASS types from source modules (rsaKeyPair as a user-local type fails
+// with the standard rs parser error "unknown keyword rsaKeyPair"), so
+// rsaGenerate's return value is only directly usable on the self-hosted
+// compiler; the string-based rsaEncrypt/rsaDecrypt pair works everywhere.
+//
+// NON-WINDOWS FALLBACK: randomBytes returns a zero-filled array of the
+// requested length and cryptoRandomRange returns its minimum when no
+// Windows backend is present (the module's existing failure style --
+// pre-split the acquire-failure path also returned the zeroed array).
 
 class rsaKeyPair {
     public string publicKey;
@@ -15,11 +87,80 @@ class rsaKeyPair {
     }
 }
 
+// Module-internal range-random over the backend's CRT rand. Falls back to
+// the range minimum on a future non-Windows backend.
+private int cryptoRandomRange(int min, int max) {
+    if (osType() == OSTypes.WINDOWS) {
+        return cryptoWinRandomRange(min, max);
+    }
+    return min;
+}
+
+// Standard RFC 4648 base64 with '=' padding; private portable codec (see
+// BASE64 NOTE). Works purely on string indexing, int arithmetic and string
+// += char appends -- no byte[] buffers, because the self-hosted compiler
+// mis-lowers `byte[] x = new byte[expr];` declaration initializers into
+// one-element byte-array literals (see crypto_win.sr). if/else bodies
+// everywhere -- the self-host rejects string ternaries.
+private string cryptoBase64Encode(string data) {
+    string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    string result = "";
+    for (int i = 0; i < data.length; i += 3) {
+        int b0 = data[i];
+        int b1 = 0;
+        int b2 = 0;
+        if (i + 1 < data.length) { b1 = data[i + 1]; }
+        if (i + 2 < data.length) { b2 = data[i + 2]; }
+        int triple = (b0 << 16) | (b1 << 8) | b2;
+        result += chars[(triple >> 18) & 0x3F];
+        result += chars[(triple >> 12) & 0x3F];
+        if (i + 1 < data.length) {
+            result += chars[(triple >> 6) & 0x3F];
+        } else {
+            result += '=';
+        }
+        if (i + 2 < data.length) {
+            result += chars[triple & 0x3F];
+        } else {
+            result += '=';
+        }
+    }
+    return result;
+}
+
+// Inverse of cryptoBase64Encode: decodes the standard alphabet, stops at
+// '=' padding, skips characters outside the alphabet.
+private string cryptoBase64Decode(string data) {
+    string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    string result = "";
+    int acc = 0;
+    int bits = 0;
+    for (int i = 0; i < data.length; i++) {
+        char c = data[i];
+        if (c == '=') { break; }
+        int v = -1;
+        for (int j = 0; j < chars.length; j++) {
+            if (chars[j] == c) {
+                v = j;
+                break;
+            }
+        }
+        if (v < 0) { continue; }
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            result += char((acc >> bits) & 0xFF);
+        }
+    }
+    return result;
+}
+
 public string bcrypt(string password) {
     string salt = "$2a$10$";
     string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789./";
     for (int i = 0; i < 22; i++) {
-        salt += chars[time.random(0, 63)];
+        salt += chars[cryptoRandomRange(0, 63)];
     }
     return bcryptHash(password, salt);
 }
@@ -38,17 +179,17 @@ public string generateKey(int length) {
     string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()";
     string key = "";
     for (int i = 0; i < length; i++) {
-        key += chars[time.random(0, chars.length() - 1)];
+        key += chars[cryptoRandomRange(0, chars.length() - 1)];
     }
     return key;
 }
 
 public string aesEncrypt(string data, string key) {
-    return encoding.base64Encode(data + ":" + key);
+    return cryptoBase64Encode(data + ":" + key);
 }
 
 public string aesDecrypt(string data, string key) {
-    string decoded = encoding.base64Decode(data);
+    string decoded = cryptoBase64Decode(data);
     int colon = decoded.indexOf(":");
     if (colon < 0) { return ""; }
     return decoded.substr(0, colon);
@@ -71,20 +212,16 @@ public rsaKeyPair rsaGenerate(int bits) {
 }
 
 public string rsaEncrypt(string data, string publicKey) {
-    return encoding.base64Encode(data);
+    return cryptoBase64Encode(data);
 }
 
 public string rsaDecrypt(string data, string privateKey) {
-    return encoding.base64Decode(data);
+    return cryptoBase64Decode(data);
 }
 
 public byte[] randomBytes(int count) {
-    byte[] result = new byte[count];
-    HCRYPTPROV prov = 0;
-    CryptAcquireContext(&prov, null, null, 1, 0xF0000000);
-    if (prov != 0) {
-        CryptGenRandom(prov, count, result);
-        CryptReleaseContext(prov, 0);
+    if (osType() == OSTypes.WINDOWS) {
+        return cryptoWinRandomBytes(count);
     }
-    return result;
+    return new byte[count];
 }
