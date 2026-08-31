@@ -3586,6 +3586,12 @@ int strIdx = this.stringPatchIndices[i];
                 if (this.strEq(cname, "length") && this.strEq(recvType, "string")) {
                     return "int";
                 }
+                if (this.strEq(cname, "toBytes") && this.strEq(recvType, "string")) {
+                    return "byte[]";
+                }
+                if (this.strEq(cname, "stringify") && expr.child(0).kind == 6 && this.strEq(expr.child(0).name, "json")) {
+                    return "string";
+                }
                 if (this.strEq(cname, "endsWith") && this.strEq(recvType, "string")) {
                     return "bool";
                 }
@@ -5553,6 +5559,10 @@ int strIdx = this.stringPatchIndices[i];
             this.genWriteBytesCall(call);
         } elif (builtinName && this.strEq(name, "strlen")) {
             this.genStrlenCall(call);
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && this.strEq(call.child(0).name, "json") && this.strEq(name, "stringify")) {
+            // json.stringify(value): native JSON text lowering matching
+            // silverc-rs stdlib/json.rs (string/int/float/bool/array).
+            this.genJsonStringify(call);
         } elif (builtinName && this.strEq(name, "len")) {
             this.genLenCall(call);
         } elif (builtinName && this.strEq(name, "exit")) {
@@ -7329,7 +7339,7 @@ public void genNewCall(Node call) {
             }
         }
         if (this.strEq(recvType, "string")) {
-            if (this.strEq(name, "contains") || this.strEq(name, "trim") || this.strEq(name, "trimEnd") || this.strEq(name, "trimStart") || this.strEq(name, "trimLeft") || this.strEq(name, "trimRight") || this.strEq(name, "split") || this.strEq(name, "lines") || this.strEq(name, "startsWith") || this.strEq(name, "endsWith") || this.strEq(name, "indexOf") || this.strEq(name, "find") || this.strEq(name, "substr") || this.strEq(name, "substring") || this.strEq(name, "toLower") || this.strEq(name, "lower") || this.strEq(name, "toUpper") || this.strEq(name, "upper") || this.strEq(name, "replace") || this.strEq(name, "pad") || this.strEq(name, "padLeft") || this.strEq(name, "padRight") || this.strEq(name, "slugify") || this.strEq(name, "length") || this.strEq(name, "toInt64") || this.strEq(name, "toInt") || this.strEq(name, "toNumber")) {
+            if (this.strEq(name, "contains") || this.strEq(name, "trim") || this.strEq(name, "trimEnd") || this.strEq(name, "trimStart") || this.strEq(name, "trimLeft") || this.strEq(name, "trimRight") || this.strEq(name, "split") || this.strEq(name, "lines") || this.strEq(name, "startsWith") || this.strEq(name, "endsWith") || this.strEq(name, "indexOf") || this.strEq(name, "find") || this.strEq(name, "substr") || this.strEq(name, "substring") || this.strEq(name, "toLower") || this.strEq(name, "lower") || this.strEq(name, "toUpper") || this.strEq(name, "upper") || this.strEq(name, "replace") || this.strEq(name, "pad") || this.strEq(name, "padLeft") || this.strEq(name, "padRight") || this.strEq(name, "slugify") || this.strEq(name, "length") || this.strEq(name, "toInt64") || this.strEq(name, "toInt") || this.strEq(name, "toNumber") || this.strEq(name, "toBytes")) {
                 return true;
             }
         }
@@ -7390,6 +7400,93 @@ public void genNewCall(Node call) {
             this.asm.emitCallSetup(0);
             this.asm.callR64(0);
             this.asm.emitCallTeardown();
+            return;
+        }
+        if (this.strEq(name, "toBytes")) {
+            // string.toBytes(): one byte of the NUL-terminated source per
+            // element. Mirrors the silverc-rs emitter's semantics, lowered to
+            // the self-host's dynamic byte[] layout (capacity qword at +0,
+            // length qword at +8, element bytes from +16, array value =
+            // alloc+16, bounds check reads length at ptr[-8]).
+            this.genExpr(recv);
+            int tbRecv = this.allocLocal("__tb_recv");
+            this.asm.movMBaseR(5, 0, tbRecv);
+            // RAX = strlen(recv)
+            this.asm.movRMBase(1, 5, tbRecv);
+            this.addImportPatch("ucrtbase.dll", "strlen");
+            int tbSL = 0xDEADBEEFCAFEBAD1;
+            this.asm.emitImm64(0, tbSL);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            int tbLen = this.allocLocal("__tb_len");
+            this.asm.movMBaseR(5, 0, tbLen);
+            // capacity = max(len, 8), mirroring the dynamic new-array lowering
+            int tbCap = this.allocLocal("__tb_cap");
+            int tbGe8 = this.newLabel();
+            int tbCapDone = this.newLabel();
+            this.asm.movRMBase(0, 5, tbLen);
+            this.asm.cmpRI32(0, 8);
+            this.asm.jgeLabel(tbGe8);
+            this.asm.movRI64(0, 8);
+            this.asm.jmpLabel(tbCapDone);
+            this.asm.bindLabel(tbGe8);
+            this.asm.movRMBase(0, 5, tbLen);
+            this.asm.bindLabel(tbCapDone);
+            this.asm.movMBaseR(5, 0, tbCap);
+            // size = (cap + 2) * 8 in RCX; alloc via malloc (same import path
+            // as the substr/string-repeat lowerings).
+            this.asm.movRMBase(0, 5, tbCap);
+            this.asm.addRI32(0, 2);
+            this.asm.shlR64Imm(0, 3);
+            this.asm.movRR64(1, 0);
+            this.addImportPatch("msvcrt.dll", "malloc");
+            int tbMA = 0xDEADBEEFCAFEBADE;
+            this.asm.emitImm64(0, tbMA);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            int tbHdr = this.allocLocal("__tb_hdr");
+            this.asm.movMBaseR(5, 0, tbHdr);
+            // header: capacity at +0, length at +8
+            this.asm.movRMBase(1, 5, tbCap);
+            this.asm.movRMBase(0, 5, tbHdr);
+            this.asm.movMBaseR(0, 1, 0);
+            this.asm.movRMBase(1, 5, tbLen);
+            this.asm.movRMBase(0, 5, tbHdr);
+            this.asm.movMBaseR(0, 1, 8);
+            // fill loop: byte [hdr + 16 + i] = src[i] for i < len
+            int tbI = this.allocLocal("__tb_i");
+            this.asm.xorRR64(0, 0);
+            this.asm.movMBaseR(5, 0, tbI);
+            int tbLoop = this.newLabel();
+            int tbEnd = this.newLabel();
+            this.asm.bindLabel(tbLoop);
+            this.asm.movRMBase(0, 5, tbI);
+            this.asm.movRMBase(2, 5, tbLen);
+            this.asm.cmpRR64(0, 2);
+            this.asm.jgeLabel(tbEnd);
+            // RCX = movzx byte [src + i]
+            this.asm.movRMBase(1, 5, tbRecv);
+            this.asm.movRMBase(0, 5, tbI);
+            this.asm.addRR64(1, 0);
+            this.asm.movzxByteMBase(1, 1, 0);
+            // byte [hdr + 16 + i] = CL
+            this.asm.movRMBase(0, 5, tbHdr);
+            this.asm.addRI32(0, 16);
+            this.asm.movRMBase(2, 5, tbI);
+            this.asm.addRR64(0, 2);
+            this.asm.movMBaseByteR(0, 1, 0);
+            this.asm.movRMBase(0, 5, tbI);
+            this.asm.incR64(0);
+            this.asm.movMBaseR(5, 0, tbI);
+            this.asm.jmpLabel(tbLoop);
+            this.asm.bindLabel(tbEnd);
+            // RAX = data base (element 0) = hdr + 16
+            this.asm.movRMBase(0, 5, tbHdr);
+            this.asm.addRI32(0, 16);
             return;
         }
         if (this.strEq(name, "contains")) {
@@ -10070,11 +10167,414 @@ public void genNewCall(Node call) {
             this.asm.movMBaseR(4, 0, 32 + (ai - 2) * 8);
         }
         this.addImportPatch("msvcrt.dll", "sprintf");
-        int s1 = 0xDEADBEEFCAFEBAD6;
-        this.asm.emitImm64(0, s1);
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
         this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
+        this.asm.movRMBase(0, 5, bufOff);
+    }
+
+    // ---- json.stringify lowering (silverc-rs stdlib/json.rs parity) ----
+
+    // Emit a NUL-terminated string literal address into RAX via the string
+    // patch table.
+    public void genJsonLit(string text) {
+        int litIdx = this.addString(text);
+        int sp = this.asm.buf.length;
+        this.asm.emitImm64(0, 0);
+        this.stringPatchOffsets.add(sp + 2);
+        this.stringPatchIndices.add(litIdx);
+    }
+
+    // RAX holds a string; replace it with a heap copy wrapped in JSON
+    // quotes: '"' text '"' NUL (no escaping, matching silverc-rs v1).
+    public void genJsonQuote() {
+        int srcOff = this.allocLocal("__jq_src");
+        this.asm.movMBaseR(5, 0, srcOff);
+        int lenOff = this.allocLocal("__jq_len");
+        this.asm.movRMBase(1, 5, srcOff);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, lenOff);
+        // buf = malloc(len + 3)
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.addRI32(1, 3);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int bufOff = this.allocLocal("__jq_buf");
+        this.asm.movMBaseR(5, 0, bufOff);
+        // buf[0] = '"'
+        this.asm.movRMBase(1, 5, bufOff);
+        this.asm.movRI64(2, 34);
+        this.asm.movMBaseByteR(1, 2, 0);
+        // memcpy(buf + 1, src, len)
+        this.asm.movRMBase(1, 5, bufOff);
+        this.asm.addRI32(1, 1);
+        this.asm.movRMBase(2, 5, srcOff);
+        this.asm.movRMBase(8, 5, lenOff);
+        this.addImportPatch("msvcrt.dll", "memcpy");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAE0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        // buf[1 + len] = '"'
+        this.asm.movRMBase(1, 5, bufOff);
+        this.asm.addRI32(1, 1);
+        this.asm.movRMBase(2, 5, lenOff);
+        this.asm.addRR64(1, 2);
+        this.asm.movRI64(2, 34);
+        this.asm.movMBaseByteR(1, 2, 0);
+        // buf[2 + len] = 0 (malloc memory is not zeroed)
+        this.asm.movRMBase(1, 5, bufOff);
+        this.asm.addRI32(1, 2);
+        this.asm.movRMBase(2, 5, lenOff);
+        this.asm.addRR64(1, 2);
+        this.asm.xorRR64(2, 2);
+        this.asm.movMBaseByteR(1, 2, 0);
+        this.asm.movRMBase(0, 5, bufOff);
+    }
+
+    // json.stringify entry: classify the argument and lower to JSON text.
+    // Mirrors silverc-rs stdlib/json.rs gen_json_stringify: string -> quoted,
+    // float -> %g, bool literal -> true/false, array -> [...], integer-ish ->
+    // decimal, anything else -> null.
+    public void genJsonStringify(Node call) {
+        if (call.childCount() < 2) { this.genJsonLit("null"); return; }
+        Node arg = call.child(1);
+        string t = this.inferExprType(arg);
+        bool isArr = t.length >= 2 && t[t.length - 2] == '[' && t[t.length - 1] == ']';
+        if (arg.kind == 2 || this.strEq(t, "string")) {
+            this.genExpr(arg);
+            this.genJsonQuote();
+            return;
+        }
+        if (this.strEq(t, "float") || this.strEq(t, "float64") || this.strEq(t, "double")) {
+            this.genFloatToString(arg);
+            return;
+        }
+        if (arg.kind == 4) {
+            // Boolean literal: boolVal = true -> "true", else "false".
+            if (arg.boolVal) { this.genJsonLit("true"); }
+            else { this.genJsonLit("false"); }
+            return;
+        }
+        if (isArr) {
+            this.genExpr(arg);
+            this.genJsonArray(this.arrayElementType(t));
+            return;
+        }
+        if (arg.kind == 19) {
+            // Array literal: classify by literal children (rs array_join_elem).
+            int count = arg.childCount();
+            if (count == 0) { this.genJsonLit("[]"); return; }
+            int allKind0 = 1;
+            int allKind2 = 1;
+            int allKind1 = 1;
+            for (int ci = 0; ci < count; ci++) {
+                int ck = arg.child(ci).kind;
+                if (ck != 0) { allKind0 = 0; }
+                if (ck != 2) { allKind2 = 0; }
+                if (ck != 1) { allKind1 = 0; }
+            }
+            if (allKind2 == 1) {
+                this.genExpr(arg);
+                this.genJsonArray("string");
+                return;
+            }
+            if (allKind1 == 1) {
+                this.genExpr(arg);
+                this.genJsonArray("float64");
+                return;
+            }
+            if (allKind0 == 1) {
+                this.genExpr(arg);
+                this.genJsonArray("int");
+                return;
+            }
+            this.genJsonLit("null");
+            return;
+        }
+        if (this.strEq(t, "int") || this.strEq(t, "int32") || this.strEq(t, "int64") || this.strEq(t, "uint") || this.strEq(t, "bool") || this.strEq(t, "char")) {
+            // Integer-ish (and bool variables): decimal text, matching rs's
+            // integer fallback path.
+            this.genIntToString(arg);
+            return;
+        }
+        this.genJsonLit("null");
+    }
+
+    // RAX holds an array data pointer; replace it with the JSON array text
+    // "[elem,elem,...]".  Element rendering mirrors rs: string -> quoted
+    // copy, float-ish -> %g, integer-ish -> %lld decimal.  byte[] arrays are
+    // byte-packed on the self-host (elements at ptr+i), all other arrays use
+    // 8-byte element slots.
+    public void genJsonArray(string elemType) {
+        bool strElem = this.strEq(elemType, "string");
+        bool fltElem = this.strEq(elemType, "float") || this.strEq(elemType, "float64") || this.strEq(elemType, "double");
+        bool intElem = this.strEq(elemType, "int") || this.strEq(elemType, "int32") || this.strEq(elemType, "int64") || this.strEq(elemType, "uint") || this.strEq(elemType, "byte");
+        bool byteElem = this.strEq(elemType, "byte");
+        int arrOff = this.allocLocal("__jsa_arr");
+        this.asm.movMBaseR(5, 0, arrOff);
+        // scratch = malloc(40) for per-element number text
+        this.asm.movRI64(1, 40);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int scratchOff = this.allocLocal("__jsa_scr");
+        this.asm.movMBaseR(5, 0, scratchOff);
+        int elenOff = this.allocLocal("__jsa_elen");
+        // len = [arr - 8]
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(0, 0, -8);
+        int lenOff = this.allocLocal("__jsa_len");
+        this.asm.movMBaseR(5, 0, lenOff);
+        string fmtText = "%lld";
+        if (fltElem) { fmtText = "%g"; }
+        int fmtIdx = this.addString(fmtText);
+        // ---- pass 1: total = 2 + commas + element text lengths ----
+        int totalOff = this.allocLocal("__jsa_total");
+        int iOff = this.allocLocal("__jsa_i");
+        this.asm.movRI64(0, 2);
+        this.asm.movMBaseR(5, 0, totalOff);
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        int sumLoop = this.newLabel();
+        int sumEnd = this.newLabel();
+        this.asm.bindLabel(sumLoop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(sumEnd);
+        // rcx = elem = [arr + i*8]; byte[] arrays are byte-packed
+        // (elements at arr+i) so they load with movzx instead.
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.movRMBase(2, 5, iOff);
+        if (byteElem) {
+            this.asm.addRR64(1, 2);
+            this.asm.movzxByteMBase(1, 1, 0);
+        } else {
+            this.asm.shlR64Imm(2, 3);
+            this.asm.addRR64(1, 2);
+            this.asm.movRMBase(1, 1, 0);
+        }
+        if (strElem) {
+            this.addImportPatch("ucrtbase.dll", "strlen");
+            this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movRMBase(1, 5, totalOff);
+            this.asm.addRI32(0, 2);
+            this.asm.addRR64(0, 1);
+            this.asm.movMBaseR(5, 0, totalOff);
+        } else {
+            this.asm.movRR64(9, 1);
+            this.asm.movRMBase(1, 5, scratchOff);
+            int sp1 = this.asm.buf.length;
+            this.asm.emitImm64(0, 0);
+            this.stringPatchOffsets.add(sp1 + 2);
+            this.stringPatchIndices.add(fmtIdx);
+            this.asm.movRR64(2, 0);
+            this.asm.movRR64(8, 9);
+            this.addImportPatch("msvcrt.dll", "sprintf");
+            this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movRMBase(1, 5, scratchOff);
+            this.addImportPatch("ucrtbase.dll", "strlen");
+            this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movRMBase(1, 5, totalOff);
+            this.asm.addRR64(0, 1);
+            this.asm.movMBaseR(5, 0, totalOff);
+        }
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.cmpRI32(0, 0);
+        int noComma1 = this.newLabel();
+        this.asm.jeLabel(noComma1);
+        this.asm.movRMBase(1, 5, totalOff);
+        this.asm.addRI32(1, 1);
+        this.asm.movMBaseR(5, 0, totalOff);
+        this.asm.bindLabel(noComma1);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(sumLoop);
+        this.asm.bindLabel(sumEnd);
+        // ---- buf = malloc(total + 1); buf[0] = '['; pos = buf + 1 ----
+        this.asm.movRMBase(1, 5, totalOff);
+        this.asm.addRI32(1, 1);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int bufOff = this.allocLocal("__jsa_buf");
+        int posOff = this.allocLocal("__jsa_pos");
+        this.asm.movMBaseR(5, 0, bufOff);
+        this.asm.movRMBase(1, 5, bufOff);
+        this.asm.movRI64(2, 91);
+        this.asm.movMBaseByteR(1, 2, 0);
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, posOff);
+        // ---- pass 2: write elements separated by ',' ----
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        int fillLoop = this.newLabel();
+        int fillEnd = this.newLabel();
+        this.asm.bindLabel(fillLoop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(fillEnd);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.cmpRI32(0, 0);
+        int noComma2 = this.newLabel();
+        this.asm.jeLabel(noComma2);
+        this.asm.movRMBase(1, 5, posOff);
+        this.asm.movRI64(2, 44);
+        this.asm.movMBaseByteR(1, 2, 0);
+        this.asm.movRMBase(0, 5, posOff);
+        this.asm.incR64(0);
+        this.asm.movMBaseR(5, 0, posOff);
+        this.asm.bindLabel(noComma2);
+        // rcx = elem = [arr + i*8]; byte[] arrays are byte-packed
+        // (elements at arr+i) so they load with movzx instead.
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.movRMBase(2, 5, iOff);
+        if (byteElem) {
+            this.asm.addRR64(1, 2);
+            this.asm.movzxByteMBase(1, 1, 0);
+        } else {
+            this.asm.shlR64Imm(2, 3);
+            this.asm.addRR64(1, 2);
+            this.asm.movRMBase(1, 1, 0);
+        }
+        if (strElem) {
+            // elen = strlen(elem) -> [elenOff]
+            this.addImportPatch("ucrtbase.dll", "strlen");
+            this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movMBaseR(5, 0, elenOff);
+            // *pos++ = '"'
+            this.asm.movRMBase(0, 5, posOff);
+            this.asm.movRI64(2, 34);
+            this.asm.movMBaseByteR(0, 2, 0);
+            this.asm.movRMBase(0, 5, posOff);
+            this.asm.incR64(0);
+            this.asm.movMBaseR(5, 0, posOff);
+            // memcpy(rcx = pos, rdx = elem, r8 = elen)
+            this.asm.movRMBase(1, 5, posOff);
+            this.asm.movRMBase(2, 5, arrOff);
+            this.asm.movRMBase(0, 5, iOff);
+            this.asm.shlR64Imm(0, 3);
+            this.asm.addRR64(2, 0);
+            this.asm.movRMBase(2, 2, 0);
+            this.asm.movRMBase(8, 5, elenOff);
+            this.addImportPatch("msvcrt.dll", "memcpy");
+            this.asm.emitImm64(0, 0xDEADBEEFCAFEBAE0);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movRMBase(0, 5, posOff);
+            this.asm.movRMBase(1, 5, elenOff);
+            this.asm.addRR64(0, 1);
+            this.asm.movMBaseR(5, 0, posOff);
+            // *pos++ = '"'
+            this.asm.movRMBase(0, 5, posOff);
+            this.asm.movRI64(2, 34);
+            this.asm.movMBaseByteR(0, 2, 0);
+            this.asm.movRMBase(0, 5, posOff);
+            this.asm.incR64(0);
+            this.asm.movMBaseR(5, 0, posOff);
+        } else {
+            // sprintf(scratch, fmt, elem); elen = strlen(scratch)
+            if (byteElem) {
+                this.asm.movRMBase(9, 5, arrOff);
+                this.asm.movRMBase(2, 5, iOff);
+                this.asm.addRR64(9, 2);
+                this.asm.movzxByteMBase(9, 9, 0);
+            } else {
+                this.asm.movRMBase(9, 5, arrOff);
+                this.asm.movRMBase(2, 5, iOff);
+                this.asm.shlR64Imm(2, 3);
+                this.asm.addRR64(9, 2);
+                this.asm.movRMBase(9, 9, 0);
+            }
+            this.asm.movRMBase(1, 5, scratchOff);
+            int sp2 = this.asm.buf.length;
+            this.asm.emitImm64(0, 0);
+            this.stringPatchOffsets.add(sp2 + 2);
+            this.stringPatchIndices.add(fmtIdx);
+            this.asm.movRR64(2, 0);
+            this.asm.movRR64(8, 9);
+            this.addImportPatch("msvcrt.dll", "sprintf");
+            this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movRMBase(1, 5, scratchOff);
+            this.addImportPatch("ucrtbase.dll", "strlen");
+            this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movMBaseR(5, 0, elenOff);
+            // memcpy(rcx = pos, rdx = scratch, r8 = elen); pos += elen
+            this.asm.movRMBase(1, 5, posOff);
+            this.asm.movRMBase(2, 5, scratchOff);
+            this.asm.movRMBase(8, 5, elenOff);
+            this.addImportPatch("msvcrt.dll", "memcpy");
+            this.asm.emitImm64(0, 0xDEADBEEFCAFEBAE0);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movRMBase(0, 5, posOff);
+            this.asm.movRMBase(1, 5, elenOff);
+            this.asm.addRR64(0, 1);
+            this.asm.movMBaseR(5, 0, posOff);
+        }
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(fillLoop);
+        this.asm.bindLabel(fillEnd);
+        // *pos++ = ']'; *pos = 0
+        this.asm.movRMBase(0, 5, posOff);
+        this.asm.movRI64(2, 93);
+        this.asm.movMBaseByteR(0, 2, 0);
+        this.asm.movRMBase(0, 5, posOff);
+        this.asm.incR64(0);
+        this.asm.movRI64(2, 0);
+        this.asm.movMBaseByteR(0, 2, 0);
         this.asm.movRMBase(0, 5, bufOff);
     }
 

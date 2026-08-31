@@ -13,8 +13,14 @@ public string base64Encode(string data) {
         int idx = i / 3 * 4;
         out[idx] = chars[(b >> 18) & 0x3F];
         out[idx + 1] = chars[(b >> 12) & 0x3F];
-        out[idx + 2] = (i + 1 < len) ? chars[(b >> 6) & 0x3F] : '=';
-        out[idx + 3] = (i + 2 < len) ? chars[b & 0x3F] : '=';
+        // NOTE: the ternaries are hoisted into decl temps because an
+        // assignment-statement rhs `x = c ? a : b` mis-parses on the
+        // self-host (the ternary escapes the assignment rhs); decl inits
+        // parse it correctly on both compilers.
+        int c3 = (i + 1 < len) ? chars[(b >> 6) & 0x3F] : '=';
+        out[idx + 2] = c3;
+        int c4 = (i + 2 < len) ? chars[b & 0x3F] : '=';
+        out[idx + 3] = c4;
     }
     string result = "";
     for (int i = 0; i < outLen; i++) { result += char(out[i]); }
@@ -33,7 +39,14 @@ public string base64Decode(string data) {
         int b = 0;
         for (int j = 0; j < 4; j++) {
             if (i + j < inLen && data[i + j] != '=') {
-                b = (b << 6) | chars.indexOf(data[i + j]);
+                // Manual char scan: indexOf(char) lowers to strstr with the
+                // char code as a pointer on both compilers, so it can never
+                // be used here.
+                int code = -1;
+                for (int k = 0; k < 64; k++) {
+                    if (chars[k] == data[i + j]) { code = k; break; }
+                }
+                b = (b << 6) | code;
             } else { b <<= 6; }
         }
         if (o < outLen) { out[o++] = (b >> 16) & 0xFF; }
@@ -71,9 +84,13 @@ public string hexDecode(string data) {
     int len = data.length() / 2;
     byte[] out = new byte[len];
     for (int i = 0; i < len; i++) {
-        string h = data.substr(i * 2, 2);
-        int high = h[0] <= '9' ? h[0] - '0' : (h[0] & 0xDF) - 'A' + 10;
-        int low = h[1] <= '9' ? h[1] - '0' : (h[1] & 0xDF) - 'A' + 10;
+        // Direct char indexing: substr's second argument is an END index on
+        // silverc-rs but a LENGTH on the self-host, so substr(i*2, 2) is not
+        // parity-safe and is avoided here.
+        int hb = data[i * 2];
+        int lb = data[i * 2 + 1];
+        int high = hb <= '9' ? hb - '0' : (hb & 0xDF) - 'A' + 10;
+        int low = lb <= '9' ? lb - '0' : (lb & 0xDF) - 'A' + 10;
         out[i] = (high << 4) | low;
     }
     string result = "";
