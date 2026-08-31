@@ -1,4 +1,35 @@
+import { SystemFunction036 as RtlGenRandom } from win32.advapi32;
+
 mod export uuid;
+
+// DOCS -- std `uuid` module. Pure Silver formatting over the advapi32
+// CSPRNG. Two fixes vs the pre-split file (which never compiled anywhere):
+//
+// 1. GRANT: RtlGenRandom was called with NO import grant (both compilers
+//    reject that: "unknown method RtlGenRandom"). The conventional
+//    RtlGenRandom name is not a real export -- advapi32 exports it as
+//    SystemFunction036 (documented alias), so the grant aliases the real
+//    export to the conventional name: the PE import keeps
+//    advapi32!SystemFunction036 while the calls below stay readable.
+//
+// 2. BUFFER LAYOUT: Silver arrays are [cap, len, elem...] with 8-byte
+//    elements, so a byte[] crosses a DLL boundary as a QWORD buffer (the
+//    std/ws_win.sr + std/mysql_win.sr probed posture: "byte[] must NOT
+//    cross a DLL boundary as a packed buffer"). The pre-split file passed a
+//    byte[16] to RtlGenRandom and read bytes[i] -- contiguous 16 bytes land
+//    in the first two qword slots, so bytes[1] would have read the low byte
+//    of random byte 8, not byte 1. The CSPRNG now writes into a packed
+//    int[2] (two qwords = 16 wire bytes) and the byte values are unpacked
+//    into int[16] one-per-slot with shifts -- the proven mysql/mongo
+//    backend layout. x64 is little-endian; byte i lives at packed slot i/8,
+//    byte position i%8 (shifted low-to-high).
+//
+// Also: `s.length()` call form -> `.length` property (the property form is
+// the only string-length spelling std sources use; the call form reads
+// garbage on the self-host for arrays and was never the std convention).
+//
+// `char(0)` is not used here; `'\0'` would lex as '0' anyway (both
+// compilers' lexer quirk, see std/sysinfo.sr).
 
 class uuid {
     public int version;
@@ -6,25 +37,36 @@ class uuid {
 
     construct() { this.version = 4; this.variant = 1; }
 
+    // 16 random bytes via the CSPRNG. The byte[] result holds one byte per
+    // element slot (values 0..255 stored into the qword slots -- assignment
+    // is safe; only DLL-side CONTIGUOUS packed reads were the trap above).
     public byte[] toBytes() {
+        int[] packed = new int[2];
+        RtlGenRandom(packed, 16);
         byte[] bytes = new byte[16];
-        RtlGenRandom(bytes, 16);
+        for (int i = 0; i < 16; i++) {
+            bytes[i] = (packed[i / 8] >> ((i % 8) * 8)) & 0xFF;
+        }
         return bytes;
     }
 }
 
 public string generate() {
-    byte[] bytes = new byte[16];
-    RtlGenRandom(bytes, 16);
-    bytes[6] = (bytes[6] & 0x0F) | 0x40;
-    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    int[] packed = new int[2];
+    RtlGenRandom(packed, 16);
+    int[] b = new int[16];
+    for (int i = 0; i < 16; i++) {
+        b[i] = (packed[i / 8] >> ((i % 8) * 8)) & 0xFF;
+    }
+    b[6] = (b[6] & 0x0F) | 0x40;
+    b[8] = (b[8] & 0x3F) | 0x80;
 
     string hex = "0123456789abcdef";
     string result = "";
     for (int i = 0; i < 16; i++) {
         if (i == 4 || i == 6 || i == 8 || i == 10) { result += "-"; }
-        result += hex[(bytes[i] >> 4) & 0x0F];
-        result += hex[bytes[i] & 0x0F];
+        result += hex[(b[i] >> 4) & 0x0F];
+        result += hex[b[i] & 0x0F];
     }
     return result;
 }
@@ -46,8 +88,8 @@ public uuid fromBytes(byte[] bytes) {
 }
 
 public bool isValid(string s) {
-    if (s.length() != 36) { return false; }
-    for (int i = 0; i < s.length(); i++) {
+    if (s.length != 36) { return false; }
+    for (int i = 0; i < s.length; i++) {
         if (i == 8 || i == 13 || i == 18 || i == 23) {
             if (s[i] != '-') { return false; }
         } else {
