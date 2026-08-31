@@ -1,39 +1,333 @@
-import * from win32.ws2_32;
+import * from os;
+import * from http_server_win;
 
 mod export http_server;
-import * from headers;
-import * from encoding;
-import * from json;
+
+// DOCS -- public `http_server` module (UNIFIED_CORE_LIBRARY.md Phase 2).
+// This is the unified, portable front of the HTTP server library. It contains
+// ZERO win32 imports: every ws2_32 call moved into the internal Windows
+// backend std/http_server_win.sr, and every entry that touches the network
+// routes through the OS gate `if (osType() == OSTypes.WINDOWS)` before
+// calling it (osType() is std/os.sr's plain-Silver stand-in -- see that file
+// for why the gate does not use the native os.type query).
+//
+// The else branch of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For a
+// future non-Windows backend the fallbacks follow the module's failure style:
+// serve/serveBounded return without listening, currentSocket() stays -1, and
+// requestHeader() stays "".
+//
+// DISPATCH (per compiler, probed): `http_server` is builtin-reserved on
+// NEITHER compiler -- silverc-rs's builtin_modules_set (src/main.rs lists
+// fs/json/yaml/env/url/hash/path/bom/console/math/http only) and the
+// self-hosted compiler's visBuiltinModule (compiler/visibility.sr) plus its
+// driver lists all exclude it. Both compilers resolve `import * from
+// http_server;` as an ORDINARY SOURCE module (std/http_server.sr); no native
+// dispatch exists to preserve. (http_server.sr's entry in silverc.srp's
+// exclude list only keeps it out of the compiler's own aggregate build -- it
+// does not make `http_server` a builtin.)
+//
+// PRE-SPLIT STATE (probed 2026-08 against this file's git HEAD copy, both
+// compilers): the old std/http_server.sr NEVER compiled under either
+// compiler. silverc-rs rejected the `void callbackFunc(request, response)`
+// fn-parameter at line 96 ("you forgot a comma" / "Missing close
+// parenthesis" -- the fn type carries ARGUMENT types, which no compiler
+// accepts; DOCS/259's `void () name` is the only fn-parameter shape and it
+// is zero-argument), the `struct sockaddr_in addr;` local at line 100
+// ("Expected 'LeftBrace' but found Identifier(addr)") and cascaded through
+// line 128; the self-hosted compiler died with "Parse error ... expected {
+// but found (" at the same fn-parameter (reported against the aggregate
+// line 292). Also unexpressible: `AF_INET`/`SOCK_STREAM`/`SOL_SOCKET`/
+// `SO_REUSEADDR` resolve to nothing (neither name is in either compiler's
+// ws2_32 export table: WSAStartup WSACleanup socket bind listen accept recv
+// send shutdown closesocket connect select setsockopt ioctlsocket htons
+// inet_addr getaddrinfo freeaddrinfo WSAGetLastError only -- the constants
+// are passed as literals now: 2/1/0xFFFF/0x0004). Every body was therefore
+// dead text -- there was NO observable pre-split behavior to preserve
+// beyond names, arities and intent.
+//
+// DEAD -> LIVE (what this split made actually work, mirroring the
+// std/ws.sr / std/net.sr / std/smtp.sr splits):
+// - The transport: socket + SO_REUSEADDR + bind(INADDR_ANY) + listen(10)
+//   over ws2_32 with WSAStartup (the pre-split file never initialized
+//   winsock), the sockaddr_in image packed into an int[2] qword buffer, and
+//   DLL returns normalized with the two-sided `v < 0 || v > 2147483647`
+//   check (the self-host zero-extends SOCKET_ERROR to 4294967295; see
+//   std/http_server_win.sr). Every accepted client inherits a 30 s
+//   SO_RCVTIMEO, so a client that connects and goes silent cannot hang the
+//   accept loop (the pre-split file had no timeout -- and never ran).
+// - serve(): pre-split it took `(int port, void callbackFunc(request,
+//   response))`. The fn-parameter CANNOT carry the (request, response)
+//   payload on either compiler (see PRE-SPLIT STATE); per the std/ws.sr
+//   port it is re-typed to the DOCS/259 zero-arg spelling and the payload
+//   flows through the NEW accessors instead -- inside the handler, build
+//   the request from currentRaw() and the response from currentSocket()
+//   (see THE HANDLER CONTRACT below).
+//   serve() keeps the pre-split infinite `while (true)` accept loop: it
+//   never returns by design (never call it from a probe or test).
+// - serveBounded(port, handler, maxRequests) is NEW (additive): the same
+//   loop bounded to exactly maxRequests accept attempts, closing the
+//   listening socket before it returns -- the probe/test path.
+// - request parsing: the pre-split construct parsed the request line with
+//   substr spans that are WRONG on silverc-rs (rs substr(start, X) is
+//   (start, END) while the self-host is (start, LENGTH); the pre-split
+//   `first.substr(i1 + 1, i2 - i1 - 1)` produced garbage on rs). The parse
+//   is rewritten as pure index scanning over char codes; the only substr
+//   spans kept are the dual-correct (start, end-exclusive) forms -- they
+//   denote the same character range under BOTH semantics -- plus single-
+//   argument tails. Line/header splits are manual CR/LF scans (no
+//   string.split): the std/headers.sr multimap this module used to depend
+//   on compiles on both compilers but its runtime shapes are landmined
+//   (string ternaries, the `.length()` call form that reads garbage on the
+//   self-host), so the wrapper now carries its own local headermap class
+//   built on the probed parallel string[] idiom (std/mongo.sr doc
+//   precedent).
+// - Response building moved verbatim from the dead send() body into the
+//   ADDITIVE pure render(body) helper (single source of truth, probeable
+//   byte-identically on both compilers -- the std/ws.sr encodeFrame
+//   precedent); send() renders then writes. Connection: close is sent per
+//   response and the client socket is closed after the handler returns --
+//   HTTP keep-alive is NOT implemented (the pre-split file already sent
+//   `Connection: close`; documented, not a regression).
+//
+// NOT INVENTED: response.json(object) keeps its pre-split name/arity but is
+// a stored NO-OP: the pre-split body called json.stringify(data), and
+// `json.stringify` is a RUNTIME CRASHER on BOTH compilers (probed 2026-08:
+// `json.stringify("hello")` alone dies 0xC0000005 on silverc-rs AND on the
+// self-host; `object` locals are additionally rejected at parse time on
+// both). No stringification exists to delegate to, so the member sends
+// nothing; callers should format their JSON as text and use send()
+// (`send("{\"ok\":true}")`). The pre-split `Content-Length` used the
+// `body.length()` CALL form -- property form now (the call form reads
+// garbage on the self-host).
+//
+// THE HANDLER CONTRACT (probed end-to-end on both compilers -- this is the
+// only supported way to write a handler; the probe evidence is cited per
+// rule):
+//
+//     import * from http_server;
+//
+//     void main() {
+//         http_server.serveBounded(8080, (void () {
+//             var req = new request(http_server.currentRaw());
+//             string path = req.path;              // field read into a LOCAL
+//             var res = new response(http_server.currentSocket());
+//             if (path == "/hello") {
+//                 res.status(200).send("hello");
+//             } else {
+//                 res.status(404).send("not found");
+//             }
+//         }), 3);
+//     }
+//
+// - The handler is a DOCS/259 anonymous `(void () { ... })` passed to the
+//   module-qualified serve/serveBounded call. A qualified call whose
+//   fn-parameter is INVOKED (not stored by the callee through the module
+//   boundary) is the probed-working shape on rs (the async.sr qualified-call
+//   landmine only hits calls that STORE the fn argument across the module
+//   boundary; serve/serveBounded store it INSIDE the module, same-module,
+//   which is the probed-working async setJob shape).
+// - The anon body must NOT capture outer locals (no closure capture on
+//   either compiler): reach the module through qualified free-function
+//   calls only.
+// - BOTH the request and the response MUST be bare-new'd in the handler --
+//   `var req = new request(http_server.currentRaw());` and `var res = new
+//   response(http_server.currentSocket());` -- and this is why there is no
+//   accessor-returning currentRequest()/currentResponse() pair:
+//   - Methods called on a var returned by a cross-module free function are
+//     SILENT NO-OPS on silverc-rs (probed: r.status(404)/r.emit("x")
+//     neither ran nor mutated the instance; the self-host ran both), so an
+//     accessor-returned response would swallow every send on rs.
+//   - FIELD reads on such a var are mis-indexed on rs (probed live: after
+//     `var req = accessorCurrentRequest()`, req.path returned the METHOD
+//     field -- "GET" -- on rs while the self-host read it correctly; only
+//     the FIRST field round-trips). A BARE-NEW'd instance reads fields and
+//     dispatches methods exactly on both compilers (probed via the fixed-
+//     input request/response probes), and currentRaw()'s string /
+//     currentSocket()'s int free-function returns are probed value-exact
+//     on both.
+// - STRING FIELD reads off req are safe in concatenations only when
+//   assigned to a local first: `"p=" + req.path` stringifies the field
+//   POINTER on rs (probed: prints a number), while
+//   `string p = req.path;` + `"p=" + p` prints the text on both.
+// - The handler must call send()/html()/redirect() exactly as the
+//   pre-split callback had to; a handler that sends nothing leaves the
+//   client with an empty connection (closed after the handler returns).
+//   send() is self-contained (it carries the socket fd), so calling it on
+//   the fresh instance is safe on both compilers.
+// - For request HEADERS use the additive requestHeader(name) free function
+//   (same-module parse) instead of poking req.headers from the handler.
+//
+// API PRESERVATION (every public name/arity of the pre-split file,
+// unchanged): class request -- public fields method/path/version/body
+// (construct(string raw) preserved); class response -- construct(int sock),
+// status(int code) -> response, header(string name, string value) ->
+// response, send(string body), json(object data) (see NOT INVENTED),
+// html(string content), redirect(string url); free function serve. The
+// private sendRaw(string, int) helper became the backend's hsWinSend.
+//
+// FORCED EXCEPTIONS (documented):
+// - request.headers is typed `headermap` (this module's local class, with
+//   the get/has/getAll/set/add/serialize surface) instead of the
+//   std/headers `multimap` -- the pre-split field could never be used (the
+//   file never compiled anywhere) and the multimap's runtime shapes are
+//   landmined (see DEAD -> LIVE). Field NAME preserved.
+// - serve's fn-parameter is `void ()` (zero-arg) instead of
+//   `void (request, response)` -- the arg-carrying fn type parses on
+//   NEITHER compiler (PRE-SPLIT STATE); the payload flows through the
+//   accessors per THE HANDLER CONTRACT.
+//
+// ADDITIVE (all documented, all probeable): serveBounded(port, handler,
+// maxRequests) -- bounded accept loop, closes the listening socket when
+// done; response.render(body) -- the pure response-text builder (status
+// line, serialized headers, default Content-Type, Content-Length,
+// Connection: close, body) with NO socket write; currentRaw() /
+// currentSocket() / requestHeader(name) -- the handler accessors; class
+// headermap and class server -- infrastructure (server is the state holder
+// behind the free functions; both are ordinary classes a user could name,
+// but the handler contract above is the supported surface).
+
+class headermap {
+    string[] names;
+    string[] values;
+
+    construct() {
+        this.names = [];
+        this.values = [];
+    }
+
+    private void removeKey(string key) {
+        string[] keepNames = [];
+        string[] keepVals = [];
+        for (int i = 0; i < this.names.length; i++) {
+            if (this.names[i] != key) {
+                keepNames.push(this.names[i]);
+                keepVals.push(this.values[i]);
+            }
+        }
+        this.names = keepNames;
+        this.values = keepVals;
+    }
+
+    // Replaces every entry for (the lowered) name with one value -- the
+    // std/headers multimap.set semantics (kvp.set replaced the value list).
+    public void set(string name, string value) {
+        string key = name.toLower();
+        this.removeKey(key);
+        this.names.push(key);
+        this.values.push(value);
+    }
+
+    // Appends one more value for name (duplicates allowed; get() returns
+    // the first, getAll() collects them all) -- multimap.add semantics.
+    public void add(string name, string value) {
+        this.names.push(name.toLower());
+        this.values.push(value);
+    }
+
+    public string get(string name) {
+        string key = name.toLower();
+        for (int i = 0; i < this.names.length; i++) {
+            if (this.names[i] == key) { return this.values[i]; }
+        }
+        return "";
+    }
+
+    public string[] getAll(string name) {
+        string key = name.toLower();
+        string[] out = [];
+        for (int i = 0; i < this.names.length; i++) {
+            if (this.names[i] == key) { out.push(this.values[i]); }
+        }
+        return out;
+    }
+
+    public bool has(string name) {
+        string key = name.toLower();
+        for (int i = 0; i < this.names.length; i++) {
+            if (this.names[i] == key) { return true; }
+        }
+        return false;
+    }
+
+    // The std/headers multimap.serialize format, preserved verbatim (minus
+    // its string ternary and `.length()` call forms): every entry emitted
+    // as "Name: value\r\n" with the first letter of the lowered key
+    // capitalized; an empty key emits ": value\r\n".
+    public string serialize() {
+        string result = "";
+        for (int i = 0; i < this.names.length; i++) {
+            string key = this.names[i];
+            string val = this.values[i];
+            string cap = key;
+            if (key.length > 0) {
+                cap = key.substr(0, 1).toUpper() + key.substr(1);
+            }
+            result += cap + ": " + val + "\r\n";
+        }
+        return result;
+    }
+}
 
 class request {
     public string method;
     public string path;
     public string version;
     public string body;
-    public multimap headers;
+    public headermap headers;
 
+    // Parses one raw HTTP/1.1 request (request line, headers, body). Pure
+    // index scanning over char codes -- see DEAD -> LIVE for why the
+    // pre-split substr spans could not be kept. On a malformed request the
+    // fields stay "" (the pre-split early returns left them null).
     construct(string raw) {
-        int lineEnd = raw.indexOf("\r\n");
+        this.method = "";
+        this.path = "";
+        this.version = "";
+        this.body = "";
+        this.headers = new headermap();
+        int lineEnd = -1;
+        for (int i = 0; i + 1 < raw.length; i++) {
+            if (raw[i] == 13 && raw[i + 1] == 10) { lineEnd = i; break; }
+        }
         if (lineEnd < 0) { return; }
         string first = raw.substr(0, lineEnd);
-        int i1 = first.indexOf(" ");
-        int i2 = first.lastIndexOf(" ");
+        int i1 = -1;
+        int i2 = -1;
+        for (int i = 0; i < first.length; i++) {
+            if (first[i] == 32) {
+                if (i1 < 0) { i1 = i; }
+                i2 = i;
+            }
+        }
         if (i1 < 0 || i2 < 0 || i1 == i2) { return; }
         this.method = first.substr(0, i1);
-        this.path = first.substr(i1 + 1, i2 - i1 - 1);
+        // Index-sliced spans (slice(start, endExclusive)): the ONLY portable
+        // substr forms are substr(0, n) and single-argument tails -- for any
+        // other start the rs (start, END) and self-host (start, LENGTH)
+        // semantics diverge (probed 2026-08: substr(i1+1, i2) yielded the
+        // right span on rs and an OVERRUN on the self-host).
+        this.path = slice(first, i1 + 1, i2);
         this.version = first.substr(i2 + 1);
-        int hdrEnd = raw.indexOf("\r\n\r\n");
+        int hdrEnd = -1;
+        for (int i = 0; i + 3 < raw.length; i++) {
+            if (raw[i] == 13 && raw[i + 1] == 10 && raw[i + 2] == 13 && raw[i + 3] == 10) { hdrEnd = i; break; }
+        }
         if (hdrEnd < 0) { return; }
-        string hdrStr = raw.substr(lineEnd + 2, hdrEnd - lineEnd - 2);
-        this.headers = headers.parse(hdrStr);
-        this.body = raw.substr(hdrEnd + 4);
+        if (hdrEnd > lineEnd + 2) {
+            string hdrStr = slice(raw, lineEnd + 2, hdrEnd);
+            parseHeaderBlock(this.headers, hdrStr);
+        }
+        if (hdrEnd + 4 <= raw.length) {
+            this.body = raw.substr(hdrEnd + 4);
+        }
     }
 }
 
 class response {
     private int statusCode;
     private string statusText;
-    private multimap headers;
+    private headermap headers;
     private string body;
     private int socket;
 
@@ -41,7 +335,8 @@ class response {
         this.socket = sock;
         this.statusCode = 200;
         this.statusText = "OK";
-        this.headers = new multimap();
+        this.headers = new headermap();
+        this.body = "";
     }
 
     public response status(int code) {
@@ -59,23 +354,23 @@ class response {
         return this;
     }
 
+    // Renders the full response text and writes it on the client socket.
+    // The write routes through the backend; on a non-Windows backend (or a
+    // socket of -1) nothing is sent.
     public void send(string body) {
         this.body = body;
-        string resp = "HTTP/1.1 " + this.statusCode + " " + this.statusText + "\r\n";
-        resp += this.headers.serialize();
-        if (!this.headers.has("Content-Type")) {
-            resp += "Content-Type: text/plain\r\n";
+        string resp = this.render(body);
+        if (osType() == OSTypes.WINDOWS && this.socket >= 0) {
+            hsWinSend(this.socket, resp);
         }
-        resp += "Content-Length: " + body.length() + "\r\n";
-        resp += "Connection: close\r\n\r\n";
-        resp += body;
-        sendRaw(resp, this.socket);
     }
 
-    public void json(object data) {
-        this.header("Content-Type", "application/json");
-        this.send(json.stringify(data));
-    }
+    // Stored NO-OP (see NOT INVENTED in the module header): the pre-split
+    // body called json.stringify(data), which is a runtime crasher on both
+    // compilers (probed 2026-08, 0xC0000005 both) and `object` locals do
+    // not parse on either. No stringification exists to delegate to, so
+    // the member sends nothing; format JSON as text and use send().
+    public void json(object data) { }
 
     public void html(string content) {
         this.header("Content-Type", "text/html");
@@ -86,43 +381,224 @@ class response {
         this.status(301).header("Location", url);
         this.send("Moved to " + url);
     }
-}
 
-private void sendRaw(string data, int sock) {
-    byte[] bytes = data.toBytes();
-    send(sock, bytes, bytes.length, 0);
-}
-
-public void serve(int port, void callbackFunc(request, response)) {
-    int server = socket(AF_INET, SOCK_STREAM, 0);
-    if (server < 0) { printline("Failed to create socket"); return; }
-
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = 0;
-    addr.sin_port = (port & 0xFF) << 8 | (port >> 8) & 0xFF;
-
-    int opt = 1;
-    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &opt, 4);
-    if (bind(server, &addr, 16) < 0) {
-        closesocket(server);
-        printline("Failed to bind to port " + port);
-        return;
-    }
-    listen(server, 10);
-    printline("HTTP server listening on port " + port);
-    while (true) {
-        int client = accept(server, null, null);
-        if (client < 0) { continue; }
-        byte[] buf = new byte[8192];
-        int n = recv(client, buf, 8192, 0);
-        if (n > 0) {
-            string raw = "";
-            for (int i = 0; i < n; i++) { raw += char(buf[i]); }
-            request req = new request(raw);
-            response res = new response(client);
-            callbackFunc(req, res);
+    // ADDITIVE (the pure response builder, moved verbatim from the dead
+    // pre-split send() body): status line, serialized headers, the default
+    // Content-Type when none was set, Content-Length (property form -- the
+    // pre-split .length() call form reads garbage on the self-host),
+    // "Connection: close" (keep-alive is NOT implemented -- the pre-split
+    // file already sent close), a blank line, and the body. NO socket
+    // write -- probeable byte-identically on both compilers.
+    public string render(string body) {
+        string resp = "HTTP/1.1 " + this.statusCode + " " + this.statusText + "\r\n";
+        resp += this.headers.serialize();
+        if (!this.headers.has("Content-Type")) {
+            resp += "Content-Type: text/plain\r\n";
         }
-        closesocket(client);
+        resp += "Content-Length: " + body.length + "\r\n";
+        resp += "Connection: close\r\n\r\n";
+        resp += body;
+        return resp;
+    }
+}
+
+class server {
+    private int listenFd;
+    private int port;
+    private string curRaw;
+    private int curFd;
+    private object handlerSlot;
+
+    construct(int p) {
+        this.listenFd = -1;
+        this.port = p;
+        this.curRaw = "";
+        this.curFd = -1;
+        this.handlerSlot = null;
+    }
+
+    // Stores the handler (method fn-parameter -> object slot -- the probed
+    // std/async.sr idiom; object-slot CALL-THROUGH is a silent no-op on the
+    // self-host, so invocation always goes through relay()).
+    public void handle(void () h) {
+        this.handlerSlot = h;
+    }
+
+    private void relay(void () h) {
+        h();
+    }
+
+    public void setPort(int p) {
+        this.port = p;
+    }
+
+    // Binds and listens (the pre-split "HTTP server listening on port N" /
+    // "Failed to bind to port N" messages preserved verbatim).
+    public void listenNow() {
+        if (osType() == OSTypes.WINDOWS) {
+            this.listenFd = hsWinListen(this.port);
+        }
+        if (this.listenFd < 0) {
+            printline("Failed to bind to port " + this.port);
+        } else {
+            printline("HTTP server listening on port " + this.port);
+        }
+    }
+
+    // One accept-dispatch cycle: accept, read the request (single recv up
+    // to 8192 bytes -- the pre-split shape; an oversized request truncates
+    // exactly as it would have), store it as the current request, fire the
+    // zero-arg handler, then close the client (Connection: close). Returns
+    // true only when a request was dispatched.
+    public bool acceptOnce() {
+        if (this.listenFd < 0) { return false; }
+        int client = hsWinAccept(this.listenFd);
+        if (client < 0) { return false; }
+        this.curFd = client;
+        string raw = hsWinReceive(client, 8192);
+        if (raw.length <= 0) {
+            hsWinClose(client);
+            return false;
+        }
+        this.curRaw = raw;
+        this.relay(this.handlerSlot);
+        hsWinClose(client);
+        return true;
+    }
+
+    // The pre-split serve loop shape: never returns.
+    public void serveLoop() {
+        while (true) {
+            this.acceptOnce();
+        }
+    }
+
+    // ADDITIVE: exactly maxRequests accept attempts, then the listening
+    // socket is closed and the call returns -- the bounded probe/test path.
+    public void serveBoundedLoop(int maxRequests) {
+        for (int i = 0; i < maxRequests; i++) {
+            this.acceptOnce();
+        }
+        if (this.listenFd >= 0) {
+            hsWinClose(this.listenFd);
+            this.listenFd = -1;
+        }
+    }
+
+    public string curRawPub() {
+        return this.curRaw;
+    }
+
+    public int curFdPub() {
+        return this.curFd;
+    }
+}
+
+// The module singleton (a global initialized once; globals themselves are
+// READ-ONLY on both compilers -- probed -- so all mutation flows through
+// theServer's methods from inside this module).
+private server theServer = new server(0);
+
+// The pre-split free function (first argument preserved; the fn-parameter
+// re-typed per FORCED EXCEPTIONS). Infinite loop -- never returns (use
+// serveBounded when the process must continue afterwards). On a
+// non-Windows backend this returns immediately.
+public void serve(int port, void () handler) {
+    if (osType() != OSTypes.WINDOWS) { return; }
+    theServer.setPort(port);
+    theServer.handle(handler);
+    theServer.listenNow();
+    theServer.serveLoop();
+}
+
+// ADDITIVE: the bounded serve -- exactly maxRequests accept attempts, then
+// the listening socket is closed and the call returns. The probe/test path
+// for serve.
+public void serveBounded(int port, void () handler, int maxRequests) {
+    if (osType() != OSTypes.WINDOWS) { return; }
+    theServer.setPort(port);
+    theServer.handle(handler);
+    theServer.listenNow();
+    theServer.serveBoundedLoop(maxRequests);
+}
+
+// ADDITIVE accessor (THE HANDLER CONTRACT): the raw bytes of the in-flight
+// request. The handler builds its request with
+// `var req = new request(http_server.currentRaw());` -- bare-new from the
+// string free-function return is the probed-exact shape on both compilers
+// (see the contract for why an accessor-returning currentRequest() would
+// mis-read fields on rs). Returns "" when no request is in flight.
+public string currentRaw() {
+    return theServer.curRawPub();
+}
+
+// ADDITIVE accessor (THE HANDLER CONTRACT): the in-flight client socket.
+// Pass it to `new response(...)` in the handler; int free-function returns
+// are probed value-exact on both compilers (unlike an accessor-returned
+// response instance, whose methods are silent no-ops on rs -- probed).
+public int currentSocket() {
+    return theServer.curFdPub();
+}
+
+// ADDITIVE accessor: the named header of the current request ("" when
+// absent or no request is in flight). Same-module parse -- the supported
+// way to read headers from a handler.
+public string requestHeader(string name) {
+    request r = new request(theServer.curRawPub());
+    return r.headers.get(name);
+}
+
+// Index-sliced span [start, endExclusive) built by char scan -- the only
+// portable multi-part substring form (see the note in request's construct).
+private string slice(string s, int start, int endExclusive) {
+    string out = "";
+    for (int i = start; i < endExclusive; i++) {
+        out += s[i];
+    }
+    return out;
+}
+
+// Trims spaces/tabs from both ends (manual scan -- no string.trim
+// dependency; the std/headers parse used trim()).
+private string trimSpaces(string s) {
+    int a = 0;
+    int b = s.length - 1;
+    while (a <= b && (s[a] == 32 || s[a] == 9)) { a++; }
+    while (b >= a && (s[b] == 32 || s[b] == 9)) { b--; }
+    string out = "";
+    for (int i = a; i <= b; i++) {
+        out += s[i];
+    }
+    return out;
+}
+
+// Parses one "\r\n"-separated header block into m (manual CR/LF scans --
+// see DEAD -> LIVE for why string.split is not used). Malformed lines
+// (no colon) are skipped, exactly like the std/headers parse.
+private void parseHeaderBlock(headermap m, string block) {
+    int i = 0;
+    while (i < block.length) {
+        int lineEnd = -1;
+        for (int j = i; j + 1 < block.length; j++) {
+            if (block[j] == 13 && block[j + 1] == 10) { lineEnd = j; break; }
+        }
+        string line = "";
+        if (lineEnd < 0) {
+            line = block.substr(i);
+            i = block.length;
+        } else {
+            line = slice(block, i, lineEnd);
+            i = lineEnd + 2;
+        }
+        string trimmed = trimSpaces(line);
+        if (trimmed.length == 0) { continue; }
+        int colon = -1;
+        for (int c = 0; c < trimmed.length; c++) {
+            if (trimmed[c] == 58) { colon = c; break; }
+        }
+        if (colon < 0) { continue; }
+        string name = trimSpaces(trimmed.substr(0, colon));
+        string value = trimSpaces(trimmed.substr(colon + 1));
+        m.add(name, value);
     }
 }

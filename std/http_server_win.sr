@@ -1,0 +1,168 @@
+import { socket as hsWinRawSocket, connect as hsWinRawConnect, listen as hsWinRawListen, bind as hsWinRawBind, accept as hsWinRawAccept, recv as hsWinRawRecv, send as hsWinRawSend, closesocket as hsWinRawClose, inet_addr as hsWinRawInetAddr, setsockopt as hsWinRawSetSockopt, WSAStartup as hsWinRawStartup } from win32.ws2_32;
+
+internal mod export http_server_win;
+
+// DOCS -- INTERNAL Windows backend of the public `http_server` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). Every ws2_32 DLL call the HTTP server
+// needs lives here and nowhere else: the public wrapper (std/http_server.sr)
+// contains zero win32 imports and reaches this code only behind the OS gate
+// `if (osType() == OSTypes.WINDOWS)`. See std/os.sr for why the gate calls
+// the plain-Silver osType() stand-in instead of the native os.type query.
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects. A user file that tries `import * from http_server_win;`
+// fails with the standard internal-visibility error on both compilers (same
+// posture as std/mongo_win.sr / std/smtp_win.sr / std/net_win.sr, probed
+// there; re-probed for http_server_win).
+//
+// IMPORT GRANTS -- ALL ALIASED (the std/smtp_win.sr / std/mongo_win.sr
+// probed posture, one grant line: socket/connect/listen/bind/accept/recv/
+// send/closesocket/inet_addr/setsockopt/WSAStartup, each `X as hsWinRawY`).
+// With the direct (unaliased) grant shape shared by std/ftp_win.sr and
+// std/net_win.sr silverc-rs mis-lowers raw `send`/`recv` calls (probed
+// there: garbage bytes both directions), while the aliased calls work on
+// rs; aliasing all grants routes every call through the probed-working
+// path on both compilers and costs nothing (the PE import keeps the real
+// export names). connect/inet_addr are granted to keep the grant line
+// identical to the other phase-2 socket backends' template; the listen
+// path below binds INADDR_ANY (ip 0) and never dials out, so it does not
+// call them (a granted-but-unused export is harmless).
+//
+// MEMORY LAYOUT (identical to std/mongo_win.sr / std/smtp_win.sr, probed
+// there): Silver arrays are [cap, len, elem...] with 8-byte elements, so an
+// int[] doubles as a packed qword buffer for DLL calls; `byte[]` must NOT
+// cross a DLL boundary as a packed buffer, so send packs payloads into an
+// int[] and receive unpacks recv's bytes out of an int[] with shifts.
+// Strings ARE packed byte buffers -- but ONLY for NUL-free payloads (an
+// embedded NUL byte is silently DROPPED when concatenated into a string,
+// probed on BOTH compilers): HTTP/1.1 requests and responses are text, so
+// the string path is safe here; a binary body would need the int[] path.
+// sockaddr_in (16 bytes) is packed into one int[2] via hsWinFillSockaddr,
+// byte-for-byte the probed mongoWinFillSockaddr/smtpWinFillSockaddr
+// algorithm (`struct sockaddr_in` locals and `&addr` are unexpressible in
+// Silver -- the same phantom syntax that kept the pre-split std/
+// http_server.sr from compiling anywhere, probed on both compilers).
+//
+// WSAStartup: issued before the listen socket is created; it is
+// reference-counted, so repeated calls are harmless. The pre-split file
+// never called it at all (winsock would have stayed uninitialized) -- a
+// documented fix, not a regression: the pre-split file never compiled
+// anywhere (see std/http_server.sr PRE-SPLIT STATE).
+//
+// DLL RETURN NORMALIZATION (see std/smtp_win.sr for the general rule): the
+// self-hosted compiler ZERO-extends 32-bit DLL int returns, silverc-rs
+// sign-extends them, so SOCKET_ERROR (-1) arrives as 4294967295 on the
+// self-host and -1 on rs. Every return below that can be SOCKET_ERROR
+// (socket/accept; bind results close the socket and return -1 anyway;
+// listen/send/closesocket/setsockopt results are deliberately ignored --
+// see each function) is normalized with the two-sided check
+// `v < 0 || v > 2147483647`, which is correct on both compilers and cannot
+// misfire: valid SOCKET handles are small positive values far below 2^31.
+//
+// RECEIVE TIMEOUT: hsWinListen arms SO_RCVTIMEO (SOL_SOCKET 0xFFFF,
+// SO_RCVTIMEO 0x1006, 30000 ms as a DWORD in one int[] qword slot) on the
+// LISTEN socket, and the timeout is inherited by every accepted client
+// socket, so the wrapper's per-request recv is bounded: a client that
+// connects and then goes silent cannot hang a probe past 30 s -- the read
+// returns SOCKET_ERROR, which hsWinReceive reports as "". (The pre-split
+// file had no timeout at all -- and never ran.)
+//
+// SCOPE: this backend is TRANSPORT ONLY. The HTTP protocol itself (request
+// line parsing, header parsing, response status line / headers /
+// Content-Length assembly) is pure Silver and lives in the public wrapper
+// (std/http_server.sr) -- backends exist only where real DLL-backed
+// operations exist. This file compiles standalone (primitives only, no
+// wrapper-class references).
+
+// WSAStartup into a 408-byte scratch LPWSADATA (the std/mongo_win.sr
+// shape). Result ignored: a failure surfaces at socket() below.
+internal int hsWinStartup() {
+    byte[] wsa = new byte[408];
+    return hsWinRawStartup(0x0202, wsa);
+}
+
+// Packs family/port/addr into the sockaddr_in image (two qwords). `ip` is
+// the network-order u32 that inet_addr returns; the listen path passes 0
+// (INADDR_ANY -- the pre-split addr.sin_addr.s_addr = 0).
+internal void hsWinFillSockaddr(int[] sa, int port, int ip) {
+    int pHi = (port >> 8) & 0xFF;
+    int pLo = port & 0xFF;
+    sa[0] = 2 | (pHi << 16) | (pLo << 24) | ((ip & 0xFFFFFFFF) << 32);
+    sa[1] = 0;
+}
+
+// Creates the listening socket for `port`: WSAStartup, socket, SO_REUSEADDR
+// (the pre-split setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)), bind to
+// INADDR_ANY, listen with backlog 10 (the pre-split hard-coded value), and
+// arm the inherited 30 s SO_RCVTIMEO. Returns the socket handle, or -1 on
+// any failure (startup, socket, bind -- all normalized per the DLL-return
+// note above).
+internal int hsWinListen(int port) {
+    hsWinStartup();
+    int sock = hsWinRawSocket(2, 1, 0);
+    if (sock < 0 || sock > 2147483647) { return -1; }
+    int[] reuse = new int[1];
+    reuse[0] = 1;
+    hsWinRawSetSockopt(sock, 0xFFFF, 0x0004, reuse, 4);
+    int[] sa = new int[2];
+    hsWinFillSockaddr(sa, port, 0);
+    int rc = hsWinRawBind(sock, sa, 16);
+    if (rc < 0 || rc > 2147483647) {
+        hsWinRawClose(sock);
+        return -1;
+    }
+    hsWinRawListen(sock, 10);
+    int[] timeout = new int[1];
+    timeout[0] = 30000;
+    hsWinRawSetSockopt(sock, 0xFFFF, 0x1006, timeout, 4);
+    return sock;
+}
+
+// Accepts one client. Returns the client socket handle, or -1 on failure
+// (normalized per the DLL-return note above).
+internal int hsWinAccept(int fd) {
+    int client = hsWinRawAccept(fd, null, null);
+    if (client < 0 || client > 2147483647) { return -1; }
+    return client;
+}
+
+// Sends the whole `data` string on `fd`: packed byte-for-byte into int[]
+// qword slots before the send() call (byte[] must not cross the DLL
+// boundary packed). The send result (byte count or SOCKET_ERROR) is
+// deliberately ignored: the pre-split sendRaw never checked it either, and
+// a short write on a fresh loopback connection does not occur in practice.
+internal void hsWinSend(int fd, string data) {
+    int len = data.length;
+    if (len <= 0) { return; }
+    int slots = (len + 7) / 8;
+    int[] packedBuf = new int[slots];
+    for (int i = 0; i < len; i++) {
+        int b = int(data[i]);
+        packedBuf[i / 8] = packedBuf[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
+    }
+    hsWinRawSend(fd, packedBuf, len, 0);
+}
+
+// Receives up to maxLen raw bytes; returns them as a string. Returns "" on
+// disconnect, timeout, or a zero-extended SOCKET_ERROR (see the DLL-return
+// note above) -- the caller cannot distinguish those, which is the desired
+// graceful shape for the per-request read.
+internal string hsWinReceive(int fd, int maxLen) {
+    if (maxLen <= 0) { return ""; }
+    int slots = (maxLen + 7) / 8;
+    int[] buf = new int[slots];
+    int n = hsWinRawRecv(fd, buf, maxLen, 0);
+    if (n <= 0 || n > 2147483647) { return ""; }
+    string result = "";
+    for (int i = 0; i < n; i++) {
+        int b = (buf[i / 8] >> ((i % 8) * 8)) & 0xFF;
+        char c = char(b);
+        result += c.toString();
+    }
+    return result;
+}
+
+internal void hsWinClose(int fd) {
+    hsWinRawClose(fd);
+}
