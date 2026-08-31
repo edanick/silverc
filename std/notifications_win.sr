@@ -1,0 +1,68 @@
+internal mod export notifications_win;
+
+// DOCS -- INTERNAL Windows backend of the public `notifications` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). The non-portable toast machinery lives
+// here and nowhere else: the public wrapper (std/notifications.sr) contains
+// zero native-bridge calls and reaches this code only behind the OS gate
+// `if (osType() == OSTypes.WINDOWS)` (osType() is std/os.sr's plain-Silver
+// stand-in -- see that file for why the gate does not use the native os.type
+// query).
+//
+// NO WIN32 IMPORT GRANTS -- and this is deliberate, probed 2026-08: unlike
+// every other phase-2 backend (smtp_win/http_server_win/mongo_win/...), this
+// file grants NOTHING from win32.* because the DLL work it needs is done by
+// the COMPILER-SYNTHESIZED `nativeToastShow` bridge, not by Silver-side
+// import grants. The bridge is dispatched BY NAME from any module (there is
+// no module-scoped dispatch to preserve -- probed in the rs codegen and the
+// self-host parser/codegen):
+//
+// - silverc-rs: the call `nativeToastShow(title, body, appName)` is
+//   intercepted in src/codegen.rs (call path ~line 8247 and identifier path
+//   ~line 2623) and lowered to runtime::emit_toast_show, which registers the
+//   IAT imports DIRECTLY (src/runtime.rs emit_toast_imports -- advapi32
+//   RegCreateKeyExW/RegSetValueExW/RegCloseKey for the AppUserModelId
+//   registration under HKCU\Software\Classes\AppUserModelId, shell32
+//   SetCurrentProcessExplicitAppUserModelID, user32 CreateWindowExW for the
+//   hidden STATIC helper window, user32 LoadIconW, shell32 Shell_NotifyIconA
+//   NIM_ADD with NIF_INFO for the tray balloon, then NIM_DELETE +
+//   DestroyWindow; plus the kernel32 MultiByteToWideChar and
+//   ole32/combase WinRT helpers recorded alongside). Those exports live in
+//   the compiler's own IAT tables, NOT in any win32.* Silver grant table --
+//   there is nothing to grant and nothing missing (no MessageBoxA/W and no
+//   SHQueryUserNotificationState anywhere in this module's bridge).
+//   Shell_NotifyIconA balloons are fire-and-forget: the call returns
+//   immediately and the balloon auto-expires (no user dismissal blocks the
+//   process).
+// - self-hosted silverc: compiler/parser.sr:742 whitelists the name as a
+//   callable native helper and compiler/mini_cg.sr:7044 lowers the call to a
+//   no-op returning 0 (the wrapper has already printed the canonical NOTIFY:
+//   parity line by then).
+// - silveri: eval.sr defines a `nativeToastShow` builtin no-op the same way.
+//
+// Everything here is project-internal: the `internal mod export` marker plus
+// `internal` on every function keep the backend from leaking to user
+// projects. A user file that tries `import * from notifications_win;` fails
+// with the standard internal-visibility error on both compilers (same
+// posture as std/smtp_win.sr / std/http_server_win.sr, probed there and
+// re-probed for notifications_win). Note the self-hosted compiler_driver.sr
+// prepend search ("from notifications") substring-matches
+// "from notifications_win" and will prepend the public wrapper too -- that
+// is harmless: the wrapper carries no backend-internal references, and the
+// internal-visibility rejection of the backend import still fires (probed).
+//
+// STRING ARGUMENTS: the wrapper reads the Notification fields into locals
+// first and passes plain string VALUES across this module boundary (the
+// probed-safe shape -- std/smtp.sr's smtpWinSend crosses string args the
+// same way). This backend passes its own parameters (locals) straight into
+// the bridge. No arrays, no packed buffers, no byte[] boundary crossings --
+// the NOTIFYICONDATAA assembly is entirely inside the rs bridge.
+
+// Fires the toast/tray-balloon for one notification: title, body and the
+// AppUserModelId name. Returns nothing; every failure inside the bridge is
+// silent (the bridge itself never throws a Silver exception on any backend,
+// and the wrapper additionally wraps the call in try/catch, preserving the
+// pre-split defensive shape). On the self-host backend this whole call is a
+// no-op -- the wrapper's parity printline is the observable behavior there.
+internal void notifWinShow(string title, string body, string appName) {
+    nativeToastShow(title, body, appName);
+}
