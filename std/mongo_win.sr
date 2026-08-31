@@ -1,0 +1,289 @@
+import { socket as mongoWinRawSocket, connect as mongoWinRawConnect, recv as mongoWinRawRecv, send as mongoWinRawSend, closesocket as mongoWinRawClose, inet_addr as mongoWinRawInetAddr, setsockopt as mongoWinRawSetSockopt, WSAStartup as mongoWinRawStartup } from win32.ws2_32;
+
+internal mod export mongo_win;
+
+// DOCS -- INTERNAL Windows backend of the public `mongo` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). Every ws2_32 DLL call the mongo module
+// needs lives here and nowhere else: the public wrapper (std/mongo.sr)
+// contains zero win32 imports and reaches this code only behind the OS gate
+// `if (osType() == OSTypes.WINDOWS)`. See std/os.sr for why the gate calls
+// the plain-Silver osType() stand-in instead of the native os.type query.
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects. A user file that tries `import * from mongo_win;` fails
+// with the standard internal-visibility error on both compilers (same
+// posture as std/pop_win.sr / std/imap_win.sr / std/ssh_win.sr /
+// std/sql_win.sr / std/mysql_win.sr, probed there; re-probed for
+// mongo_win).
+//
+// IMPORT GRANTS -- ALL ALIASED (the std/mysql_win.sr probed posture, one
+// grant line: socket/connect/recv/SEND/closesocket/inet_addr/setsockopt/
+// WSAStartup, each `X as mongoWinRawY`): unlike mysql_win this backend DOES
+// transmit (the one-shot hello query), so the `send` grant is present --
+// aliased like every other grant because with the direct (unaliased) grant
+// shape shared by std/ftp_win.sr/std/net_win.sr silverc-rs mis-lowers raw
+// `send`/`recv` calls (probed there: garbage bytes both directions), while
+// aliased calls work on rs. The PE import keeps the real export names.
+//
+// MEMORY LAYOUT (identical to std/mysql_win.sr, probed there): Silver
+// arrays are [cap, len, elem...] with 8-byte elements, so an int[] doubles
+// as a packed qword buffer for DLL calls; `byte[]` must NOT cross a DLL
+// boundary as a packed buffer. Strings ARE packed byte buffers -- but ONLY
+// for NUL-free payloads: probed 2026-08 on BOTH compilers, an embedded NUL
+// byte is silently DROPPED when it is concatenated into a string. The
+// MongoDB wire bytes (message header, BSON) are full of NULs, so nothing on
+// the wire path ever touches string concatenation: the outgoing message is
+// assembled directly into a packed int[] (NUL values survive in an int[]
+// slot) and the reply is recv'd into a packed int[] and parsed there. The
+// ONLY string this backend returns is a NUL-free summary: char(1) (a
+// control char, NOT NUL -- control chars survive concat, probed via the
+// mysql greeting's char(10)) followed by the reply's BSON document length
+// as ASCII decimal digits, e.g. char(1) + "323".
+//
+// WSAStartup: issued before each socket creation; it is reference-counted,
+// so the repeated calls are harmless.
+//
+// DLL RETURN NORMALIZATION (see std/smtp_win.sr for the general rule): the
+// self-hosted compiler ZERO-extends 32-bit DLL int returns, silverc-rs
+// sign-extends them, so SOCKET_ERROR (-1) arrives as 4294967295 on the
+// self-host and -1 on rs. Every return that can be SOCKET_ERROR (socket/
+// connect/send/recv; setsockopt/closesocket results are deliberately
+// ignored) is normalized with the two-sided check `v < 0 || v > 2147483647`,
+// which is correct on both compilers and cannot misfire: valid SOCKET
+// handles are small positive values far below 2^31.
+//
+// RECEIVE TIMEOUT: mongoWinConnect arms SO_RCVTIMEO (SOL_SOCKET 0xFFFF,
+// SO_RCVTIMEO 0x1006, 30000 ms) on every socket it returns. With the
+// timeout, mongoWinHello's reads are bounded: a peer that accepts and then
+// goes silent cannot hang a probe past 30 s per read -- the read returns
+// SOCKET_ERROR, which ends the accumulation and makes mongoWinHello return
+// "".
+//
+// SCOPE -- TRANSPORT plus the ONE legacy handshake-level exchange (the
+// std/mysql_win.sr honesty posture): mongoWinHello sends a legacy
+// OP_QUERY (opCode 2004) carrying {isMaster: 1} to namespace "admin.$cmd"
+// (the one request every MongoDB server -- legacy and current -- still
+// answers before any authentication), then reads and validates the reply's
+// 2013-era header: responseTo must match the requestId we sent (1) and
+// opCode must be 1 (OP_REPLY), after which the reply body's BSON document
+// length field (the LE int32 at body offset 20 = wire offset 36) is read.
+// NO BSON element parsing happens (the reply's ok field is NOT extracted --
+// the header validation IS the "a MongoDB-speaking peer answered MY query"
+// signal), no authentication of any kind (MongoDB SCRAM-SHA-1/SCRAM-SHA-256
+// needs HMAC and SHA-1/SHA-256; std/hash on BOTH compilers is djb2/fnv1
+// only -- silverc-rs src/stdlib/hash.rs and the self-host std/hash.sr expose
+// no md5/sha/hmac at all), no sessions, no OP_MSG sections framing, no
+// cursor batches, no writes (see std/mongo.sr's honesty note). This file
+// compiles standalone (primitives only, no wrapper-class references).
+//
+// x64 IS LITTLE-ENDIAN and BSON is little-endian, so multi-byte LE fields
+// are packed/unpacked byte-by-byte with shifts (mongoWinPutLE32/mongoWinLE)
+// -- no byte-order swap anywhere.
+
+// WSAStartup into a 408-byte scratch LPWSADATA (the std/mysql_win.sr
+// shape). Result ignored: a failure surfaces at socket() below.
+internal int mongoWinStartup() {
+    byte[] wsa = new byte[408];
+    return mongoWinRawStartup(0x0202, wsa);
+}
+
+// Packs family/port/addr into the sockaddr_in image (two qwords). `ip` is
+// the network-order u32 that inet_addr returns; 0 means INADDR_ANY.
+internal void mongoWinFillSockaddr(int[] sa, int port, int ip) {
+    int pHi = (port >> 8) & 0xFF;
+    int pLo = port & 0xFF;
+    sa[0] = 2 | (pHi << 16) | (pLo << 24) | ((ip & 0xFFFFFFFF) << 32);
+    sa[1] = 0;
+}
+
+// Opens a TCP connection to host:port and arms the receive timeout. Returns
+// the socket handle, or -1 on any failure (startup, socket, connect -- all
+// normalized per the DLL-return note above). `host` must be a dotted IP
+// (inet_addr posture -- no name resolution, so "localhost" fails gracefully
+// here); an unparseable host or port 0 fails the connect gracefully.
+internal int mongoWinConnect(string host, int port) {
+    mongoWinStartup();
+    int sock = mongoWinRawSocket(2, 1, 0);
+    if (sock < 0 || sock > 2147483647) { return -1; }
+    int ip = mongoWinRawInetAddr(host);
+    int[] sa = new int[2];
+    mongoWinFillSockaddr(sa, port, ip);
+    int rc = mongoWinRawConnect(sock, sa, 16);
+    if (rc < 0 || rc > 2147483647) {
+        mongoWinRawClose(sock);
+        return -1;
+    }
+    int[] opt = new int[1];
+    opt[0] = 30000;
+    mongoWinRawSetSockopt(sock, 0xFFFF, 0x1006, opt, 4);
+    return sock;
+}
+
+// Writes one byte of the outgoing wire image. `wire` is a PACKED int[]
+// (8 wire bytes per slot, little-endian -- the DLL qword-buffer layout);
+// slot i/8 byte i%8 gets `v & 0xFF`. NUL bytes ride fine in the slots.
+internal void mongoWinPutByte(int[] wire, int i, int v) {
+    int slot = i / 8;
+    int shift = (i % 8) * 8;
+    wire[slot] = wire[slot] | ((v & 0xFF) << shift);
+}
+
+// Writes a little-endian int32 field of the wire image (4 putByte calls).
+internal void mongoWinPutLE32(int[] wire, int off, int v) {
+    mongoWinPutByte(wire, off, v & 0xFF);
+    mongoWinPutByte(wire, off + 1, (v >> 8) & 0xFF);
+    mongoWinPutByte(wire, off + 2, (v >> 16) & 0xFF);
+    mongoWinPutByte(wire, off + 3, (v >> 24) & 0xFF);
+}
+
+// Reads a little-endian int32 whose four bytes sit in four int[] slots
+// (one wire byte per slot -- the recv-side unpacked layout). Multi-line on
+// purpose: the self-host rejects `<<` one-liner methods.
+internal int mongoWinLE(int[] raw, int off) {
+    int b0 = raw[off];
+    int b1 = raw[off + 1] << 8;
+    int b2 = raw[off + 2] << 16;
+    int b3 = raw[off + 3] << 24;
+    return b0 | b1 | b2 | b3;
+}
+
+// n as ASCII decimal digits (NUL-free); "" never happens for n >= 0
+// (n == 0 -> "0"). Used only for the summary's document length.
+internal string mongoWinDecimal(int n) {
+    if (n <= 0) { return "0"; }
+    int v = n;
+    string rev = "";
+    while (v > 0) {
+        int d = v % 10;
+        rev += char(int('0') + d);
+        v = v / 10;
+    }
+    string s = "";
+    for (int i = rev.length - 1; i >= 0; i--) {
+        s += rev[i];
+    }
+    return s;
+}
+
+// Assembles the one-shot legacy handshake query into a PACKED 58-byte wire
+// image (int[8], 8 bytes per slot, zero-padded past byte 57):
+//
+//   [ 0.. 3] messageLength = 58            (LE int32)
+//   [ 4.. 7] requestId     = 1             (LE int32)
+//   [ 8..11] responseTo    = 0             (LE int32)
+//   [12..15] opCode        = 2004 OP_QUERY (LE int32)
+//   [16..19] OP_QUERY flags = 0
+//   [20..30] fullCollectionName "admin.$cmd" NUL-terminated (11 bytes)
+//   [31..34] numberToSkip  = 0
+//   [35..38] numberToReturn = 1
+//   [39..57] BSON query document, 19 bytes:
+//              [39..42] doc length = 19
+//              [   43 ] element type 0x10 (int32)
+//              [44..51] key "isMaster" (8 bytes)
+//              [   52 ] key terminator NUL
+//              [53..56] value 1 (LE int32)
+//              [   57 ] document terminator NUL
+//
+// Every multi-byte field is little-endian (BSON and the 2013 wire header
+// both are; x64 is little-endian too, but the bytes are written explicitly
+// regardless).
+internal void mongoWinBuildHello(int[] wire) {
+    for (int z = 0; z < 8; z++) {
+        wire[z] = 0;
+    }
+    mongoWinPutLE32(wire, 0, 58);
+    mongoWinPutLE32(wire, 4, 1);
+    mongoWinPutLE32(wire, 8, 0);
+    mongoWinPutLE32(wire, 12, 2004);
+    mongoWinPutLE32(wire, 16, 0);
+    // "admin.$cmd" + NUL
+    mongoWinPutByte(wire, 20, 97);
+    mongoWinPutByte(wire, 21, 100);
+    mongoWinPutByte(wire, 22, 109);
+    mongoWinPutByte(wire, 23, 105);
+    mongoWinPutByte(wire, 24, 110);
+    mongoWinPutByte(wire, 25, 46);
+    mongoWinPutByte(wire, 26, 36);
+    mongoWinPutByte(wire, 27, 99);
+    mongoWinPutByte(wire, 28, 109);
+    mongoWinPutByte(wire, 29, 100);
+    mongoWinPutByte(wire, 30, 0);
+    mongoWinPutLE32(wire, 31, 0);
+    mongoWinPutLE32(wire, 35, 1);
+    // BSON doc {isMaster: 1}
+    mongoWinPutLE32(wire, 39, 19);
+    mongoWinPutByte(wire, 43, 16);
+    // "isMaster"
+    mongoWinPutByte(wire, 44, 105);
+    mongoWinPutByte(wire, 45, 115);
+    mongoWinPutByte(wire, 46, 77);
+    mongoWinPutByte(wire, 47, 97);
+    mongoWinPutByte(wire, 48, 115);
+    mongoWinPutByte(wire, 49, 116);
+    mongoWinPutByte(wire, 50, 101);
+    mongoWinPutByte(wire, 51, 114);
+    mongoWinPutByte(wire, 52, 0);
+    mongoWinPutLE32(wire, 53, 1);
+    mongoWinPutByte(wire, 57, 0);
+}
+
+// The one-shot legacy handshake exchange: send the OP_QUERY isMaster
+// request built above, read the reply, validate its header. Returns the
+// NUL-free summary string char(1) + decimal(reply BSON document length)
+// when a MongoDB-shaped reply arrived (responseTo == 1 AND opCode == 1 AND
+// a sane positive BSON length); "" on ANY failure -- no connection, send
+// error, silent or slow peer (30 s SO_RCVTIMEO per read), hangup, garbage
+// bytes, or a reply that does not answer our requestId with OP_REPLY.
+//
+// BOUNDED: one send of exactly 58 bytes (single-shot -- a 58-byte write
+// into a fresh TCP socket's buffer is atomic in practice and Silver has no
+// pointer arithmetic to resume a partial write with), then at most 16 recv
+// calls of up to 1024 bytes each (16 KB) into a 2048-byte parse window,
+// each read under the 30 s SO_RCVTIMEO -- no path can spin or hang. The
+// parse needs only the first 40 bytes (16-byte header + 20-byte OP_REPLY
+// prologue + the 4-byte BSON document length); accumulation stops as soon
+// as 40 bytes are in.
+//
+// LENIENT (the mysql greeting posture): messageLength, responseFlags,
+// cursorId, startingFrom, numberReturned and the BSON document's contents
+// are read past but not validated; ONLY responseTo == 1, opCode == 1 and
+// 0 < bsonLen <= 48000000 (BSON's 48 MB cap) are checked.
+internal string mongoWinHello(int fd) {
+    if (fd < 0) { return ""; }
+    int[] wire = new int[8];
+    mongoWinBuildHello(wire);
+    int sent = mongoWinRawSend(fd, wire, 58, 0);
+    if (sent < 0 || sent > 2147483647) { return ""; }
+    if (sent != 58) { return ""; }
+    int[] raw = new int[2048];
+    int[] chunk = new int[128];
+    int total = 0;
+    for (int guard = 0; guard < 16; guard++) {
+        int n = mongoWinRawRecv(fd, chunk, 1024, 0);
+        if (n <= 0 || n > 2147483647) { break; }
+        if (n > 1024) { n = 1024; }
+        for (int j = 0; j < n; j++) {
+            if (total >= 2048) { break; }
+            int b = (chunk[j / 8] >> ((j % 8) * 8)) & 0xFF;
+            raw[total] = b;
+            total++;
+        }
+        if (total >= 40) { break; }
+    }
+    if (total < 40) { return ""; }
+    int respTo = mongoWinLE(raw, 8);
+    int op = mongoWinLE(raw, 12);
+    if (respTo != 1) { return ""; }
+    if (op != 1) { return ""; }
+    int docLen = mongoWinLE(raw, 36);
+    if (docLen <= 0 || docLen > 48000000) { return ""; }
+    string info = "";
+    info += char(1);
+    info += mongoWinDecimal(docLen);
+    return info;
+}
+
+internal void mongoWinClose(int fd) {
+    mongoWinRawClose(fd);
+}

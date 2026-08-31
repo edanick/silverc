@@ -1,30 +1,117 @@
-import * from win32.ws2_32;
+import * from os;
+import * from mongo_win;
+import * from uuid;
 
 mod export mongo;
-import {generate} from uuid;
+
+// DOCS -- public `mongo` module (UNIFIED_CORE_LIBRARY.md Phase 2). Unified,
+// portable front of the MongoDB client. ZERO win32 imports: the ws2_32
+// transport lives in the internal backend std/mongo_win.sr and is reached
+// only behind the OS gate `if (osType() == OSTypes.WINDOWS)` (osType() is
+// std/os.sr's plain-Silver stand-in -- see that file for why the gate does
+// not use the native os.type query).
+//
+// PRE-SPLIT STATE (probed 2026-08 against git HEAD, both compilers): the old
+// std/mongo.sr NEVER compiled. silverc-rs rejected `kvp<string, object>`
+// ("unknown keyword object") and the braced `import {generate} from uuid;`
+// (named imports from source modules resolve each NAME as a module on rs);
+// the self-host cascaded from the same generic. The win32.ws2_32 import was
+// VESTIGIAL -- no body ever touched a socket. So there was no observable
+// pre-split behavior to preserve beyond names, arities and intent.
+//
+// HONESTY BOUNDARY (std/mysql_win.sr posture, documented there and in the
+// backend): the transport is REAL (TCP + WSAStartup + SO_RCVTIMEO + the
+// legacy OP_QUERY {isMaster: 1} hello exchange with reply-header
+// validation), exposed through the ADDITIVE client.ping()/client.lastHello()
+// members. Everything else is the pre-split in-memory stub shape: writes
+// (insert/insertMany/update/delete) and reads (find/findOne/count/aggregate)
+// do NOT reach a server -- there is no BSON document encoding, no OP_MSG
+// sections framing, no cursors, and NO authentication (SCRAM-SHA-1/256 needs
+// HMAC/SHA; std/hash on BOTH compilers is djb2/fnv1 only -- see the backend
+// header). insert() keeps its pre-split intent: it returns a fresh
+// uuid.generate() string (the client-side id the caller would attach to the
+// document); it does NOT fabricate server success (the old mysql insert
+// fabricating 1 is the anti-pattern).
+//
+// LANDMINES SHAPING THIS FILE (all probed, see the sibling modules): the
+// generic `kvp<string, object>` does not parse on rs -- doc stores the
+// proven parallel string[] idiom (std/sql.sr precedent); class-body field
+// initializers do not parse on rs (assign in construct); `char(0)` not
+// '\0'; `.length` PROPERTY form (the `.length()` call form reads garbage on
+// the self-host); `.push` arrays MUST `= []` decl-init inside construct;
+// STAR import for uuid (braced form breaks rs for source modules); no `as`
+// casts; no `<<` one-liner methods (self-host); rs substr(start, X) is
+// (start, END) while the self-host is (start, LENGTH) -- index scanning
+// only; digit parsing uses int(c) - 48, not char subtraction.
 
 class doc {
-    private kvp<string, object> fields;
+    // Pre-split `kvp<string, object> fields` -- unparseable on rs. Parallel
+    // arrays instead (sql.sr precedent); initialized in construct so the
+    // first set() cannot hit the uninitialized-kvp AV the sql agent probed
+    // on headers.sr.
+    string[] keys;
+    string[] vals;
 
-    construct() { }
+    construct() {
+        this.keys = [];
+        this.vals = [];
+    }
+
+    // ADDITIVE (documented): the pre-split doc could only read an
+    // uninitialized map (always null -> ""); without a setter the class is
+    // dead weight. set() + has() make get() meaningful. Values are stored
+    // stringified -- the pre-split get() returned val.toString().
+    public void set(string key, string val) {
+        if (this.has(key)) {
+            int i = this.indexOf(key);
+            this.vals[i] = val;
+            return;
+        }
+        this.keys.push(key);
+        this.vals.push(val);
+    }
 
     public string get(string key) {
-        object val = this.fields.get(key);
-        if (val == null) { return ""; }
-        return val.toString();
+        int i = this.indexOf(key);
+        if (i < 0) { return ""; }
+        return this.vals[i];
+    }
+
+    // ADDITIVE (documented).
+    public bool has(string key) {
+        return this.indexOf(key) >= 0;
+    }
+
+    int indexOf(string key) {
+        for (int i = 0; i < this.keys.length; i++) {
+            if (this.keys[i] == key) { return i; }
+        }
+        return -1;
     }
 }
 
 class cursor {
-    private doc[] docs;
-    private int idx;
+    doc[] docs;
+    int idx;
 
-    construct() { this.docs = []; this.idx = 0; }
+    construct() {
+        this.docs = [];
+        this.idx = 0;
+    }
 
-    public bool hasNext() { return this.idx < this.docs.length(); }
+    // ADDITIVE (documented): pre-split had no way to fill a cursor; keeps
+    // the in-module shape honest without inventing server behavior.
+    public void add(doc d) {
+        this.docs.push(d);
+    }
+
+    public bool hasNext() { return this.idx < this.docs.length; }
+
     public doc next() {
-        if (this.idx >= this.docs.length()) { return new doc(); }
-        doc d = this.docs[this.idx]; this.idx++; return d;
+        if (this.idx >= this.docs.length) { return new doc(); }
+        doc d = this.docs[this.idx];
+        this.idx++;
+        return d;
     }
 }
 
@@ -34,19 +121,118 @@ class collection {
     construct(string name) { this.name = name; }
 
     public string insert(object data) { return uuid.generate(); }
+
     public void insertMany(object[] docs) { }
+
     public cursor find(object filter) { return new cursor(); }
+
     public doc findOne(object filter) { return new doc(); }
+
     public void update(object filter, object update) { }
+
     public void delete(object filter) { }
+
     public int count(object filter) { return 0; }
+
     public cursor aggregate(object[] pipeline) { return new cursor(); }
 }
 
 class client {
     private string uri;
+    private string host;
+    private int port;
+    private string helloInfo;
+    private bool pinged;
 
-    construct(string uri) { this.uri = uri; }
+    construct(string uri) {
+        this.uri = uri;
+        this.host = "";
+        this.port = 27017;
+        this.helloInfo = "";
+        this.pinged = false;
+        this.parseUri();
+    }
+
+    // mongodb://host[:port][/db] -- pure index scanning. "mongodb://" is 10
+    // characters; the port default stays 27017 when the URI carries none.
+    void parseUri() {
+        string u = this.uri;
+        int scheme = 0;
+        if (u.length >= 10) {
+            if (u[0] == 'm' && u[1] == 'o' && u[2] == 'n' && u[3] == 'g'
+                && u[4] == 'o' && u[5] == 'd' && u[6] == 'b' && u[7] == ':'
+                && u[8] == '/' && u[9] == '/') {
+                scheme = 10;
+            }
+        }
+        if (scheme == 0) { return; }
+        string rest = "";
+        for (int i = scheme; i < u.length; i++) { rest += u[i]; }
+        string hostPart = rest;
+        int slash = -1;
+        for (int i = 0; i < rest.length; i++) {
+            if (rest[i] == '/') { slash = i; break; }
+        }
+        if (slash > 0) {
+            hostPart = "";
+            for (int i = 0; i < slash; i++) { hostPart += rest[i]; }
+        }
+        // Built into LOCALS first, fields assigned once at the end: compound
+        // assign on a string FIELD inside a loop is unreliable on the
+        // self-host (the float += codegen family; probed 2026-08 -- locals
+        // are safe, `this.host += x` silently keeps the old value).
+        string hostOut = hostPart;
+        int portOut = 27017;
+        int colon = -1;
+        for (int i = 0; i < hostPart.length; i++) {
+            if (hostPart[i] == ':') { colon = i; break; }
+        }
+        if (colon >= 0) {
+            hostOut = "";
+            for (int i = 0; i < colon; i++) { hostOut += hostPart[i]; }
+            string portStr = "";
+            for (int i = colon + 1; i < hostPart.length; i++) { portStr += hostPart[i]; }
+            int p = 0;
+            bool ok = portStr.length > 0;
+            for (int i = 0; i < portStr.length; i++) {
+                char c = portStr[i];
+                if (c < '0' || c > '9') { ok = false; break; }
+                p = p * 10 + (int(c) - 48);
+            }
+            if (ok) { portOut = p; }
+        }
+        this.host = hostOut;
+        this.port = portOut;
+    }
+
+    // ADDITIVE (documented): the only member that reaches the network --
+    // dial host:port (default 27017), run the legacy hello exchange in the
+    // backend, cache the NUL-free summary. false/"" on any failure
+    // (unreachable host, garbage reply, non-Windows OS). Dotted-IP hosts
+    // only (inet_addr posture -- no DNS here; dns.lookup feeds it).
+    public bool ping() {
+        if (this.pinged) { return this.helloInfo != ""; }
+        this.pinged = true;
+        if (this.host == "") { return false; }
+        if (osType() != OSTypes.WINDOWS) { return false; }
+        int fd = mongoWinConnect(this.host, this.port);
+        if (fd < 0) { return false; }
+        this.helloInfo = mongoWinHello(fd);
+        mongoWinClose(fd);
+        return this.helloInfo != "";
+    }
+
+    // ADDITIVE (documented): the cached hello summary -- char(1) control
+    // char + the reply BSON document length in ASCII decimal; "" before a
+    // successful ping().
+    public string lastHello() { return this.helloInfo; }
+
+    // ADDITIVE (documented): the parsed URI pieces (defaults: empty host,
+    // 27017 port). Named hostName/portNumber on purpose -- a getter whose
+    // name equals its field is resolved as a FIELD READ by both compilers
+    // (probed: rs prints the instance pointer, the self-host prints empty).
+    public string hostName() { return this.host; }
+    public int portNumber() { return this.port; }
 
     public collection collection(string name) {
         return new collection(name);
