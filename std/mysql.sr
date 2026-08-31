@@ -1,19 +1,317 @@
-import * from win32.ws2_32;
+import * from os;
+import * from mysql_win;
 
 mod export mysql;
 
+// DOCS -- public `mysql` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is
+// the unified, portable front of the MySQL wire client. It contains ZERO
+// win32 imports: every ws2_32 call moved into the internal Windows backend
+// std/mysql_win.sr, and every entry that touches the network routes through
+// the OS gate `if (osType() == OSTypes.WINDOWS)` before calling it
+// (osType() is std/os.sr's plain-Silver stand-in -- see that file for why
+// the gate does not use the native os.type query).
+//
+// The else side of every gate is unreachable on this backend (silverc only
+// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
+// a future non-Windows backend the fallbacks follow the module's failure
+// style: connect() returns a connection with no greeting accepted,
+// query()/insert() stay silent no-ops (query's empty result, insert's 0),
+// close() stays a no-op, getLastReply() stays "".
+//
+// DISPATCH (per compiler, probed): `mysql` is builtin-reserved on NEITHER
+// compiler -- silverc-rs's builtin_modules_set (src/main.rs:81 lists
+// fs/json/yaml/env/url/hash/path/bom/console/math/http only) and the
+// self-hosted compiler's visBuiltinModule (compiler/visibility.sr:605 lists
+// fs/json/yaml/llmai/LLMAI/os/project/exception/bom/process/notifications/
+// env/url/hash/path/console/math/http) plus its driver prepend list all
+// exclude it (grep for "mysql" under silverc-rs/src/ and silverc/compiler/
+// finds nothing; the only hit anywhere is mysql.sr's own entry in
+// silverc.srp's exclude list, which only keeps this module out of the
+// compiler's own aggregate build -- the same posture as sql.sr/ssh.sr/
+// smtp.sr/pop.sr/imap.sr; it does not make `mysql` a builtin). Both
+// compilers resolve `import * from mysql;` as an ORDINARY SOURCE module
+// (std/mysql.sr); no native dispatch exists to preserve. mysql_win.sr is
+// NOT excluded: its mysqlWin* names collide with nothing in the aggregate
+// namespace, exactly like ssh_win.sr/sql_win.sr/pop_win.sr/smtp_win.sr/
+// imap_win.sr.
+//
+// PRE-SPLIT STATE (probed 2026-08 against this file's git HEAD copy, fresh
+// -o names on both compilers): the old std/mysql.sr COMPILED on both
+// compilers -- it imported win32.ws2_32 but called NOTHING from it: no
+// socket, no WSAStartup, no timeout, no wire framing anywhere. At runtime:
+// - query(): STACK-OVERFLOWED (exit 0xC00000FD, re-probed on BOTH compilers
+//   today) -- the two-arg overload's body was `return this.query(sql);`,
+//   which under the OVERLOAD DISPATCH BUG (below) re-dispatches by NAME to
+//   itself and recurses forever. The one-arg call could never reach its own
+//   body either (same dispatch).
+// - insert(): returned a fabricated 1 on both compilers (probed:
+//   "insert=1", exit 0) -- a successful write that never happened.
+// - connection.query/insert were the ONLY reachable entries: connect()
+//   wrapped the four strings in a connection and close() was an empty
+//   no-op. row and result instances were UNREACHABLE: result declared no
+//   methods at all, query (had it returned) returned an empty `new
+//   result()`, and nothing ever built a row; row's private
+//   `kvp<string, string> data` was never initialized (empty construct), so
+//   get(name) would have read an uninitialized kvp had any row been
+//   reachable (the std/headers.sr probe cited in std/sql.sr shows rs
+//   silently returning null for reads off a fresh kvp and the self-host
+//   access-violating once it is written).
+//
+// HONESTY NOTE -- this is NOT an authenticated MySQL client: real MySQL
+// needs the full handshake (the server picks the auth plugin;
+// mysql_native_password needs SHA1 -- SHA1(password) XOR
+// SHA1(scramble + SHA1(SHA1(password))); caching_sha2_password needs TLS or
+// RSA), and NONE of that is implemented here. Verified 2026-08: std/hash
+// on BOTH compilers is djb2/fnv1 only (silverc-rs src/stdlib/hash.rs
+// gen_hash_call and the self-host std/hash.sr expose no md5/sha at all),
+// so the mysql_native_password scramble CANNOT be built -- auth is
+// documented UNSUPPORTED, not faked. No HandshakeResponse41 is ever sent
+// (sending one with an unscrambleable garbage auth response would be
+// pretending), so there is NO session: connect() performs the one MySQL
+// wire exchange that precedes any authentication -- it opens a real TCP
+// connection (dotted-IP host, MySQL's default port 3306; the pre-split
+// signature has no port parameter), reads and parses the server's initial
+// handshake greeting packet (protocol version byte, NUL-terminated server
+// version string -- see the NUL LANDMINE for why the parse happens on int[]
+// bytes inside the backend), surfaces what it saw through the ADDITIVE
+// serverVersion()/protocolVersion()/getLastReply() getters, and closes the
+// socket. isConnected() stays false -- the honest terminal state, since
+// authentication never happens. Against a non-MySQL listener the greeting
+// parse fails earlier and equally gracefully: the connection comes back
+// with no greeting accepted and the process exits cleanly. No exceptions
+// anywhere. The user/pass/db parameters are carried unused by the exchange
+// (stored for a future session implementation, exactly as the pre-split
+// construct carried them).
+//
+// query()/insert() NEVER touch the network on this build: there is no
+// authenticated session to run a statement on, and bytes sent to a MySQL
+// server before the handshake completes are misread as handshake data.
+// query() returns an EMPTY result (rows stay empty -- no result-set
+// framing exists to interpret anything with); insert() returns 0, the
+// honest affected-rows count for a statement that never executed (the
+// pre-split's fabricated 1 is gone -- see DEAD -> LIVE).
+//
+// DEAD -> LIVE (what this split made actually work, mirroring the
+// std/ssh.sr / std/sql.sr splits):
+// - The transport: socket + connect over ws2_32 with WSAStartup (the
+//   pre-split file never initialized winsock), the sockaddr_in image
+//   packed into an int[2] qword buffer, DLL returns normalized with the
+//   two-sided `v < 0 || v > 2147483647` check (the self-host zero-extends
+//   SOCKET_ERROR to 4294967295; see std/mysql_win.sr), and a 30 s
+//   SO_RCVTIMEO so no read can hang on a silent peer (the pre-split file
+//   had no timeout and no reads).
+// - connect(): pre-split wrapped four strings and did nothing. It now
+//   performs the greeting exchange described above; serverVersion()/
+//   protocolVersion()/getLastReply() keep what was observed.
+// - insert(): pre-split fabricated 1. It now returns 0 (nothing executed).
+// - query(): pre-split stack-overflowed. Both overloads now return an
+//   empty result via a differently-named private implementation.
+//
+// NOT INVENTED: no authentication of any kind (see the honesty note), no
+// HandshakeResponse41, no OK/ERR packet handling, no command phase, no
+// COM_QUERY framing, no result-set framing, no prepared statements, no
+// compression, no TLS. The greeting's payload length, sequence id,
+// scramble and capability flags are read past but not validated (the
+// lenient ssh bannerOk posture: byte 4 must be 10 and the version string
+// must be NUL-terminated -- nothing else is checked).
+//
+// NUL LANDMINE (new, probed 2026-08 on BOTH compilers): an embedded NUL
+// byte is silently DROPPED when concatenated into a string (a probe built
+// char(19),char(0),char(0),char(0),char(10),"8.0.32",char(0),char(200) and
+// the resulting string was 9 bytes -- every char(0) vanished, byte-identical
+// on silverc-rs and the self-host). The MySQL greeting is full of NULs
+// (header high bytes, sequence id, the version terminator), so the raw
+// packet can never ride the string concat path the ssh/sql backends use.
+// std/mysql_win.sr's mysqlWinGreeting therefore recv's into int[] buffers
+// (NUL values survive in an int[] slot), parses there, and returns only a
+// NUL-free summary string: one protocol byte followed by the server
+// version characters. The free helpers below operate on that summary.
+//
+// OVERLOAD DISPATCH BUG (compiler-level, same shape std/sql.sr documented
+// -- NO compiler change was made for this split): same-name METHOD
+// overloads with DIFFERENT ARITIES dispatch by NAME to the LAST-DECLARED
+// overload, ignoring arity, and a same-name delegation inside an overload
+// body (`this.query(sql)` inside the two-arg query) re-dispatches to
+// ITSELF and recurses forever -- probed 2026-08 on BOTH compilers: the
+// pre-split query() exited 0xC00000FD (stack overflow) on each. WORKAROUND
+// IN THIS FILE (no compiler change): the two query overloads do NOT
+// delegate to this.query -- each calls the differently-named private
+// runQuery and carries its params unused, so both overloads are
+// behaviorally identical and the name-only dispatch lands safely whichever
+// overload it picks. insert() is single-declaration (no overloads), so it
+// is unaffected.
+//
+// API PRESERVATION (every public name/arity of the pre-split file,
+// unchanged): class row -- construct(), get(string) -> string; class
+// result -- construct(); class connection -- construct(string host, string
+// user, string pass, string db), query(string) -> result, query(string,
+// object[]) -> result (BOTH overloads preserved), insert(string, object[])
+// -> int, close(); free function connect(string, string, string, string)
+// -> connection. NO RENAMES were needed: every pre-split name (row,
+// result, connection, get, query, insert, close, connect, host, user,
+// pass, db) and every additive name (has, hasNext, next, runQuery, absorb,
+// defaultPort, greetingOk, greetingProtocol, greetingVersion,
+// getLastReply, isConnected, serverVersion, protocolVersion, lastReply,
+// protocolVer, serverVer, names, values, rows, idx, info) is keyword-free
+// on both compilers -- checked against silverc-rs src/token.rs and the
+// self-host compiler/lexer.sr keyword tables (grep: zero hits). The
+// dangerous SQL-adjacent identifiers are clear: `from`/`to`/`match` are
+// keywords on BOTH compilers and appear nowhere in this API; `insert` is
+// a keyword on NEITHER (it is a method name here -- the pre-split's own
+// name, preserved). `object[]` params survive verbatim (the type parses
+// on both compilers -- the std/sql.sr probe).
+//
+// ADDITIVE (the std/ssh.sr / std/sql.sr precedent, documented):
+// connection.getLastReply() returns the greeting summary string the
+// backend built (protocol byte + server version chars) after a successful
+// greeting, "" before the first connect, after a failed connect, or when
+// the peer sent no parseable greeting (mysql reads are packet-framed, so
+// unlike ssh's text banner there is no useful text surface for junk -- the
+// graceful signal is isConnected() staying false and protocolVersion()
+// staying 0); connection.isConnected() is true only after a COMPLETED
+// authenticated session, which never happens on this build (authentication
+// is unimplemented -- see the honesty note); connection.serverVersion()
+// returns the greeting's server version string (e.g. "8.0.32"; "" when no
+// greeting was accepted); connection.protocolVersion() returns the
+// greeting's protocol version byte (10 on real servers; 0 when none was
+// accepted); row.has(name) is the containment test (get returns null for
+// absent names, so has() is the non-null check callers want);
+// result.hasNext()/next() give the (currently always empty) rows an
+// iteration surface so a future protocol can fill them without an API
+// change -- hasNext() is false and next() null on this build; free pure
+// helpers -- defaultPort() (3306, MySQL's default port; the pre-split
+// connect signature carries no port parameter), greetingOk(info) (true
+// when `info` carries a protocol-10 byte and a non-empty version string),
+// greetingProtocol(info) (the protocol byte, 0 when absent) and
+// greetingVersion(info) (the version tail after the protocol byte, "" when
+// absent) are pure and probeable byte-identically on both compilers. Also
+// additive and invisible: the private lastReply/protocolVer/serverVer
+// fields (initialized in construct -- the pre-split construct set only
+// host/user/pass/db), the private absorb/runQuery plumbing, row's two
+// parallel `= []`-initialized string[] arrays (replacing the pre-split's
+// never-initialized kvp field -- the KVP LANDMINE std/sql.sr probed:
+// an uninitialized kvp silently swallows writes on rs and access-violates
+// on the self-host), and result's `= []`-initialized row[] field.
+//
+// CALLER NOTES: instantiate with `var c = connect("127.0.0.1", "user",
+// "pass", "db");` -- a lowercase class arriving from a star-imported
+// module cannot be spelled as a local's type on silverc-rs (per-file
+// parsing; `var` works on both, probed via std/ftps.sr) and `new
+// mod.connection()` dies on BOTH compilers. NOTE the pre-existing name
+// collision: std/sql.sr (a DIFFERENT module) also exports a class
+// `connection` and a free `connect` -- a file that star-imports BOTH
+// modules collides; pick one per file (or alias) -- this predates the
+// split and the pre-split names are preserved here verbatim. The host
+// must be a dotted IP (inet_addr posture -- no name resolution, same as
+// std/ssh.sr's client); the port is always defaultPort() (3306). Strings
+// returned across this module's boundary (getLastReply/serverVersion and
+// the free helpers) should be assigned to a local before being
+// concatenated into larger expressions (silverc-rs stringifies the return
+// pointer in expression position; see std/dns.sr's RS-ONLY CALLER
+// LANDMINE). After connect(), check protocolVersion() != 0 (or
+// greetingOk(c.getLastReply()) with the reply in a local) to know whether
+// a real MySQL server greeted; isConnected() is always false on this
+// build. query() always returns an exhausted result and insert() always
+// returns 0 -- no session exists (see the honesty note). close() is the
+// pre-split no-op kept verbatim: connect() closes its own socket before
+// returning, so there is no session handle left to close.
+
+// MySQL's default port -- the port every connect() uses (the pre-split
+// connect signature carries no port parameter). ADDITIVE, pure; probeable.
+public int defaultPort() {
+    return 3306;
+}
+
+// True when `info` is a parsed greeting summary: a protocol-10 byte
+// followed by at least one version character. Pure; probeable.
+public bool greetingOk(string info) {
+    if (info.length < 2) { return false; }
+    return int(info[0]) == 10;
+}
+
+// The protocol version byte of a greeting summary (10 on real servers);
+// 0 when the summary is empty. Pure; probeable.
+public int greetingProtocol(string info) {
+    if (info.length < 1) { return 0; }
+    return int(info[0]);
+}
+
+// The server version tail of a greeting summary (everything after the
+// protocol byte, e.g. "8.0.32"); "" when absent. Pure; probeable.
+public string greetingVersion(string info) {
+    if (info.length < 2) { return ""; }
+    return sliceRange(info, 1, info.length);
+}
+
 class row {
-    private kvp<string, string> data;
+    private string[] names;
+    private string[] values;
 
-    construct() { }
+    construct() {
+        this.names = [];
+        this.values = [];
+    }
 
-    public string get(string name) { return this.data.get(name); }
+    // The pre-split API, made safe: the pre-split body read a
+    // never-initialized private kvp (see the KVP LANDMINE in the docs --
+    // rs silently returns null, the self-host access-violates once it is
+    // written); this implementation carries the same contract (the matching
+    // value, or null when the name is absent) over two parallel
+    // `= []`-initialized arrays. On this build rows are never populated
+    // (no result-set framing exists -- see the honesty note), so every
+    // get() returns null; the arrays exist so a future protocol can fill
+    // rows without an API change.
+    public string get(string name) {
+        for (int i = 0; i < this.names.length; i++) {
+            if (this.names[i] == name) {
+                return this.values[i];
+            }
+        }
+        return null;
+    }
+
+    // ADDITIVE: true when `name` is present (get returns null for absent
+    // names, so has() is the non-null check callers want).
+    public bool has(string name) {
+        for (int i = 0; i < this.names.length; i++) {
+            if (this.names[i] == name) {
+                return true;
+            }
+        }
+        return false;
+    }
 }
 
 class result {
     private row[] rows;
+    private int idx;
 
-    construct() { }
+    construct() {
+        this.rows = [];
+        this.idx = 0;
+    }
+
+    // ADDITIVE: the pre-split result declared NO methods -- query() handed
+    // callers an object they could not observe. hasNext()/next() give the
+    // rows an iteration surface so a future protocol can fill them without
+    // an API change; on this build rows stay empty (no session, no
+    // result-set framing -- see the honesty note), so hasNext() is always
+    // false. The `.length` PROPERTY form: the .length() CALL form reads
+    // garbage on the self-host for class-element arrays (the ARRAY-LENGTH
+    // landmine std/sql.sr probed).
+    public bool hasNext() {
+        return this.idx < this.rows.length;
+    }
+
+    // ADDITIVE: the row at the cursor, advancing it; null once exhausted
+    // (and always on this build). The pre-split result had no accessor at
+    // all -- nothing to preserve beyond the class name and construct().
+    public row next() {
+        if (this.idx >= this.rows.length) { return null; }
+        row r = this.rows[this.idx];
+        this.idx++;
+        return r;
+    }
 }
 
 class connection {
@@ -21,24 +319,142 @@ class connection {
     private string user;
     private string pass;
     private string db;
+    private string lastReply;
+    private int protocolVer;
+    private string serverVer;
 
     construct(string host, string user, string pass, string db) {
-        this.host = host; this.user = user; this.pass = pass; this.db = db;
+        this.host = host;
+        this.user = user;
+        this.pass = pass;
+        this.db = db;
+        this.lastReply = "";
+        this.protocolVer = 0;
+        this.serverVer = "";
     }
 
+    // ADDITIVE (the std/ssh.sr / std/sql.sr getLastReply precedent): the
+    // greeting summary (protocol byte + server version chars) after a
+    // successful greeting exchange; "" before the first connect, after a
+    // failed connect, or when the peer sent no parseable greeting (see the
+    // ADDITIVE docs -- packet framing gives junk no text surface).
+    public string getLastReply() {
+        return this.lastReply;
+    }
+
+    // ADDITIVE: true only after a COMPLETED authenticated session. Always
+    // false on this build -- authentication is unimplemented (see the
+    // honesty note); the getter exists for the std/pop.sr/std/ssh.sr
+    // failure-reporting shape.
+    public bool isConnected() {
+        return false;
+    }
+
+    // ADDITIVE: the greeting's server version string (e.g. "8.0.32"), ""
+    // when no protocol-10 greeting was accepted.
+    public string serverVersion() {
+        return this.serverVer;
+    }
+
+    // ADDITIVE: the greeting's protocol version byte (10 on real MySQL
+    // servers); 0 when none was accepted. This is the "did a real server
+    // greet me" test callers want.
+    public int protocolVersion() {
+        return this.protocolVer;
+    }
+
+    // The pre-split one-arg query, made safe: returns an EMPTY result (no
+    // session exists to run the statement on -- see the honesty note; the
+    // pre-split body stack-overflowed before returning, probed today on
+    // both compilers as exit 0xC00000FD). NOTE (overload dispatch bug):
+    // call sites dispatch by NAME to the last-declared overload of a name
+    // regardless of arity; both overloads call the same private runQuery,
+    // so either landing is behaviorally identical.
     public result query(string sql) {
-        return new result();
+        return this.runQuery(sql);
     }
 
+    // The pre-split two-arg query; params are carried unused exactly as
+    // the pre-split body carried them. Deliberately does NOT call
+    // this.query(sql) -- that delegation re-dispatches to the last-declared
+    // same-name overload (itself) and recurses forever on BOTH compilers
+    // (the pre-split query() crash).
     public result query(string sql, object[] params) {
-        return this.query(sql);
+        return this.runQuery(sql);
     }
 
-    public int insert(string sql, object[] params) { return 1; }
+    // The pre-split insert, made honest: returns 0 -- the affected-rows
+    // count of a statement that never executed (there is no session to run
+    // it on; the pre-split body fabricated a 1, probed today on both
+    // compilers). Single declaration, no overloads: unaffected by the
+    // dispatch bug.
+    public int insert(string sql, object[] params) {
+        return 0;
+    }
 
+    // Pre-split empty stub, preserved verbatim: there is no session socket
+    // to close -- connect() closes its own socket before returning (no
+    // authentication happens, so nothing stays open).
     public void close() { }
+
+    // Shared implementation of both query overloads (differently-named on
+    // purpose -- the dispatch bug note above). Builds the empty result the
+    // honesty note describes; sql/params never reach any network.
+    private result runQuery(string sql) {
+        result r = new result();
+        return r;
+    }
+
+    // Records what the greeting exchange observed. `info` is the backend's
+    // NUL-free summary (protocol byte + server version chars, see the NUL
+    // LANDMINE); anything not shaped like a protocol-10 greeting leaves
+    // lastReply empty and the getters at their construct() defaults, which
+    // is the graceful-failure surface for junk/silent peers. Private, and
+    // called ONLY from this module's free connect() through the instance
+    // (`c.absorb(...)`) -- probed working on both compilers
+    // (build/probe p2: a private method called on an instance from a
+    // same-module free function compiles and runs on both; unqualified
+    // calls are the shape that breaks on rs).
+    private void absorb(string info) {
+        if (greetingOk(info)) {
+            this.protocolVer = greetingProtocol(info);
+            this.serverVer = greetingVersion(info);
+            this.lastReply = info;
+        } else {
+            this.lastReply = "";
+        }
+    }
 }
 
+// The pre-split free function, made live: wraps the four strings in a
+// connection (the pre-split shape) and then performs the one MySQL wire
+// exchange that precedes any authentication -- TCP connect (dotted-IP
+// host, defaultPort(), 30 s SO_RCVTIMEO armed by the backend), a bounded
+// read-and-parse of the server's handshake greeting, socket close. No
+// HandshakeResponse41 is ever sent and no session exists (see the honesty
+// note); isConnected() stays false. On any failure (unreachable host, no
+// greeting, non-MySQL peer) the connection comes back with
+// protocolVersion() 0 and getLastReply() "" and the process exits cleanly.
 public connection connect(string host, string user, string pass, string db) {
-    return new connection(host, user, pass, db);
+    connection c = new connection(host, user, pass, db);
+    if (osType() != OSTypes.WINDOWS) { return c; }
+    int sock = mysqlWinConnect(host, defaultPort());
+    if (sock < 0) { return c; }
+    string info = mysqlWinGreeting(sock);
+    mysqlWinClose(sock);
+    c.absorb(info);
+    return c;
+}
+
+// Copies s[start .. end) character by character. Deliberately NOT substr:
+// rs's two-arg substr treats X as an END offset while the self-host treats
+// it as a LENGTH -- identical only when start is 0 (probed; see
+// silverc-rs/src/string_ops.rs emit_string_substring) -- and every caller
+// here slices from a nonzero offset.
+private string sliceRange(string s, int start, int end) {
+    string result = "";
+    for (int i = start; i < end; i++) {
+        result += s[i];
+    }
+    return result;
 }

@@ -1,0 +1,209 @@
+import { socket as mysqlWinRawSocket, connect as mysqlWinRawConnect, recv as mysqlWinRawRecv, closesocket as mysqlWinRawClose, inet_addr as mysqlWinRawInetAddr, setsockopt as mysqlWinRawSetSockopt, WSAStartup as mysqlWinRawStartup } from win32.ws2_32;
+
+internal mod export mysql_win;
+
+// DOCS -- INTERNAL Windows backend of the public `mysql` module
+// (UNIFIED_CORE_LIBRARY.md Phase 2). Every ws2_32 DLL call the mysql module
+// needs lives here and nowhere else: the public wrapper (std/mysql.sr)
+// contains zero win32 imports and reaches this code only behind the OS gate
+// `if (osType() == OSTypes.WINDOWS)`. See std/os.sr for why the gate calls
+// the plain-Silver osType() stand-in instead of the native os.type query.
+//
+// Everything in this file is project-internal: the `internal mod export`
+// marker plus `internal` on every function keep the backend from leaking to
+// user projects. A user file that tries `import * from mysql_win;` fails
+// with the standard internal-visibility error on both compilers (same
+// posture as std/pop_win.sr / std/imap_win.sr / std/ssh_win.sr /
+// std/sql_win.sr, probed there; re-probed for mysql_win).
+//
+// IMPORT GRANTS -- ALL ALIASED (UNIFIED_CORE_LIBRARY.md phase 2 `X as Y`
+// form, the std/pop_win.sr / std/imap_win.sr / std/ssh_win.sr /
+// std/sql_win.sr probed posture): none of the ws2_32 exports granted here
+// (socket/connect/recv/closesocket/inet_addr/setsockopt/WSAStartup) collide
+// with a name in the mysql public API (classes row/result/connection with
+// construct/get/has/hasNext/next/query/insert/close, the free function
+// connect, and the additive defaultPort/getLastReply/isConnected/
+// serverVersion/protocolVersion/greetingOk/greetingProtocol/greetingVersion),
+// so no alias is REQUIRED for namespace reasons; the class names
+// row/result/connection match no ws2_32 export and the client METHOD names
+// are class-scoped and never collide with flat DLL grants (the probed
+// ws_win.sr pattern). EVERY grant is aliased anyway, probed-verified
+// posture: with the direct (unaliased) grant shape shared by
+// std/ftp_win.sr/std/net_win.sr, silverc-rs mis-lowers the raw `send`/`recv`
+// calls (a probed two-program exchange delivered 2 garbage bytes per call in
+// BOTH directions while the same binaries built by the self-host exchanged
+// the exact payloads -- see the std/ftps.sr caller notes), while the aliased
+// calls (rawSocket/rawConnect, the pop_win/smtp_win shape) work on rs.
+// Aliasing all seven grants routes every call through the probed-working
+// aliased path on both compilers and costs nothing (the PE import keeps the
+// real export names). NO `send` GRANT: this backend never transmits -- the
+// client stops before authentication (see std/mysql.sr's honesty note), so
+// there is nothing to send; a backend grants exactly what it uses
+// (std/math_win.sr precedent).
+//
+// MEMORY LAYOUT (identical to std/pop_win.sr / std/imap_win.sr /
+// std/ssh_win.sr / std/sql_win.sr, probed there): Silver arrays are
+// [cap, len, elem...] with 8-byte elements, so an int[] doubles as a packed
+// qword buffer for DLL calls; `byte[]` must NOT cross a DLL boundary as a
+// packed buffer. Strings ARE packed byte buffers -- but ONLY for NUL-free
+// payloads: probed 2026-08 on BOTH compilers, an embedded NUL byte is
+// silently DROPPED when it is concatenated into a string (a probe built
+// char(19),char(0),char(0),char(0),char(10),"8.0.32",char(0),char(200) and
+// the resulting string was 9 bytes -- every char(0) vanished; byte-per-byte
+// identical on silverc-rs and the self-host). The MySQL greeting is full of
+// NUL bytes (the 3-byte header's high length bytes, the sequence id, the
+// NUL that terminates the server version string), so the greeting can NOT
+// ride the string concat path the sibling backends use. mysqlWinGreeting
+// therefore recv's into int[] buffers and unpacks bytes with shifts -- NUL
+// values survive in an int[] slot -- and returns only a NUL-free summary
+// string (one protocol byte + the ASCII server version characters).
+//
+// WSAStartup: issued before each socket creation; it is reference-counted,
+// so the repeated calls are harmless. The pre-split mysql.sr imported
+// win32.ws2_32 but never called anything from it -- no socket call, no
+// WSAStartup, no framing anywhere (see std/mysql.sr PRE-SPLIT STATE).
+//
+// DLL RETURN NORMALIZATION (see std/smtp_win.sr for the general rule): the
+// self-hosted compiler ZERO-extends 32-bit DLL int returns, silverc-rs
+// sign-extends them, so SOCKET_ERROR (-1) arrives as 4294967295 on the
+// self-host and -1 on rs. Every return below that can be SOCKET_ERROR
+// (socket/connect/recv; connect/setsockopt/closesocket results are
+// deliberately ignored -- see each function) is normalized with the
+// two-sided check `v < 0 || v > 2147483647`, which is correct on both
+// compilers and cannot misfire: valid SOCKET handles are small positive
+// values far below 2^31.
+//
+// RECEIVE TIMEOUT: mysqlWinConnect arms SO_RCVTIMEO (SOL_SOCKET 0xFFFF,
+// SO_RCVTIMEO 0x1006, 30000 ms as a DWORD in the low half of one int[]
+// qword slot) on every socket it returns. The pre-split file had no timeout
+// and no reads at all; with the timeout, mysqlWinGreeting's reads are
+// bounded: a peer that accepts and then goes silent cannot hang a probe
+// past 30 s per read -- the read simply returns SOCKET_ERROR, which stops
+// the accumulation and makes mysqlWinGreeting return "".
+//
+// SCOPE: this backend is TRANSPORT plus the one piece of MySQL wire framing
+// that must happen before any authentication: the initial handshake greeting
+// packet parse (mysqlWinGreeting). NO MySQL authentication lives anywhere --
+// mysql_native_password needs SHA1 (SHA1(password) ^ SHA1(scramble +
+// SHA1(SHA1(password)))), and std/hash on BOTH compilers is djb2/fnv1 only
+// (silverc-rs src/stdlib/hash.rs gen_hash_call and the self-host
+// std/hash.sr expose no md5/sha at all -- probed 2026-08), so the scramble
+// cannot be built; caching_sha2_password additionally needs TLS or RSA.
+// The client consequently NEVER sends a HandshakeResponse41 -- sending one
+// with an unscrambleable garbage auth response would be pretending.
+// No OK/ERR packet handling, no command phase, no result-set framing (see
+// std/mysql.sr's honesty note; a real implementation is a separate feature
+// ticket). This file compiles standalone (primitives only, no
+// wrapper-class references).
+
+internal int mysqlWinStartup() {
+    byte[] wsa = new byte[408];
+    return mysqlWinRawStartup(0x0202, wsa);
+}
+
+// Packs family/port/addr into the sockaddr_in image (two qwords). `ip` is
+// the network-order u32 that inet_addr returns; 0 means INADDR_ANY.
+internal void mysqlWinFillSockaddr(int[] sa, int port, int ip) {
+    int pHi = (port >> 8) & 0xFF;
+    int pLo = port & 0xFF;
+    sa[0] = 2 | (pHi << 16) | (pLo << 24) | ((ip & 0xFFFFFFFF) << 32);
+    sa[1] = 0;
+}
+
+// Opens a TCP connection to host:port and arms the receive timeout. Returns
+// the socket handle, or -1 on any failure (startup, socket, connect -- all
+// normalized per the DLL-return note above). `host` must be a dotted IP
+// (inet_addr posture -- no name resolution); an unparseable host or port 0
+// fails the connect gracefully here.
+internal int mysqlWinConnect(string host, int port) {
+    mysqlWinStartup();
+    int sock = mysqlWinRawSocket(2, 1, 0);
+    if (sock < 0 || sock > 2147483647) { return -1; }
+    int ip = mysqlWinRawInetAddr(host);
+    int[] sa = new int[2];
+    mysqlWinFillSockaddr(sa, port, ip);
+    int rc = mysqlWinRawConnect(sock, sa, 16);
+    if (rc < 0 || rc > 2147483647) {
+        mysqlWinRawClose(sock);
+        return -1;
+    }
+    int[] opt = new int[1];
+    opt[0] = 30000;
+    mysqlWinRawSetSockopt(sock, 0xFFFF, 0x1006, opt, 4);
+    return sock;
+}
+
+// Reads and parses the server's initial handshake greeting packet (the one
+// MySQL wire message that precedes any authentication). Returns a NUL-free
+// summary string whose first character is the greeting's protocol version
+// byte (10 on every real server) followed by the server version string
+// (e.g. char(10) + "8.0.32"); "" when the peer said nothing, hung up, or
+// the bytes are not a protocol-10 greeting.
+//
+// WHY THE BYTES GO THROUGH int[]: the greeting packet is
+// [3-byte payload length LE][sequence id][payload], payload =
+// [protocol version byte][server version string][NUL][auth-plugin-data
+// part 1 (8 bytes)][filler][capability flags]... -- it contains NUL bytes
+// (header high bytes, sequence id, the version terminator), and probed
+// 2026-08 on BOTH compilers NULs are silently dropped by string
+// concatenation (see the MEMORY LAYOUT note), so the packet cannot be
+// accumulated as a string. This function recv's into a packed int[] chunk
+// buffer, unpacks one byte per int[] slot into `raw` (NULs survive there),
+// and stops as soon as the version-terminating NUL has been seen after
+// byte 4 (a real greeting carries it well within the first 100 bytes).
+//
+// BOUNDED: at most 16 recv calls of up to 1024 bytes (~16 KB) and one 30 s
+// SO_RCVTIMEO per call -- no path can spin or hang. The 1024-byte
+// accumulation window covers the version prefix of any real greeting; a
+// greeting whose version terminator lies beyond it fails gracefully ("").
+// A read returning 0, a zero-extended SOCKET_ERROR (timeout/disconnect),
+// or a run past the window ends accumulation; the parse then either
+// already succeeded or returns "".
+//
+// LENIENT (the ssh bannerOk posture): the payload's byte 4 must be 10 (the
+// MySQL protocol version) and a NUL must terminate the version string; the
+// 3-byte payload length and the sequence id are NOT validated. Junk that
+// happens to carry byte 10 at that position and a NUL afterwards would be
+// misread as a greeting -- the same leniency std/ssh.sr's bannerOk accepts.
+internal string mysqlWinGreeting(int fd) {
+    if (fd < 0) { return ""; }
+    int[] raw = new int[1024];
+    int[] chunk = new int[128];
+    int total = 0;
+    int proto = -1;
+    int verEnd = -1;
+    for (int guard = 0; guard < 16; guard++) {
+        int n = mysqlWinRawRecv(fd, chunk, 1024, 0);
+        if (n <= 0 || n > 2147483647) { break; }
+        if (n > 1024) { n = 1024; }
+        for (int j = 0; j < n; j++) {
+            if (total >= 1024) { break; }
+            int b = (chunk[j / 8] >> ((j % 8) * 8)) & 0xFF;
+            raw[total] = b;
+            total++;
+        }
+        if (total >= 5 && proto < 0) {
+            proto = raw[4];
+        }
+        if (verEnd < 0) {
+            for (int k = 5; k < total; k++) {
+                if (raw[k] == 0) {
+                    verEnd = k;
+                    break;
+                }
+            }
+        }
+        if (proto == 10 && verEnd >= 0) { break; }
+    }
+    if (proto != 10 || verEnd < 0) { return ""; }
+    string info = "";
+    info += char(proto);
+    for (int m = 5; m < verEnd; m++) {
+        info += char(raw[m]);
+    }
+    return info;
+}
+
+internal void mysqlWinClose(int fd) {
+    mysqlWinRawClose(fd);
+}
