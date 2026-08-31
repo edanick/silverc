@@ -2028,7 +2028,15 @@ int strIdx = this.stringPatchIndices[i];
                         this.registerLiveSlot(off, stmt.typeHint);
                     }
                 } else {
-                if (this.strEq(stmt.typeHint, "byte[]") && initNode.kind == 19) {
+                // A runtime-sized `new byte[expr]` initializer parses as a
+                // kind-19 array node with op=2 and the size expression as its
+                // single child. genByteArrayLiteral would treat that child as
+                // element 0 of a one-element literal; route the dyn-new form
+                // through genExpr instead, whose kind-19 handler owns the
+                // HeapAlloc(HEAP_ZERO_MEMORY) runtime-sized lowering (same
+                // shape the `return new byte[n];` workaround path uses).
+                bool isDynByteNew = initNode.op == 2 && initNode.childCount() == 1;
+                if (this.strEq(stmt.typeHint, "byte[]") && initNode.kind == 19 && !isDynByteNew) {
                     this.genByteArrayLiteral(initNode);
                 } elif (initNode.kind == 74) {
                     this.genStructLiteral(initNode, stmt.typeHint);
@@ -9320,6 +9328,53 @@ public void genNewCall(Node call) {
                 this.asm.addRI32(10, fieldOff);
                 this.asm.movMBaseR(10, 0, 0);
                 return;
+            }
+            if (obj.kind == 6) {
+                // obj.field op= rhs with a variable receiver: load the
+                // receiver, read the current field value, apply the op to the
+                // evaluated RHS, and store the result back through the same
+                // receiver. The generic fallthrough below only evaluated the
+                // RHS and discarded it, so every `obj.field += x` silently
+                // kept the old value. Mirrors silverc-rs gen_binary's
+                // MemberAccess compound-assignment branch (load current value,
+                // push, evaluate RHS, integer op, store back).
+                string varType = this.getLocalType(obj.name);
+                int off = this.findLocal(obj.name);
+                int gi = this.findGlobal(obj.name);
+                string lookupType = varType;
+                string elemType = this.arrayElementType(varType);
+                if (!this.strEq(elemType, "")) { lookupType = elemType; }
+                int fieldOff = this.findFieldOffset(lookupType, fieldName);
+                if (fieldOff < 0) {
+                    fieldOff = this.findFieldOffsetInAllClasses(fieldName);
+                }
+                if (fieldOff >= 0 && (off != 0 || gi >= 0)) {
+                    if (off != 0) {
+                        this.asm.movRMBase(0, 5, off);
+                    } else {
+                        this.genGlobalLoad(gi);
+                    }
+                    this.asm.pushR64(0);
+                    this.asm.movRMBase(0, 0, fieldOff);
+                    this.asm.pushR64(0);
+                    this.genExpr(rhs);
+                    this.asm.movRR64(1, 0);
+                    this.asm.popR64(0);
+                    if (op == 14) { this.asm.addRR64(0, 1); }
+                    elif (op == 15) { this.asm.subRR64(0, 1); }
+                    elif (op == 16) { this.asm.mulRR64(1); }
+                    elif (op == 17) { this.emitDivisorCheck(); this.asm.cqo(); this.asm.idivR64(1); }
+                    elif (op == 29) { this.emitDivisorCheck(); this.asm.cqo(); this.asm.idivR64(1); this.asm.movRR64(0, 2); }
+                    elif (op == 30) { this.asm.andRR64(0, 1); }
+                    elif (op == 31) { this.asm.orRR64(0, 1); }
+                    elif (op == 32) { this.asm.xorRR64(0, 1); }
+                    elif (op == 33) { this.asm.movRR64(11, 1); this.asm.shlRCl64(0); }
+                    elif (op == 34) { this.asm.movRR64(11, 1); this.asm.shrRCl64(0); }
+                    this.asm.popR64(11);
+                    this.asm.addRI32(11, fieldOff);
+                    this.asm.movMBaseR(11, 0, 0);
+                    return;
+                }
             }
             if (obj.kind == 13) {
                 // Nested member chain compound assign (e.g. this.inner.x += 1)
