@@ -407,6 +407,69 @@ class MiniCg {
         return this.inferExprType(expr);
     }
 
+    public bool isClassName(string t) {
+        if (this.strEq(t, "")) { return false; }
+        for (int i = 0; i < this.classNames.length; i++) {
+            if (this.strEq(this.classNames[i], t)) { return true; }
+        }
+        return false;
+    }
+
+    // Mirror of rs find_class_for_expr: the class name an expression's value
+    // belongs to, for Assign-time var->class registration. Resolves through
+    // the local/global type table, the class field tables and inferExprType
+    // (which already resolves `new C(...)` - a non-member call named after
+    // the class - to C).
+    public string findClassForExpr(Node expr) {
+        if (expr.kind == 6) {
+            if (this.strEq(expr.name, "this")) {
+                if (!this.strEq(this.currentClassName, "")) { return this.currentClassName; }
+            }
+            string t = this.getLocalType(expr.name);
+            if (this.isClassName(t)) { return t; }
+            if (this.isClassName(expr.name)) { return expr.name; }
+            if (!this.strEq(this.currentClassName, "")) {
+                string ft = this.findFieldType(this.currentClassName, expr.name);
+                if (this.isClassName(ft)) { return ft; }
+            }
+            return "";
+        }
+        if (expr.kind == 13) {
+            if (expr.childCount() > 0) {
+                string ot = this.inferExprType(expr.child(0));
+                if (!this.strEq(ot, "")) {
+                    string ft = this.findFieldType(ot, expr.name);
+                    if (this.isClassName(ft)) { return ft; }
+                }
+            }
+            return "";
+        }
+        if (expr.kind == 24) {
+            if (expr.childCount() > 0) {
+                string et = this.arrayElementType(this.inferExprType(expr.child(0)));
+                if (this.isClassName(et)) { return et; }
+            }
+            return "";
+        }
+        if (expr.kind == 10) {
+            string t = this.inferExprType(expr);
+            if (this.isClassName(t)) { return t; }
+            if (!expr.isMember) {
+                // Class-returning user function (mirrors rs FunctionCall arm
+                // via func_return_structs).
+                for (int ri = 0; ri < this.funcNames.length; ri++) {
+                    if (this.strEq(this.funcNames[ri], expr.name) && this.strEq(this.funcClasses[ri], "")) {
+                        string rt = this.funcRetTypes[ri];
+                        if (this.isClassName(rt)) { return rt; }
+                        break;
+                    }
+                }
+            }
+            return "";
+        }
+        return "";
+    }
+
     public int findFieldOffset(string className, string fieldName) {
         int start = -1;
         int cnt = 0;
@@ -9314,6 +9377,36 @@ public void genNewCall(Node call) {
         if (lhs.kind == 24 && lhs.childCount() >= 2) {
             Node arrNode = lhs.child(0);
             Node idxNode = lhs.child(1);
+            // dict[k] op= r lowers to dict[k] = dict[k] op r (mirrors
+            // silverc-rs fd010e3 Index compound-assign arm).
+            if (this.isDictType(this.inferReceiverType(arrNode))) {
+                Node keyExpr = new Node();
+                keyExpr.kind = 24;
+                keyExpr.children.add(arrNode);
+                keyExpr.children.add(idxNode);
+                Node updated = new Node();
+                updated.kind = 7;
+                if (op == 14) { updated.op = 1; }
+                elif (op == 15) { updated.op = 2; }
+                elif (op == 16) { updated.op = 3; }
+                elif (op == 17) { updated.op = 4; }
+                elif (op == 29) { updated.op = 13; }
+                elif (op == 30) { updated.op = 22; }
+                elif (op == 31) { updated.op = 23; }
+                elif (op == 32) { updated.op = 24; }
+                elif (op == 33) { updated.op = 18; }
+                elif (op == 34) { updated.op = 19; }
+                else { updated.op = 1; }
+                updated.children.add(keyExpr);
+                updated.children.add(rhs);
+                Node assignBin = new Node();
+                assignBin.kind = 7;
+                assignBin.op = 20;
+                assignBin.children.add(lhs);
+                assignBin.children.add(updated);
+                this.genBinary(assignBin);
+                return;
+            }
             bool arrIsByte = false;
             if (arrNode.kind == 6) {
                 arrIsByte = this.isByteElemType(this.getLocalType(arrNode.name));
@@ -9327,61 +9420,29 @@ public void genNewCall(Node call) {
                 } else {
                     arrIsByte = this.isByteElemType(this.inferExprType(arrNode));
                 }
+            } elif (arrNode.kind == 24) {
+                arrIsByte = this.isByteElemType(this.inferExprType(arrNode));
             }
-            if (arrNode.kind == 6) {
-                int arrOff = this.findLocal(arrNode.name);
-                this.genExpr(idxNode);
-                this.asm.pushR64(0);
-                this.asm.movRMBase(11, 5, arrOff);
-                this.asm.popR64(0);
-                if (!arrIsByte) { this.asm.shlR64Imm(0, 3); }
-                this.asm.addRR64(11, 0);
-                if (arrIsByte) {
-                    this.asm.movzxByteMBase(0, 11, 0);
-                } else {
-                    this.asm.movRMBase(0, 11, 0);
-                }
-                this.asm.pushR64(0);
-                this.genExpr(rhs);
-                this.asm.movRR64(1, 0);
-                this.asm.popR64(0);
-                if (op == 14) { this.asm.addRR64(0, 1); }
-                elif (op == 15) { this.asm.subRR64(0, 1); }
-                elif (op == 16) { this.asm.mulRR64(1); }
-                elif (op == 17) { this.emitDivisorCheck(); this.asm.cqo(); this.asm.idivR64(1); }
-                elif (op == 29) { this.emitDivisorCheck(); this.asm.cqo(); this.asm.idivR64(1); this.asm.movRR64(0, 2); }
-                elif (op == 30) { this.asm.andRR64(0, 1); }
-                elif (op == 31) { this.asm.orRR64(0, 1); }
-                elif (op == 32) { this.asm.xorRR64(0, 1); }
-                elif (op == 33) { this.asm.movRR64(11, 1); this.asm.shlRCl64(0); }
-                elif (op == 34) { this.asm.movRR64(11, 1); this.asm.shrRCl64(0); }
-                if (arrIsByte) {
-                    this.asm.movMBaseByteR(11, 0, 0);
-                } else {
-                    this.asm.movMBaseR(11, 0, 0);
-                }
-                return;
-            } else {
+            if (arrIsByte) {
+                // byte[]/char[] elements are byte-packed on self-host: keep
+                // the byte RMW, but resolve the array base through genExpr so
+                // GLOBAL arrays load through their storage slot too
+                // (findLocal returns 0 for globals and [rbp+0] is the saved
+                // frame pointer - mirroring the rs genExpr(arr) base rule).
                 this.genExpr(arrNode);
                 this.asm.pushR64(0);
                 this.genExpr(idxNode);
-                if (!arrIsByte) { this.asm.shlR64Imm(0, 3); }
                 this.asm.movRR64(11, 0);
                 this.asm.popR64(0);
                 this.asm.addRR64(0, 11);
                 this.asm.pushR64(0);
-                if (arrIsByte) {
-                    this.asm.movzxByteMBase(0, 0, 0);
-                } else {
-                    this.asm.movRMBase(0, 0, 0);
-                }
+                this.asm.movzxByteMBase(0, 0, 0);
                 this.asm.pushR64(0);
                 this.genExpr(rhs);
                 this.asm.movRR64(1, 0);
                 this.asm.popR64(0);
                 if (op == 14) { this.asm.addRR64(0, 1); }
                 elif (op == 15) { this.asm.subRR64(0, 1); }
-
                 elif (op == 16) { this.asm.mulRR64(1); }
                 elif (op == 17) { this.emitDivisorCheck(); this.asm.cqo(); this.asm.idivR64(1); }
                 elif (op == 29) { this.emitDivisorCheck(); this.asm.cqo(); this.asm.idivR64(1); this.asm.movRR64(0, 2); }
@@ -9391,13 +9452,89 @@ public void genNewCall(Node call) {
                 elif (op == 33) { this.asm.movRR64(11, 1); this.asm.shlRCl64(0); }
                 elif (op == 34) { this.asm.movRR64(11, 1); this.asm.shrRCl64(0); }
                 this.asm.popR64(11);
-                if (arrIsByte) {
-                    this.asm.movMBaseByteR(11, 0, 0);
-                } else {
-                    this.asm.movMBaseR(11, 0, 0);
-                }
+                this.asm.movMBaseByteR(11, 0, 0);
                 return;
             }
+            // arr[i] op= rhs - read-modify-write through the element address,
+            // mirroring the rs fd010e3 Index lowering: genExpr(arr) yields the
+            // array base for locals AND globals (globals load through their
+            // storage slot), idx*8 selects the slot. Without this arm the
+            // statement silently no-ops or corrupts the frame
+            // (`gdata[0] += 10` stored through [rbp+0]).
+            this.genExpr(arrNode);
+            this.asm.pushR64(0);
+            this.genExpr(idxNode);
+            this.asm.movRR64(1, 0);
+            this.asm.shlR64Imm(1, 3);
+            this.asm.popR64(0);
+            this.asm.addRR64(0, 1);
+            // Spill the element address: genExpr(rhs) is free to scratch
+            // rax/r11 and may call.
+            int addrOff = this.allocLocal("__idxassign_addr");
+            this.asm.movMBaseR(5, 0, addrOff);
+            Node lhsExpr = new Node();
+            lhsExpr.kind = 24;
+            lhsExpr.children.add(arrNode);
+            lhsExpr.children.add(idxNode);
+            if (op == 14 && this.isStringLike(lhsExpr)) {
+                // String element: integer-add would combine heap pointers and
+                // fault on next use. Concat through the shared machinery
+                // (fresh heap buffer), then store back through the spilled
+                // element address.
+                Node concatBin = new Node();
+                concatBin.kind = 7;
+                concatBin.op = 1;
+                concatBin.children.add(lhsExpr);
+                concatBin.children.add(rhs);
+                this.genStringConcat(concatBin);
+                this.asm.movRMBase(1, 5, addrOff);
+                this.asm.movMBaseR(1, 0, 0);
+            } elif (this.isFloatLike(lhsExpr) && (op == 14 || op == 15 || op == 16 || op == 17)) {
+                // Float element: SSE op on the double bits stored in the
+                // slot, store the bits back (same XMM sequence as
+                // genFloatBinary / the rs float element path).
+                this.asm.movRMBase(0, 5, addrOff);
+                this.asm.movRMBase(0, 0, 0);
+                int bitsOff = this.allocLocal("__fassign_lhs");
+                this.asm.movMBaseR(5, 0, bitsOff);
+                this.genExpr(rhs);
+                this.asm.movRR64(1, 0);
+                this.asm.movRMBase(0, 5, bitsOff);
+                this.emitMovqXmmGpr(0, 0);
+                if (this.isFloatLike(rhs)) {
+                    this.emitMovqXmmGpr(1, 1);
+                } else {
+                    this.emitCvtsi2sdXmmGpr(1, 1);
+                }
+                if (op == 14) { this.asm.addsdXMM(0, 1); }
+                elif (op == 15) { this.asm.subsdXMM(0, 1); }
+                elif (op == 16) { this.asm.mulsdXMM(0, 1); }
+                elif (op == 17) { this.asm.divsdXMM(0, 1); }
+                this.asm.movqR64XMM(0, 0);
+                this.asm.movRMBase(1, 5, addrOff);
+                this.asm.movMBaseR(1, 0, 0);
+            } else {
+                // Integer/bool/pointer element: load, op, store.
+                this.asm.movRMBase(0, 5, addrOff);
+                this.asm.movRMBase(0, 0, 0);
+                this.asm.pushR64(0);
+                this.genExpr(rhs);
+                this.asm.movRR64(1, 0);
+                this.asm.popR64(0);
+                if (op == 14) { this.asm.addRR64(0, 1); }
+                elif (op == 15) { this.asm.subRR64(0, 1); }
+                elif (op == 16) { this.asm.mulRR64(1); }
+                elif (op == 17) { this.emitDivisorCheck(); this.asm.cqo(); this.asm.idivR64(1); }
+                elif (op == 29) { this.emitDivisorCheck(); this.asm.cqo(); this.asm.idivR64(1); this.asm.movRR64(0, 2); }
+                elif (op == 30) { this.asm.andRR64(0, 1); }
+                elif (op == 31) { this.asm.orRR64(0, 1); }
+                elif (op == 32) { this.asm.xorRR64(0, 1); }
+                elif (op == 33) { this.asm.movRR64(11, 1); this.asm.shlRCl64(0); }
+                elif (op == 34) { this.asm.movRR64(11, 1); this.asm.shrRCl64(0); }
+                this.asm.movRMBase(1, 5, addrOff);
+                this.asm.movMBaseR(1, 0, 0);
+            }
+            return;
         }
         if (lhs.kind == 13 && lhs.childCount() >= 1) {
             Node obj = lhs.child(0);
@@ -9644,6 +9781,26 @@ public void genNewCall(Node call) {
             } else {
                 this.genExpr(rhs);
             }
+            // Declared-then-assigned objects (`FBox b; b = new FBox();`) and
+            // untyped vars (`var v; v = new C();`) get their class registered
+            // here, mirroring the rs fd010e3 Assign-time registration. rs
+            // registers unless struct_vars already holds the name, and
+            // struct_vars only ever holds class names, so the sh equivalent
+            // guard is "the current type is not already a registered class".
+            // Without it member accesses on the variable see no receiver
+            // class: string fields stringify as the raw pointer and float
+            // fields print as the bit pattern.
+            string assignCurT = this.getLocalType(lhs.name);
+            if (rhs.kind == 10 && !rhs.isMember && this.isClassName(rhs.name)) {
+                if (off != 0 && !this.isClassName(assignCurT)) {
+                    this.setLocalType(lhs.name, rhs.name);
+                }
+            } elif (off != 0 && !this.isClassName(assignCurT)) {
+                string rhsClass = this.findClassForExpr(rhs);
+                if (!this.strEq(rhsClass, "")) {
+                    this.setLocalType(lhs.name, rhsClass);
+                }
+            }
             if (off != 0) {
                 if (this.isRefParam(lhs.name)) {
                     // Write through the reference to the caller's slot.
@@ -9773,7 +9930,7 @@ public void genNewCall(Node call) {
                     arrIsByte = this.isByteElemType(this.inferExprType(arrNode));
                 }
             }
-            if (arrNode.kind == 6) {
+            if (arrNode.kind == 6 && this.findLocal(arrNode.name) != 0) {
                 int arrOff = this.findLocal(arrNode.name);
                 this.genExpr(idxNode);
                 this.asm.pushR64(0);
@@ -9792,7 +9949,11 @@ public void genNewCall(Node call) {
                 this.asm.movRI64(0, 0);
                 return;
             } else {
-
+                // Mirror the rs plain-assign Index lowering: gen_expr(arr)
+                // yields the array base for locals AND globals (globals load
+                // through their storage slot). The old findLocal-only arm
+                // stored globals through [rbp+0] - the saved rbp - and
+                // crashed on return.
                 this.genExpr(arrNode);
                 this.asm.pushR64(0);
                 this.genExpr(idxNode);
@@ -10125,7 +10286,32 @@ public void genNewCall(Node call) {
         }
         if (expr.kind == 24) {
             string t = this.inferExprType(expr);
-            return this.strEq(t, "float") || this.strEq(t, "float64") || this.strEq(t, "double");
+            if (this.strEq(t, "float") || this.strEq(t, "float64") || this.strEq(t, "double")) { return true; }
+            // Element reads on arrays whose declared element type is float64
+            // hold double bit patterns too (mirrors rs fd010e3 is_float_expr
+            // Index arm). inferExprType covers local/global declared types;
+            // bare class fields (`farr[i]` meaning this.farr) and member
+            // receivers (`this.farr[i]`, `obj.farr[i]`, including objects
+            // whose class was only registered at assignment time) resolve
+            // through the class field tables here.
+            if (expr.childCount() > 0) {
+                Node arrNode = expr.child(0);
+                string ft = "";
+                if (arrNode.kind == 6) {
+                    if (!this.strEq(this.currentClassName, "")) {
+                        ft = this.findFieldType(this.currentClassName, arrNode.name);
+                    }
+                } elif (arrNode.kind == 13 && arrNode.childCount() > 0) {
+                    string ownerT = this.inferReceiverType(arrNode.child(0));
+                    if (!this.strEq(ownerT, "")) {
+                        ft = this.findFieldType(ownerT, arrNode.name);
+                    }
+                }
+                if (ft.length >= 2 && ft[ft.length - 2] == '[' && ft[ft.length - 1] == ']') {
+                    string inner = this.arrayElementType(ft);
+                    if (this.strEq(inner, "float") || this.strEq(inner, "float64") || this.strEq(inner, "double")) { return true; }
+                }
+            }
         }
         if (expr.kind == 7) {
             int fop = expr.op;
