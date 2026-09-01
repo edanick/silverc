@@ -147,6 +147,11 @@ class MiniCg {
     // parameter slot's stored address.
     public prop string[] fnPtrParamNames;
 
+    // Overload dispatch by argument count (UNIFIED_CORE_LIBRARY.md 7.4 #2):
+    // resolved function index of every forward call so same-named overload
+    // entries patch to their own body instead of the last declaration's.
+    public prop int[] forwardCallFuncIdxs;
+
     // UNIFIED_CORE_LIBRARY.md 7.4 #8 -- source-module names seen in
     // `import * from X;` / `import { n } from X;` statements. Dotted-new
     // (`new mod.Class(...)`) resolves through these.
@@ -220,6 +225,7 @@ class MiniCg {
 
         this.forwardCallNames = [];
         this.forwardCallClasses = [];
+        this.forwardCallFuncIdxs = [];
         this.globalNames = [];
         this.globalTypes = [];
         this.globalOffsets = [];
@@ -1619,6 +1625,7 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.emitCallSetup(0);
         this.asm.callRel32(0);
         this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallFuncIdxs.add(-1);
         this.forwardCallNames.add("__silver_rt_init");
         this.forwardCallClasses.add("");
         this.asm.emitCallTeardown();
@@ -1626,6 +1633,7 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.emitCallSetup(0);
             this.asm.callRel32(0);
             this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallFuncIdxs.add(-1);
             this.forwardCallNames.add("__init_globals");
             this.forwardCallClasses.add("");
             this.asm.emitCallTeardown();
@@ -1634,6 +1642,7 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.emitCallSetup(0);
             this.asm.callRel32(0);
             this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallFuncIdxs.add(-1);
             this.forwardCallNames.add("main");
             this.forwardCallClasses.add("");
             this.asm.emitCallTeardown();
@@ -1747,6 +1756,7 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.emitCallSetup(0);
         this.asm.callRel32(0);
         this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallFuncIdxs.add(-1);
         this.forwardCallNames.add("__init_globals");
         this.forwardCallClasses.add("");
         this.asm.emitCallTeardown();
@@ -1756,6 +1766,7 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.emitCallSetup(0);
             this.asm.callRel32(0);
             this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallFuncIdxs.add(-1);
             this.forwardCallNames.add("main");
             this.forwardCallClasses.add("");
             this.asm.emitCallTeardown();
@@ -1783,9 +1794,22 @@ int strIdx = this.stringPatchIndices[i];
             string targetName = this.forwardCallNames[i];
             string targetClass = this.forwardCallClasses[i];
             int targetOff = -1;
-            for (int j = 0; j < this.funcNames.length; j++) {
-                if (this.strEq(this.funcNames[j], targetName) && this.strEq(this.funcClasses[j], targetClass)) {
-                    targetOff = this.funcOffsets[j];
+            // Overload dispatch by argument count (7.4 #2): forward calls
+            // remember the exact function-table index they resolved to at
+            // the call site, so same-named overload entries patch to their
+            // own body instead of whichever same-named entry the legacy
+            // name scan found last. Falls back to the name scan only when
+            // no recorded index exists (older entries).
+            if (i < this.forwardCallFuncIdxs.length && this.forwardCallFuncIdxs[i] >= 0) {
+                int fi = this.forwardCallFuncIdxs[i];
+                if (fi < this.funcOffsets.length) {
+                    targetOff = this.funcOffsets[fi];
+                }
+            } else {
+                for (int j = 0; j < this.funcNames.length; j++) {
+                    if (this.strEq(this.funcNames[j], targetName) && this.strEq(this.funcClasses[j], targetClass)) {
+                        targetOff = this.funcOffsets[j];
+                    }
                 }
             }
             if (targetOff >= 0) {
@@ -6675,6 +6699,7 @@ public void genNewCall(Node call) {
         } else {
             this.asm.callRel32(0);
             this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallFuncIdxs.add(-1);
             this.forwardCallNames.add("construct");
             this.forwardCallClasses.add(this.funcClasses[ctorIdx]);
         }
@@ -6741,6 +6766,7 @@ public void genNewCall(Node call) {
         } else {
             this.asm.callRel32(0);
             this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallFuncIdxs.add(-1);
             this.forwardCallNames.add("construct");
             this.forwardCallClasses.add(parentClass);
         }
@@ -7009,6 +7035,37 @@ public void genNewCall(Node call) {
         return false;
     }
 
+    // Overload dispatch by argument count (UNIFIED_CORE_LIBRARY.md 7.4 #2):
+    // the LAST declared overload of `name` (class `cls`, "" for globals)
+    // whose parameter list accepts `nargs` arguments. The variadic tail is
+    // itself optional (required = non-default count among the fixed prefix);
+    // same-arity ties keep the last declaration. -1 when nothing matches.
+    public int selectOverloadIdx(string name, string cls, int nargs) {
+        int best = -1;
+        for (int i = 0; i < this.funcNames.length; i++) {
+            if (this.strEq(this.funcNames[i], name) && this.strEq(this.funcClasses[i], cls)) {
+                int pc = (i < this.funcParamCounts.length) ? this.funcParamCounts[i] : -1;
+                if (pc < 0) { continue; }
+                int pStart = this.funcParamStarts[i];
+                bool variadic = i < this.funcHasVariadic.length && this.funcHasVariadic[i] == 1;
+                int fixedLen = pc;
+                if (variadic && pc > 0) { fixedLen = pc - 1; }
+                int minArgs = 0;
+                for (int k = 0; k < fixedLen; k++) {
+                    if (pStart + k < this.funcParamHasDefaults.length && this.funcParamHasDefaults[pStart + k] == 0) { minArgs = minArgs + 1; }
+                }
+                bool accepts;
+                if (variadic) {
+                    accepts = nargs >= minArgs;
+                } else {
+                    accepts = nargs >= minArgs && nargs <= pc;
+                }
+                if (accepts) { best = i; }
+            }
+        }
+        return best;
+    }
+
     public void genUserCall(Node call) {
         string name = call.name;
         // Module-qualified call (e.g. json_runtime.get(x, "y") inside a class
@@ -7050,33 +7107,53 @@ public void genNewCall(Node call) {
                 nargs = call.childCount() - 1;
             }
         }
+        // Scope 1: current-class methods (and globals when generating a
+        // plain function, whose currentClassName is ""). Overload dispatch
+        // by argument count (UNIFIED_CORE_LIBRARY.md 7.4 #2): when the
+        // scope declares this name more than once, the call resolves to
+        // the LAST declaration accepting the argument count; a count no
+        // overload accepts is a compile error. A single declaration keeps
+        // the legacy last-match behavior.
+        int s1Matched = -1;
+        int s1Count = 0;
         for (int i = 0; i < this.funcNames.length; i++) {
             if (!isModuleCall && this.strEq(this.funcNames[i], name) && this.strEq(this.funcClasses[i], this.currentClassName)) {
-                funcIdx = i;
+                s1Matched = i;
+                s1Count = s1Count + 1;
             }
         }
+        if (s1Count > 1) {
+            funcIdx = this.selectOverloadIdx(name, this.currentClassName, nargs);
+            if (funcIdx < 0) {
+                printline("no overload of '" + name + "' takes " + nargs.toString() + " argument(s)");
+                exit(1);
+                return;
+            }
+        } else {
+            funcIdx = s1Matched;
+        }
+        // Scope 2: globals (module-qualified calls, or names the current
+        // class does not declare). Same overload rule; a single global
+        // keeps the legacy behavior of the old closest-arity scan.
         if (funcIdx < 0) {
-            // Global-function overloads (same name, class "") resolve by
-            // argument count so path.join(string,string) and
-            // path.join(string[]) select the right body instead of whichever
-            // was declared last. Ties keep the last declaration.
-            int bestIdx = -1;
-            int bestDist = -1;
+            int s2Matched = -1;
+            int s2Count = 0;
             for (int i = 0; i < this.funcNames.length; i++) {
                 if (this.strEq(this.funcNames[i], name) && this.strEq(this.funcClasses[i], "")) {
-                    int pc = (i < this.funcParamCounts.length) ? this.funcParamCounts[i] : -1;
-                    int dist = -1;
-                    if (pc >= 0) {
-                        dist = pc - nargs;
-                        if (dist < 0) { dist = -dist; }
-                    }
-                    if (bestIdx < 0 || (dist >= 0 && dist <= bestDist)) {
-                        bestIdx = i;
-                        bestDist = dist;
-                    }
+                    s2Matched = i;
+                    s2Count = s2Count + 1;
                 }
             }
-            funcIdx = bestIdx;
+            if (s2Count > 1) {
+                funcIdx = this.selectOverloadIdx(name, "", nargs);
+                if (funcIdx < 0) {
+                    printline("no overload of '" + name + "' takes " + nargs.toString() + " argument(s)");
+                    exit(1);
+                    return;
+                }
+            } else {
+                funcIdx = s2Matched;
+            }
         }
         if (funcIdx < 0) {
             for (int i = 0; i < this.funcNames.length; i++) {
@@ -7185,6 +7262,7 @@ public void genNewCall(Node call) {
             } else {
                 this.asm.callRel32(0);
                 this.forwardCalls.add(this.asm.buf.length - 4);
+                this.forwardCallFuncIdxs.add(funcIdx);
                 this.forwardCallNames.add(name);
                 this.forwardCallClasses.add(lookupClass);
             }
@@ -7413,6 +7491,7 @@ public void genNewCall(Node call) {
             this.asm.callRel32(0);
 
             this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallFuncIdxs.add(-1);
             this.forwardCallNames.add(name);
             this.forwardCallClasses.add("");
         }
@@ -7495,6 +7574,7 @@ public void genNewCall(Node call) {
         } else {
             this.asm.callRel32(0);
             this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallFuncIdxs.add(-1);
             this.forwardCallNames.add(name);
             this.forwardCallClasses.add("MiniAsm");
         }
@@ -8878,10 +8958,21 @@ public void genNewCall(Node call) {
             }
         }
         int funcIdx = -1;
+        // Overload dispatch by argument count (UNIFIED_CORE_LIBRARY.md 7.4
+        // #2): among this class's same-named methods, the LAST declaration
+        // accepting the explicit argument count (explicit = children minus
+        // the receiver). Falls back to the legacy any-class scan only when
+        // the receiver's class offers no declaration at all.
+        int explicitUserArgs = call.childCount() - 1;
+        if (explicitUserArgs < 0) { explicitUserArgs = 0; }
+        bool haveExactClass = false;
         for (int i = 0; i < this.funcNames.length; i++) {
             if (this.strEq(this.funcNames[i], name) && this.typeNameEq(this.funcClasses[i], recvClass)) {
-                funcIdx = i;
+                haveExactClass = true;
             }
+        }
+        if (haveExactClass) {
+            funcIdx = this.selectOverloadIdx(name, recvClass, explicitUserArgs);
         }
         if (funcIdx < 0) {
             for (int i = 0; i < this.funcNames.length; i++) {
@@ -8992,12 +9083,14 @@ public void genNewCall(Node call) {
             } else {
                 this.asm.callRel32(0);
                 this.forwardCalls.add(this.asm.buf.length - 4);
+                this.forwardCallFuncIdxs.add(funcIdx);
                 this.forwardCallNames.add(name);
                 this.forwardCallClasses.add(lookupClass);
             }
         } else {
             this.asm.callRel32(0);
             this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallFuncIdxs.add(-1);
             this.forwardCallNames.add(name);
             this.forwardCallClasses.add(lookupClass);
         }
