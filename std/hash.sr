@@ -25,3 +25,350 @@ public int64 djb2File(string path) {
 public int64 fnv1File(string path) {
     return fnv1(file.readString(path));
 }
+
+// ---------------------------------------------------------------------------
+// SHA-256 / SHA-1 / HMAC — FIPS 180-4 and RFC 2104, pure Silver.
+//
+// Word arithmetic is int64: every SHA-256/SHA-1 word is kept in
+// [0, 0xFFFFFFFF] by masking with & 0xFFFFFFFF after every add/shift/rotate.
+// Because masked words are positive int64 values, Silver's (arithmetic)
+// right shift behaves as a logical right shift on them — no sign-extension
+// hazard — and left shifts are re-masked before the value is used again.
+// Messages ride as int[] byte arrays (one 0..255 value per slot).
+// ---------------------------------------------------------------------------
+
+public string sha256(string data) {
+    return bytesToHex(sha256Core(strToBytes(data)));
+}
+
+public string sha1(string data) {
+    return bytesToHex(sha1Core(strToBytes(data)));
+}
+
+// RFC 2104 HMAC with a 64-byte block. Keys longer than 64 bytes are hashed
+// first (H(key)); the key is then zero-padded to the block size and XORed
+// with ipad (0x36) / opad (0x5C):
+//   HMAC = H(opad_key || H(ipad_key || message))
+public string hmacSha256(string key, string msg) {
+    return hmacHex(key, strToBytes(msg), 0);
+}
+
+public string hmacSha1(string key, string msg) {
+    return hmacHex(key, strToBytes(msg), 1);
+}
+
+int[] strToBytes(string s) {
+    int[] b = [];
+    for (int i = 0; i < s.length; i++) {
+        b.add(s[i] & 0xFF);
+    }
+    return b;
+}
+
+int[] concatBytes(int[] a, int[] b) {
+    int[] out = [];
+    for (int i = 0; i < a.length; i++) {
+        out.add(a[i] & 0xFF);
+    }
+    for (int i = 0; i < b.length; i++) {
+        out.add(b[i] & 0xFF);
+    }
+    return out;
+}
+
+string bytesToHex(int[] bytes) {
+    string hexChars = "0123456789abcdef";
+    string out = "";
+    for (int i = 0; i < bytes.length; i++) {
+        int b = bytes[i] & 0xFF;
+        out += hexChars[(b >> 4) & 0x0F];
+        out += hexChars[b & 0x0F];
+    }
+    return out;
+}
+
+// 32-bit rotate right. x must already be masked into [0, 0xFFFFFFFF] so the
+// right shift is sign-safe; the left shift may set bits above 31, so the
+// result is masked once at the end.
+int64 rotr32(int64 x, int n) {
+    return ((x >> n) | (x << (32 - n))) & 0xFFFFFFFF;
+}
+
+int64 rotl32(int64 x, int n) {
+    return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF;
+}
+
+// Fills one 64-byte compression block from the "virtual" padded message:
+// original bytes, then the 0x80 terminator, zero padding, and finally the
+// big-endian 64-bit message length in bits.
+void fillBlock(int[] blk, int[] msg, int idx, int len, int total, int64 totalBits) {
+    for (int j = 0; j < 64; j++) {
+        int abs = idx + j;
+        int v = 0;
+        if (abs < len) {
+            v = msg[abs] & 0xFF;
+        } elif (abs == len) {
+            v = 0x80;
+        } elif (abs >= total - 8) {
+            int64 sh = 8 * int64(total - 1 - abs);
+            v = int((totalBits >> sh) & 0xFF);
+        }
+        blk[j] = v;
+    }
+}
+
+int[] sha256Core(int[] msg) {
+    int[] h = [];
+    h.add(0x6a09e667);
+    h.add(0xbb67ae85);
+    h.add(0x3c6ef372);
+    h.add(0xa54ff53a);
+    h.add(0x510e527f);
+    h.add(0x9b05688c);
+    h.add(0x1f83d9ab);
+    h.add(0x5be0cd19);
+    int[] k = [];
+    k.add(0x428a2f98);
+    k.add(0x71374491);
+    k.add(0xb5c0fbcf);
+    k.add(0xe9b5dba5);
+    k.add(0x3956c25b);
+    k.add(0x59f111f1);
+    k.add(0x923f82a4);
+    k.add(0xab1c5ed5);
+    k.add(0xd807aa98);
+    k.add(0x12835b01);
+    k.add(0x243185be);
+    k.add(0x550c7dc3);
+    k.add(0x72be5d74);
+    k.add(0x80deb1fe);
+    k.add(0x9bdc06a7);
+    k.add(0xc19bf174);
+    k.add(0xe49b69c1);
+    k.add(0xefbe4786);
+    k.add(0x0fc19dc6);
+    k.add(0x240ca1cc);
+    k.add(0x2de92c6f);
+    k.add(0x4a7484aa);
+    k.add(0x5cb0a9dc);
+    k.add(0x76f988da);
+    k.add(0x983e5152);
+    k.add(0xa831c66d);
+    k.add(0xb00327c8);
+    k.add(0xbf597fc7);
+    k.add(0xc6e00bf3);
+    k.add(0xd5a79147);
+    k.add(0x06ca6351);
+    k.add(0x14292967);
+    k.add(0x27b70a85);
+    k.add(0x2e1b2138);
+    k.add(0x4d2c6dfc);
+    k.add(0x53380d13);
+    k.add(0x650a7354);
+    k.add(0x766a0abb);
+    k.add(0x81c2c92e);
+    k.add(0x92722c85);
+    k.add(0xa2bfe8a1);
+    k.add(0xa81a664b);
+    k.add(0xc24b8b70);
+    k.add(0xc76c51a3);
+    k.add(0xd192e819);
+    k.add(0xd6990624);
+    k.add(0xf40e3585);
+    k.add(0x106aa070);
+    k.add(0x19a4c116);
+    k.add(0x1e376c08);
+    k.add(0x2748774c);
+    k.add(0x34b0bcb5);
+    k.add(0x391c0cb3);
+    k.add(0x4ed8aa4a);
+    k.add(0x5b9cca4f);
+    k.add(0x682e6ff3);
+    k.add(0x748f82ee);
+    k.add(0x78a5636f);
+    k.add(0x84c87814);
+    k.add(0x8cc70208);
+    k.add(0x90befffa);
+    k.add(0xa4506ceb);
+    k.add(0xbef9a3f7);
+    k.add(0xc67178f2);
+    int len = msg.length;
+    int64 totalBits = int64(len) * 8;
+    int pad = 0;
+    while (((len + 1 + pad) % 64) != 56) {
+        pad++;
+    }
+    int total = len + 1 + pad + 8;
+    int[] w = [];
+    int[] blk = [];
+    for (int i = 0; i < 64; i++) {
+        w.add(0);
+        blk.add(0);
+    }
+    int idx = 0;
+    while (idx < total) {
+        fillBlock(blk, msg, idx, len, total, totalBits);
+        for (int t = 0; t < 16; t++) {
+            w[t] = ((blk[t * 4] & 0xFF) << 24) | ((blk[t * 4 + 1] & 0xFF) << 16) | ((blk[t * 4 + 2] & 0xFF) << 8) | (blk[t * 4 + 3] & 0xFF);
+        }
+        for (int t = 16; t < 64; t++) {
+            int64 wm15 = int64(w[t - 15]);
+            int64 wm2 = int64(w[t - 2]);
+            int64 s0 = (rotr32(wm15, 7) ^ rotr32(wm15, 18) ^ ((wm15 >> 3) & 0xFFFFFFFF));
+            int64 s1 = (rotr32(wm2, 17) ^ rotr32(wm2, 19) ^ ((wm2 >> 10) & 0xFFFFFFFF));
+            w[t] = int((int64(w[t - 16]) + s0 + int64(w[t - 7]) + s1) & 0xFFFFFFFF);
+        }
+        int64 a = int64(h[0]);
+        int64 b = int64(h[1]);
+        int64 c = int64(h[2]);
+        int64 d = int64(h[3]);
+        int64 e = int64(h[4]);
+        int64 f = int64(h[5]);
+        int64 g = int64(h[6]);
+        int64 hh = int64(h[7]);
+        for (int t = 0; t < 64; t++) {
+            int64 S1 = (rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25));
+            int64 ch = ((e & f) ^ ((e ^ 0xFFFFFFFF) & g));
+            int64 temp1 = (hh + S1 + ch + int64(k[t]) + int64(w[t])) & 0xFFFFFFFF;
+            int64 S0 = (rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22));
+            int64 maj = ((a & b) ^ (a & c) ^ (b & c));
+            int64 temp2 = (S0 + maj) & 0xFFFFFFFF;
+            hh = g;
+            g = f;
+            f = e;
+            e = (d + temp1) & 0xFFFFFFFF;
+            d = c;
+            c = b;
+            b = a;
+            a = (temp1 + temp2) & 0xFFFFFFFF;
+        }
+        h[0] = int((int64(h[0]) + a) & 0xFFFFFFFF);
+        h[1] = int((int64(h[1]) + b) & 0xFFFFFFFF);
+        h[2] = int((int64(h[2]) + c) & 0xFFFFFFFF);
+        h[3] = int((int64(h[3]) + d) & 0xFFFFFFFF);
+        h[4] = int((int64(h[4]) + e) & 0xFFFFFFFF);
+        h[5] = int((int64(h[5]) + f) & 0xFFFFFFFF);
+        h[6] = int((int64(h[6]) + g) & 0xFFFFFFFF);
+        h[7] = int((int64(h[7]) + hh) & 0xFFFFFFFF);
+        idx += 64;
+    }
+    int[] out = [];
+    for (int i = 0; i < 8; i++) {
+        int64 word = int64(h[i]);
+        out.add(int((word >> 24) & 0xFF));
+        out.add(int((word >> 16) & 0xFF));
+        out.add(int((word >> 8) & 0xFF));
+        out.add(int(word & 0xFF));
+    }
+    return out;
+}
+
+int[] sha1Core(int[] msg) {
+    int[] h = [];
+    h.add(0x67452301);
+    h.add(0xefcdab89);
+    h.add(0x98badcfe);
+    h.add(0x10325476);
+    h.add(0xc3d2e1f0);
+    int len = msg.length;
+    int64 totalBits = int64(len) * 8;
+    int pad = 0;
+    while (((len + 1 + pad) % 64) != 56) {
+        pad++;
+    }
+    int total = len + 1 + pad + 8;
+    int[] w = [];
+    int[] blk = [];
+    for (int i = 0; i < 80; i++) {
+        w.add(0);
+    }
+    for (int i = 0; i < 64; i++) {
+        blk.add(0);
+    }
+    int idx = 0;
+    while (idx < total) {
+        fillBlock(blk, msg, idx, len, total, totalBits);
+        for (int t = 0; t < 16; t++) {
+            w[t] = ((blk[t * 4] & 0xFF) << 24) | ((blk[t * 4 + 1] & 0xFF) << 16) | ((blk[t * 4 + 2] & 0xFF) << 8) | (blk[t * 4 + 3] & 0xFF);
+        }
+        for (int t = 16; t < 80; t++) {
+            int64 x = (int64(w[t - 3]) ^ int64(w[t - 8]) ^ int64(w[t - 14]) ^ int64(w[t - 16]));
+            w[t] = int(rotl32(x, 1));
+        }
+        int64 a = int64(h[0]);
+        int64 b = int64(h[1]);
+        int64 c = int64(h[2]);
+        int64 d = int64(h[3]);
+        int64 e = int64(h[4]);
+        for (int t = 0; t < 80; t++) {
+            int64 f = 0;
+            int64 kk = 0;
+            if (t < 20) {
+                f = ((b & c) | ((b ^ 0xFFFFFFFF) & d));
+                kk = 0x5A827999;
+            } elif (t < 40) {
+                f = (b ^ c ^ d);
+                kk = 0x6ED9EBA1;
+            } elif (t < 60) {
+                f = ((b & c) | (b & d) | (c & d));
+                kk = 0x8F1BBCDC;
+            } else {
+                f = (b ^ c ^ d);
+                kk = 0xCA62C1D6;
+            }
+            int64 temp = (rotl32(a, 5) + f + e + kk + int64(w[t])) & 0xFFFFFFFF;
+            e = d;
+            d = c;
+            c = rotl32(b, 30);
+            b = a;
+            a = temp;
+        }
+        h[0] = int((int64(h[0]) + a) & 0xFFFFFFFF);
+        h[1] = int((int64(h[1]) + b) & 0xFFFFFFFF);
+        h[2] = int((int64(h[2]) + c) & 0xFFFFFFFF);
+        h[3] = int((int64(h[3]) + d) & 0xFFFFFFFF);
+        h[4] = int((int64(h[4]) + e) & 0xFFFFFFFF);
+        idx += 64;
+    }
+    int[] out = [];
+    for (int i = 0; i < 5; i++) {
+        int64 word = int64(h[i]);
+        out.add(int((word >> 24) & 0xFF));
+        out.add(int((word >> 16) & 0xFF));
+        out.add(int((word >> 8) & 0xFF));
+        out.add(int(word & 0xFF));
+    }
+    return out;
+}
+
+string hmacHex(string key, int[] msgBytes, int algo) {
+    int[] k = strToBytes(key);
+    if (algo == 0) {
+        if (k.length > 64) {
+            k = sha256Core(k);
+        }
+    } else {
+        if (k.length > 64) {
+            k = sha1Core(k);
+        }
+    }
+    int[] ipad = [];
+    int[] opad = [];
+    for (int i = 0; i < 64; i++) {
+        int kb = 0;
+        if (i < k.length) {
+            kb = k[i] & 0xFF;
+        }
+        ipad.add(kb ^ 0x36);
+        opad.add(kb ^ 0x5C);
+    }
+    int[] outerDig = [];
+    if (algo == 0) {
+        int[] innerDig = sha256Core(concatBytes(ipad, msgBytes));
+        outerDig = sha256Core(concatBytes(opad, innerDig));
+    } else {
+        int[] innerDig = sha1Core(concatBytes(ipad, msgBytes));
+        outerDig = sha1Core(concatBytes(opad, innerDig));
+    }
+    return bytesToHex(outerDig);
+}
