@@ -534,6 +534,16 @@ class Parser {
         // function: allowed for zero-arg calls only (the stored address is
         // called, arguments cannot be passed).
         if (this.anonWalkDepth == 0 && call.childCount() == 0 && this.fnPtrCallScopeHas(name)) { return; }
+        // Dotted names (dotted-new attempts, UNIFIED_CORE_LIBRARY.md 7.4 #8)
+        // are never free functions of this pass — in anonymous bodies too:
+        // codegen resolves them through the module namespace or reports
+        // `Unknown type '<name>'`, matching the reference compiler for known
+        // and unknown modules.
+        bool callNameHasDot = false;
+        for (int d = 0; d < name.length; d++) {
+            if (name[d] == '.') { callNameHasDot = true; break; }
+        }
+        if (callNameHasDot) { return; }
         if (this.anonWalkDepth > 0) {
             // DOCS/259 -- inside an isolated anonymous body an unresolved
             // call is reported with the reference checker's wording.
@@ -2678,6 +2688,16 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             ctor.name = this.advance().text;
             ctor.line = t.line;
             ctor.col = t.col;
+            // Dotted-new (UNIFIED_CORE_LIBRARY.md 7.4 #8): a qualified class
+            // name `new mod.Class(args)` — any chain depth, the last segment
+            // is the class. Joined into a single dotted call name; codegen
+            // resolves it through the module's flattened namespace. Each
+            // segment must be an identifier (parse error otherwise, matching
+            // the reference compiler's ExpectedToken("identifier")).
+            while (this.check(108)) {
+                this.advance();
+                ctor.name = ctor.name + "." + this.expect(7).text;
+            }
             if (this.check(104)) {
                 // new T[n]: native array allocation.  A zero/omitted size
                 // produces an empty array; a positive constant size produces

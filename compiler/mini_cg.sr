@@ -147,6 +147,11 @@ class MiniCg {
     // parameter slot's stored address.
     public prop string[] fnPtrParamNames;
 
+    // UNIFIED_CORE_LIBRARY.md 7.4 #8 -- source-module names seen in
+    // `import * from X;` / `import { n } from X;` statements. Dotted-new
+    // (`new mod.Class(...)`) resolves through these.
+    public prop string[] userModuleNames;
+
     // Optional codegen progress reporter: when non-null the driver calls
     // codegenTick after each function body is generated so long compiles
     // show movement.
@@ -253,6 +258,7 @@ class MiniCg {
         this.anonRelocLabelIds = [];
         this.anonRelocPatchOffsets = [];
         this.fnPtrParamNames = [];
+        this.userModuleNames = [];
     }
 
     public void collectClassLayouts(Node[] program) {
@@ -411,6 +417,86 @@ class MiniCg {
         if (this.strEq(t, "")) { return false; }
         for (int i = 0; i < this.classNames.length; i++) {
             if (this.strEq(this.classNames[i], t)) { return true; }
+        }
+        return false;
+    }
+
+    // True when `name` starts with `<module>.` for a known user module
+    // (UNIFIED_CORE_LIBRARY.md 7.4 #8). The module part compares
+    // case-insensitively, mirroring the Rust compiler's has_user_module
+    // (import site and call site may differ in casing).
+    public bool isUserModulePrefix(string name) {
+        for (int i = 0; i < this.userModuleNames.length; i++) {
+            string m = this.userModuleNames[i];
+            if (name.length <= m.length) { continue; }
+            if (name[m.length] != '.') { continue; }
+            if (this.strEqIgnoreCase(projectSlice(name, 0, m.length), m)) { return true; }
+        }
+        return false;
+    }
+
+    // Dotted-new resolution: project modules are flattened into one
+    // namespace, so `new mod.Class(args)` denotes the class `Class`
+    // exported by module `mod`. Any chain depth resolves through its last
+    // segment: the module part is the longest known module prefix, the
+    // class is the rest. Returns "" for bare names and unknown dotted
+    // names (bare paths are completely unchanged).
+    public string dottedNewClassName(string name) {
+        if (!this.isUserModulePrefix(name)) { return ""; }
+        string[] segs = [];
+        string cur = "";
+        for (int i = 0; i < name.length; i++) {
+            if (name[i] == '.') { segs.add(cur); cur = ""; }
+            else { cur = cur + name[i]; }
+        }
+        segs.add(cur);
+        if (segs.length < 2) { return ""; }
+        for (int k = segs.length - 1; k >= 1; k = k - 1) {
+            string module = "";
+            for (int a = 0; a < k; a++) {
+                if (a > 0) { module = module + "."; }
+                module = module + segs[a];
+            }
+            string cls = "";
+            for (int b = k; b < segs.length; b++) {
+                if (b > k) { cls = cls + "."; }
+                cls = cls + segs[b];
+            }
+            if (this.hasUserModuleName(module) && this.isClassName(cls)) {
+                return cls;
+            }
+        }
+        return "";
+    }
+
+    public bool hasUserModuleName(string name) {
+        for (int i = 0; i < this.userModuleNames.length; i++) {
+            if (this.strEqIgnoreCase(this.userModuleNames[i], name)) { return true; }
+        }
+        return false;
+    }
+
+    // ASCII case-insensitive equality (mirrors the Rust compiler's
+    // eq_ignore_ascii_case).
+    private bool strEqIgnoreCase(string a, string b) {
+        if (a.length != b.length) { return false; }
+        for (int i = 0; i < a.length; i++) {
+            char ca = a[i];
+            char cb = b[i];
+            if (ca >= 'A' && ca <= 'Z') { ca = char(ca + 32); }
+            if (cb >= 'A' && cb <= 'Z') { cb = char(cb + 32); }
+            if (ca != cb) { return false; }
+        }
+        return true;
+    }
+
+    // Built-in stdlib module names never carry user Silver classes, so they
+    // are not user modules (mirrors the Rust compiler's STDLIB_MODULES
+    // exclusion in user-module registration).
+    private bool isStdlibModuleName(string name) {
+        string[] stdlibModules = ["math", "fs", "file", "folder", "json", "http", "llmai", "LLMAI", "env", "url", "hash", "path", "keyboard", "mouse", "bom", "binary_metadata", "process", "console", "gui", "registry", "os"];
+        for (int i = 0; i < stdlibModules.length; i++) {
+            if (this.strEq(stdlibModules[i], name)) { return true; }
         }
         return false;
     }
@@ -1131,6 +1217,20 @@ int strIdx = this.stringPatchIndices[i];
                 // no-op source-module marker). Registered, not treated as an
                 // enum.
                 this.registerWin32Import(pi);
+                // UNIFIED_CORE_LIBRARY.md 7.4 #8: source-module imports are
+                // remembered so dotted-new `new mod.Class(...)` resolves
+                // through the module's flattened namespace. Native win32
+                // sources carry no Silver classes, and neither do the
+                // built-in stdlib modules (STDLIB_MODULES), so neither kind
+                // becomes a user module — mirroring the Rust compiler.
+                string src = pi.typeHint;
+                bool srcIsWin32 = this.strEq(src, "win32");
+                if (!srcIsWin32 && src.length > 6) {
+                    if (this.strEq(projectSlice(src, 0, 6), "win32.")) { srcIsWin32 = true; }
+                }
+                if (!srcIsWin32 && src.length > 0 && !this.isStdlibModuleName(src)) {
+                    this.userModuleNames.add(src);
+                }
             } elif (pi.kind == 105) {
                 this.enumNames.add(pi.name);
                 for (int j = 0; j < pi.childCount(); j++) {
@@ -3593,6 +3693,11 @@ int strIdx = this.stringPatchIndices[i];
             // type so `new X(...).field` (and .method()) can resolve the field
             // on the result instead of leaving it as an unknown type.
             if (!expr.isMember) {
+                // Dotted-new (UNIFIED_CORE_LIBRARY.md 7.4 #8): `new mod.Class`
+                // infers the flattened class `Class` so var declarations type
+                // through it, mirroring rs resolve_new_class_name.
+                string dotted = this.dottedNewClassName(cname);
+                if (dotted.length > 0 && this.isClassName(dotted)) { return dotted; }
                 for (int ci = 0; ci < this.classNames.length; ci++) {
                     if (this.strEq(this.classNames[ci], cname)) {
                         return cname;
@@ -5482,6 +5587,21 @@ int strIdx = this.stringPatchIndices[i];
         if (!call.isMember && call.childCount() == 0 && this.isFnPtrParam(name)) {
             this.genFnPtrCall(name);
             return;
+        }
+        // Dotted-new (UNIFIED_CORE_LIBRARY.md 7.4 #8): `new mod.Class(...)`
+        // parses as a non-member call whose name carries the dotted class
+        // path. It resolves through the module's flattened namespace and
+        // then lowers exactly like bare `new FlattenedName(...)`; unknown
+        // module or class is a compile error naming the full dotted form.
+        if (!call.isMember && name.contains(".")) {
+            string resolved = this.dottedNewClassName(name);
+            if (resolved.length > 0) {
+                call.name = resolved;
+                name = resolved;
+            } else {
+                printline(call.line.toString() + ":" + call.col.toString() + ": Unknown type '" + call.name + "'");
+                exit(1);
+            }
         }
         int isClass = 0;
         for (int i = 0; i < this.classNames.length; i++) {
@@ -9794,6 +9914,14 @@ public void genNewCall(Node call) {
             if (rhs.kind == 10 && !rhs.isMember && this.isClassName(rhs.name)) {
                 if (off != 0 && !this.isClassName(assignCurT)) {
                     this.setLocalType(lhs.name, rhs.name);
+                }
+            } elif (rhs.kind == 10 && !rhs.isMember) {
+                // Dotted-new assign: register the flattened class the same
+                // way bare `v = new C()` does above (UNIFIED_CORE_LIBRARY.md
+                // 7.4 #8).
+                string dottedCls = this.dottedNewClassName(rhs.name);
+                if (dottedCls.length > 0 && off != 0 && !this.isClassName(assignCurT)) {
+                    this.setLocalType(lhs.name, dottedCls);
                 }
             } elif (off != 0 && !this.isClassName(assignCurT)) {
                 string rhsClass = this.findClassForExpr(rhs);
