@@ -9127,6 +9127,104 @@ public void genNewCall(Node call) {
                 // `this.field += x` (parity with silverc-rs).
                 fieldOff = this.findFieldOffset(this.currentClassName, lhs.name);
             }
+            if (op == 14 && fieldOff >= 0) {
+                string bfT = this.findFieldType(this.currentClassName, lhs.name);
+                if (this.strEq(bfT, "string")) {
+                    // Bare string field `s += x`: the getLocalType string
+                    // check below only sees locals/globals, so the generic
+                    // path would integer-add heap pointers and fault on the
+                    // next use. Build a synthetic this.field lhs and run the
+                    // concat machinery (mirrors silverc-rs bare-field string
+                    // dispatch). The old buffer is not freed — same ownership
+                    // as string-local +=.
+                    Node synthMember = new Node();
+                    synthMember.kind = 13;
+                    synthMember.name = lhs.name;
+                    Node thisNode = new Node();
+                    thisNode.kind = 6;
+                    thisNode.name = "this";
+                    synthMember.children = [thisNode];
+                    Node concatBin = new Node();
+                    concatBin.children = [synthMember, rhs];
+                    this.genStringConcat(concatBin);
+                    int thisOff = this.findLocal("this");
+                    if (thisOff != 0) {
+                        this.asm.pushR64(0);
+                        this.asm.movRMBase(0, 5, thisOff);
+                        this.asm.addRI32(0, fieldOff);
+                        this.asm.popR64(1);
+                        this.asm.movMBaseR(0, 1, 0);
+                    } else {
+                        this.asm.movMBaseR(5, 0, 0);
+                    }
+                    return;
+                }
+            }
+            // Float LHS (local, bare field, or global): these hold IEEE-754
+            // bit patterns; the integer ops below corrupt them (1.0 + 0.5 as
+            // a bit add is garbage). Route through the SSE path — the same
+            // XMM sequence as genFloatBinary (mirrors silverc-rs float
+            // compound-assign dispatch).
+            string lhsT = this.getLocalType(lhs.name);
+            bool lhsFloat = this.strEq(lhsT, "float") || this.strEq(lhsT, "float64") || this.strEq(lhsT, "double");
+            if (!lhsFloat && fieldOff >= 0) {
+                string ffT = this.findFieldType(this.currentClassName, lhs.name);
+                lhsFloat = this.strEq(ffT, "float") || this.strEq(ffT, "float64") || this.strEq(ffT, "double");
+            }
+            if (lhsFloat && (op == 14 || op == 15 || op == 16 || op == 17)) {
+                if (off != 0) { this.asm.movRMBase(0, 5, off); }
+                elif (gi >= 0) { this.genGlobalLoad(gi); }
+                elif (fieldOff >= 0) {
+                    int thisOff = this.findLocal("this");
+                    if (thisOff != 0) {
+                        this.asm.movRMBase(0, 5, thisOff);
+                        this.asm.movRMBase(0, 0, fieldOff);
+                    } else {
+                        this.asm.xorRR64(0, 0);
+                    }
+                }
+                if (this.isRefParam(lhs.name)) { this.asm.movRMBase(0, 0, 0); }
+                int bitsOff = this.allocLocal("__fassign_lhs");
+                this.asm.movMBaseR(5, 0, bitsOff);
+                this.genExpr(rhs);
+                this.asm.movRR64(1, 0);
+                this.asm.movRMBase(0, 5, bitsOff);
+                this.emitMovqXmmGpr(0, 0);
+                if (this.isFloatLike(rhs)) {
+                    this.emitMovqXmmGpr(1, 1);
+                } else {
+                    this.emitCvtsi2sdXmmGpr(1, 1);
+                }
+                if (op == 14) { this.asm.addsdXMM(0, 1); }
+                elif (op == 15) { this.asm.subsdXMM(0, 1); }
+                elif (op == 16) { this.asm.mulsdXMM(0, 1); }
+                elif (op == 17) { this.asm.divsdXMM(0, 1); }
+                this.asm.movqR64XMM(0, 0);
+                if (off != 0) {
+                    if (this.isRefParam(lhs.name)) {
+                        this.asm.pushR64(0);
+                        this.asm.movRMBase(0, 5, off);
+                        this.asm.popR64(1);
+                        this.asm.movMBaseR(0, 1, 0);
+                    } else {
+                        this.asm.movMBaseR(5, 0, off);
+                    }
+                }
+                elif (gi >= 0) { this.genGlobalStore(gi); }
+                elif (fieldOff >= 0) {
+                    int thisOff = this.findLocal("this");
+                    if (thisOff != 0) {
+                        this.asm.pushR64(0);
+                        this.asm.movRMBase(0, 5, thisOff);
+                        this.asm.addRI32(0, fieldOff);
+                        this.asm.popR64(1);
+                        this.asm.movMBaseR(0, 1, 0);
+                    } else {
+                        this.asm.movMBaseR(5, 0, 0);
+                    }
+                }
+                return;
+            }
             if (op == 14) {
                 string lt = this.getLocalType(lhs.name);
                 if (this.strEq(lt, "string")) {
@@ -9308,6 +9406,49 @@ public void genNewCall(Node call) {
                 int thisOff = this.findLocal("this");
                 int fieldOff = this.findFieldOffset(this.currentClassName, fieldName);
                 if (fieldOff < 0) { this.genExpr(rhs); return; }
+                string fT = this.findFieldType(this.currentClassName, fieldName);
+                if ((this.strEq(fT, "float") || this.strEq(fT, "float64") || this.strEq(fT, "double"))
+                    && (op == 14 || op == 15 || op == 16 || op == 17)) {
+                    // Float field compound-assign: the field holds IEEE-754
+                    // bits; the integer ops below corrupt them. Run the same
+                    // XMM sequence as genFloatBinary on this+fieldOff
+                    // (mirrors silverc-rs MemberAccess float dispatch).
+                    int bitsOff = this.allocLocal("__fassign_lhs");
+                    this.asm.movRMBase(0, 5, thisOff);
+                    this.asm.movRMBase(0, 0, fieldOff);
+                    this.asm.movMBaseR(5, 0, bitsOff);
+                    this.genExpr(rhs);
+                    this.asm.movRR64(1, 0);
+                    this.asm.movRMBase(0, 5, bitsOff);
+                    this.emitMovqXmmGpr(0, 0);
+                    if (this.isFloatLike(rhs)) {
+                        this.emitMovqXmmGpr(1, 1);
+                    } else {
+                        this.emitCvtsi2sdXmmGpr(1, 1);
+                    }
+                    if (op == 14) { this.asm.addsdXMM(0, 1); }
+                    elif (op == 15) { this.asm.subsdXMM(0, 1); }
+                    elif (op == 16) { this.asm.mulsdXMM(0, 1); }
+                    elif (op == 17) { this.asm.divsdXMM(0, 1); }
+                    this.asm.movqR64XMM(0, 0);
+                    this.asm.movRMBase(10, 5, thisOff);
+                    this.asm.addRI32(10, fieldOff);
+                    this.asm.movMBaseR(10, 0, 0);
+                    return;
+                }
+                if (this.strEq(fT, "string") && op == 14) {
+                    // String field compound-assign: integer-add would combine
+                    // heap pointers and fault on next use. Run the concat
+                    // machinery (fresh buffer in rax) with the this.field lhs
+                    // node, then store back through this+fieldOff. The old
+                    // buffer is not freed — same ownership as string-local
+                    // += and plain field assignment (mirrors silverc-rs).
+                    this.genStringConcat(bin);
+                    this.asm.movRMBase(10, 5, thisOff);
+                    this.asm.addRI32(10, fieldOff);
+                    this.asm.movMBaseR(10, 0, 0);
+                    return;
+                }
                 this.asm.movRMBase(0, 5, thisOff);
                 this.asm.movRMBase(0, 0, fieldOff);
                 this.asm.pushR64(0);
@@ -9347,6 +9488,68 @@ public void genNewCall(Node call) {
                 int fieldOff = this.findFieldOffset(lookupType, fieldName);
                 if (fieldOff < 0) {
                     fieldOff = this.findFieldOffsetInAllClasses(fieldName);
+                }
+                string varFieldT = this.findFieldType(lookupType, fieldName);
+                if ((this.strEq(varFieldT, "float") || this.strEq(varFieldT, "float64") || this.strEq(varFieldT, "double"))
+                    && (op == 14 || op == 15 || op == 16 || op == 17)
+                    && fieldOff >= 0 && (off != 0 || gi >= 0)) {
+                    // Float field compound-assign through a variable
+                    // receiver: the field holds IEEE-754 bits; the integer
+                    // ops below corrupt them. Spill the receiver (rax is
+                    // scratch across genExpr), load the double bits, run the
+                    // same XMM sequence as genFloatBinary, store the bits
+                    // back through the spilled receiver (mirrors
+                    // silverc-rs).
+                    int objOff = this.allocLocal("__fassign_obj");
+                    int bitsOff = this.allocLocal("__fassign_lhs");
+                    if (off != 0) {
+                        this.asm.movRMBase(0, 5, off);
+                    } else {
+                        this.genGlobalLoad(gi);
+                    }
+                    this.asm.movMBaseR(5, 0, objOff);
+                    this.asm.movRMBase(0, 0, fieldOff);
+                    this.asm.movMBaseR(5, 0, bitsOff);
+                    this.genExpr(rhs);
+                    this.asm.movRR64(1, 0);
+                    this.asm.movRMBase(0, 5, bitsOff);
+                    this.emitMovqXmmGpr(0, 0);
+                    if (this.isFloatLike(rhs)) {
+                        this.emitMovqXmmGpr(1, 1);
+                    } else {
+                        this.emitCvtsi2sdXmmGpr(1, 1);
+                    }
+                    if (op == 14) { this.asm.addsdXMM(0, 1); }
+                    elif (op == 15) { this.asm.subsdXMM(0, 1); }
+                    elif (op == 16) { this.asm.mulsdXMM(0, 1); }
+                    elif (op == 17) { this.asm.divsdXMM(0, 1); }
+                    this.asm.movqR64XMM(0, 0);
+                    this.asm.movRMBase(11, 5, objOff);
+                    this.asm.addRI32(11, fieldOff);
+                    this.asm.movMBaseR(11, 0, 0);
+                    return;
+                }
+                if (this.strEq(varFieldT, "string") && op == 14
+                    && fieldOff >= 0 && (off != 0 || gi >= 0)) {
+                    // String field compound-assign through a variable
+                    // receiver: integer-add would combine heap pointers and
+                    // fault on next use. Spill the receiver, run the concat
+                    // machinery (fresh heap buffer in rax), then store back
+                    // through the spilled receiver + fieldOff. The old
+                    // buffer is not freed — same ownership as string-local
+                    // += and plain field assignment (mirrors silverc-rs).
+                    int objOff = this.allocLocal("__strassign_obj");
+                    if (off != 0) {
+                        this.asm.movRMBase(0, 5, off);
+                    } else {
+                        this.genGlobalLoad(gi);
+                    }
+                    this.asm.movMBaseR(5, 0, objOff);
+                    this.genStringConcat(bin);
+                    this.asm.movRMBase(11, 5, objOff);
+                    this.asm.addRI32(11, fieldOff);
+                    this.asm.movMBaseR(11, 0, 0);
+                    return;
                 }
                 if (fieldOff >= 0 && (off != 0 || gi >= 0)) {
                     if (off != 0) {
