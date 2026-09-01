@@ -1,5 +1,56 @@
 mod export headers;
 
+// UNIFIED_CORE_LIBRARY.md §7.4 item 15 -- uninitialized-kvp latent-bug fix.
+//
+// PRE-FIX STATE (probed 2026-09, fresh -o builds on both compilers): the file
+// COMPILED everywhere (`kvp<string, string[]>` parses on both) but the
+// multimap's single field `private kvp<string, string[]> data;` was NEVER
+// initialized (construct() was empty), so every touch of it was undefined.
+// silverc-rs silently swallowed the early reads (get/has on the fresh field
+// returned null/"") and then access-violated 0xC0000005 as soon as the
+// multimap was used further (second get / getAll / serialize -- the kvp is
+// garbage, not an object); the self-hosted compiler access-violated
+// 0xC0000005 on the FIRST touching operation (set or has). There was no
+// working pre-fix behavior to preserve beyond the API surface.
+//
+// FIX (the established std-split idiom, probed working on both compilers):
+// the map-like field is replaced by two parallel `= []`-initialized string[]
+// arrays -- std/http_server.sr's local headermap (which was written to get
+// AWAY from this multimap), std/mongo.sr's doc and std/sql.sr's row all use
+// the same shape. Each (key, value) pair is one entry; a key added N times
+// appears N times. Keys are stored lowered (name.toLower()), exactly like
+// the pre-split set/add/get paths lowercased before touching the kvp.
+//
+// API PRESERVATION (every public name/arity/return of the pre-split file,
+// unchanged): class header -- public name/value fields, construct(string,
+// string); class multimap -- construct(), get(string) -> string (first value
+// for the name, "" when absent), getAll(string) -> string[] (ALL values for
+// the name in insertion order, null when absent -- the pre-split
+// delegation's kvp.get contract, which the pre-split code itself null-
+// checked), has(string) -> bool, set(string, string) (replaces any existing
+// entry with the single new value), add(string, string) (appends one more
+// value for the name), remove(string), serialize() -> string; free function
+// parse(string) -> multimap. get/add/serialize output is byte-identical to
+// the pre-split formulas (first value; one "Cap: value\r\n" line per value
+// with the first letter of the lowered key capitalized).
+//
+// LANDMINES SHAPING THE BODIES (all probed, see the sibling modules): the
+// serialize() string ternary is gone (string ternaries are landmined on the
+// self-host -- the reason http_server.sr re-typed its own serializer); the
+// `.length` PROPERTY form everywhere (the `.length()` CALL form reads
+// garbage on the self-host); substr only in the dual-correct forms
+// substr(0, n) and single-argument tails; string fields copied to locals
+// before concatenation.
+//
+// DISPATCH (probed): `headers` is builtin-reserved on NEITHER compiler --
+// silverc-rs's builtin_modules_set (src/main.rs:81 lists fs/json/yaml/env/
+// url/hash/path/bom/console/math/http only) and the self-hosted compiler's
+// visBuiltinModule both exclude it. Both compilers resolve
+// `import * from headers;` as an ORDINARY SOURCE module from disk
+// (std\headers.sr candidates); the module is also excluded from the
+// compiler's own aggregate build (silverc.srp). No native dispatch exists,
+// so there is no per-compiler call interception to preserve.
+
 class header {
     public string name;
     public string value;
@@ -8,53 +59,98 @@ class header {
 }
 
 class multimap {
-    private kvp<string, string[]> data;
+    // Pre-split `private kvp<string, string[]> data;` -- uninitialized, and
+    // the generic does not even have a working runtime on either compiler.
+    // Parallel arrays instead (see the header); one entry per (key, value).
+    private string[] keys;
+    private string[] vals;
 
-    construct() { }
-
-    public string get(string name) {
-        string[] vals = this.data.get(name.toLower());
-        if (vals == null || vals.length() == 0) { return ""; }
-        return vals[0];
+    construct() {
+        this.keys = [];
+        this.vals = [];
     }
 
+    // The first value stored under `name`, "" when absent (pre-split
+    // contract: the pre-split get() returned vals[0] or "").
+    public string get(string name) {
+        string key = name.toLower();
+        for (int i = 0; i < this.keys.length; i++) {
+            if (this.keys[i] == key) { return this.vals[i]; }
+        }
+        return "";
+    }
+
+    // Every value stored under `name`, in insertion order; null when the
+    // name is absent (the pre-split delegation returned the kvp's stored
+    // list, which was null for absent names -- the pre-split code
+    // null-checked the result, so the contract is preserved).
     public string[] getAll(string name) {
-        return this.data.get(name.toLower());
+        string key = name.toLower();
+        string[] out = [];
+        for (int i = 0; i < this.keys.length; i++) {
+            if (this.keys[i] == key) { out.push(this.vals[i]); }
+        }
+        if (out.length == 0) { return null; }
+        return out;
     }
 
     public bool has(string name) {
-        return this.data.get(name.toLower()) != null;
-    }
-
-    public void set(string name, string value) {
-        string[] vals = [value];
-        this.data.set(name.toLower(), vals);
-    }
-
-    public void add(string name, string value) {
-        string[] existing = this.data.get(name.toLower());
-        if (existing == null) {
-            this.set(name, value);
-        } else {
-            existing.push(value);
+        string key = name.toLower();
+        for (int i = 0; i < this.keys.length; i++) {
+            if (this.keys[i] == key) { return true; }
         }
+        return false;
+    }
+
+    // Replaces every entry for (the lowered) name with the single value --
+    // the pre-split set() semantics (kvp.set stored a fresh one-element
+    // list, discarding prior values).
+    public void set(string name, string value) {
+        string key = name.toLower();
+        this.removeKey(key);
+        this.keys.push(key);
+        this.vals.push(value);
+    }
+
+    // Appends one more value for name (pre-split add(): existing list got a
+    // push, or set() on a fresh name). get() keeps returning the first
+    // inserted value; serialize() emits every value.
+    public void add(string name, string value) {
+        this.keys.push(name.toLower());
+        this.vals.push(value);
     }
 
     public void remove(string name) {
-        this.data.remove(name.toLower());
+        this.removeKey(name.toLower());
     }
 
+    private void removeKey(string key) {
+        string[] keepKeys = [];
+        string[] keepVals = [];
+        for (int i = 0; i < this.keys.length; i++) {
+            if (this.keys[i] != key) {
+                keepKeys.push(this.keys[i]);
+                keepVals.push(this.vals[i]);
+            }
+        }
+        this.keys = keepKeys;
+        this.vals = keepVals;
+    }
+
+    // The pre-split serialize format, preserved verbatim minus its string
+    // ternary and `.length()` call forms: one "Name: value\r\n" line per
+    // entry, in insertion order, with the first letter of the lowered key
+    // capitalized; an empty key emits ": value\r\n".
     public string serialize() {
         string result = "";
-        string[] keys = this.data.keys();
-        for (int ki = 0; ki < keys.length(); ki++) {
-            string key = keys[ki];
-            string[] vals = this.data.get(key);
-            for (int vi = 0; vi < vals.length(); vi++) {
-                string v = vals[vi];
-                string cap = key.length() > 0 ? key.substr(0, 1).toUpper() + key.substr(1) : key;
-                result += cap + ": " + v + "\r\n";
+        for (int i = 0; i < this.keys.length; i++) {
+            string key = this.keys[i];
+            string val = this.vals[i];
+            string cap = key;
+            if (key.length > 0) {
+                cap = key.substr(0, 1).toUpper() + key.substr(1);
             }
+            result += cap + ": " + val + "\r\n";
         }
         return result;
     }
@@ -63,9 +159,9 @@ class multimap {
 public multimap parse(string raw) {
     multimap m = new multimap();
     string[] lines = raw.split("\r\n");
-    for (int li = 0; li < lines.length(); li++) {
+    for (int li = 0; li < lines.length; li++) {
         string line = lines[li];
-        if (line.trim().length() == 0) { continue; }
+        if (line.trim().length == 0) { continue; }
         int colon = line.indexOf(":");
         if (colon < 0) { continue; }
         string name = line.substr(0, colon).trim();

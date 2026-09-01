@@ -1,17 +1,147 @@
 mod export sqlite;
 
+// UNIFIED_CORE_LIBRARY.md §7.4 item 15 -- audit verdict: `sqlite` is a PURE
+// SILVER, DEAD-STUB module with NO SQLite bridge, exactly like the
+// exception/graphql/project/system_tray no-backend precedent. The stale
+// SQLite3Exec call is removed; nothing was invented in its place (a real
+// SQLite bridge means either sqlite3.dll FFI or the SQLite file format --
+// neither exists in either compiler today; that is a separate feature
+// ticket).
+//
+// PRE-FIX STATE (probed 2026-09, fresh -o builds on both compilers): the
+// file NEVER COMPILED anywhere --
+// - Parse blocker (BOTH compilers): `public void transaction(void
+//   callback())` declared the callback parameter in the C-style spelling,
+//   which no compiler accepts (catalog landmine #13; the graphql.sr
+//   precedent). silverc-rs: "48:42: Expected 'type' but found
+//   'LeftParen'"; self-host: "Parse error at line 48, column 42: expected
+//   { but found (". One line ported to the DOCS/259 zero-arg spelling
+//   `void () callback`; name and arity preserved.
+// - Ungrantable call (dead text): connection.execute() called
+//   `SQLite3Exec(this.path, sql)` with NO win32 import anywhere in the
+//   file and no DLL module in either compiler's table exporting that name
+//   (win32.rs's table is kernel32/user32/ws2_32/winhttp/wininet/msvcrt/
+//   advapi32/shell32/version/registry -- the SQLite3* API lives in
+//   sqlite3.dll, which is not bridged). Had the file compiled, silverc-rs
+//   would have warned "unresolved call(s) trap at runtime: SQLite3Exec"
+//   (the sql.sr SQLExecDirect precedent) and the self-host would have
+//   emitted a silent unresolved slot -- 0xC0000005 at the first execute().
+//   The call is REMOVED; execute() is now a documented no-op. The
+//   pre-split (path, sql) argument shape matched no real API signature
+//   either (sqlite3_exec takes a db handle, not a file path) -- the same
+//   cargo-cult dead text sql.sr's SQLExecDirect was.
+// - Uninitialized-kvp row (this ticket's shape): `private kvp<string,
+//   string> data;` was never initialized (empty construct); probed via the
+//   identical shapes in std/headers.sr and std/csv.sr -- silverc-rs
+//   silently swallows set() and get() returns null, the self-host
+//   access-violates 0xC0000005 on the first touch. No row instance was
+//   ever reachable anyway (result.rows was never populated and is
+//   private), so get() was unreachable dead text.
+// - result: `private row[] rows;` was declared without an initializer and
+//   never assigned -- a latent null-deref had anything ever touched it.
+// - statement.execute(object[] params) dropped `params` on the floor
+//   (called this.conn.execute(this.sql) without them) -- preserved as
+//   carried-unused, the sql.sr overload posture.
+//
+// HONESTY BOUNDARY: there is NO SQLite wire protocol, NO file-format
+// reader, and NO DLL bridge here. open() wraps the path in a connection
+// (the pre-split shape); execute() is a silent no-op; query() returns an
+// empty result (rows stay empty -- there is no row framing to fill them
+// with, so hasNext-less result.get is unreachable by construction);
+// transaction() runs BEGIN/COMMIT execute() calls around the callback --
+// i.e. two no-ops around the callback, which still runs (the callback
+// side-effect contract is preserved). close() is the pre-split no-op.
+// Against a real SQLite file nothing happens and nothing crashes.
+//
+// FIX IDIOM (this ticket): row's storage is now two parallel `= []`-
+// initialized string[] arrays (std/sql.sr row / std/mongo.sr doc
+// precedent), with ADDITIVE set()/has() (documented, the mongo.sr
+// posture) so the class is not dead weight for a future bridge; result's
+// rows field is `= []`-initialized in construct().
+//
+// API PRESERVATION (every public name/arity of the pre-split file,
+// unchanged): class row -- construct(), get(string) -> string; class
+// result -- construct(); class statement -- construct(string, connection),
+// execute(object[]); class connection -- construct(string), execute(string),
+// query(string) -> result, prepare(string) -> statement,
+// transaction(void () callback), close(); free function open(string) ->
+// connection. ADDITIVE (documented): row.set(string, string),
+// row.has(string). The transaction fn-parameter is the ONE retype forced
+// by the parse blocker (C-style fn-params are unparseable on both
+// compilers -- the graphql.sr precedent); it is zero-arg, so handlers
+// needing payload must reach it through outer scope/module state the same
+// way graphql/http_server handlers do.
+//
+// DISPATCH (probed): `sqlite` is builtin-reserved on NEITHER compiler --
+// silverc-rs's builtin_modules_set (src/main.rs:81 lists fs/json/yaml/env/
+// url/hash/path/bom/console/math/http only) and the self-hosted compiler's
+// visBuiltinModule both exclude it, and the module is excluded from the
+// compiler's own aggregate build (silverc.srp). Both compilers resolve
+// `import * from sqlite;` as an ORDINARY SOURCE module from disk; no
+// native dispatch exists, so there is no per-compiler call interception
+// to preserve.
+
 class row {
-    private kvp<string, string> data;
+    // Pre-split `private kvp<string, string> data;` -- uninitialized dead
+    // text (rs swallowed writes, sh would AV on first touch). Parallel
+    // arrays instead (sql.sr row / mongo.sr doc precedent); initialized in
+    // construct so the first set() cannot hit the uninitialized-kvp AV.
+    private string[] names;
+    private string[] values;
 
-    construct() { }
+    construct() {
+        this.names = [];
+        this.values = [];
+    }
 
-    public string get(string name) { return this.data.get(name); }
+    // ADDITIVE (documented, the mongo.sr doc posture): without a setter the
+    // pre-split row could only read an uninitialized map; set() + has()
+    // make get() meaningful for a future bridge.
+    public void set(string name, string value) {
+        for (int i = 0; i < this.names.length; i++) {
+            if (this.names[i] == name) {
+                this.values[i] = value;
+                return;
+            }
+        }
+        this.names.push(name);
+        this.values.push(value);
+    }
+
+    // The pre-split API: the value stored under `name`, or null when
+    // absent (the kvp.get contract the pre-split body targeted -- sql.sr
+    // row keeps the same contract). On this build rows are never populated
+    // (no bridge exists), so every get() returns null; the parallel-array
+    // implementation exists so a future bridge can fill rows without an
+    // API change.
+    public string get(string name) {
+        for (int i = 0; i < this.names.length; i++) {
+            if (this.names[i] == name) {
+                return this.values[i];
+            }
+        }
+        return null;
+    }
+
+    // ADDITIVE (documented): true when `name` is present (get returns null
+    // for absent names, so has() is the non-null check callers want --
+    // the sql.sr row posture).
+    public bool has(string name) {
+        for (int i = 0; i < this.names.length; i++) {
+            if (this.names[i] == name) {
+                return true;
+            }
+        }
+        return false;
+    }
 }
 
 class result {
     private row[] rows;
 
-    construct() { }
+    construct() {
+        this.rows = [];
+    }
 }
 
 class statement {
@@ -23,6 +153,10 @@ class statement {
         this.conn = conn;
     }
 
+    // The pre-split body delegated to this.conn.execute(this.sql) and
+    // dropped `params`; the delegation shape is preserved (execute() is a
+    // no-op on this build -- see the honesty boundary), so params remain
+    // carried-unused exactly as before.
     public void execute(object[] params) {
         this.conn.execute(this.sql);
     }
@@ -31,12 +165,18 @@ class statement {
 class connection {
     private string path;
 
-    construct(string path) { this.path = path; }
-
-    public void execute(string sql) {
-        SQLite3Exec(this.path, sql);
+    construct(string path) {
+        this.path = path;
     }
 
+    // Was the ungrantable SQLite3Exec call (dead text -- see the pre-fix
+    // state). Documented no-op: no SQLite bridge exists to hand the
+    // statement to.
+    public void execute(string sql) { }
+
+    // The pre-split body verbatim in shape: an empty result. rows stay
+    // EMPTY on this build -- there is no bridge to produce rows, so
+    // reading them is unreachable by construction.
     public result query(string sql) {
         return new result();
     }
@@ -45,12 +185,19 @@ class connection {
         return new statement(sql, this);
     }
 
-    public void transaction(void callback()) {
+    // Parse blocker fixed: `void callback()` -> `void () callback` (the
+    // DOCS/259 zero-arg spelling, the graphql.sr precedent). Behavior on
+    // this build: BEGIN and COMMIT are no-op execute() calls; the callback
+    // still runs between them, so the caller's side effects happen. There
+    // is no ROLLBACK path -- no failure can occur inside the no-op
+    // execute() calls.
+    public void transaction(void () callback) {
         this.execute("BEGIN");
         callback();
         this.execute("COMMIT");
     }
 
+    // Pre-split empty no-op, preserved verbatim (nothing is held open).
     public void close() { }
 }
 
