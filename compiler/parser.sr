@@ -163,8 +163,8 @@ class Parser {
     }
 
     // True when a statement-leading lowercase identifier is an unknown
-    // keyword: not a declared type heading a declaration shape, and not an
-    // identifier with known meaning (SYNTAX_EXCEPTIONS.md).
+    // keyword: not heading a declaration shape, and not an identifier with
+    // known meaning (SYNTAX_EXCEPTIONS.md).
     private bool identShouldFlag(Token cur, int nk) {
         if (!this.identStartsLower(cur.text)) { return false; }
         // Primitive type words that lex as identifiers (e.g. `double`) head
@@ -174,14 +174,20 @@ class Parser {
             || this.strEq(cur.text, "int32") || this.strEq(cur.text, "int64")
             || this.strEq(cur.text, "float64") || this.strEq(cur.text, "string")
             || this.strEq(cur.text, "boolean")) { return false; }
-        bool declShape = nk == 7 || nk == 104 || nk == 123 || nk == 120;
-        if (declShape) {
+        // UNIFIED_CORE_LIBRARY.md §7.4 #9: any `T ident` (or `T[] ident`,
+        // `T? ident`, `<T> ident`) declaration shape is accepted — the
+        // declaration type name is validated later (type checker / codegen
+        // resolve it against the flattened aggregate), mirroring the rs
+        // compiler's decl-shape heuristic (silverc-rs 7ca4ca7).  This covers
+        // imported classes the parser has not reached yet and same-file
+        // classes declared after use.
+        if (nk == 7 && this.pos + 2 < this.tokens.length && this.tokens[this.pos + 2].kind == 100) {
             // `T name (` is a function-signature shape — legacy sources use
             // non-keyword return spellings there; leave it to parseFunction.
-            if (nk == 7 && this.pos + 2 < this.tokens.length && this.tokens[this.pos + 2].kind == 100) {
-                return false;
-            }
-            return !this.isDeclaredTypeName(cur.text);
+            return false;
+        }
+        if (nk == 7 || nk == 104 || nk == 123 || nk == 120) {
+            return false;
         }
         return !this.knownIdentName(cur.text);
     }
