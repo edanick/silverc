@@ -1,32 +1,25 @@
-import * from os;
-import * from keyboard_win;
-
 // ---------------------------------------------------------------------------
 // keyboard - Win32 keyboard input for the self-hosted Silver compiler.
 //
-// Mirror of silverc-rs/src/stdlib/keyboard.rs. Compiled by silverc-rs as
-// part of the bootstrap pipeline; when the silverc self-hosted compiler
-// emits the .exe, user calls route through user32.dll (keybd_event,
-// VkKeyScanA, GetKeyState).
+// UNIFIED_CORE_LIBRARY.md v2 canonical fold -- the universal keyboard
+// module: there is no keyboard_win.sr backend and no win-named helpers. The
+// user32 calls (keybd_event, VkKeyScanA, GetKeyState) live inline in the
+// `#on WINDOWS` regions of the public functions that need them, one unified
+// function name per operation, no wrapper indirection, no alias imports, no
+// osType() gates. No ws2_32 import either -- the pre-fold module carried a
+// vestigial `import * from win32.ws2_32;` that no call site ever used
+// (grants without call sites resolve to nothing on both compilers, so
+// dropping it is behavior-neutral).
 //
-// UNIFIED_CORE_LIBRARY.md Phase 2 -- this is the unified, portable front of
-// the keyboard library. It contains ZERO win32 imports: every user32 call
-// moved into the internal Windows backend std/keyboard_win.sr, and every
-// DLL-backed entry below routes through the OS gate
-// `if (osType() == OSTypes.WINDOWS)` before touching it (osType() is
-// std/os.sr's plain-Silver stand-in -- see that file and std/console.sr for
-// why the gate does not use the native os.type query).
+// For a future non-Windows backend the fallbacks follow the module's
+// read/write style: the state-changing entries (press/hold/release/send/
+// type) become silent no-ops, isDown returns false, and nameToVk (hence vk)
+// resolves through the pure keyNameToVk name table only -- its user32
+// VkKeyScanA fallback is gated too, so unknown names report 0 instead of
+// touching a DLL. The VK_* constants and keyNameToVk are pure and stay
+// ungated.
 //
-// The else side of every gate is unreachable on this backend (silverc only
-// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
-// a future non-Windows backend the fallbacks follow the module's read/write
-// style: the state-changing entries (press/hold/release/send/type) become
-// silent no-ops, isDown returns false, and nameToVk (hence vk) resolves
-// through the pure keyNameToVk name table only -- its user32 VkKeyScanA
-// fallback is gated too, so unknown names report 0 instead of touching a
-// DLL. The VK_* constants and keyNameToVk are pure and stay ungated.
-//
-// DISPATCH NOTE (per compiler, unchanged by this split): the qualified
+// DISPATCH NOTE (per compiler, unchanged by this fold): the qualified
 // spellings never reach this source on silverc-rs. It answers every
 // `keyboard.<fn>()` call with its native builtin before any module source is
 // consulted (STDLIB_MODULES carries "keyboard" in src/stdlib/mod.rs;
@@ -42,17 +35,9 @@ import * from keyboard_win;
 // keyboard is not builtin-reserved (std/project.sr projectBuiltin) and not
 // on the driver's hand-prepend/exclude lists, so this module's source is
 // collected and every `keyboard.<fn>()` spelling resolves to the functions
-// below; the DLL touches inside them go through the backend's aliased
-// imports. Pre-split, those bare DLL names (keybd_event, VkKeyScanA,
-// GetKeyState) were answered by the self-host's generic user32 elif in
-// mini_cg.sr (NOT compiler_driver.sr, despite what this header used to
-// say) after a win32.user32 import grant; the backend's aliased grants now
-// carry the calls with the same direct-IAT lowering, so nothing changes.
-//
-// VESTIGIAL IMPORT DROPPED: the pre-split module also carried
-// `import * from win32.ws2_32;`, but no ws2_32 function was ever called --
-// a keyboard module has no socket business. Grants without call sites
-// resolve to nothing on both compilers, so dropping it is behavior-neutral.
+// below; the bare user32 names inside them are classified by mini_cg.sr's
+// keyboard elif (user32.dll) and lowered through the direct-IAT path, exactly
+// as pre-fold.
 //
 // TESTING NOTE: press/hold/release/send/type inject real keystrokes into
 // the user's session when run, so they are verified compile-only; the
@@ -61,6 +46,10 @@ import * from keyboard_win;
 // ---------------------------------------------------------------------------
 
 mod export keyboard;
+
+#on WINDOWS
+import * from win32.user32;
+#off
 
 // ---------------------------------------------------------------------------
 // VK_* constants matching Win32 virtual-key codes used by user32.
@@ -202,45 +191,45 @@ int keyNameToVk(string name) {
 int nameToVk(string name) {
     int vk = keyNameToVk(name);
     if (vk != 0) { return vk; }
-    if (osType() == OSTypes.WINDOWS) {
-        // Fallback: a single cstring is enough for VkKeyScanA.
-        int scan = kbWinVkKeyScan(name);
-        if (scan == -1) { return 0; }
-        return scan & 0xFF;
-    }
+    #on WINDOWS
+    // Fallback: a single cstring is enough for VkKeyScanA.
+    int scan = VkKeyScanA(name);
+    if (scan == -1) { return 0; }
+    return scan & 0xFF;
+    #off
     return 0;
 }
 
 // ---------------------------------------------------------------------------
 // Core press / release helpers (no private qualifier - silverc-rs parser
-// doesn't recognize `private`). All key injection goes through the gated
-// backend; on a future non-Windows backend these are silent no-ops.
+// doesn't recognize `private`). On a future non-Windows backend these are
+// silent no-ops.
 // ---------------------------------------------------------------------------
 
 void press(string keyName) {
     int vk = nameToVk(keyName);
-    if (osType() == OSTypes.WINDOWS) {
-        kbWinKeyEvent(vk, 0, 0, 0);
-    }
+    #on WINDOWS
+    keybd_event(vk, 0, 0, 0);
+    #off
 }
 
 void press(int vk) {
-    if (osType() == OSTypes.WINDOWS) {
-        kbWinKeyEvent(vk, 0, 0, 0);
-    }
+    #on WINDOWS
+    keybd_event(vk, 0, 0, 0);
+    #off
 }
 
 void release(string keyName) {
     int vk = nameToVk(keyName);
-    if (osType() == OSTypes.WINDOWS) {
-        kbWinKeyEvent(vk, 0, KEYEVENTF_KEYUP, 0);
-    }
+    #on WINDOWS
+    keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+    #off
 }
 
 void release(int vk) {
-    if (osType() == OSTypes.WINDOWS) {
-        kbWinKeyEvent(vk, 0, KEYEVENTF_KEYUP, 0);
-    }
+    #on WINDOWS
+    keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+    #off
 }
 
 void hold(string keyName) { press(keyName); }
@@ -248,18 +237,18 @@ void hold(string keyName) { press(keyName); }
 void hold(int vk)         { press(vk); }
 
 void send(string text) {
-    if (osType() == OSTypes.WINDOWS) {
-        for (int i = 0; i < text.length; i++) {
-            string one = text[i]; // char -> string for VkKeyScanA fallback
-            int vk = nameToVk(one);
-            if (vk == 0) {
-                int scan = kbWinVkKeyScan(one);
-                vk = scan & 0xFF;
-            }
-            kbWinKeyEvent(vk, 0, 0, 0);
-            kbWinKeyEvent(vk, 0, KEYEVENTF_KEYUP, 0);
+    #on WINDOWS
+    for (int i = 0; i < text.length; i++) {
+        string one = text[i]; // char -> string for VkKeyScanA fallback
+        int vk = nameToVk(one);
+        if (vk == 0) {
+            int scan = VkKeyScanA(one);
+            vk = scan & 0xFF;
         }
+        keybd_event(vk, 0, 0, 0);
+        keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
     }
+    #off
 }
 
 void type(string text) { send(text); }
@@ -267,16 +256,16 @@ void type(string text) { send(text); }
 bool isDown(string keyName) {
     int vk = nameToVk(keyName);
     if (vk == 0) { return false; }
-    if (osType() == OSTypes.WINDOWS) {
-        return (kbWinGetKeyState(vk) & 0x8000) != 0;
-    }
+    #on WINDOWS
+    return (GetKeyState(vk) & 0x8000) != 0;
+    #off
     return false;
 }
 
 bool isDown(int vk) {
-    if (osType() == OSTypes.WINDOWS) {
-        return (kbWinGetKeyState(vk) & 0x8000) != 0;
-    }
+    #on WINDOWS
+    return (GetKeyState(vk) & 0x8000) != 0;
+    #off
     return false;
 }
 
