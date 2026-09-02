@@ -1,22 +1,14 @@
-import * from os;
-import * from dns_win;
+import * from net;
 
 mod export dns;
 
-// DOCS -- public `dns` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
-// unified, portable front of the DNS library. It contains ZERO win32
-// imports: the one DLL-backed operation -- getaddrinfo behind lookup(),
-// a ws2_32 call -- lives in the internal Windows backend std/dns_win.sr,
-// and every entry that touches it routes through the OS gate
-// `if (osType() == OSTypes.WINDOWS)` before calling it (osType() is
-// std/os.sr's plain-Silver stand-in -- see that file for why the gate does
-// not use the native os.type query).
-//
-// The else branch of the lookup gate is unreachable on this backend
-// (silverc only emits Windows PEs and osType() is the compile-time WINDOWS
-// constant). For a future non-Windows backend the fallback follows the
-// module's failure style: lookup() returns [] (the same shape a failing
-// getaddrinfo produces).
+// DOCS -- public `dns` module (UNIFIED_CORE_LIBRARY.md §4 rule 6, the
+// CANONICAL FOLD SHAPE). This is a PROTOCOL module: it carries ZERO OS code
+// and NO `#on` regions -- name resolution routes through the public
+// `net.lookup(host, family)` primitive of the universal `net` socket core
+// module (getaddrinfo is a ws2_32 call and lives in net.sr's regions; the
+// old std/dns_win.sr backend is deleted). No win32 imports, no win-prefixed
+// helpers, no osType() gates.
 //
 // DISPATCH (per compiler, probed): `dns` is builtin-reserved on NEITHER
 // compiler -- silverc-rs's builtin_modules_set (src/main.rs:81 lists
@@ -26,59 +18,38 @@ mod export dns;
 // `import * from dns;` as an ORDINARY SOURCE module (std\dns.sr); no native
 // dispatch exists to preserve.
 //
-// PRE-SPLIT STATE (probed against this file's git HEAD, 00a1d12, before the
-// rewrite): the old std/dns.sr NEVER compiled under either compiler.
-// silverc-rs rejected `struct addrinfo hints;` (line 6) and
-// `struct sockaddr_in* addr = ai.ai_addr;` (line 17) with
-// "unknown keyword addrinfo/hints/sockaddr_in" plus cascade errors, and the
-// `() =>` lambda of resolveAsync (line 49) with "Expected expression"; the
-// self-hosted compiler rejected the same struct lines ("unknown keyword
-// addrinfo/hints/sockaddr_in"), the unknown type `task` and the `=>`
-// lambda ("expected ) but found =>"). Every body was therefore dead text --
-// there was NO observable pre-split behavior to preserve beyond names,
-// arities, return types and intent.
+// LOOKUP ROUTING (probed): cross-module call dispatch is by BARE NAME +
+// arity -- module qualifiers are dropped and the LAST declaration accepting
+// the argument count wins (silverc-rs codegen.rs resolve_overload_symbol;
+// self-host mini_cg.sr selectOverloadIdx). dns's own public
+// `lookup(string)` would therefore intercept a one-argument
+// `net.lookup(host)` call and recurse forever, so net.lookup carries a
+// trailing defaulted `family` parameter and THIS module calls the
+// two-argument shape `net.lookup(host, 2)` that only net's declaration
+// accepts (see net.sr's name-resolution section). net.lookup returns []
+// on any failure -- dns.lookup keeps that shape verbatim.
 //
-// One more latent pre-split landmine, now fixed: the old bodies declared
-// their result arrays WITHOUT initialization (`string[] mx;`) and pushed
-// into them -- a NULL-array access violation at runtime on silverc-rs
-// (probed: a minimal `string[] mx; mx.push(...)` module dies with 0xC0000005
-// before its first print, because the console output is buffered and lost on
-// the abnormal exit). Every array local in this module and its backend
-// therefore uses the empty-literal decl-init `string[] x = [];` (the
-// std/async.sr idiom); ftp/ftps/smtp agents should copy this idiom for any
-// result array they build with push.
+// PRE-SPLIT STATE (carried from the fold record): the pre-split dns.sr
+// NEVER compiled under either compiler, so no observable pre-fold behavior
+// exists beyond names, arities, return types and intent. The
+// empty-literal decl-init idiom (`string[] x = [];` before push) is kept
+// everywhere: an uninitialized `string[] mx;` + push is a NULL-array
+// access violation at runtime on silverc-rs (probed).
 //
-// RS-ONLY CALLER LANDMINE (probed, pre-existing silverc-rs codegen bug --
-// not caused by this split): a CROSS-MODULE string-returning call used
-// directly inside an expression stringifies the raw return pointer, e.g.
-// `print("ip: " + dns.reverse(ip))` prints a decimal address (a minimal
-// two-module `print("B " + lib.hello())` fixture reproduces it, so the
-// trigger is the lowering, not dns; the self-host is correct in every
-// context, and same-module method calls like `ip.replace(...)` are
-// unaffected on both). Assign the result to a local first:
-// `string r = dns.reverse(ip); print("ip: " + r);` -- the assignment
-// context lowers correctly on both compilers. ftp/ftps/smtp agents: apply
-// the same assign-first rule at every string-returning free-function call
-// site in probes and docs.
+// RS-ONLY CALLER LANDMINE (probed, pre-existing silverc-rs codegen bug):
+// a CROSS-MODULE string-returning call used directly inside an expression
+// stringifies the raw return pointer, e.g.
+// `print("ip: " + dns.reverse(ip))` prints a decimal address. Assign the
+// result to a local first:
+// `string r = dns.reverse(ip); print("ip: " + r);`
 //
-// API PRESERVATION (every public name/arity/return type of the pre-split
-// file, unchanged):
-// - lookup: the pre-split getaddrinfo intent, now actually functional
-//   (AF_INET + SOCK_STREAM hints, dotted-quad rendering copied VERBATIM from
-//   the pre-split expression, [] on failure). The raw addrinfo walk the
-//   pre-split text sketched (`struct` locals, pointer field access) is
-//   unexpressible in the current grammar on either compiler; the backend
-//   reproduces it with the probed int[] qword-buffer + memcpy idiom
-//   (std/dns_win.sr). WSAStartup is now issued before each lookup
-//   (refcounted): the pre-split file never initialized winsock, so its
-//   getaddrinfo would have failed with WSANOTINITIALISED unless ws/net had
-//   initialized it first -- a documented fix, not a regression (the file
-//   never ran).
+// API PRESERVATION (every public name/arity/return type, unchanged):
+// - lookup: getaddrinfo-backed via net.lookup (AF_INET + SOCK_STREAM
+//   hints, dotted-quad rendering verbatim from the pre-split expression,
+//   [] on failure).
 // - resolveMX/resolveNS/resolveTXT/reverse: pure-Silver pre-split stubs,
 //   kept BYTE-IDENTICAL ("10 mail."+host / "ns1."+host / [] /
-//   "host-"+ip.replace(".","-")+".example.com"). They contain no DLL ops
-//   and are portable as-is; backends exist only where real DLL-backed
-//   operations exist.
+//   "host-"+ip.replace(".","-")+".example.com"). They touch no sockets.
 // - resolveAsync + the local `task` class: the pre-split body
 //   `return new task(() => { lookup(host); });` is doubly unexpressible --
 //   `=>` lambdas are a parse error on both compilers, and the suite-proven
@@ -88,27 +59,22 @@ mod export dns;
 //   never imported the async module, so its `task` type was unresolved dead
 //   text on both compilers; importing async is not an option (silverc-rs
 //   lexes `async` as a keyword -- see std/async.sr's DISPATCH note -- so
-//   `import * from async;` cannot compile there). The split therefore
+//   `import * from async;` cannot compile there). The module therefore
 //   defines a minimal local `task` class (the async.sr class shape: inert
-//   until awaited) that STORES the host and performs the gated lookup at
+//   until awaited) that STORES the host and performs the lookup at
 //   awaitResult() time -- the closest expression of the pre-split intent
-//   ("a task that looks up host"), probed end-to-end on both compilers
-//   (resolveAsync("localhost"); t.awaitResult() fires the lookup). The
-//   setHost method is ADDITIVE (the pre-split file declared no class at
-//   all). AGGREGATE CAVEAT: a self-host project importing BOTH dns and
-//   async would now see two classes named `task` (async defines its own);
-//   no such combination ever worked pre-split -- neither module compiled --
-//   and on silverc-rs the async module cannot be imported at all, so no
-//   previously-working program regresses. awaitResult() returns "" (the
-//   pre-split/async task.result was never assigned; async.sr documents the
-//   same inert-shape posture).
+//   ("a task that looks up host"), probed end-to-end (resolveAsync then
+//   awaitResult fires the lookup). The setHost method is ADDITIVE.
+//   CLASS-SHADOW NOTE (same posture as ws.socket/net.socket above): a
+//   program importing BOTH dns and async sees two `class task`
+//   declarations; async's is registered first, dns's wins. No such
+//   combination ever worked pre-fold -- neither module compiled -- and on
+//   silverc-rs the async module cannot be imported at all. awaitResult()
+//   returns "" (the async task.result was never assigned; async.sr
+//   documents the same inert-shape posture).
 
 public string[] lookup(string host) {
-    if (osType() == OSTypes.WINDOWS) {
-        return dnsWinLookup(host);
-    }
-    string[] empty = [];
-    return empty;
+    return net.lookup(host, 2);
 }
 
 public string[] resolveMX(string host) {
@@ -142,12 +108,10 @@ class task {
     }
 
     // Runs the lookup this task was created for (the pre-split job was
-    // `lookup(host)`) and returns "" -- the pre-split/async task result
-    // shape (async.sr: task.result is never assigned).
+    // `lookup(host)`) and returns "" -- the async task result shape
+    // (async.sr: task.result is never assigned).
     public string awaitResult() {
-        if (osType() == OSTypes.WINDOWS) {
-            dnsWinLookup(this.host);
-        }
+        net.lookup(this.host, 2);
         return "";
     }
 }

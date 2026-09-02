@@ -1,5 +1,6 @@
 #on WINDOWS
 import * from win32.ws2_32;
+import { memcpy } from win32.msvcrt;
 #off
 
 mod export net;
@@ -246,6 +247,26 @@ public void sendRaw(int fd, string data) {
     #off
 }
 
+// Sends a byte[] payload on the raw descriptor: every byte is packed into an
+// int[] qword buffer before the send() call (byte[] must not cross a DLL
+// boundary packed -- its slots are qwords; see the MEMORY LAYOUT note above).
+// Exists for wire formats whose bytes are produced as byte[] -- e.g. ws
+// frames (encodeFrame), which may legitimately contain 0x00 bytes that a
+// Silver string cannot carry. No-op on len <= 0.
+public void sendBytesRaw(int fd, byte[] data) {
+    #on WINDOWS
+    int len = data.length;
+    if (len <= 0) { return; }
+    int slots = (len + 7) / 8;
+    int[] packedBuf = new int[slots];
+    for (int i = 0; i < len; i++) {
+        int b = data[i] & 0xFF;
+        packedBuf[i / 8] = packedBuf[i / 8] | (b << ((i % 8) * 8));
+    }
+    send(fd, packedBuf, len, 0);
+    #off
+}
+
 // Receives up to maxLen bytes from the raw descriptor and returns them as a
 // string ("" on error or clean close).
 public string recvRaw(int fd, int maxLen) {
@@ -353,4 +374,58 @@ int dllListen(int sock, int backlog) {
     return -1;
     #off
     return -1;
+}
+
+// ---- name resolution -------------------------------------------------------
+// net is the socket AND name-resolution core: getaddrinfo is a ws2_32 call,
+// so it lives here. Resolves `host` to its IPv4 dotted-quad addresses (the
+// AF_INET hint means every returned node is a sockaddr_in; family defaults
+// to 2 = AF_INET). Returns [] on any failure -- the shape a failing
+// getaddrinfo produces.
+//
+// NAME-COLLISION FINDING (this fold): the dns module also exports a public
+// one-argument `lookup(string)` and cross-module call dispatch is by BARE
+// NAME + arity (the LAST declaration accepting the argument count wins,
+// silverc-rs codegen.rs resolve_overload_symbol / self-host mini_cg.sr
+// selectOverloadIdx -- module-qualified calls lose their qualifier). A
+// same-name same-arity net.lookup(string) would therefore be UNREACHABLE
+// from dns.sr: its own declaration would intercept every one-argument call
+// and recurse forever. The trailing defaulted `family` parameter keeps the
+// prescribed one-argument call shape (`net.lookup("host")`) for every other
+// caller while giving dns.sr the two-argument call shape `net.lookup(host,
+// 2)` that only this declaration accepts. Family is the getaddrinfo
+// ai_family hint field (runtime shift into the high dword of hints qword 0;
+// the constant-fold of `2 << 32` is unproven on the self-host, runtime
+// shifts by 32 are the probed sockaddr idiom).
+public string[] lookup(string host, int family = 2) {
+    #on WINDOWS
+    byte[] wsa = new byte[408];
+    WSAStartup(0x0202, wsa);
+    int[] hints = new int[6];
+    hints[0] = family << 32;
+    hints[1] = 1;
+    int[] res = new int[1];
+    int ret = getaddrinfo(host, null, hints, res);
+    if (ret != 0) { string[] empty = []; return empty; }
+    string[] addresses = [];
+    int node = res[0];
+    while (node != 0) {
+        int[] nodeBuf = new int[6];
+        memcpy(nodeBuf, node, 48);
+        int saPtr = nodeBuf[4];
+        int next = nodeBuf[5];
+        if (saPtr != 0) {
+            int[] sa = new int[2];
+            memcpy(sa, saPtr, 16);
+            int ip = (sa[0] >> 32) & 0xFFFFFFFF;
+            string ipStr = ((ip >> 0) & 0xFF) + "." + ((ip >> 8) & 0xFF) + "." + ((ip >> 16) & 0xFF) + "." + ((ip >> 24) & 0xFF);
+            addresses.push(ipStr);
+        }
+        node = next;
+    }
+    freeaddrinfo(res[0]);
+    return addresses;
+    #off
+    string[] empty = [];
+    return empty;
 }
