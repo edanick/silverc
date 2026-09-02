@@ -5,6 +5,23 @@ import * from token;
 import * from parser;
 import * from node;
 import * from string;
+import * from preprocess;
+
+// DOCS/260 — every file the visibility pass reads must go through the
+// preprocessor first: non-matching `#on` regions are never tokenized, so the
+// re-read + re-lex here must not see them either.
+string visPreprocess(string path, string src) {
+    string[] ppErrs = [];
+    string target = ppTargetOs();
+    string filtered = ppPreprocess(src, target, ppErrs);
+    if (ppErrs.length > 0) {
+        for (int vpI = 0; vpI < ppErrs.length; vpI++) {
+            printline(ppErrs[vpI]);
+        }
+        exit(1);
+    }
+    return filtered;
+}
 
 // One parsed source file: its top-level items plus the `mod export` names
 // recorded by the parser (the flattened program drops those containers).
@@ -146,8 +163,9 @@ class VisibilityChecker {
         for (int i = 0; i < this.visitedPaths.length; i++) {
             if (cliArgEq(this.visitedPaths[i], path)) { return null; }
         }
-        string src = visTryReadFile(path);
-        if (src.length == 0) { return null; }
+        string rawSrc = visTryReadFile(path);
+        if (rawSrc.length == 0) { return null; }
+        string src = visPreprocess(path, rawSrc);
         this.visitedPaths.add(path);
         Lexer lexer = new Lexer(src + "\n");
         Token[] toks = lexer.tokenize();

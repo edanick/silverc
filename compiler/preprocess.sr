@@ -1,0 +1,204 @@
+mod export preprocess;
+
+// DOCS/260 — the preprocessor: `#on <OS>` / `#else` / `#off` region filter.
+//
+// A line/region filter stage that runs BEFORE lexing. Lines inside regions
+// whose OS does not match the compile target are NEVER tokenized — they are
+// replaced by blank lines so every downstream line/column diagnostic keeps
+// pointing at the original file's lines (the filter always emits the same
+// number of lines it consumed).
+//
+// v1 semantics (UNIFIED_CORE_LIBRARY.md §2):
+//   #on WINDOWS   open a region fed only on WINDOWS builds
+//   #else         fed only when no preceding `#on` of the region matched
+//   #off          close the region; shared code resumes
+//   Nesting is forbidden: an `#on` inside an open region is an error.
+//
+// Directives are recognized on their OWN lines (first non-whitespace token);
+// indented directives are fine, nothing else may share the line. Any other
+// line-leading `#...` token is NOT a directive and passes through unchanged.
+//
+// Errors are appended to the `errs` array (messages embed the original line
+// number); the caller prints them and exits with status 1.
+//
+// Implementation shape: pass 1 is a pure state-machine scan that records the
+// char offsets of the lines to blank (no string building, so scanning a
+// 600KB source stays linear); pass 2 splices the output from a handful of
+// kept runs. Files with nothing to blank return their input untouched.
+
+// The target OS for every current build. The self-hosted compiler has no
+// --os flag in v1; all regions resolve against WINDOWS.
+public string ppTargetOs() {
+    return "WINDOWS";
+}
+
+private bool ppEq(string a, string b) {
+    if (a.length != b.length) { return false; }
+    for (int i = 0; i < a.length; i++) {
+        if (a[i] != b[i]) { return false; }
+    }
+    return true;
+}
+
+private bool ppIsOsName(string name) {
+    return ppEq(name, "WINDOWS") || ppEq(name, "LINUX") || ppEq(name, "MAC");
+}
+
+private string ppSlice(string s, int start, int end) {
+    string r = "";
+    for (int i = start; i < end; i++) { r = r + s[i]; }
+    return r;
+}
+
+private int ppFindChar(string hay, char needle, int start) {
+    for (int i = start; i < hay.length; i++) {
+        if (hay[i] == needle) { return i; }
+    }
+    return -1;
+}
+
+// First non-whitespace (space/tab) offset at or after `start`, bounded by
+// `end` (exclusive). Returns `end` when the range holds only whitespace.
+private int ppSkipBlanks(string s, int start, int end) {
+    int p = start;
+    while (p < end) {
+        char c = s[p];
+        if (c == ' ' || c == '\t') { p++; continue; }
+        break;
+    }
+    return p;
+}
+
+public string ppPreprocess(string source, string targetOs, string[] errs) {
+    // Pass 1: pure scan. Parallel arrays describe each line to blank:
+    // start offset, newline offset (-1 = last line without terminator),
+    // and 1 when the line ends with a CRLF terminator.
+    int[] dropAt = [];
+    int[] dropNl = [];
+    int[] dropCr = [];
+
+    // mode: 0 = outside regions, 1 = inside a region
+    int mode = 0;
+    bool active = false;
+    bool matchedAny = false;
+    int regionOpenLine = 0;
+    int regionOpenOsStart = 0;
+    int regionOpenOsEnd = 0;
+    int lineNo = 1;
+    int i = 0;
+    while (i < source.length) {
+        int nl = ppFindChar(source, '\n', i);
+        int end = (nl >= 0) ? nl : source.length;
+        // Content excludes a trailing CR of CRLF terminators.
+        int contentEnd = end;
+        if (contentEnd > i && source[contentEnd - 1] == '\r') { contentEnd--; }
+
+        int p = ppSkipBlanks(source, i, contentEnd);
+        bool isDirective = false;
+        if (p < contentEnd && source[p] == '#') {
+            // Directive candidate: lowercase word right after '#'.
+            int q = p + 1;
+            int wordEnd = q;
+            while (wordEnd < contentEnd) {
+                char c = source[wordEnd];
+                if (c < 'a' || c > 'z') { break; }
+                wordEnd++;
+            }
+            string word = ppSlice(source, q, wordEnd);
+            if (ppEq(word, "on")) {
+                isDirective = true;
+                int nameStart = ppSkipBlanks(source, wordEnd, contentEnd);
+                int nameEnd = nameStart;
+                while (nameEnd < contentEnd) {
+                    char c = source[nameEnd];
+                    if (c == ' ' || c == '\t') { break; }
+                    nameEnd++;
+                }
+                string osName = ppSlice(source, nameStart, nameEnd);
+                int after = ppSkipBlanks(source, nameEnd, contentEnd);
+                if (osName.length == 0) {
+                    errs.add("preprocessor: '#on' requires an OS name (WINDOWS, LINUX, MAC), at line " + lineNo.toString());
+                    return source;
+                }
+                if (after < contentEnd) {
+                    errs.add("preprocessor: unexpected text after '#on', at line " + lineNo.toString());
+                    return source;
+                }
+                if (!ppIsOsName(osName)) {
+                    errs.add("preprocessor: unknown OS name '" + osName + "' after '#on' (valid OS names are WINDOWS, LINUX, MAC), at line " + lineNo.toString());
+                    return source;
+                }
+                if (mode == 1) {
+                    errs.add("preprocessor: '#on' inside an open '#on' region (nesting is forbidden), at line " + lineNo.toString());
+                    return source;
+                }
+                mode = 1;
+                active = ppEq(osName, targetOs);
+                matchedAny = active;
+                regionOpenLine = lineNo;
+                regionOpenOsStart = nameStart;
+                regionOpenOsEnd = nameEnd;
+            } elif (ppEq(word, "else")) {
+                isDirective = true;
+                if (ppSkipBlanks(source, wordEnd, contentEnd) < contentEnd) {
+                    errs.add("preprocessor: unexpected text after '#else', at line " + lineNo.toString());
+                    return source;
+                }
+                if (mode == 0) {
+                    errs.add("preprocessor: '#else' without an open '#on' region, at line " + lineNo.toString());
+                    return source;
+                }
+                active = !matchedAny;
+            } elif (ppEq(word, "off")) {
+                isDirective = true;
+                if (ppSkipBlanks(source, wordEnd, contentEnd) < contentEnd) {
+                    errs.add("preprocessor: unexpected text after '#off', at line " + lineNo.toString());
+                    return source;
+                }
+                if (mode == 0) {
+                    errs.add("preprocessor: '#off' without an open '#on' region, at line " + lineNo.toString());
+                    return source;
+                }
+                mode = 0;
+            }
+            // Any other `#word` is not a directive: pass through unchanged.
+        }
+
+        if (isDirective || (mode == 1 && !active)) {
+            dropAt.add(i);
+            dropNl.add(nl);
+            dropCr.add((contentEnd != end) ? 1 : 0);
+        }
+
+        if (nl < 0) { break; }
+        i = nl + 1;
+        lineNo++;
+    }
+
+    if (mode == 1) {
+        string osName = ppSlice(source, regionOpenOsStart, regionOpenOsEnd);
+        errs.add("preprocessor: '#on " + osName + "' region opened at line " + regionOpenLine.toString() + " is never closed by '#off' (end of file)");
+        return source;
+    }
+
+    if (dropAt.length == 0) { return source; }
+
+    // Pass 2: splice — one slice per kept run, one terminator per blanked
+    // line, so a directive-heavy file costs a handful of concatenations.
+    string result = "";
+    int copyStart = 0;
+    for (int d = 0; d < dropAt.length; d++) {
+        if (dropAt[d] > copyStart) {
+            result = result + ppSlice(source, copyStart, dropAt[d]);
+        }
+        if (dropNl[d] >= 0) {
+            if (dropCr[d] == 1) { result = result + "\r\n"; }
+            else { result = result + "\n"; }
+        }
+        copyStart = (dropNl[d] >= 0) ? dropNl[d] + 1 : source.length;
+    }
+    if (copyStart < source.length) {
+        result = result + ppSlice(source, copyStart, source.length);
+    }
+    return result;
+}

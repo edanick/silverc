@@ -39,6 +39,23 @@ mod export project;
 import * from fs;
 import * from string;
 import * from progress;
+import * from preprocess;
+
+// DOCS/260 — filter one source file through the `#on`/`#else`/`#off`
+// preprocessor. A region error prints to stderr and aborts with status 1
+// (matching silverc-rs), so malformed regions can never reach the parser.
+string preprocessOrProjectFail(string src) {
+    string[] ppErrs = [];
+    string target = ppTargetOs();
+    string out = ppPreprocess(src, target, ppErrs);
+    if (ppErrs.length > 0) {
+        for (int peI = 0; peI < ppErrs.length; peI++) {
+            eprintln(ppErrs[peI]);
+        }
+        exit(1);
+    }
+    return out;
+}
 
 bool projectHasSuffix(string path, string suffix) {
     if (path.length < suffix.length) { return false; }
@@ -576,7 +593,11 @@ class ProjectVisited {
 string projectCollect(string path, string root, string[] sourceDirs, ProjectVisited visited, bool emitMarkers, ProgressReporter progress) {
     if (visited.contains(path)) { return ""; }
     visited.add(path);
-    string source = file.readString(path);
+    // DOCS/260 — filter each project source BEFORE its imports are scanned
+    // and its text joins the aggregate, so every file's `#on` regions resolve
+    // independently and non-matching regions never reach the parser.
+    string rawSource = file.readString(path);
+    string source = preprocessOrProjectFail(rawSource);
     string result = "";
     int cursor = 0;
     while (cursor < source.length) {
@@ -606,7 +627,10 @@ string projectCollect(string path, string root, string[] sourceDirs, ProjectVisi
 int projectCountCollect(string path, string root, string[] sourceDirs, ProjectVisited visited) {
     if (visited.contains(path)) { return 0; }
     visited.add(path);
-    string source = file.readString(path);
+    // DOCS/260 — mirror projectCollect's filter so counts stay in lockstep
+    // (a region error aborts during collection, before the aggregate builds).
+    string rawSource = file.readString(path);
+    string source = preprocessOrProjectFail(rawSource);
     int sub = 0;
     int cursor = 0;
     while (cursor < source.length) {

@@ -17,6 +17,7 @@ import * from bcache;
 import * from watcher;
 import * from progress;
 import * from visibility;
+import * from preprocess;
 import * from win32.kernel32;
 
 // Print the final success line on STDERR (alongside the progress lines) once
@@ -83,6 +84,22 @@ string tryReadFile(string path) {
         result = "";
     }
     return result;
+}
+
+// DOCS/260 — run the `#on`/`#else`/`#off` preprocessor over one file's text.
+// On a region error the messages print to stderr and the compile aborts with
+// status 1 (matching silverc-rs). Empty input passes through unchanged.
+string drvPreprocessOrDie(string src) {
+    string[] ppErrs = [];
+    string target = ppTargetOs();
+    string out = ppPreprocess(src, target, ppErrs);
+    if (ppErrs.length > 0) {
+        for (int peI = 0; peI < ppErrs.length; peI++) {
+            eprintln(ppErrs[peI]);
+        }
+        exit(1);
+    }
+    return out;
 }
 
 // File stem of a path: characters after the last separator, extension
@@ -186,6 +203,10 @@ string collectModule(string name, string inputFile, string[] visited, bool emitM
     if (modPath.length == 0) { return ""; }
     string modSrc = tryReadFile(modPath);
     if (modSrc.length == 0) { return ""; }
+    // DOCS/260 — filter the module BEFORE its imports are scanned so imports
+    // inside non-matching regions are never resolved.
+    string modFiltered = drvPreprocessOrDie(modSrc);
+    modSrc = modFiltered;
     string result = "";
     int cursor = 0;
     while (cursor < modSrc.length) {
@@ -219,7 +240,8 @@ int countModule(string name, string inputFile, string[] visited) {
     visited.add(name);
     string modPath = findModulePath(name, inputFile);
     if (modPath.length == 0) { return 0; }
-    string modSrc = tryReadFile(modPath);
+    string countRaw = tryReadFile(modPath);
+    string modSrc = drvPreprocessOrDie(countRaw);
     if (modSrc.length == 0) { return 0; }
     int sub = 0;
     int cursor = 0;
@@ -672,12 +694,20 @@ int compileOnce(CliFlags flags, string outputFile) {
         ProjectVisited pVisited = new ProjectVisited();
         moduleCount = projectCountCollect(projectJoin(pRoot, pEntry), pRoot, pSources, pVisited);
         progress = new ProgressReporter(moduleCount);
-        source = projectBuildSource(inputFile, flags.cacheBytecode);
+        // DOCS/260 — the .srp aggregate (markers + per-file sources) was
+        // already filtered per file inside projectCollect; this pass is a
+        // no-op safety net (files with no directives return unchanged).
+        string builtSource = projectBuildSource(inputFile, flags.cacheBytecode);
+        source = drvPreprocessOrDie(builtSource);
     } else {
         // `.col` declarations require a project manifest with a configured
         // collection directory. Standalone source compilation reports the
         // same UnknownCollectionException as the native compiler.
         source = projectExpandCollections(source, ".", "");
+
+        // DOCS/260 — the preprocessor runs before anything else scans the
+        // entry source (import probes, module collection, the lexer).
+        source = drvPreprocessOrDie(source);
 
         // The universal llmai client is a source-level standard library. Keep
         // the low-level WinInet builtin available, but include the shared
