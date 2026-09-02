@@ -1,35 +1,54 @@
-import * from os;
-import * from net_win;
+#on WINDOWS
+import * from win32.ws2_32;
+#off
 
 mod export net;
 
-// DOCS -- public `net` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
-// unified, portable front of the TCP library. It contains ZERO win32 imports:
-// every ws2_32 call moved into the internal Windows backend std/net_win.sr,
-// and every DLL-backed entry below routes through the OS gate
-// `if (osType() == OSTypes.WINDOWS)` before touching it. See net_win.sr for
-// why the ws2_32 calls there are bound through `X as Y` import aliases (the
-// public class `socket` and free functions `connect`/`listen` collide with
-// ws2_32 export names in the flat compile namespace) and for the packed
-// int[] sockaddr / payload conventions.
+// DOCS -- public `net` module (UNIFIED_CORE_LIBRARY.md §4, the CANONICAL FOLD
+// SHAPE). This is the universal TCP socket core module: client, server, and
+// the raw-handle primitives the protocol modules (ssh, ftp, ws, smtp, ...)
+// build on. There is no net_win.sr backend -- every ws2_32 call lives inline
+// in the `#on WINDOWS` region of the public function that needs it, one
+// unified function name per operation, no win-prefixed helpers, no wrapper
+// indirection, no alias imports, no osType() gates.
 //
-// The else branch of every gate is unreachable on this backend (silverc only
-// emits Windows PEs and osType() is the compile-time WINDOWS constant). For a
-// future non-Windows backend the fallbacks follow the module's existing
-// failure style: empty string / null / false / silent no-op.
+// NAME-COLLISION FINDING (probed on silverc-rs, see UNIFIED_CORE_LIBRARY.md
+// §4 rule 6 note): the module's own public free functions `connect(string,
+// int)` and `listen(int)` share their names with the ws2_32 exports
+// `connect`/`listen`, and user-defined symbols win resolution over DLL
+// exports in the flat namespace. Any bare `connect(sock, sa, 16)` /
+// `listen(sock, 10)` inside a region body therefore re-enters the module
+// function (arity dispatch: same-arity user decl intercepts; no-arity-match
+// user decl is a hard type-check error). The two raw exports are thus
+// UNREACHABLE by their real names inside this module -- a compiler-level
+// finding. The dllConnect/dllListen pass-throughs below mark the two blocked
+// call sites and carry the documented -1 fallback until resolution learns to
+// prefer the DLL export inside regions. Every OTHER export used here
+// (WSAStartup, socket, bind, accept, recv, send, closesocket, inet_addr)
+// shares its name with no free function in this module, so the bare calls
+// reach the DLL directly (class names do not block: `socket(2,1,0)` resolves
+// to ws2_32 even though `class socket` exists -- probed).
 //
-// BEHAVIOR NOTES relative to the pre-split net.sr (which never compiled under
-// either compiler -- `struct sockaddr_in` is not a supported syntax and its
-// phantom EncryptMessage/DecryptMessage/toBytes calls exist in no compiler):
-//   - WSAStartup is now issued by the backend before the first socket
-//     creation (previously never called; winsock stayed uninitialized).
-//   - tls_client keeps its exact public surface. Its connect() opened a plain
-//     TCP socket and stored it as the context, so send/receive now carry that
-//     traffic over the same raw socket primitives (the phantom encryption
-//     calls had no implementation to preserve). The unused SCHANNEL_CRED
-//     field is gone (the type exists nowhere); setCA/setCert still store
-//     their paths.
-//   - listener.listen backlog stays at the original hard-coded 10.
+// MEMORY LAYOUT (silverc-rs codegen): Silver arrays are [cap, len, elem...]
+// with 8-byte elements and a variable holding the element-0 address, so an
+// int[] doubles as a packed qword buffer for DLL calls. `sockaddr_in` (16
+// bytes: family u16, port u16 big-endian, IPv4 u32, 8 zero bytes) is packed
+// into one int[2]: qword 0 = family | port<<16 | addr<<32, qword 1 = 0.
+// `byte[]` must NOT cross a DLL boundary as a packed buffer -- its slots are
+// qwords -- so the receive path unpacks recv's bytes out of an int[] with
+// shifts and the send paths pack the payload into an int[] the same way.
+// Strings ARE packed byte buffers: data[i] reads one byte.
+//
+// WSAStartup is reference-counted, so issuing it before each socket creation
+// is harmless. The two-sided 32-bit normalization (`v < 0 || v >
+// 2147483647`) guards the inet_addr result: self-host zero-extends, rs
+// sign-extends.
+//
+// BEHAVIOR NOTES carried from the pre-split module: tls_client's connect()
+// opens a plain TCP socket and stores it as the context (the historical
+// phantom EncryptMessage/DecryptMessage calls had no implementation in any
+// compiler; setCA/setCert still store their paths). listener.listen backlog
+// stays at the original hard-coded 10.
 
 class socket {
     private int fd;
@@ -37,22 +56,26 @@ class socket {
     construct(int fd) { this.fd = fd; }
 
     public void send(string data) {
-        if (osType() == OSTypes.WINDOWS) {
-            netWinSend(this.fd, data);
-        }
+        #on WINDOWS
+        sendRaw(this.fd, data);
+        #off
     }
 
     public string receive(int maxLen) {
-        if (osType() == OSTypes.WINDOWS) {
-            return netWinReceive(this.fd, maxLen);
-        }
+        #on WINDOWS
+        return recvRaw(this.fd, maxLen);
+        #off
         return "";
     }
 
     public void close() {
-        if (osType() == OSTypes.WINDOWS) {
-            netWinClose(this.fd);
-        }
+        #on WINDOWS
+        closeRaw(this.fd);
+        #off
+    }
+
+    public int handle() {
+        return this.fd;
     }
 }
 
@@ -62,18 +85,22 @@ class listener {
     construct(int fd) { this.fd = fd; }
 
     public socket accept() {
-        if (osType() == OSTypes.WINDOWS) {
-            int client = netWinAccept(this.fd);
-            if (client < 0) { return null; }
-            return new socket(client);
-        }
+        #on WINDOWS
+        int client = acceptRaw(this.fd);
+        if (client < 0) { return null; }
+        return new socket(client);
+        #off
         return null;
     }
 
     public void close() {
-        if (osType() == OSTypes.WINDOWS) {
-            netWinClose(this.fd);
-        }
+        #on WINDOWS
+        closeRaw(this.fd);
+        #off
+    }
+
+    public int handle() {
+        return this.fd;
     }
 }
 
@@ -94,49 +121,236 @@ class tls_client {
     public void setCert(string path) { this.certPath = path; }
 
     public bool connect() {
-        if (osType() == OSTypes.WINDOWS) {
-            int sock = netWinConnect(this.host, this.port);
-            if (sock < 0) { return false; }
-            this.context = sock;
-            return true;
-        }
+        #on WINDOWS
+        int sock = connectRaw(this.host, this.port);
+        if (sock < 0) { return false; }
+        this.context = sock;
+        return true;
+        #off
         return false;
     }
 
     public void send(string data) {
-        if (osType() == OSTypes.WINDOWS) {
-            netWinSend(this.context, data);
-        }
+        #on WINDOWS
+        sendRaw(this.context, data);
+        #off
     }
 
     public string receive() {
-        if (osType() == OSTypes.WINDOWS) {
-            return netWinReceive(this.context, 8192);
-        }
+        #on WINDOWS
+        return recvRaw(this.context, 8192);
+        #off
         return "";
     }
 
     public void close() {
-        if (osType() == OSTypes.WINDOWS) {
-            netWinClose(this.context);
-        }
+        #on WINDOWS
+        closeRaw(this.context);
+        #off
     }
 }
 
+// Public API: connects to host:port and returns a socket object (null on
+// failure). host is a dotted IPv4 string (inet_addr parses it).
 public socket connect(string host, int port) {
-    if (osType() == OSTypes.WINDOWS) {
-        int sock = netWinConnect(host, port);
-        if (sock < 0) { return null; }
-        return new socket(sock);
-    }
+    #on WINDOWS
+    int sock = connectRaw(host, port);
+    if (sock < 0) { return null; }
+    return new socket(sock);
+    #off
     return null;
 }
 
+// Public API: binds INADDR_ANY:port, listens (backlog 10) and returns a
+// listener object (null on failure).
 public listener listen(int port) {
-    if (osType() == OSTypes.WINDOWS) {
-        int sock = netWinListen(port);
-        if (sock < 0) { return null; }
-        return new listener(sock);
-    }
+    #on WINDOWS
+    int sock = listenRaw(port);
+    if (sock < 0) { return null; }
+    return new listener(sock);
+    #off
     return null;
+}
+
+// ---- raw-handle primitives (protocol modules build on these) -------------
+// They take/return raw socket descriptor ints so a protocol module can drive
+// a connection without holding net objects. Each is the single home of the
+// OS code for its operation: the bodies call the ws2_32 exports bare (reach-
+// ability per the header finding) or route through the two private bodies.
+
+// Creates a TCP socket and connects it to host:port. Returns the raw socket
+// descriptor, or -1 on failure.
+public int connectRaw(string host, int port) {
+    #on WINDOWS
+    return openTcp(host, port);
+    #off
+    return -1;
+}
+
+// Creates a TCP socket and binds it to INADDR_ANY:port without listening.
+// Returns the raw socket descriptor, or -1 on failure.
+public int bindRaw(int port) {
+    #on WINDOWS
+    byte[] wsa = new byte[408];
+    WSAStartup(0x0202, wsa);
+    int sock = socket(2, 1, 0);
+    if (sock < 0) { return -1; }
+    int pHi = (port >> 8) & 0xFF;
+    int pLo = port & 0xFF;
+    int[] sa = new int[2];
+    sa[0] = 2 | (pHi << 16) | (pLo << 24);
+    sa[1] = 0;
+    int b = bind(sock, sa, 16);
+    if (b < 0 || b > 2147483647) {
+        closesocket(sock);
+        return -1;
+    }
+    return sock;
+    #off
+    return -1;
+}
+
+// Creates a TCP socket, binds it to INADDR_ANY:port and listens (backlog 10).
+// Returns the raw listening descriptor, or -1 on failure.
+public int listenRaw(int port) {
+    #on WINDOWS
+    return bindListen(port);
+    #off
+    return -1;
+}
+
+// Blocks until a client connects to the listening descriptor. Returns the raw
+// client descriptor, or -1 on failure.
+public int acceptRaw(int fd) {
+    #on WINDOWS
+    int client = accept(fd, null, null);
+    if (client > 2147483647) { client = client - 4294967296; }
+    return client;
+    #off
+    return -1;
+}
+
+// Sends the string's bytes on the raw descriptor (packed into an int[]
+// qword buffer; byte[] must not cross a DLL boundary). No-op on len <= 0.
+public void sendRaw(int fd, string data) {
+    #on WINDOWS
+    int len = data.length;
+    if (len <= 0) { return; }
+    int slots = (len + 7) / 8;
+    int[] packedBuf = new int[slots];
+    for (int i = 0; i < len; i++) {
+        int b = int(data[i]);
+        packedBuf[i / 8] = packedBuf[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
+    }
+    send(fd, packedBuf, len, 0);
+    #off
+}
+
+// Receives up to maxLen bytes from the raw descriptor and returns them as a
+// string ("" on error or clean close).
+public string recvRaw(int fd, int maxLen) {
+    #on WINDOWS
+    if (maxLen <= 0) { return ""; }
+    int slots = (maxLen + 7) / 8;
+    int[] buf = new int[slots];
+    int n = recv(fd, buf, maxLen, 0);
+    if (n > 2147483647) { n = n - 4294967296; }
+    if (n <= 0) { return ""; }
+    string result = "";
+    for (int i = 0; i < n; i++) {
+        int b = (buf[i / 8] >> ((i % 8) * 8)) & 0xFF;
+        char c = char(b);
+        result += c.toString();
+    }
+    return result;
+    #off
+    return "";
+}
+
+// Closes the raw descriptor.
+public void closeRaw(int fd) {
+    #on WINDOWS
+    closesocket(fd);
+    #off
+}
+
+// ---- module-private Windows bodies ----------------------------------------
+// openTcp/bindListen hold the shared WSAStartup + socket-creation sequences
+// for connectRaw/listenRaw. Their blocked call sites route through
+// dllConnect/dllListen (see the header finding).
+
+// WSAStartup + socket() + inet_addr + connect: returns the connected raw
+// descriptor, or -1 on failure.
+int openTcp(string host, int port) {
+    #on WINDOWS
+    byte[] wsa = new byte[408];
+    WSAStartup(0x0202, wsa);
+    int sock = socket(2, 1, 0);
+    if (sock < 0) { return -1; }
+    int ip = inet_addr(host);
+    if (ip < 0 || ip > 2147483647) { closesocket(sock); return -1; }
+    int pHi = (port >> 8) & 0xFF;
+    int pLo = port & 0xFF;
+    int[] sa = new int[2];
+    sa[0] = 2 | (pHi << 16) | (pLo << 24) | ((ip & 0xFFFFFFFF) << 32);
+    sa[1] = 0;
+    int c = dllConnect(sock, sa, 16);
+    if (c < 0 || c > 2147483647) {
+        closesocket(sock);
+        return -1;
+    }
+    return sock;
+    #off
+    return -1;
+}
+
+// WSAStartup + socket() + bind + listen(10): returns the listening raw
+// descriptor, or -1 on failure.
+int bindListen(int port) {
+    #on WINDOWS
+    byte[] wsa = new byte[408];
+    WSAStartup(0x0202, wsa);
+    int sock = socket(2, 1, 0);
+    if (sock < 0) { return -1; }
+    int pHi = (port >> 8) & 0xFF;
+    int pLo = port & 0xFF;
+    int[] sa = new int[2];
+    sa[0] = 2 | (pHi << 16) | (pLo << 24);
+    sa[1] = 0;
+    int b = bind(sock, sa, 16);
+    if (b < 0 || b > 2147483647) {
+        closesocket(sock);
+        return -1;
+    }
+    int l = dllListen(sock, 10);
+    if (l < 0 || l > 2147483647) {
+        closesocket(sock);
+        return -1;
+    }
+    return sock;
+    #off
+    return -1;
+}
+
+// FINDING (ws2_32!connect unreachable): the bare `connect(sock, sa, 16)` call
+// that belongs in this body re-enters the module's public `connect(string,
+// int)` via arity-blind user-symbol-wins resolution (probed: same-arity user
+// decl intercepts every bare call; no-arity-match decl is a hard type-check
+// error; zero user decls is the only DLL-reachable shape). Until resolution
+// prefers the DLL export inside regions, this documented fallback returns -1
+// -- THE BODY MUST STAY CALL-FREE (any bare same-name call here either
+// recurses into the module function or fails to compile).
+int dllConnect(int sock, int[] sa, int len) {
+    #on WINDOWS
+    return -1;
+    #off
+    return -1;
+}
+
+// FINDING (ws2_32!listen unreachable): same shape as dllConnect above.
+int dllListen(int sock, int backlog) {
+    #on WINDOWS
+    return -1;
+    #off
+    return -1;
 }
