@@ -2252,8 +2252,18 @@ int strIdx = this.stringPatchIndices[i];
                     isArrTy = true;
                 }
             }
+            bool isFnArrTy = this.strEq(localTy, "void ()[]");
             if (off != 0) {
-                if (isArrTy) {
+                if (isFnArrTy) {
+                    // DOCS/259 G3: fn-typed array locals auto-allocate 8
+                    // zeroed address slots so `jobs[0] = job; jobs[0]();`
+                    // works immediately (same shape as rs NewArray).
+                    Node arrInit = new Node(); arrInit.kind = 19; arrInit.op = 2;
+                    Node sizeLit = new Node(); sizeLit.kind = 0; sizeLit.intVal = 8;
+                    arrInit.children.add(sizeLit);
+                    this.genExpr(arrInit);
+                    this.asm.movMBaseR(5, 0, off);
+                } elif (isArrTy) {
                     Node arrInit = new Node(); arrInit.kind = 19;
                     this.genExpr(arrInit);
                     this.asm.movMBaseR(5, 0, off);
@@ -3209,6 +3219,23 @@ int strIdx = this.stringPatchIndices[i];
             // drainAnonFunctions); the expression's value is that function's
             // address, placed here as a placeholder patched at layout time.
             this.genAnonFunctionArg(expr);
+        } elif (kind == 86) {
+            // DOCS/259 G4: `expr as Type` is a no-op for class instances —
+            // the value IS the instance pointer. (Primitive targets/operands
+            // are rejected at parse time with a clean error.)
+            this.genExpr(expr.child(0));
+        } elif (kind == 87) {
+            // DOCS/259 G3: call through a function-typed value — child(0) is
+            // the full index expression; evaluating it performs the
+            // bounds-checked element load and leaves the stored function
+            // address in RAX. The address is staged in R10 BEFORE the aligned
+            // call setup (the proven fn-field pattern; R10 survives setup).
+            this.genExpr(expr.child(0));
+            this.asm.movRR64(10, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(10);
+            this.asm.emitCallTeardown();
+            this.emitExcCheck();
         }
     }
 
@@ -3638,6 +3665,27 @@ int strIdx = this.stringPatchIndices[i];
             }
             return;
         }
+        if (obj.kind == 86 || obj.kind == 23) {
+            // DOCS/259 G4: member access through an as-cast ((b as Box).v)
+            // or through parentheses around one.  The cast is a no-op, so
+            // evaluate the operand and load the field from the operand's
+            // class layout.  A paren node (kind 23) may wrap the cast, so
+            // unwrap through both shapes.
+            Node castOperand = obj.child(0);
+            while (castOperand.kind == 23 && castOperand.childCount() > 0) {
+                castOperand = castOperand.child(0);
+            }
+            this.genExpr(obj);
+            string castType = this.inferExprType(castOperand);
+            int castFieldOff = this.findFieldOffset(castType, fieldName);
+            if (castFieldOff < 0) {
+                castFieldOff = this.findFieldOffsetInAllClasses(fieldName);
+            }
+            if (castFieldOff >= 0) {
+                this.asm.movRMBase(0, 0, castFieldOff);
+            }
+            return;
+        }
         this.genExpr(obj);
     }
 
@@ -3671,6 +3719,14 @@ int strIdx = this.stringPatchIndices[i];
         }
         if (expr.kind == 69) {
             return "string";
+        }
+        if (expr.kind == 86) {
+            // DOCS/259 G4: an as-cast has its operand's type.
+            return this.inferExprType(expr.child(0));
+        }
+        if (expr.kind == 87) {
+            // DOCS/259 G3: an indirect call through a `void ()` value.
+            return "void ()";
         }
         if (expr.kind == 70) {
             return "tuple";
@@ -5609,6 +5665,13 @@ int strIdx = this.stringPatchIndices[i];
         // only; the parameter holds an address, not an invocable-with-args
         // target.
         if (!call.isMember && call.childCount() == 0 && this.isFnPtrParam(name)) {
+            this.genFnPtrCall(name);
+            return;
+        }
+        // DOCS/259 G2: invoking a fn-typed LOCAL (`void () cb; cb = ...; cb();`)
+        // — same 8-byte address slot contract as fn-typed parameters.  The
+        // local's declared type distinguishes it from an unknown bare call.
+        if (!call.isMember && call.childCount() == 0 && this.strEq(this.getLocalType(name), "void ()")) {
             this.genFnPtrCall(name);
             return;
         }
@@ -8973,6 +9036,27 @@ public void genNewCall(Node call) {
         }
         if (haveExactClass) {
             funcIdx = this.selectOverloadIdx(name, recvClass, explicitUserArgs);
+        }
+        // DOCS/259 G2: a zero-arg member call on a receiver whose class
+        // declares a fn-typed field of that name (`this.cb()` / `obj.cb()`)
+        // is an indirect call through the stored function address. Method
+        // declarations win (checked above); class field tables already include
+        // inherited fields, so the parent chain is covered.
+        if (funcIdx < 0 && call.childCount() == 1) {
+            string fieldType = this.findFieldType(recvClass, name);
+            if (this.strEq(fieldType, "void ()")) {
+                int fnFieldOff = this.findFieldOffset(recvClass, name);
+                if (fnFieldOff >= 0) {
+                    this.genExpr(call.child(0));
+                    this.asm.movRMBase(0, 0, fnFieldOff);
+                    this.asm.movRR64(10, 0);
+                    this.asm.emitCallSetup(0);
+                    this.asm.callR64(10);
+                    this.asm.emitCallTeardown();
+                    this.emitExcCheck();
+                    return;
+                }
+            }
         }
         if (funcIdx < 0) {
             for (int i = 0; i < this.funcNames.length; i++) {

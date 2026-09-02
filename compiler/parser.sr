@@ -473,6 +473,12 @@ class Parser {
     }
 
     private void walkCallDiagnostics(Node n) {
+        if (n.kind == 50 && this.strEq(n.typeHint, "void ()") && n.name.length > 0) {
+            // DOCS/259 G2 -- fn-typed locals are invocable like fn-typed
+            // parameters once declared (forward-visible for the rest of the
+            // walk, matching the reference compiler's never-popped registry).
+            this.fnPtrCallScope.add(n.name);
+        }
         if (n.kind == 100) {
             // DOCS/259 -- the enclosing function's fn-typed parameters are
             // invocable as zero-arg calls within its body only. The scope is
@@ -1534,6 +1540,21 @@ class Parser {
                 }
                 if (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } cpt = cpt + "[]"; }
                 if (this.check(123)) { this.advance(); cpt = cpt + "?"; }
+                if (this.check(100)) {
+                    // DOCS/259 G1 -- function-typed constructor parameter
+                    // suffix: `void () name`. Only the supported `void ()`
+                    // shape is accepted (mirrors parseFunction's param path).
+                    if (this.strEq(cpt, "void") && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 101) {
+                        this.advance();
+                        this.advance();
+                        cpt = "void ()";
+                    } else {
+                        Token ftTok = this.peek();
+                        this.recordError(ftTok.line.toString() + ":" + ftTok.col.toString() + ": Unexpected token '(: function-typed parameters support only `void () name`; other shapes are not supported yet (see DOCS/259)'");
+                        this.skipBalancedParens();
+                        cpt = "void ()";
+                    }
+                }
                 if (this.check(147)) {
                     this.advance();
                     cpt = cpt + "[]";
@@ -1595,6 +1616,13 @@ class Parser {
                 }
                 if (this.check(121)) { ft = ft + ">"; this.advance(); }
             }
+            if (this.strEq(ft, "void") && this.check(100) && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 101) {
+                // DOCS/259 G2 -- fn-typed prop: `prop void () cb;` (fn arrays
+                // too via the `[]` suffix below).
+                this.advance();
+                this.advance();
+                ft = "void ()";
+            }
             if (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } ft = ft + "[]"; }
             if (this.check(123)) { this.advance(); ft = ft + "?"; }
             field.typeHint = ft;
@@ -1603,7 +1631,7 @@ class Parser {
             this.expect(106);
             return field;
         }
-        if (this.check(28) || this.check(18) || this.check(19) || this.check(20) || this.check(25) || this.check(27) || this.check(22) || this.check(23) || this.check(26) || this.check(7)) {
+        if (this.check(28) || this.check(18) || this.check(19) || this.check(20) || this.check(25) || this.check(27) || this.check(22) || this.check(23) || this.check(26) || this.check(17) || this.check(7)) {
             int savedPos = this.pos;
             string ft = this.advance().text;
             if (this.check(120)) {
@@ -1611,6 +1639,14 @@ class Parser {
                     ft = ft + this.advance().text;
                 }
                 if (this.check(121)) { ft = ft + ">"; this.advance(); }
+            }
+            if (this.strEq(ft, "void") && this.check(100) && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 101) {
+                // DOCS/259 G2 -- bare fn-typed field: `void () cb;` (fn arrays
+                // too via the `[]` suffix below). 17 (`void`) was added to the
+                // member dispatch so this path is reached at all.
+                this.advance();
+                this.advance();
+                ft = "void ()";
             }
             if (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } ft = ft + "[]"; }
             if (this.check(123)) { this.advance(); ft = ft + "?"; }
@@ -1991,6 +2027,29 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         // receiver (`int.parseInt(s)`), not a declaration.
         if ((this.check(28) || this.check(18) || this.check(19) || this.check(20) || this.check(25) || this.check(27) || this.check(22) || this.check(23) || this.check(26)) && !(this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 108)) {
             return this.parseVarDecl();
+        }
+        if (this.check(17) && this.pos + 2 < this.tokens.length && this.tokens[this.pos + 1].kind == 100 && this.tokens[this.pos + 2].kind == 101) {
+            // DOCS/259 G2/G3 -- local fn-typed declaration: `void () cb;` or
+            // `void ()[] jobs;` (decl-init forms included).  The value is an
+            // 8-byte function address (or an array of them).
+            this.advance();
+            this.advance();
+            this.advance();
+            string declType = "void ()";
+            while (this.check(104) && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 105) {
+                this.advance();
+                this.advance();
+                declType = declType + "[]";
+            }
+            Node n = new Node(); n.kind = 50;
+            n.typeHint = declType;
+            n.name = this.advance().text;
+            if (this.check(110)) {
+                this.advance();
+                n.children.add(this.parseExpr(0));
+            }
+            this.expectSemi();
+            return n;
         }
         Node exprStmt = new Node(); exprStmt.kind = 61;
         exprStmt.children.add(this.parseExpr(0));
@@ -2458,6 +2517,28 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 lhs = idx;
                 continue;
             }
+            if (this.check(100) && lhs.kind == 24) {
+                // DOCS/259 G3 -- indirect call through a function-typed value
+                // (`jobs[0]()`). The FULL index expression is carried as the
+                // callee child so codegen performs the bounds-checked element
+                // load; the element holds the function address. Zero-argument
+                // calls only.
+                Token callOpen = this.peek();
+                this.advance();
+                if (!this.check(101)) {
+                    this.recordError(callOpen.line.toString() + ":" + callOpen.col.toString() + ": Unexpected token '(: function-typed values support only zero-argument calls — the supported type is `void ()` (see DOCS/259)'");
+                    this.skipBalancedParens();
+                } else {
+                    this.advance();
+                }
+                Node indirect = new Node();
+                indirect.kind = 87;
+                indirect.line = lhs.line;
+                indirect.col = lhs.col;
+                indirect.children.add(lhs);
+                lhs = indirect;
+                continue;
+            }
             if (this.check(108)) {
                 this.advance();
                 Token name = this.advance();
@@ -2583,6 +2664,31 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 // infix operator there; stop and let the index handler see it.
                 break;
             }
+            if (this.check(38) && this.isAsCastAhead()) {
+                // DOCS/259 G4 -- `expr as Type`: a no-op cast for class
+                // instances. Binds between the comparison operators (prec 5)
+                // and the bitwise operators (prec 6+) — same relative strength
+                // the Rust compiler gives it — and chains left-associatively.
+                // `as` NOT followed by a type-like token is left alone (the
+                // generic path then ends the expression, so statement-position
+                // `T as Alias;` type aliases still parse through parseVarDecl
+                // before any expression work).
+                int castLine = this.peek().line;
+                int castCol = this.peek().col;
+                this.advance();
+                string target = this.parseAsCastTarget();
+                if (this.isPrimitiveTypeSpelling(target) || (lhs.kind >= 0 && lhs.kind <= 4)) {
+                    this.recordError(castLine.toString() + ":" + castCol.toString() + ": Unexpected token 'as: as cast only supports class instances (see DOCS/259); got 'expression as " + target + "''");
+                }
+                Node cast = new Node();
+                cast.kind = 86;
+                cast.name = target;
+                cast.line = castLine;
+                cast.col = castCol;
+                cast.children.add(lhs);
+                lhs = cast;
+                continue;
+            }
             int prec = this.getPrec(this.peek().kind);
             if (prec < minPrec) { break; }
             int nextMin = prec + 1;
@@ -2635,6 +2741,59 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         if (kind == 117) { return 23; }
         if (kind == 118) { return 24; }
         return 0;
+    }
+
+    // DOCS/259 G4 -- lookahead for the `as` cast: the `as` keyword must be
+    // followed by a type-like token (class identifier or primitive keyword).
+    // A comma, closing paren/bracket, semicolon, brace, or operator after
+    // `as` means it is NOT a cast (e.g. the range-for `for (x as start..end)`
+    // spelling is consumed before parseExpr ever sees that context, and bare
+    // `T as Alias;` declaration statements end the expression here).
+    private bool isAsCastAhead() {
+        if (this.pos + 1 >= this.tokens.length) { return false; }
+        int nk = this.tokens[this.pos + 1].kind;
+        if (nk == 7) { return true; }
+        if (nk == 17 || nk == 18 || nk == 19 || nk == 20 || nk == 22 || nk == 23 || nk == 25 || nk == 26 || nk == 27) { return true; }
+        return false;
+    }
+
+    // DOCS/259 G4 -- parse the cast target spelling after `as`: an
+    // identifier (class name), a primitive keyword, or a generic/nullable
+    // shape. Array/nullable suffixes are accepted like a plain type.
+    private string parseAsCastTarget() {
+        Token t = this.advance();
+        string target = t.text;
+        if (this.check(120)) {
+            while (!this.check(121) && !this.check(106) && !this.check(103)) {
+                target = target + this.advance().text;
+            }
+            if (this.check(121)) { target = target + ">"; this.advance(); }
+        }
+        while (this.check(104)) {
+            this.advance();
+            this.expect(105);
+            target = target + "[]";
+        }
+        if (this.check(123)) { this.advance(); target = target + "?"; }
+        return target;
+    }
+
+    // DOCS/259 G4 -- primitive type spellings rejected as cast targets (the
+    // cast is only a class-instance assertion).
+    private bool isPrimitiveTypeSpelling(string t) {
+        if (this.strEq(t, "int")) { return true; }
+        if (this.strEq(t, "int32")) { return true; }
+        if (this.strEq(t, "int64")) { return true; }
+        if (this.strEq(t, "uint")) { return true; }
+        if (this.strEq(t, "float")) { return true; }
+        if (this.strEq(t, "float64")) { return true; }
+        if (this.strEq(t, "double")) { return true; }
+        if (this.strEq(t, "bool")) { return true; }
+        if (this.strEq(t, "byte")) { return true; }
+        if (this.strEq(t, "char")) { return true; }
+        if (this.strEq(t, "string")) { return true; }
+        if (this.strEq(t, "void")) { return true; }
+        return false;
     }
 
     private int getPrec(int kind) {
