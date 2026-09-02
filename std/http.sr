@@ -1,43 +1,148 @@
-import * from os;
-import * from http_win;
-
 mod export http;
 
-// DOCS -- public `http` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
-// unified, portable front of the HTTP client. It contains ZERO win32
-// references: every winhttp.dll call moved into the internal Windows backend
-// std/http_win.sr, and every entry below routes through the OS gate
-// `if (osType() == OSTypes.WINDOWS)` before touching it. See http_win.sr for
-// why the winhttp calls there are bound through `X as Y` import aliases and
-// for the behavior notes carried over from the pre-split implementation.
+// DOCS -- public `http` module (UNIFIED_CORE_LIBRARY.md v2 canonical fold).
+// This is the universal HTTP client module: there is no http_win.sr backend
+// and no win-named helpers -- one module, one OS layer (http rides net per
+// the layering pyramid; the winhttp fast path here is the OPTIONAL Windows
+// fast path of §4). Every winhttp.dll call lives inline in the `#on WINDOWS`
+// regions of the public functions that need it, one unified function name
+// per operation, no wrapper indirection, no alias imports, no osType()
+// gates (so `import * from os;` is gone too: the preprocessor replaces the
+// gate). Plain `import * from win32.winhttp;` -- all WinHttp* export names
+// are tabled on both compilers and none collides with this module's public
+// API (get/post/delete). The private extractHost/extractPort/extractPath
+// helpers are pure URL string parsing -- no OS code, so they stay ungated
+// with their pre-split names.
 //
-// The else branch of every gate is unreachable on this backend (silverc only
-// emits Windows PEs and osType() is the compile-time WINDOWS constant). For a
-// future non-Windows backend the fallbacks follow the module's existing
-// failure style: empty string.
+// http is builtin-reserved on BOTH compilers (rs main.rs builtin_modules_set,
+// self-host std/project.sr projectBuiltin), so this source is rarely
+// compiled -- user `http.<fn>()` calls are answered natively (rs
+// stdlib::http::gen_http_call). The fold is for source hygiene; behavior is
+// native-dispatched and unchanged.
 //
-// PUBLIC API (unchanged from the pre-split std/http.sr): get(url),
-// post(url, body), delete(url). The extractHost/extractPort/extractPath
-// helpers were private and moved into the backend under httpWin-prefixed
-// names (see http_win.sr).
+// BEHAVIOR NOTES (bodies below are the pre-split implementations, with the
+// DLL call sites renamed from the backend's aliases to the bare export
+// names):
+//   - Responses still accumulate with `result += char(buf[i])` loops.
+//     char(int) semantics currently differ between compilers (silverc-rs was
+//     aligned with silveri in commit 886e1a7; the self-host is a known
+//     outlier), so the shapes are preserved as-is to keep each compiler's
+//     behavior exactly where it was.
+//   - The read loop hands the DLL a `byte[]`, whose slots are qwords, so a
+//     raw byte stream written by WinHttpReadData only lines up with
+//     `buf[i]` for the first eight bytes; net.sr's int[] shift packing is
+//     the layout-safe idiom a future parity pass should apply here.
+//   - post() still serializes with body.toBytes(), which neither compiler
+//     implements as a real builtin (the self-host parses it but silently
+//     miscompiles the call); preserved verbatim for the reasons above.
+//
+// NON-WINDOWS FALLBACK: every entry returns the empty string when no
+// Windows region is present (the module's existing failure style).
+
+#on WINDOWS
+import * from win32.winhttp;
+#off
+
+// Private URL helpers (pure string parsing -- no OS code, ungated).
+
+private string extractHost(string url) {
+    int start = url.indexOf("://");
+    if (start >= 0) { start += 3; } else { start = 0; }
+    int end = url.indexOf(":", start);
+    if (end < 0) { end = url.indexOf("/", start); }
+    if (end < 0) { end = url.length; }
+    return url.substr(start, end - start);
+}
+
+private int extractPort(string url) {
+    int start = url.indexOf("://");
+    if (start >= 0) { start += 3; } else { start = 0; }
+    int colon = url.indexOf(":", start);
+    if (colon < 0) {
+        if (url.substr(0, 5) == "https") { return 443; }
+        return 80;
+    }
+    int slash = url.indexOf("/", colon);
+    if (slash < 0) { slash = url.length; }
+    return int(url.substr(colon + 1, slash - colon - 1));
+}
+
+private string extractPath(string url) {
+    int start = url.indexOf("://");
+    if (start >= 0) { start = url.indexOf("/", start + 3); }
+    if (start < 0) { return "/"; }
+    return url.substr(start);
+}
 
 public string get(string url) {
-    if (osType() == OSTypes.WINDOWS) {
-        return httpWinGet(url);
+    #on WINDOWS
+    int session = WinHttpOpen("Silver/1.0", 0, null, null, 0);
+    if (session == 0) { return ""; }
+    int conn = WinHttpConnect(session, extractHost(url), extractPort(url), 0);
+    if (conn == 0) { WinHttpCloseHandle(session); return ""; }
+    int req = WinHttpOpenRequest(conn, "GET", extractPath(url), null, null, null, 0);
+    if (req == 0) { WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
+    bool sent = WinHttpSendRequest(req, null, 0, null, 0, 0, 0);
+    if (!sent) { WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
+    bool recvd = WinHttpReceiveResponse(req, null);
+    if (!recvd) { WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
+    string result = "";
+    byte[] buf = new byte[4096];
+    int read = 0;
+    while (WinHttpReadData(req, buf, 4096, &read) && read > 0) {
+        for (int i = 0; i < read; i++) { result += char(buf[i]); }
     }
+    WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session);
+    return result;
+    #off
     return "";
 }
 
 public string post(string url, string body) {
-    if (osType() == OSTypes.WINDOWS) {
-        return httpWinPost(url, body);
+    #on WINDOWS
+    int session = WinHttpOpen("Silver/1.0", 0, null, null, 0);
+    if (session == 0) { return ""; }
+    int conn = WinHttpConnect(session, extractHost(url), extractPort(url), 0);
+    if (conn == 0) { WinHttpCloseHandle(session); return ""; }
+    int req = WinHttpOpenRequest(conn, "POST", extractPath(url), null, null, null, 0);
+    if (req == 0) { WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
+    byte[] bodyBytes = body.toBytes();
+    bool sent = WinHttpSendRequest(req, "Content-Type: application/json\r\n", -1, bodyBytes, bodyBytes.length, bodyBytes.length, 0);
+    if (!sent) { WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
+    bool recvd = WinHttpReceiveResponse(req, null);
+    if (!recvd) { WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
+    string result = "";
+    byte[] buf = new byte[4096];
+    int read = 0;
+    while (WinHttpReadData(req, buf, 4096, &read) && read > 0) {
+        for (int i = 0; i < read; i++) { result += char(buf[i]); }
     }
+    WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session);
+    return result;
+    #off
     return "";
 }
 
 public string delete(string url) {
-    if (osType() == OSTypes.WINDOWS) {
-        return httpWinDelete(url);
+    #on WINDOWS
+    int session = WinHttpOpen("Silver/1.0", 0, null, null, 0);
+    if (session == 0) { return ""; }
+    int conn = WinHttpConnect(session, extractHost(url), extractPort(url), 0);
+    if (conn == 0) { WinHttpCloseHandle(session); return ""; }
+    int req = WinHttpOpenRequest(conn, "DELETE", extractPath(url), null, null, null, 0);
+    if (req == 0) { WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
+    bool sent = WinHttpSendRequest(req, null, 0, null, 0, 0, 0);
+    if (!sent) { WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
+    bool recvd = WinHttpReceiveResponse(req, null);
+    if (!recvd) { WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return ""; }
+    string result = "";
+    byte[] buf = new byte[4096];
+    int read = 0;
+    while (WinHttpReadData(req, buf, 4096, &read) && read > 0) {
+        for (int i = 0; i < read; i++) { result += char(buf[i]); }
     }
+    WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session);
+    return result;
+    #off
     return "";
 }
