@@ -1,52 +1,63 @@
-import * from os;
-import * from io_win;
-
 mod export io;
 
-// DOCS -- public `io` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
-// unified, portable front of the standard-input library. It contains ZERO
-// win32 imports: every kernel32 call moved verbatim into the internal
-// Windows backend std/io_win.sr, and the DLL-backed entry below routes
-// through the OS gate `if (osType() == OSTypes.WINDOWS)` before touching it.
+// DOCS -- public `io` module (UNIFIED_CORE_LIBRARY.md v2 canonical fold).
+// This is the universal standard-input module: there is no io_win.sr backend
+// and no win-named helpers -- one module, one OS layer (io -> win32.kernel32).
+// The canonical shape puts the raw OS calls INSIDE the public readLine
+// body behind a `#on WINDOWS` ... `#off` region: one unified function name,
+// no wrapper indirection, no `#else`, no LINUX/MAC placeholders (the
+// non-Windows regions get filled on their own machines later). The osType()
+// runtime gate is gone: the preprocessor replaces it, so
+// `import * from os;` is not needed here. Plain
+// `import * from win32.kernel32;` -- alias imports are removed in v2;
+// neither GetStdHandle nor ReadFile collides with this module's public API
+// (readLine/input).
 //
-// The gate uses osType() (std/os.sr) instead of the native `os.type` query
-// because the self-hosted backend's builtin `os` dispatch covers only
-// os.name/os.version/os.build today -- `os.type` miscompiles there in both
-// spellings (property access yields a null string, the call form falls into
-// builtin dispatch and returns garbage). osType() is plain Silver: it
-// returns the OSTypes.WINDOWS contract value on every implementation without
-// needing native support, and it can be switched to the native query once
-// mini_cg learns a `type` branch.
+// BEHAVIOR NOTES (the body is the pre-split io.sr readLine implementation so
+// behavior is unchanged): readLine fetches the STD_INPUT_HANDLE pseudo-handle
+// (GetStdHandle(-10), the exact constant the pre-split module used) and then
+// reads one byte per kernel32!ReadFile call, appending chars until '\n',
+// stripping '\r' -- the byte-at-a-time loop, the empty-string-on-invalid-
+// handle early return, and the stop-on-zero-bytes-read end-of-stream check
+// are all exactly the pre-split shape. The handle lands in a local first
+// because nested grant calls as arguments are not a shape the backends rely
+// on. One mechanical adjustment inherited from the v1 split: the old
+// `byte[] buf[1];` fixed-declaration is spelled `byte[] buf = new byte[1];`
+// (the codebase-standard allocation idiom).
 //
-// The else branch of the gate is unreachable on this backend (silverc only
-// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
-// a future non-Windows backend the fallback follows the module's existing
-// failure style: readLine returns "" -- the same value the pre-split body
-// returned when the stdin handle was invalid. The remaining entries are NOT
-// gated on purpose: the input() alias and the prompt variant are pure Silver
-// delegation through readLine, so they inherit the gate through that call
-// and keep their original shape (printline is a builtin, not a DLL call).
-//
-// DISPATCH NOTE (per compiler, unchanged by this split): the self-hosted
+// DISPATCH NOTE (per compiler, unchanged by this fold): the self-hosted
 // compiler intercepts plain `input` and `readLine` calls with its native
 // genInputCall builtin (mini_cg: GetStdHandle(-10) + one ReadFile into a
 // 4096-byte heap buffer) before this module's globals are consulted, so the
-// wrapper's readLine body below is reached there only via `io.readLine()`
-// member calls -- the receiver "io" is not a builtin-module receiver, so
-// those fall through to this file exactly as they hit the pre-split
-// implementation. silverc-rs has no native readLine and its native `input`
-// stub (codegen.rs gen_input) only fires when no user-defined `input` is in
-// scope: once `import * from io;` resolves (through the exe-ancestor
-// silverc/std walk; io is not in the rs builtin_modules_set), io's own
-// functions win the func_labels dispatch, and the wrapper forwards into the
-// internal backend. Both paths produce the same behavior as the pre-split
-// module.
+// readLine body below is reached there only via `io.readLine()` member calls
+// -- the receiver "io" is not a builtin-module receiver, so those fall
+// through to this file exactly as they hit the pre-split implementation.
+// silverc-rs has no native readLine and its native `input` stub (codegen.rs
+// gen_input) only fires when no user-defined `input` is in scope: once
+// `import * from io;` resolves, io's own functions win the func_labels
+// dispatch. Both paths produce the same behavior as the pre-split module.
+
+#on WINDOWS
+import * from win32.kernel32;
+#off
 
 public string readLine() {
-    if (osType() == OSTypes.WINDOWS) {
-        return ioWinReadLine();
+    #on WINDOWS
+    int stdin = GetStdHandle(-10);
+    if (stdin == -1) { return ""; }
+    string result = "";
+    byte[] buf = new byte[1];
+    int read = 0;
+    while (true) {
+        bool ok = ReadFile(stdin, buf, 1, &read, null);
+        if (!ok || read == 0) { break; }
+        char c = char(buf[0]);
+        if (c == '\n') { break; }
+        if (c == '\r') { continue; }
+        result += c;
     }
-    return "";
+    return result;
+    #off
 }
 
 public string input() << readLine();

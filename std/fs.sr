@@ -1,30 +1,24 @@
-import * from os;
-import * from fs_win;
-
 mod export fs;
 
-// DOCS -- public `fs` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
-// unified, portable front of the file-system library. It contains ZERO win32
-// imports: every kernel32 call moved verbatim into the internal Windows
-// backend std/fs_win.sr, and every DLL-backed entry below routes through the
-// OS gate `if (osType() == OSTypes.WINDOWS)` before touching it.
+// DOCS -- public `fs` module (UNIFIED_CORE_LIBRARY.md v2 canonical fold).
+// This is the universal file-system module: there is no fs_win.sr backend
+// and no win-named helpers -- one module, one OS layer (fs -> win32.kernel32).
+// The canonical shape puts each raw OS call INSIDE its public function's
+// body behind a `#on WINDOWS` ... `#off` region: one unified function name,
+// no wrapper indirection, no `#else`, no LINUX/MAC placeholders (the
+// non-Windows regions get filled on their own machines later). The osType()
+// runtime gates are gone: the preprocessor replaces them, so
+// `import * from os;` is not needed here. Plain
+// `import * from win32.kernel32;` -- alias imports are removed in v2. No
+// kernel32 export name (CreateFileA, ReadFile, ...) collides with this
+// module's public API.
 //
-// The gate uses osType() (std/os.sr) instead of the native `os.type` query
-// because the self-hosted backend's builtin `os` dispatch covers only
-// os.name/os.version/os.build today -- `os.type` miscompiles there in both
-// spellings (property access yields a null string, the call form falls into
-// builtin dispatch and returns garbage). osType() is plain Silver: it
-// returns the OSTypes.WINDOWS contract value on every implementation without
-// needing native support, and it can be switched to the native query once
-// mini_cg learns a `type` branch.
-//
-// The else branch of every gate is unreachable on this backend (silverc only
-// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
-// a future non-Windows backend the fallbacks follow the module's existing
-// failure style: empty string / empty array / false / silent no-op. Pure
-// Silver combinators that only filter what a gated primitive returned
-// (FolderOps.files/folders over this.list()) inherit the gate through that
-// call and keep their original shape.
+// The bodies below are the pre-split fs.sr implementations so behavior is
+// unchanged -- including FolderOps.list's FindFirstFileA enumeration quirk
+// (the handle-based loop never copies the WIN32_FIND_DATA name, so each
+// entry contributes ""). One mechanical adjustment inherited from the v1
+// split: the old `byte[] buf[size];` fixed-declaration is spelled
+// `byte[] buf = new byte[size];` (the codebase-standard allocation idiom).
 //
 // DELEGATION QUIRK (intentional, do not "fix"): FileOps.readString still
 // calls fs.readString(path). When the self-hosted compiler compiles that
@@ -34,26 +28,29 @@ mod export fs;
 // implementation passed a Silver array header to Win32 and could crash on
 // ordinary instance reads.
 
+#on WINDOWS
+import * from win32.kernel32;
+#off
+
 class FileOps {
     construct () {}
 
     public bool exists(string path) {
-        if (osType() == OSTypes.WINDOWS) {
-            return fsWinExists(path);
-        }
-        return false;
+        #on WINDOWS
+        return GetFileAttributesA(path) != -1;
+        #off
     }
 
     public void delete(string path) {
-        if (osType() == OSTypes.WINDOWS) {
-            fsWinDelete(path);
-        }
+        #on WINDOWS
+        DeleteFileA(path);
+        #off
     }
 
     public void rename(string oldPath, string newPath) {
-        if (osType() == OSTypes.WINDOWS) {
-            fsWinRename(oldPath, newPath);
-        }
+        #on WINDOWS
+        MoveFileA(oldPath, newPath);
+        #off
     }
 
     public string readString(string path) {
@@ -65,9 +62,13 @@ class FileOps {
     }
 
     public void write(string path, byte[] data) {
-        if (osType() == OSTypes.WINDOWS) {
-            fsWinWrite(path, data);
-        }
+        #on WINDOWS
+        int h = CreateFileA(path, 0x40000000, 0, null, 2, 0x80, 0);
+        if (h == -1) { return; }
+        int wrote = 0;
+        WriteFile(h, data, data.length, &wrote, null);
+        CloseHandle(h);
+        #off
     }
 }
 
@@ -75,30 +76,44 @@ class FolderOps {
     construct () {}
 
     public string[] list(string path) {
-        if (osType() == OSTypes.WINDOWS) {
-            return fsWinListDir(path);
+        #on WINDOWS
+        string sp = path + "\\*";
+        int h = FindFirstFileA(sp, null);
+        if (h == -1) { return []; }
+        string[] names = [];
+        bool cont = true;
+        while (cont) {
+            string name = "";
+            if (name != "." && name != "..") { names.add(name); }
+            cont = FindNextFileA(h, null);
         }
-        return [];
+        FindClose(h);
+        return names;
+        #off
     }
 
     public string[] list() << this.list(".");
 
     public string[] files() {
+        #on WINDOWS
         string[] all = this.list();
         string[] result = [];
         foreach (string f in all) {
-            if (fsWinGetAttrs(f) != 0x10) { result.add(f); }
+            if (GetFileAttributesA(f) != 0x10) { result.add(f); }
         }
         return result;
+        #off
     }
 
     public string[] folders() {
+        #on WINDOWS
         string[] all = this.list();
         string[] result = [];
         foreach (string f in all) {
-            if (fsWinGetAttrs(f) == 0x10) { result.add(f); }
+            if (GetFileAttributesA(f) == 0x10) { result.add(f); }
         }
         return result;
+        #off
     }
 
     public string[] entries() << this.list();
@@ -115,15 +130,15 @@ class FolderOps {
     }
 
     public void create(string path) {
-        if (osType() == OSTypes.WINDOWS) {
-            fsWinCreateDir(path);
-        }
+        #on WINDOWS
+        CreateDirectoryA(path, null);
+        #off
     }
 
     public void create(string path, bool ignoreExistence) {
-        if (osType() == OSTypes.WINDOWS) {
-            fsWinCreateDir(path);
-        }
+        #on WINDOWS
+        CreateDirectoryA(path, null);
+        #off
     }
 }
 
@@ -131,61 +146,93 @@ public FileOps file;
 public FolderOps folder;
 
 public string readString(string path) {
-    if (osType() == OSTypes.WINDOWS) {
-        return fsWinReadString(path);
-    }
-    return "";
+    #on WINDOWS
+    int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
+    if (h == -1) { return ""; }
+    int size = GetFileSize(h, null);
+    byte[] buf = new byte[size];
+    int read = 0;
+    ReadFile(h, buf, size, &read, null);
+    CloseHandle(h);
+    string result = "";
+    foreach (byte b in buf) { result += char(b); }
+    return result;
+    #off
 }
 
 public byte[] read(string path) {
-    if (osType() == OSTypes.WINDOWS) {
-        return fsWinRead(path);
-    }
-    return [];
+    #on WINDOWS
+    int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
+    if (h == -1) { return []; }
+    int size = GetFileSize(h, null);
+    byte[] buf = new byte[size];
+    int read = 0;
+    ReadFile(h, buf, size, &read, null);
+    CloseHandle(h);
+    return buf;
+    #off
 }
 
 public void writeString(string path, string content) {
-    if (osType() == OSTypes.WINDOWS) {
-        fsWinWriteString(path, content);
-    }
+    #on WINDOWS
+    int h = CreateFileA(path, 0x40000000, 0, null, 2, 0x80, 0);
+    if (h == -1) { return; }
+    byte[] buf = content.toBytes();
+    int wrote = 0;
+    WriteFile(h, buf, buf.length, &wrote, null);
+    CloseHandle(h);
+    #off
 }
 
 public void write(string path, byte[] data) {
-    if (osType() == OSTypes.WINDOWS) {
-        fsWinWrite(path, data);
-    }
+    #on WINDOWS
+    int h = CreateFileA(path, 0x40000000, 0, null, 2, 0x80, 0);
+    if (h == -1) { return; }
+    int wrote = 0;
+    WriteFile(h, data, data.length, &wrote, null);
+    CloseHandle(h);
+    #off
 }
 
 public bool exists(string path) {
-    if (osType() == OSTypes.WINDOWS) {
-        return fsWinExists(path);
-    }
-    return false;
+    #on WINDOWS
+    return GetFileAttributesA(path) != -1;
+    #off
 }
 
 public void delete(string path) {
-    if (osType() == OSTypes.WINDOWS) {
-        fsWinDelete(path);
-    }
+    #on WINDOWS
+    DeleteFileA(path);
+    #off
 }
 
 public void rename(string oldPath, string newPath) {
-    if (osType() == OSTypes.WINDOWS) {
-        fsWinRename(oldPath, newPath);
-    }
+    #on WINDOWS
+    MoveFileA(oldPath, newPath);
+    #off
 }
 
 public string[] listDir(string path) {
-    if (osType() == OSTypes.WINDOWS) {
-        return fsWinListDir(path);
+    #on WINDOWS
+    string sp = path + "\\*";
+    int h = FindFirstFileA(sp, null);
+    if (h == -1) { return []; }
+    string[] names = [];
+    bool cont = true;
+    while (cont) {
+        string name = "";
+        if (name != "." && name != "..") { names.add(name); }
+        cont = FindNextFileA(h, null);
     }
-    return [];
+    FindClose(h);
+    return names;
+    #off
 }
 
 public void createDir(string path) {
-    if (osType() == OSTypes.WINDOWS) {
-        fsWinCreateDir(path);
-    }
+    #on WINDOWS
+    CreateDirectoryA(path, null);
+    #off
 }
 
 construct () {
