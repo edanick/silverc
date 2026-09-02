@@ -1,26 +1,37 @@
-import * from os;
-import * from datetime_win;
-
 mod export datetime;
 
-// DOCS -- public `datetime` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is
-// the unified, portable front of the date/time library. It contains ZERO
-// win32 imports: every kernel32 call moved into the internal Windows backend
-// std/datetime_win.sr, and every DLL-backed entry below routes through the
-// OS gate `if (osType() == OSTypes.WINDOWS)` before touching it.
+// DOCS -- public `datetime` module (UNIFIED_CORE_LIBRARY.md v2 canonical
+// fold). This is the universal date/time module: the former internal Windows
+// backend std/datetime_win.sr was folded back into this file and deleted.
+// There is no datetime_win.sr anymore -- one module, one OS layer
+// (datetime -> win32.kernel32).
 //
-// The gate uses osType() (std/os.sr) instead of the native `os.type` query
-// because the self-hosted backend's builtin `os` dispatch covers only
-// os.name/os.version/os.build today -- `os.type` miscompiles there in both
-// spellings (see std/time.sr for the full notes). osType() is plain Silver:
-// it returns the OSTypes.WINDOWS contract value on every implementation
-// without needing native support.
+// CANONICAL SHAPE (v2 rule 6): the raw OS calls live INSIDE the public
+// function bodies (the `now` constructor and utcNow) behind `#on WINDOWS`
+// regions -- one unified function name, no win-prefixed helpers, no wrapper
+// indirection. The osType() runtime gates and the `os` import are gone (the
+// preprocessor replaces them); no #else and no LINUX/MAC placeholders -- the
+// other-OS regions get filled on their own machines later (a future
+// non-Windows backend would leave the zero-field constructor path; every
+// field is still assigned on every path because the self-hosted backend does
+// not zero fresh object memory).
 //
-// The else side of every gate is unreachable on this backend (silverc only
-// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
-// a future non-Windows backend the fallbacks follow the module's failure
-// style: a default-constructed `now` keeps zero fields. unix()/diff() are
-// pure arithmetic over whatever fields the instance holds and need no gate.
+// PLAIN IMPORT: the kernel32 grant is a plain full-table
+// `import * from win32.kernel32;` inside its own region -- alias imports are
+// removed in v2. GetLocalTime and GetSystemTime are present in BOTH
+// compilers' kernel32 export tables (silverc-rs/src/win32.rs and the
+// self-host win32ExportTable), so the plain grant resolves without any table
+// change.
+//
+// MEMORY LAYOUT (silverc-rs codegen, unchanged by the fold): Silver arrays
+// are [cap, len, elem...] with 8-byte elements and a variable holding the
+// element-0 address, so an int[] doubles as a packed qword buffer for DLL
+// calls. SYSTEMTIME is 8 consecutive u16 words (wYear, wMonth, wDayOfWeek,
+// wDay, wHour, wMinute, wSecond, wMilliseconds) = 16 bytes, packed into one
+// int[2]: slot 0 holds words 0-3, slot 1 words 4-7. The unpack shifts each
+// field back out; the wDayOfWeek word is never needed by the public API and
+// is not returned. All extracted fields are u16, so the sign bit of either
+// slot stays clear and the shifts never see a negative operand.
 //
 // OPERATOR NOTE: the pre-split file declared the difference operation as
 // `public duration operator-(now other)`. Silver has no operator overloading
@@ -51,15 +62,17 @@ mod export datetime;
 // declares ONE constructor with trailing default parameters (a supported
 // mechanism -- codegen materializes missing trailing args for `new`):
 // `new now()` still means "current local time" (the -1 sentinel selects the
-// gated GetLocalTime path) and `new now(y,m,d,h,mi,s)` a fixed moment.
-// Every field is assigned on every path because the self-hosted backend
-// does not zero fresh object memory (unset fields read as garbage there).
+// GetLocalTime region) and `new now(y,m,d,h,mi,s)` a fixed moment.
 //
 // FORMAT NOTE: the specifier pads use if/else locals instead of the
 // string ternary `(cond ? "0" : "") + field`: the self-hosted backend
 // garbles string-typed ternaries concatenated with an int field (probe:
 // the ternary arm collapses to "" and the field value is lost), while the
 // if/else shape compiles identically on both backends.
+
+#on WINDOWS
+import * from win32.kernel32;
+#off
 
 class duration {
     private int64 totalMs;
@@ -84,24 +97,21 @@ class now {
 
     construct(int y = -1, int m = 0, int d = 0, int h = 0, int mi = 0, int s = 0) {
         if (y == -1) {
-            if (osType() == OSTypes.WINDOWS) {
-                int[] f = datetimeWinLocalFields();
-                this.year = f[0];
-                this.month = f[1];
-                this.day = f[2];
-                this.hour = f[3];
-                this.minute = f[4];
-                this.second = f[5];
-                this.millisecond = f[6];
-            } else {
-                this.year = 0;
-                this.month = 0;
-                this.day = 0;
-                this.hour = 0;
-                this.minute = 0;
-                this.second = 0;
-                this.millisecond = 0;
-            }
+            #on WINDOWS
+            // GetLocalTime fills the packed SYSTEMTIME buffer with the
+            // caller's LOCAL time; the shifts unpack {year, month, day,
+            // hour, minute, second, millisecond} (the pre-split
+            // datetimeWinLocalFields + unpack mechanics, moved inline).
+            int[] st = new int[2];
+            GetLocalTime(st);
+            this.year = st[0] & 0xFFFF;
+            this.month = (st[0] >> 16) & 0xFFFF;
+            this.day = (st[0] >> 48) & 0xFFFF;
+            this.hour = st[1] & 0xFFFF;
+            this.minute = (st[1] >> 16) & 0xFFFF;
+            this.second = (st[1] >> 32) & 0xFFFF;
+            this.millisecond = (st[1] >> 48) & 0xFFFF;
+            #off
         } else {
             this.year = y;
             this.month = m;
@@ -176,12 +186,20 @@ public now now() {
 
 public now utcNow() {
     now n = new now();
-    if (osType() == OSTypes.WINDOWS) {
-        int[] f = datetimeWinUtcFields();
-        n.year = f[0]; n.month = f[1]; n.day = f[2];
-        n.hour = f[3]; n.minute = f[4]; n.second = f[5];
-        n.millisecond = f[6];
-    }
+    #on WINDOWS
+    // GetSystemTime fills the packed SYSTEMTIME buffer with wall-clock UTC
+    // and the shifts overwrite the constructor's local-time fields (the
+    // pre-split datetimeWinUtcFields mechanics, moved inline).
+    int[] st = new int[2];
+    GetSystemTime(st);
+    n.year = st[0] & 0xFFFF;
+    n.month = (st[0] >> 16) & 0xFFFF;
+    n.day = (st[0] >> 48) & 0xFFFF;
+    n.hour = st[1] & 0xFFFF;
+    n.minute = (st[1] >> 16) & 0xFFFF;
+    n.second = (st[1] >> 32) & 0xFFFF;
+    n.millisecond = (st[1] >> 48) & 0xFFFF;
+    #off
     return n;
 }
 

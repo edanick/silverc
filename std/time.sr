@@ -1,46 +1,50 @@
-import * from os;
-import * from time_win;
-
 mod export time;
 
-// DOCS -- public `time` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
-// unified, portable front of the timing library. It contains ZERO win32
-// imports: every kernel32 call moved verbatim into the internal Windows
-// backend std/time_win.sr, and every DLL-backed entry below routes through
-// the OS gate `if (osType() == OSTypes.WINDOWS)` before touching it.
+// DOCS -- public `time` module (UNIFIED_CORE_LIBRARY.md v2 canonical fold).
+// This is the universal timing module: the former internal Windows backend
+// std/time_win.sr was folded back into this file and deleted. There is no
+// time_win.sr anymore -- one module, one OS layer (time -> win32.kernel32).
 //
-// The gate uses osType() (std/os.sr) instead of the native `os.type` query
-// because the self-hosted backend's builtin `os` dispatch covers only
-// os.name/os.version/os.build today -- `os.type` miscompiles there in both
-// spellings (property access yields a null string, the call form falls into
-// builtin dispatch and returns garbage). osType() is plain Silver: it
-// returns the OSTypes.WINDOWS contract value on every implementation without
-// needing native support, and it can be switched to the native query once
-// mini_cg learns a `type` branch.
+// CANONICAL SHAPE (v2 rule 6): the raw OS calls live INSIDE each public
+// function body behind a `#on WINDOWS` region -- one unified function name,
+// no win-prefixed helpers, no wrapper indirection. The osType() runtime
+// gates and the `os` import are gone (the preprocessor replaces them); no
+// #else and no LINUX/MAC placeholders -- the other-OS regions get filled on
+// their own machines later.
 //
-// The else branch of every gate is unreachable on this backend (silverc only
-// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
-// a future non-Windows backend the fallbacks follow the module's existing
-// failure style: silent no-op for sleep, 0.0 for now.
+// PLAIN IMPORT: the kernel32 grant is a plain full-table
+// `import * from win32.kernel32;` inside its own region -- alias imports are
+// removed in v2. Sleep, QueryPerformanceCounter and QueryPerformanceFrequency
+// are present in BOTH compilers' kernel32 export tables
+// (silverc-rs/src/win32.rs and the self-host win32ExportTable), so the plain
+// grant resolves without any table change. The QPC int64 out-param (&int64)
+// pattern is the pre-split one, kept exactly as it worked behind the aliased
+// grants; the QPC double derivation (count / freq * 1000.0) moved in
+// verbatim.
 //
-// DISPATCH NOTE (per compiler, unchanged by this split): silverc-rs answers
-// `time.sleep(...)` / `time.now(...)` with its native builtins (SENTINEL_SLEEP
-// and the gen_now emitter) before the module's own functions are consulted,
-// so the wrapper bodies below are dead code there; the self-hosted compiler
-// has no such builtins and dispatches those calls to these globals, which
-// forward into the internal backend. Both paths produce the same behavior.
+// DISPATCH NOTE (per compiler, unchanged by this fold): silverc-rs answers
+// bare `sleep(...)` / `now(...)` calls with native builtins (SENTINEL_SLEEP
+// and the gen_now emitter) -- but gen_call consults func_labels FIRST, so
+// with this module collected (its functions registered) the bodies below run
+// and hit the same kernel32 exports; the self-hosted compiler has no such
+// builtins and dispatches `time.*` to these globals directly. Both paths
+// produce the same behavior. The sleep pair keeps the public API's exact int
+// and uint overloads instead of funnelling both through one typed parameter
+// -- kernel32!Sleep takes the millisecond count either way.
 //
-// STOPWATCH (DOCS/259 -- anonymous function parameters): the historical
-// fourth member is live again. The receiver declares a function-typed
-// parameter `void () job` -- an 8-byte address slot -- and invoking `job()`
-// runs the caller's `(void () { ... })` body. The historical intent (bracket
-// the job with now() and report the elapsed ticks) is preserved; the
-// DOCS/259 stopwatch example is the shape reference:
+// STOPWATCH (DOCS/259 -- anonymous function parameters): the receiver
+// declares a function-typed parameter `void () job` -- an 8-byte address
+// slot -- and invoking `job()` runs the caller's `(void () { ... })` body
+// bracketed by two now() readings. The DOCS/259 shape reference:
 //
 //     time.stopwatch((void () {
 //         printline("working...");
 //         ...
 //     }));
+
+#on WINDOWS
+import * from win32.kernel32;
+#off
 
 public void stopwatch(void () job) {
     float64 start = now();
@@ -49,20 +53,23 @@ public void stopwatch(void () job) {
 }
 
 public void sleep(int ms) {
-    if (osType() == OSTypes.WINDOWS) {
-        timeWinSleepInt(ms);
-    }
+    #on WINDOWS
+    Sleep(ms);
+    #off
 }
 
 public void sleep(uint ms) {
-    if (osType() == OSTypes.WINDOWS) {
-        timeWinSleepUint(ms);
-    }
+    #on WINDOWS
+    Sleep(ms);
+    #off
 }
 
 public float64 now() {
-    if (osType() == OSTypes.WINDOWS) {
-        return timeWinNow();
-    }
-    return 0.0;
+    #on WINDOWS
+    int64 freq = 0;
+    int64 count = 0;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return float64(count) / float64(freq) * 1000.0;
+    #off
 }
