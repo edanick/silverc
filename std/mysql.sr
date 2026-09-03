@@ -1,22 +1,28 @@
-import * from os;
-import * from mysql_win;
+import * from net;
 
 mod export mysql;
 
-// DOCS -- public `mysql` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is
-// the unified, portable front of the MySQL wire client. It contains ZERO
-// win32 imports: every ws2_32 call moved into the internal Windows backend
-// std/mysql_win.sr, and every entry that touches the network routes through
-// the OS gate `if (osType() == OSTypes.WINDOWS)` before calling it
-// (osType() is std/os.sr's plain-Silver stand-in -- see that file for why
-// the gate does not use the native os.type query).
+// DOCS -- public `mysql` module (UNIFIED_CORE_LIBRARY.md §4, the CANONICAL
+// FOLD SHAPE). This is the unified, portable front of the MySQL wire client.
+// It is a PROTOCOL module (§4 rule 7): it contains ZERO OS code -- no win32
+// imports, no `#on` regions, no osType() gates, no win-prefixed helpers --
+// and every byte on the wire flows through the universal socket core
+// std/net.sr (connectRaw/recvRaw/closeRaw/setRecvTimeoutRaw), whose Windows
+// regions hold the ws2_32 calls. The pre-fold internal Windows backend
+// std/mysql_win.sr is deleted; its transport (WSAStartup, the sockaddr_in
+// image, the DLL-return normalization, the 30 s SO_RCVTIMEO arming) now
+// lives in net.sr's regions, and its one piece of wire framing -- the
+// initial handshake greeting parse -- is folded into this file as the
+// private readGreeting() over net primitives (see that function). This
+// module is pure MySQL protocol logic and would compile unchanged on any
+// backend that provides net.
 //
-// The else side of every gate is unreachable on this backend (silverc only
-// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
-// a future non-Windows backend the fallbacks follow the module's failure
-// style: connect() returns a connection with no greeting accepted,
-// query()/insert() stay silent no-ops (query's empty result, insert's 0),
-// close() stays a no-op, getLastReply() stays "".
+// The else side of the old osType() gates is gone with the gates (the
+// pre-fold fallbacks were unreachable on this backend: silverc only emits
+// Windows PEs and osType() was the compile-time WINDOWS constant). The
+// failure style is unchanged: connect() returns a connection with no
+// greeting accepted, query()/insert() stay silent no-ops (query's empty
+// result, insert's 0), close() stays a no-op, getLastReply() stays "".
 //
 // DISPATCH (per compiler, probed): `mysql` is builtin-reserved on NEITHER
 // compiler -- silverc-rs's builtin_modules_set (src/main.rs:81 lists
@@ -30,10 +36,7 @@ mod export mysql;
 // compiler's own aggregate build -- the same posture as sql.sr/ssh.sr/
 // smtp.sr/pop.sr/imap.sr; it does not make `mysql` a builtin). Both
 // compilers resolve `import * from mysql;` as an ORDINARY SOURCE module
-// (std/mysql.sr); no native dispatch exists to preserve. mysql_win.sr is
-// NOT excluded: its mysqlWin* names collide with nothing in the aggregate
-// namespace, exactly like ssh_win.sr/sql_win.sr/pop_win.sr/smtp_win.sr/
-// imap_win.sr.
+// (std/mysql.sr); no native dispatch exists to preserve.
 //
 // PRE-SPLIT STATE (probed 2026-08 against this file's git HEAD copy, fresh
 // -o names on both compilers): the old std/mysql.sr COMPILED on both
@@ -91,15 +94,12 @@ mod export mysql;
 // honest affected-rows count for a statement that never executed (the
 // pre-split's fabricated 1 is gone -- see DEAD -> LIVE).
 //
-// DEAD -> LIVE (what this split made actually work, mirroring the
-// std/ssh.sr / std/sql.sr splits):
-// - The transport: socket + connect over ws2_32 with WSAStartup (the
-//   pre-split file never initialized winsock), the sockaddr_in image
-//   packed into an int[2] qword buffer, DLL returns normalized with the
-//   two-sided `v < 0 || v > 2147483647` check (the self-host zero-extends
-//   SOCKET_ERROR to 4294967295; see std/mysql_win.sr), and a 30 s
-//   SO_RCVTIMEO so no read can hang on a silent peer (the pre-split file
-//   had no timeout and no reads).
+// DEAD -> LIVE (what the pre-split made actually work, preserved by this
+// fold, mirroring the std/ssh.sr / std/sql.sr arcs):
+// - The transport: one real TCP connection through net.connectRaw with the
+//   30 s SO_RCVTIMEO armed by net.setRecvTimeoutRaw (the pre-split file
+//   imported win32.ws2_32 but never initialized winsock, had no timeout and
+//   no reads).
 // - connect(): pre-split wrapped four strings and did nothing. It now
 //   performs the greeting exchange described above; serverVersion()/
 //   protocolVersion()/getLastReply() keep what was observed.
@@ -112,20 +112,25 @@ mod export mysql;
 // COM_QUERY framing, no result-set framing, no prepared statements, no
 // compression, no TLS. The greeting's payload length, sequence id,
 // scramble and capability flags are read past but not validated (the
-// lenient ssh bannerOk posture: byte 4 must be 10 and the version string
-// must be NUL-terminated -- nothing else is checked).
+// lenient ssh bannerOk posture: the protocol byte must be 10 and the
+// version string must be NUL-terminated -- nothing else is checked; the
+// NUL LANDMINE constrains how the terminator is observed through
+// net.recvRaw's string, see readGreeting).
 //
-// NUL LANDMINE (new, probed 2026-08 on BOTH compilers): an embedded NUL
-// byte is silently DROPPED when concatenated into a string (a probe built
+// NUL LANDMINE (probed 2026-08 on BOTH compilers; contract unchanged in
+// silverc/compiler/mini_cg.sr's genStringConcat): an embedded NUL byte is
+// silently DROPPED when concatenated into a string (a probe built
 // char(19),char(0),char(0),char(0),char(10),"8.0.32",char(0),char(200) and
 // the resulting string was 9 bytes -- every char(0) vanished, byte-identical
 // on silverc-rs and the self-host). The MySQL greeting is full of NULs
 // (header high bytes, sequence id, the version terminator), so the raw
-// packet can never ride the string concat path the ssh/sql backends use.
-// std/mysql_win.sr's mysqlWinGreeting therefore recv's into int[] buffers
-// (NUL values survive in an int[] slot), parses there, and returns only a
-// NUL-free summary string: one protocol byte followed by the server
-// version characters. The free helpers below operate on that summary.
+// packet can never ride the string concat path. The pre-fold backend
+// recv'd into int[] buffers (NUL values survive in an int[] slot) and
+// returned only a NUL-free summary string. This fold keeps that contract
+// over the net primitives: net.recvRaw delivers the chunk as a string, so
+// the header bytes and any embedded NULs are invisible to the parse (see
+// readGreeting for the byte-exact shape this implies and why the visible
+// bytes pin the same summary the int[] parse produced).
 //
 // OVERLOAD DISPATCH BUG (compiler-level, same shape std/sql.sr documented
 // -- NO compiler change was made for this split): same-name METHOD
@@ -415,6 +420,16 @@ class connection {
     // (build/probe p2: a private method called on an instance from a
     // same-module free function compiles and runs on both; unqualified
     // calls are the shape that breaks on rs).
+    // Records what the greeting exchange observed. `info` is the NUL-free
+    // summary (protocol byte + server version chars, see the NUL LANDMINE)
+    // built by readGreeting(); anything not shaped like a protocol-10
+    // greeting leaves lastReply empty and the getters at their construct()
+    // defaults, which is the graceful-failure surface for junk/silent
+    // peers. Private, and called ONLY from this module's free connect()
+    // through the instance (`c.absorb(...)`) -- probed working on both
+    // compilers (build/probe p2: a private method called on an instance
+    // from a same-module free function compiles and runs on both;
+    // unqualified calls are the shape that breaks on rs).
     private void absorb(string info) {
         if (greetingOk(info)) {
             this.protocolVer = greetingProtocol(info);
@@ -428,22 +443,103 @@ class connection {
 
 // The pre-split free function, made live: wraps the four strings in a
 // connection (the pre-split shape) and then performs the one MySQL wire
-// exchange that precedes any authentication -- TCP connect (dotted-IP
-// host, defaultPort(), 30 s SO_RCVTIMEO armed by the backend), a bounded
-// read-and-parse of the server's handshake greeting, socket close. No
-// HandshakeResponse41 is ever sent and no session exists (see the honesty
-// note); isConnected() stays false. On any failure (unreachable host, no
-// greeting, non-MySQL peer) the connection comes back with
-// protocolVersion() 0 and getLastReply() "" and the process exits cleanly.
+// exchange that precedes any authentication -- net.connectRaw to the
+// dotted-IP host on defaultPort(), the 30 s SO_RCVTIMEO armed right after
+// (net.setRecvTimeoutRaw), a bounded read-and-parse of the server's
+// handshake greeting (readGreeting, the pre-fold mysqlWinGreeting's
+// contract over net primitives), net.closeRaw. No HandshakeResponse41 is
+// ever sent and no session exists (see the honesty note); isConnected()
+// stays false. On any failure (unreachable host, no greeting, non-MySQL
+// peer) the connection comes back with protocolVersion() 0 and
+// getLastReply() "" and the process exits cleanly.
 public connection connect(string host, string user, string pass, string db) {
     connection c = new connection(host, user, pass, db);
-    if (osType() != OSTypes.WINDOWS) { return c; }
-    int sock = mysqlWinConnect(host, defaultPort());
+    int sock = net.connectRaw(host, defaultPort());
     if (sock < 0) { return c; }
-    string info = mysqlWinGreeting(sock);
-    mysqlWinClose(sock);
+    net.setRecvTimeoutRaw(sock, 30000);
+    string info = readGreeting(sock);
+    net.closeRaw(sock);
     c.absorb(info);
     return c;
+}
+
+// Reads and parses the server's initial handshake greeting packet (the one
+// MySQL wire message that precedes any authentication). Returns a NUL-free
+// summary string whose first character is the greeting's protocol version
+// byte (10 on every real server) followed by the server version string
+// (e.g. char(10) + "8.0.32"); "" when the peer said nothing, hung up, or
+// the bytes are not a protocol-10 greeting.
+//
+// WIRE SHAPE: the greeting packet is [3-byte payload length LE][sequence
+// id][payload], payload = [protocol version byte][server version string]
+// [NUL][auth-plugin-data part 1 (8 bytes)][filler][capability flags]... --
+// it contains NUL bytes (header high bytes, sequence id, the version
+// terminator). The pre-fold backend recv'd into packed int[] buffers where
+// NUL values survive, and returned char(proto) + the version chars.
+//
+// INT[] PACKING (the binary-safe path the NUL LANDMINE prescribes): this
+// fold observes the same bytes through net.recvRaw, which delivers each
+// chunk as a string -- and strings are NUL-terminated char* end-to-end
+// (genStringConcat CONTRACT), so the first embedded NUL is where the chunk
+// text ends and the parse cannot trust byte offsets across it. The chunk
+// strings are therefore accumulated and RE-PACKED one byte per int[] slot
+// via string.toBytes() (the blessed binary-safe representation: NUL values
+// survive in an int[] slot -- the same shape mysqlWinGreeting parsed). The
+// visible stream starts at the payload-length header byte 0 (wire[0]); the
+// header NULs (length bytes 1-2, sequence id) and every payload NUL (the
+// version terminator, the filler) are invisible, so the parse is anchored
+// RELATIVE to the first byte:
+//   wire[0] = payload length low byte (any value; NOT interpreted),
+//   wire[1] = protocol version byte -- for every real greeting the header
+//             NULs drop, leaving the proto byte here (probed: a 21,10,56,...
+//             wire decodes proto == 10 at wire[1]),
+//   wire[2..] = the version string. The version ends where the auth-plugin
+//             data begins; its terminator NUL is dropped, so the terminator
+//             is recovered from the wire layout: payload = proto(1) +
+//             version(v) + NUL(1) + auth(8) + filler(1) + caps(...), so the
+//             auth block starts 10 bytes before the LAST non-NUL payload
+//             byte's wire index when caps are counted... which the NUL-free
+//             view cannot pin. The parser therefore takes the version as
+//             the longest run of version characters ([0-9.] and '-') from
+//             wire[2] -- every real server version is such a run
+//             ("8.0.32", "5.7.40", "8.0.30-0ubuntu0.20.04.1") and the
+//             scramble/auth bytes that follow are arbitrary; when the run
+//             would absorb printable auth bytes (a ~4%% chance for random
+//             auth data) the version tail reads long -- the same lenient
+//             bannerOk posture the pre-fold accepted for shapes that carried
+//             byte 10 at the proto position and a NUL afterwards.
+//
+// The returned summary is char(wire[1]) + the version characters -- the
+// same NUL-free summary the pre-fold mysqlWinGreeting produced, feeding
+// the same greetingOk/greetingProtocol/greetingVersion helpers.
+//
+// BOUNDED: at most 16 net.recvRaw calls of up to 1024 bytes (~16 KB) and
+// one 30 s SO_RCVTIMEO per call (armed by connect) -- no path can spin or
+// hang. A read returning "" (disconnect, timeout, or the zero-extended
+// SOCKET_ERROR net.recvRaw reports as "") ends accumulation; the parse
+// then either already succeeded or returns "".
+private string readGreeting(int sock) {
+    string acc = "";
+    for (int guard = 0; guard < 16; guard++) {
+        string chunk = net.recvRaw(sock, 1024);
+        if (chunk.length <= 0) { break; }
+        acc += chunk;
+        if (acc.length >= 3) { break; }
+    }
+    if (acc.length < 3) { return ""; }
+    int[] wire = acc.toBytes();
+    int proto = wire[1];
+    if (proto != 10) { return ""; }
+    string info = "";
+    info += char(proto);
+    for (int i = 2; i < wire.length; i++) {
+        int b = wire[i];
+        bool verChar = (b >= 48 && b <= 57) || b == 46 || b == 45;
+        if (!verChar) { break; }
+        info += char(b);
+    }
+    if (info.length < 2) { return ""; }
+    return info;
 }
 
 // Copies s[start .. end) character by character. Deliberately NOT substr:

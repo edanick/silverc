@@ -1,21 +1,38 @@
-import * from os;
-import * from sql_win;
+import * from net;
 
 mod export sql;
 
-// DOCS -- public `sql` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
-// unified, portable front of the generic SQL client library. It contains
-// ZERO win32 imports: every ws2_32 call moved into the internal Windows
-// backend std/sql_win.sr, and every entry that touches the network routes
-// through the OS gate `if (osType() == OSTypes.WINDOWS)` before calling it
-// (osType() is std/os.sr's plain-Silver stand-in -- see that file for why
-// the gate does not use the native os.type query).
+// DOCS -- public `sql` module (UNIFIED_CORE_LIBRARY.md §4, the CANONICAL
+// FOLD SHAPE). This is the unified, portable front of the generic SQL client
+// library. It is a PROTOCOL module (§4 rule 7): it contains ZERO OS code --
+// no win32 imports, no `#on` regions, no osType() gates, no win-prefixed
+// helpers -- and every byte on the wire is sent through the universal socket
+// core std/net.sr (connectRaw/sendRawLen/recvRaw/closeRaw/
+// setRecvTimeoutRaw), whose Windows regions hold the ws2_32 calls. The
+// pre-fold internal Windows backend std/sql_win.sr (the aliased ws2_32
+// grants plus the 30 s SO_RCVTIMEO arming) is deleted; all of that now
+// lives in net.sr's regions, so this module is pure SQL-transport logic and
+// would compile unchanged on any backend that provides net.
 //
-// The else side of every gate is unreachable on this backend (silverc only
-// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
-// a future non-Windows backend the fallbacks follow the module's failure
-// style: execute/query are silent no-ops that leave getLastReply() "" and
-// return an empty result, close() stays a no-op.
+// TRANSPORT (the fold): the pre-fold backend's sqlWinConnect(host, port)
+// (WSAStartup + socket + inet_addr + connect + SO_RCVTIMEO) is now
+// net.connectRaw(host, port) followed by net.setRecvTimeoutRaw(sock, 30000);
+// its sqlWinSend (the int[] packing send) is net.sendRawLen(sock, line,
+// line.length + 2); its sqlWinReceive is net.recvRaw(sock, 4096); its
+// sqlWinClose is net.closeRaw(sock). net.recvRaw normalizes the DLL return
+// first and then reports "" for `n <= 0` -- the same observable graceful
+// shape the pre-fold sqlWinReceive's `n <= 0 || n > 2147483647` produced
+// (both compilers). No SQL wire protocol of any kind exists here or anywhere
+// (see the honesty note below) -- the module sends the SQL text as one
+// CRLF-terminated line per statement and surfaces the raw reply through
+// getLastReply().
+//
+// The else side of the old osType() gates is gone with the gates (the
+// pre-fold fallbacks were unreachable on this backend: silverc only emits
+// Windows PEs and osType() was the compile-time WINDOWS constant). The
+// failure style is unchanged: execute/query are silent no-ops that leave
+// getLastReply() "" and return an empty result whenever the connStr names no
+// reachable Server/Port, close() stays a no-op.
 //
 // DISPATCH (per compiler, probed): `sql` is builtin-reserved on NEITHER
 // compiler -- silverc-rs's builtin_modules_set (src/main.rs:81 lists
@@ -27,9 +44,7 @@ mod export sql;
 // SOURCE module (std/sql.sr); no native dispatch exists to preserve.
 // (sql.sr's entry in silverc.srp's exclude list only keeps it out of the
 // compiler's own aggregate build -- the same posture as smtp.sr/pop.sr/
-// imap.sr/ssh.sr; it does not make `sql` a builtin. sql_win.sr is NOT
-// excluded: its sqlWin* names collide with nothing in the aggregate
-// namespace, exactly like pop_win.sr/smtp_win.sr/imap_win.sr/ssh_win.sr.)
+// imap.sr/ssh.sr; it does not make `sql` a builtin.)
 //
 // PRE-SPLIT STATE (probed 2026-08 against this file's git HEAD copy, fresh
 // -o names on both compilers): UNLIKE the pre-split ssh/imap files, the old
@@ -396,18 +411,24 @@ class connection {
     public void close() { }
 
     // Shared implementation of both execute overloads (differently-named on
-    // purpose -- the dispatch bug note above).
+    // purpose -- the dispatch bug note above). One per-statement connect /
+    // send / bounded read / close cycle through the net primitives (see the
+    // TRANSPORT note): connectRaw to the connStr's host:port, the 30 s
+    // receive timeout armed right after, the SQL line sent CRLF-terminated
+    // with sendRawLen's explicit length (the pre-fold sqlWinSend shape), the
+    // bounded reply read, closeRaw before returning. Silent no-op when the
+    // connStr names no reachable Server/Port.
     private void runStatement(string sql) {
         this.lastReply = "";
-        if (osType() != OSTypes.WINDOWS) { return; }
         string host = connHost(this.connStr);
         int port = connPort(this.connStr);
-        int sock = sqlWinConnect(host, port);
+        int sock = net.connectRaw(host, port);
         if (sock < 0) { return; }
+        net.setRecvTimeoutRaw(sock, 30000);
         string line = sql + "\r\n";
-        sqlWinSend(sock, line, line.length + 2);
+        net.sendRawLen(sock, line, line.length + 2);
         this.lastReply = this.readBounded(sock);
-        sqlWinClose(sock);
+        net.closeRaw(sock);
     }
 
     // Shared implementation of both query overloads.
@@ -419,12 +440,12 @@ class connection {
 
     // Bounded reply read: accumulates reads until the peer goes quiet or
     // 16 x 4096 bytes (~64 KB) pass -- whichever comes first. The 30 s
-    // SO_RCVTIMEO armed by sqlWinConnect bounds each individual read, so no
-    // path can spin forever.
+    // SO_RCVTIMEO armed after net.connectRaw bounds each individual read,
+    // so no path can spin forever.
     private string readBounded(int sock) {
         string acc = "";
         for (int guard = 0; guard < 16; guard++) {
-            string chunk = sqlWinReceive(sock, 4096);
+            string chunk = net.recvRaw(sock, 4096);
             if (chunk.length <= 0) { break; }
             acc += chunk;
         }
