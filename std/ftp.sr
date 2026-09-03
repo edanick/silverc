@@ -1,21 +1,15 @@
-import * from os;
-import * from ftp_win;
+import * from net;
 
 mod export ftp;
 
-// DOCS -- public `ftp` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
-// unified, portable front of the FTP library. It contains ZERO win32
-// imports: every ws2_32 call moved into the internal Windows backend
-// std/ftp_win.sr, and every entry that touches the network routes through
-// the OS gate `if (osType() == OSTypes.WINDOWS)` before calling it
-// (osType() is std/os.sr's plain-Silver stand-in -- see that file for why
-// the gate does not use the native os.type query).
-//
-// The else branch of every gate is unreachable on this backend (silverc only
-// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
-// a future non-Windows backend the fallbacks follow the module's failure
-// style: login/list/download/upload/close and server start/wait are silent
-// no-ops, list() returns [], isLoggedIn() stays false.
+// DOCS -- public `ftp` module (UNIFIED_CORE_LIBRARY.md §4 rule 7, the v2
+// canonical fold). This is a PROTOCOL module: it contains ZERO OS code and no
+// preprocessor regions -- every byte on the wire moves through the universal
+// socket core std/net.sr (connectRaw/sendRawLen/recvRaw/closeRaw and
+// listenRaw/acceptRaw for the stub server). The ws2_32 code that used to live
+// in the v1 backend std/ftp_win.sr (deleted) is now net's, inside net's own
+// `#on WINDOWS` regions. win-prefixed helpers, alias imports and osType()
+// gates are gone with it.
 //
 // DISPATCH (per compiler, probed): `ftp` is builtin-reserved on NEITHER
 // compiler -- silverc-rs's builtin_modules_set (src/main.rs:81 lists
@@ -37,38 +31,26 @@ mod export ftp;
 // therefore dead text -- there was NO observable pre-split behavior to
 // preserve beyond names, arities and intent.
 //
-// DEAD -> LIVE (what this split made actually work):
-// - The control channel: socket + connect + USER/PASS over ws2_32 with
-//   WSAStartup (the pre-split file never initialized winsock), the
-//   sockaddr_in image packed into an int[2] qword buffer (`struct` locals
-//   and `&addr` are unexpressible), and DLL returns normalized with the
-//   two-sided `v < 0 || v > 2147483647` check (the self-host zero-extends
-//   SOCKET_ERROR to 4294967295; see std/ftp_win.sr).
-// - login(): pre-split it fired five sends/recvs with zero checking and
-//   stayed silent about failure. It now reads and validates the greeting
-//   (220), USER (331, or 230 = server skips PASS), PASS (230) and records
-//   the outcome in isLoggedIn()/getLastReply() (both ADDITIVE -- the
-//   pre-split surface had no way to report anything). Against a non-FTP
-//   listener the login fails gracefully: the server's banner (or "" after
-//   a silent disconnect) is surfaced through getLastReply() and the
-//   process exits cleanly. No exceptions are raised anywhere.
-// - PASV data channel: the pre-split list() sent PASV, read the reply,
-//   then NEVER connected to the data port -- it split the *control*
-//   reply text instead. list()/download()/upload() now parse the PASV
-//   reply (replyCode/replyComplete/pasvHost/pasvPort, all probed
-//   byte-identical on fixed inputs) and open a real second connection.
-// - download(): pre-split wrote the CONTROL-channel reply into the local
-//   file (the RETR ack, not the file). It now streams the data channel
-//   until EOF and writes that. upload(): pre-split read the local file
-//   and sent it over the CONTROL channel as if it were a command; it now
-//   sends STOR and the file bytes over the data channel (local content is
-//   pointer on silverc-rs; see std/dns.sr's note). The fs.* receiver is the
-//   native/builtin fs on both compilers (std/crypto.sr and std/csv.sr use
-//   the same shape).
-// - Bounded reads: every socket gets a 30 s SO_RCVTIMEO (std/ftp_win.sr).
-//   The pre-split file had no timeout and would have hung on a silent
-//   peer; readReply()'s accumulation loop is additionally bounded at 16
-//   iterations and readAll() at 4096 x 64 KB (~256 MB) so no path can
+// DEAD -> LIVE (what the protocol wiring made actually work):
+// - The control channel: net.connectRaw + USER/PASS. login() reads and
+//   validates the greeting (220), USER (331, or 230 = server skips PASS),
+//   PASS (230) and records the outcome in isLoggedIn()/getLastReply()
+//   (both ADDITIVE -- the pre-split surface had no way to report anything).
+//   Against a non-FTP listener the login fails gracefully: the server's
+//   banner (or "" after a silent disconnect) is surfaced through
+//   getLastReply() and the process exits cleanly. No exceptions anywhere.
+// - PASV data channel: list()/download()/upload() parse the PASV reply
+//   (replyCode/replyComplete/pasvHost/pasvPort, all probed byte-identical
+//   on fixed inputs) and open a real second connection with net.connectRaw.
+// - download(): streams the data channel until EOF and writes that to the
+//   local file. upload(): sends STOR and the file bytes over the data
+//   channel. The fs.* receiver is the native/builtin fs on both compilers
+//   (std/crypto.sr and std/csv.sr use the same shape).
+// - Bounded reads: every socket this module opens -- control and data
+//   alike -- gets a 30 s receive timeout via net.setRecvTimeoutRaw(fd,
+//   30000) (net arms SO_RCVTIMEO; previously the v1 backend armed the same
+//   30 s value). readReply()'s accumulation loop is additionally bounded at
+//   16 iterations and readAll() at 4096 x 64 KB (~256 MB) so no path can
 //   spin forever.
 // - QUIT: close() sends QUIT and closes immediately without waiting for
 //   the 221 (pre-split shape -- it never read the reply either), so a dead
@@ -78,12 +60,15 @@ mod export ftp;
 // (addUser/start/wait) and behavior -- wait() accepts connections one at a
 // time, sends the pre-split greeting TRUNCATED at 20 of its 22 bytes
 // ("220 FTP Server ready" without the CRLF -- the pre-split send length is
-// preserved verbatim), and closes the client. It still never authenticates
-// (addUser is a no-op: the pre-split body wrote into an uninitialized
-// `kvp` field -- a NULL deref had it ever run; the field is gone), never
-// serves files, and wait() never returns (pre-split `while (true)` shape;
-// never call it from a probe or test: it blocks the process by design).
-// There is no single-shot accept, no AUTH/TLS, no EPSV/PORT fallback.
+// preserved verbatim via net.sendRawLen), and closes the client. It still
+// never authenticates (addUser is a no-op: the pre-split body wrote into an
+// uninitialized `kvp` field -- a NULL deref had it ever run; the field is
+// gone), never serves files, and wait() never returns (pre-split
+// `while (true)` shape; never call it from a probe or test: it blocks the
+// process by design). There is no single-shot accept, no AUTH/TLS, no
+// EPSV/PORT fallback. The listen backlog is now net.listenRaw's (10) --
+// listenRaw carries the only listen() call, so the pre-split private
+// backlog 5 is superseded by the socket core's value.
 //
 // API PRESERVATION (every public name/arity of the pre-split file,
 // unchanged): client.construct(string host) -- port fixed at 21, the
@@ -95,7 +80,7 @@ mod export ftp;
 // stored and unused, as pre-split); addUser(string user, string pass,
 // string permissions); start(); wait(). The private sendCmd/recvResp
 // helper names are preserved; recvResp keeps its raw-bytes shape (the
-// multi-line reply accumulation lives in the new private readReply).
+// multi-line reply accumulation lives in the private readReply).
 //
 // CALLER NOTES: strings returned across this module's boundary
 // (getLastReply) should be assigned to a local before being concatenated
@@ -120,7 +105,7 @@ public int replyCode(string resp) {
 // "\r\n"-delimited line whose first three chars are digits and whose fourth
 // char is a space (RFC 959's "nnn " terminal form). Multi-line replies
 // ("nnn-text ... nnn text") complete only at the space form, so the
-// wrapper's readers keep accumulating until this fires or the bounded
+// module's readers keep accumulating until this fires or the bounded
 // loop exhausts.
 public bool replyComplete(string resp) {
     int lineStart = 0;
@@ -243,13 +228,13 @@ class client {
     }
 
     public void login(string user, string pass) {
-        if (osType() != OSTypes.WINDOWS) { return; }
-        this.sock = ftpWinConnect(this.host, this.port);
+        this.sock = connectRaw(this.host, this.port);
         if (this.sock < 0) {
             this.sock = -1;
             this.lastReply = "";
             return;
         }
+        setRecvTimeoutRaw(this.sock, 30000);
         this.readReply();
         if (replyCode(this.lastReply) != 220) {
             this.fail();
@@ -275,13 +260,12 @@ class client {
 
     public string[] list(string path) {
         string[] empty = [];
-        if (osType() != OSTypes.WINDOWS) { return empty; }
         if (!this.loggedIn) { return empty; }
         int data = this.openData();
         if (data < 0) { return empty; }
         this.sendCmd("LIST " + path);
         string content = this.readAll(data);
-        ftpWinClose(data);
+        closeRaw(data);
         this.readReply();
         return content.split("\r\n");
     }
@@ -292,33 +276,31 @@ class client {
     // signature used it). Parameter names are invisible to positional
     // callers, so the observable API is unchanged.
     public void download(string remote, string localPath) {
-        if (osType() != OSTypes.WINDOWS) { return; }
         if (!this.loggedIn) { return; }
         int data = this.openData();
         if (data < 0) { return; }
         this.sendCmd("RETR " + remote);
         string content = this.readAll(data);
-        ftpWinClose(data);
+        closeRaw(data);
         this.readReply();
         fs.writeString(localPath, content);
     }
 
     public void upload(string localPath, string remote) {
-        if (osType() != OSTypes.WINDOWS) { return; }
         if (!this.loggedIn) { return; }
         string content = fs.readString(localPath);
         int data = this.openData();
         if (data < 0) { return; }
         this.sendCmd("STOR " + remote);
-        ftpWinSend(data, content, content.length);
-        ftpWinClose(data);
+        sendRawLen(data, content, content.length);
+        closeRaw(data);
         this.readReply();
     }
 
     public void close() {
-        if (this.sock >= 0 && osType() == OSTypes.WINDOWS) {
+        if (this.sock >= 0) {
             this.sendCmd("QUIT");
-            ftpWinClose(this.sock);
+            closeRaw(this.sock);
         }
         this.sock = -1;
         this.loggedIn = false;
@@ -329,14 +311,14 @@ class client {
     // there instead.
     private void sendCmd(string cmd) {
         if (this.sock < 0) { return; }
-        ftpWinSend(this.sock, cmd + "\r\n", cmd.length + 2);
+        sendRawLen(this.sock, cmd + "\r\n", cmd.length + 2);
     }
 
     // One bounded read of the control channel (raw bytes as a string; ""
     // on disconnect/timeout -- pre-split recvResp shape).
     private string recvResp() {
         if (this.sock < 0) { return ""; }
-        return ftpWinReceive(this.sock, 4096);
+        return recvRaw(this.sock, 4096);
     }
 
     // Accumulates control-channel reads into lastReply until a terminating
@@ -363,9 +345,9 @@ class client {
         string host = pasvHost(this.lastReply);
         int port = pasvPort(this.lastReply);
         if (port < 0 || host.length <= 0) { return -1; }
-        int data = -1;
-        if (osType() == OSTypes.WINDOWS) {
-            data = ftpWinConnect(host, port);
+        int data = connectRaw(host, port);
+        if (data >= 0) {
+            setRecvTimeoutRaw(data, 30000);
         }
         return data;
     }
@@ -376,7 +358,7 @@ class client {
     private string readAll(int fd) {
         string acc = "";
         for (int guard = 0; guard < 4096; guard++) {
-            string chunk = ftpWinReceive(fd, 65536);
+            string chunk = recvRaw(fd, 65536);
             if (chunk.length <= 0) { break; }
             acc += chunk;
         }
@@ -388,7 +370,7 @@ class client {
     private void fail() {
         this.loggedIn = false;
         if (this.sock >= 0) {
-            ftpWinClose(this.sock);
+            closeRaw(this.sock);
         }
         this.sock = -1;
     }
@@ -407,34 +389,32 @@ class server {
 
     // No-op: credentials are recorded nowhere. The pre-split body wrote
     // into an uninitialized `kvp` field (a NULL deref had it ever run) and
-    // the server never authenticated nor served files; this split invents
-    // none of that. The `permissions` argument stays accepted and ignored
+    // the server never authenticated nor served files; no split invents
+    // that. The `permissions` argument stays accepted and ignored
     // (pre-split arity).
     public void addUser(string user, string pass, string permissions) {
     }
 
-    // Binds INADDR_ANY:port and listens (backlog 5, the pre-split value).
-    // A failed bind leaves sock -1; wait() then returns immediately.
+    // Binds INADDR_ANY:port and listens via net.listenRaw (backlog 10, the
+    // socket core's value). A failed bind leaves sock -1; wait() then
+    // returns immediately.
     public void start() {
-        if (osType() == OSTypes.WINDOWS) {
-            this.sock = ftpWinListen(this.port);
-        }
+        this.sock = listenRaw(this.port);
     }
 
     // Accept loop with the pre-split shape: per client, send the greeting
     // TRUNCATED at 20 of its 22 bytes ("220 FTP Server ready" without the
-    // CRLF -- the pre-split send length preserved verbatim) and close.
-    // NEVER RETURNS (pre-split `while (true)`); never call it from a probe
-    // or test: it blocks the process by design.
+    // CRLF -- the pre-split send length preserved verbatim through
+    // net.sendRawLen) and close. NEVER RETURNS (pre-split `while (true)`);
+    // never call it from a probe or test: it blocks the process by design.
     public void wait() {
-        if (osType() != OSTypes.WINDOWS) { return; }
         if (this.sock < 0) { this.start(); }
         if (this.sock < 0) { return; }
         while (true) {
-            int clientSock = ftpWinAccept(this.sock);
+            int clientSock = acceptRaw(this.sock);
             if (clientSock >= 0) {
-                ftpWinSend(clientSock, "220 FTP Server ready\r\n", 20);
-                ftpWinClose(clientSock);
+                sendRawLen(clientSock, "220 FTP Server ready\r\n", 20);
+                closeRaw(clientSock);
             }
         }
     }

@@ -1,21 +1,34 @@
-import * from os;
-import * from smtp_win;
+import * from net;
 
 mod export smtp;
 
-// DOCS -- public `smtp` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
-// unified, portable front of the SMTP library. It contains ZERO win32
-// imports: every ws2_32 call moved into the internal Windows backend
-// std/smtp_win.sr, and every entry that touches the network routes through
-// the OS gate `if (osType() == OSTypes.WINDOWS)` before calling it
-// (osType() is std/os.sr's plain-Silver stand-in -- see that file for why
-// the gate does not use the native os.type query).
+// DOCS -- public `smtp` module (UNIFIED_CORE_LIBRARY.md §4, the CANONICAL
+// FOLD SHAPE). This is the universal, portable front of the SMTP library.
+// It contains ZERO OS code: no win32 imports, no `#on` regions, no osType()
+// gates -- every byte on the wire is sent through the universal socket core
+// std/net.sr (connectRaw/sendRawLen/recvRaw/closeRaw/setRecvTimeoutRaw),
+// whose Windows regions hold the ws2_32 calls. This module is pure SMTP
+// protocol logic and would compile unchanged on any backend that provides
+// net.
 //
-// The else branch of every gate is unreachable on this backend (silverc only
-// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
-// a future non-Windows backend the fallbacks follow the module's failure
-// style: login/send/close and startTLS are silent no-ops, isLoggedIn() stays
-// false, getLastReply() stays "".
+// TRANSPORT (the fold): the pre-fold Windows backend std/smtp_win.sr carried
+// the aliased ws2_32 grants (socket/connect/recv/send/closesocket/inet_addr/
+// setsockopt/WSAStartup as smtpWinRaw*) plus the 30 s SO_RCVTIMEO arming;
+// all of that now lives in net.sr's regions. login() arms the timeout right
+// after connectRaw (net.setRecvTimeoutRaw) and send()/close() re-arm it on
+// their first socket use, preserving the pre-fold "every socket has a 30 s
+// receive timeout" bound. The recv loop itself (recvResp) calls
+// net.recvRaw(fd, 4096) -- the pre-fold smtpWinReceive(fd, 4096) shape --
+// and the sender (sendCmd/send's DATA phase) calls net.sendRawLen with the
+// pre-split byte counts. The pre-fold smtpWin* helpers returned "" on both
+// recv error AND zero-extended SOCKET_ERROR (`n <= 0 || n > 2147483647`);
+// net.recvRaw normalizes first and then reports "" for `n <= 0` -- the same
+// observable graceful shape.
+//
+// FAIL-STOP NOTE: with the fold, a connect failure surfaces as fd -1 and a
+// failed send path as an unresponsive channel -- both handled by the same
+// graceful failure style as before (login returns silently, getLastReply()
+// stays "" or holds the server's last words, no exceptions anywhere).
 //
 // DISPATCH (per compiler, probed): `smtp` is builtin-reserved on NEITHER
 // compiler -- silverc-rs's builtin_modules_set (src/main.rs:81 lists
@@ -304,13 +317,13 @@ class client {
     // Every step is read and validated; on any mismatch fail() drops the
     // connection and the server's last words stay in getLastReply().
     public void login(string user, string pass) {
-        if (osType() != OSTypes.WINDOWS) { return; }
-        this.sock = smtpWinConnect(this.host, this.port);
+        this.sock = net.connectRaw(this.host, this.port);
         if (this.sock < 0) {
             this.sock = -1;
             this.lastReply = "";
             return;
         }
+        net.setRecvTimeoutRaw(this.sock, 30000);
         this.readReply();
         if (replyCode(this.lastReply) != 220) {
             this.fail();
@@ -373,8 +386,9 @@ class client {
     // shape added a stray CRLF after the dot terminator). A failed step
     // returns silently; getLastReply() holds the server's last words.
     public void send() {
-        if (osType() != OSTypes.WINDOWS) { return; }
         if (!this.loggedIn) { return; }
+        if (this.sock < 0) { return; }
+        net.setRecvTimeoutRaw(this.sock, 30000);
         this.sendCmd("MAIL FROM:<" + this.fromAddr + ">");
         this.readReply();
         if (replyCode(this.lastReply) != 250) { return; }
@@ -386,7 +400,7 @@ class client {
         if (replyCode(this.lastReply) != 354) { return; }
         string msg = buildMessage(this.fromAddr, this.toAddr, this.ccAddr, this.subj, this.bodyContent, this.isHtml);
         if (this.sock >= 0) {
-            smtpWinSend(this.sock, msg, msg.length);
+            net.sendRawLen(this.sock, msg, msg.length);
         }
         this.readReply();
         if (replyCode(this.lastReply) != 250) { return; }
@@ -397,9 +411,9 @@ class client {
     // pre-split recvResp() after QUIT is dropped (it never ran -- the file
     // never compiled).
     public void close() {
-        if (this.sock >= 0 && osType() == OSTypes.WINDOWS) {
+        if (this.sock >= 0) {
             this.sendCmd("QUIT");
-            smtpWinClose(this.sock);
+            net.closeRaw(this.sock);
         }
         this.sock = -1;
         this.loggedIn = false;
@@ -410,14 +424,14 @@ class client {
     // there instead.
     private void sendCmd(string cmd) {
         if (this.sock < 0) { return; }
-        smtpWinSend(this.sock, cmd + "\r\n", cmd.length + 2);
+        net.sendRawLen(this.sock, cmd + "\r\n", cmd.length + 2);
     }
 
     // One bounded read of the control channel (raw bytes as a string; ""
     // on disconnect/timeout -- pre-split recvResp shape).
     private string recvResp() {
         if (this.sock < 0) { return ""; }
-        return smtpWinReceive(this.sock, 4096);
+        return net.recvRaw(this.sock, 4096);
     }
 
     // Accumulates control-channel reads into lastReply until a terminating
@@ -440,7 +454,7 @@ class client {
     private void fail() {
         this.loggedIn = false;
         if (this.sock >= 0) {
-            smtpWinClose(this.sock);
+            net.closeRaw(this.sock);
         }
         this.sock = -1;
     }

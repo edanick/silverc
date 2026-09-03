@@ -22,9 +22,12 @@ mod export net;
 // function (arity dispatch: same-arity user decl intercepts; no-arity-match
 // user decl is a hard type-check error). The two raw exports are thus
 // UNREACHABLE by their real names inside this module -- a compiler-level
-// finding. The dllConnect/dllListen pass-throughs below mark the two blocked
-// call sites and carry the documented -1 fallback until resolution learns to
-// prefer the DLL export inside regions. Every OTHER export used here
+// finding. Every ws2_32 export used here reaches the DLL: the module's own
+// connect(string, int) / listen(int) declarations win only their own arity
+// (resolution prefers the DLL export when no user declaration accepts the
+// argument count -- UNIFIED_CORE_LIBRARY.md §4 rule 6, both compilers), so
+// openTcp/bindListen call connect(sock, sa, 16) / listen(sock, 10) directly.
+// Every OTHER export used here
 // (WSAStartup, socket, bind, accept, recv, send, closesocket, inet_addr)
 // shares its name with no free function in this module, so the bare calls
 // reach the DLL directly (class names do not block: `socket(2,1,0)` resolves
@@ -267,6 +270,25 @@ public void sendBytesRaw(int fd, byte[] data) {
     #off
 }
 
+// Length-capped variant of sendRaw: sends the first `len` bytes of `data`
+// (clamped to data.length; no-op on len <= 0). Exists for wire shapes that
+// send a prefix of a known string -- e.g. ftp's server greeting, which
+// writes the first 20 of its 22 bytes ("220 FTP Server ready" without the
+// CRLF), preserving its pre-split byte count.
+public void sendRawLen(int fd, string data, int len) {
+    #on WINDOWS
+    if (len <= 0) { return; }
+    if (len > data.length) { len = data.length; }
+    int slots = (len + 7) / 8;
+    int[] packedBuf = new int[slots];
+    for (int i = 0; i < len; i++) {
+        int b = int(data[i]);
+        packedBuf[i / 8] = packedBuf[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
+    }
+    send(fd, packedBuf, len, 0);
+    #off
+}
+
 // Receives up to maxLen bytes from the raw descriptor and returns them as a
 // string ("" on error or clean close).
 public string recvRaw(int fd, int maxLen) {
@@ -295,10 +317,29 @@ public void closeRaw(int fd) {
     #off
 }
 
+// Arms a receive timeout on the raw descriptor: subsequent recvRaw calls on
+// it give up after `ms` milliseconds of silence and return "" instead of
+// blocking forever (SO_RCVTIMEO: SOL_SOCKET 0xFFFF, SO_RCVTIMEO 0x1006, the
+// millisecond value as a DWORD in the low half of one int[] qword slot).
+// Protocol modules (ftp, ftps, ...) arm this on every socket they open so a
+// silent peer cannot hang a bounded read loop. The setsockopt result is
+// ignored (matching the pre-fold protocol backends).
+public void setRecvTimeoutRaw(int fd, int ms) {
+    #on WINDOWS
+    int[] opt = new int[1];
+    opt[0] = ms;
+    setsockopt(fd, 0xFFFF, 0x1006, opt, 4);
+    #off
+}
+
 // ---- module-private Windows bodies ----------------------------------------
 // openTcp/bindListen hold the shared WSAStartup + socket-creation sequences
-// for connectRaw/listenRaw. Their blocked call sites route through
-// dllConnect/dllListen (see the header finding).
+// for connectRaw/listenRaw. Resolution prefers the DLL export inside regions
+// whenever no user declaration accepts the argument count (UNIFIED_CORE_
+// LIBRARY.md §4 rule 6, implemented in both compilers), so the bare
+// connect(sock, sa, 16) / listen(sock, 10) calls below reach ws2_32 while
+// the module's public connect(string, int) / listen(int) keep winning their
+// own matching arities.
 
 // WSAStartup + socket() + inet_addr + connect: returns the connected raw
 // descriptor, or -1 on failure.
@@ -315,7 +356,7 @@ int openTcp(string host, int port) {
     int[] sa = new int[2];
     sa[0] = 2 | (pHi << 16) | (pLo << 24) | ((ip & 0xFFFFFFFF) << 32);
     sa[1] = 0;
-    int c = dllConnect(sock, sa, 16);
+    int c = connect(sock, sa, 16);
     if (c < 0 || c > 2147483647) {
         closesocket(sock);
         return -1;
@@ -343,35 +384,12 @@ int bindListen(int port) {
         closesocket(sock);
         return -1;
     }
-    int l = dllListen(sock, 10);
+    int l = listen(sock, 10);
     if (l < 0 || l > 2147483647) {
         closesocket(sock);
         return -1;
     }
     return sock;
-    #off
-    return -1;
-}
-
-// FINDING (ws2_32!connect unreachable): the bare `connect(sock, sa, 16)` call
-// that belongs in this body re-enters the module's public `connect(string,
-// int)` via arity-blind user-symbol-wins resolution (probed: same-arity user
-// decl intercepts every bare call; no-arity-match decl is a hard type-check
-// error; zero user decls is the only DLL-reachable shape). Until resolution
-// prefers the DLL export inside regions, this documented fallback returns -1
-// -- THE BODY MUST STAY CALL-FREE (any bare same-name call here either
-// recurses into the module function or fails to compile).
-int dllConnect(int sock, int[] sa, int len) {
-    #on WINDOWS
-    return -1;
-    #off
-    return -1;
-}
-
-// FINDING (ws2_32!listen unreachable): same shape as dllConnect above.
-int dllListen(int sock, int backlog) {
-    #on WINDOWS
-    return -1;
     #off
     return -1;
 }

@@ -3763,6 +3763,15 @@ int strIdx = this.stringPatchIndices[i];
             if (this.strEq(arrType, "string")) { return "char"; }
             return this.arrayElementType(arrType);
         }
+        // UNIFIED_CORE_LIBRARY.md §4 rule 6: a free CALL node whose name is
+        // an imported win32 export types as int (the 32-bit DLL return is
+        // sign-extended into RAX; net.sr's bare connect/listen read it back
+        // as an int). Without this, an unresolved call inferred "" and the
+        // result was treated as string-shaped by the caller. Bare calls parse
+        // as kind 10 (member calls reach the funcNames scan above instead).
+        if (expr.kind == 10 && !expr.isMember) {
+            if (this.win32CallResolves(expr.name)) { return "int"; }
+        }
         if (expr.kind == 9) {
             return expr.name;
         }
@@ -3904,6 +3913,11 @@ int strIdx = this.stringPatchIndices[i];
                     return this.funcRetTypes[i];
                 }
             }
+            // UNIFIED_CORE_LIBRARY.md §4 rule 6: a bare call whose name is an
+            // imported win32 export (net.sr's connect/listen) returns int --
+            // the 32-bit DLL return is widened to int64 via movsxd, so the
+            // caller must not treat the result as string-shaped.
+            if (this.win32CallResolves(cname)) { return "int"; }
             if (this.strEq(cname, "readString") || this.strEq(cname, "readFile") || this.strEq(cname, "input") || this.strEq(cname, "readLine")) { return "string"; }
             if (this.strEq(cname, "strlen") || this.strEq(cname, "len")) { return "int"; }
             if (this.strEq(cname, "getenv")) { return "string"; }
@@ -5809,7 +5823,13 @@ int strIdx = this.stringPatchIndices[i];
             } else {
                 this.asm.xorRR64(0, 0);
             }
-        } elif (isClass == 1) {
+        } elif (isClass == 1 && (call.isStatic || !this.win32CallResolves(name))) {
+            // UNIFIED_CORE_LIBRARY.md §4 rule 6 -- a bare (non-new) call whose
+            // name is both a class and an imported win32 export reaches the
+            // DLL, mirroring silverc-rs (win32::resolve runs before the bare
+            // class-name fallback; net.sr's `socket(2,1,0)` under
+            // `class socket`). `new T(...)` nodes carry isStatic from the
+            // parser and always construct.
             this.genNewCall(call);
         } elif (builtinName && this.strEq(name, "printline")) {
             this.genPrintCall(call, 1);
@@ -7188,9 +7208,15 @@ public void genNewCall(Node call) {
         if (s1Count > 1) {
             funcIdx = this.selectOverloadIdx(name, this.currentClassName, nargs);
             if (funcIdx < 0) {
+                // UNIFIED_CORE_LIBRARY.md §4 rule 6: when no class-method
+                // overload accepts the argument count but the name resolves
+                // as an imported win32 export, fall through to the DLL path
+                // instead of aborting (mirrors the silverc-rs dispatcher).
+                if (this.win32CallResolves(name)) { funcIdx = -1; } else {
                 printline("no overload of '" + name + "' takes " + nargs.toString() + " argument(s)");
                 exit(1);
                 return;
+                }
             }
         } else {
             funcIdx = s1Matched;
@@ -7210,9 +7236,17 @@ public void genNewCall(Node call) {
             if (s2Count > 1) {
                 funcIdx = this.selectOverloadIdx(name, "", nargs);
                 if (funcIdx < 0) {
+                    // UNIFIED_CORE_LIBRARY.md §4 rule 6 -- resolution prefers
+                    // the DLL export inside regions: when NO user overload of
+                    // the name accepts the argument count but the name is an
+                    // imported win32 export, the call reaches the DLL
+                    // (net.sr's bare connect/listen call sites). A
+                    // same-arity user declaration still wins.
+                    if (this.win32CallResolves(name)) { funcIdx = -1; } else {
                     printline("no overload of '" + name + "' takes " + nargs.toString() + " argument(s)");
                     exit(1);
                     return;
+                    }
                 }
             } else {
                 funcIdx = s2Matched;
@@ -7242,6 +7276,26 @@ public void genNewCall(Node call) {
         int argStart = 0;
         if (isModuleCall || (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.strEq(lookupClass, ""))) {
             argStart = 1;
+        }
+        // UNIFIED_CORE_LIBRARY.md §4 rule 6 -- a resolved GLOBAL whose
+        // parameter count does not accept the call's argument count must not
+        // swallow a call whose name also resolves as an imported win32
+        // export: re-clear funcIdx so the call falls through to the DLL
+        // classification below (net.sr's bare connect/listen in module-
+        // qualified form). argStart is known only here, so this is the
+        // earliest point the check can use the module-qualified arg count.
+        if (funcIdx >= 0 && this.strEq(lookupClass, "") && this.win32CallResolves(name)) {
+            int callArgs = call.childCount() - argStart;
+            if (callArgs < 0) { callArgs = 0; }
+            int pc = (funcIdx < this.funcParamCounts.length) ? this.funcParamCounts[funcIdx] : -1;
+            if (pc < 0) {
+                funcIdx = -1;
+            } else {
+                bool variadic = funcIdx < this.funcHasVariadic.length && this.funcHasVariadic[funcIdx] == 1;
+                bool accepts;
+                if (variadic) { accepts = callArgs >= pc - 1; } else { accepts = callArgs == pc; }
+                if (!accepts) { funcIdx = -1; }
+            }
         }
         if (funcIdx >= 0 && funcIdx < this.funcOffsets.length) {
             int targetOff = this.funcOffsets[funcIdx];
