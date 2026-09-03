@@ -1,189 +1,205 @@
-import * from os;
-import * from math_win;
-
 mod export math;
 
-// DOCS -- public `math` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is
-// the unified, portable front of the math library. It contains ZERO win32
-// imports: every implementation body moved verbatim into the internal
-// Windows backend std/math_win.sr, and every numeric entry below routes
-// through the OS gate `if (osType() == OSTypes.WINDOWS)` before touching it.
+// DOCS -- public `math` module (UNIFIED_CORE_LIBRARY.md v2 canonical fold).
+// This is the pure-Silver numeric module: the former internal Windows backend
+// std/math_win.sr was folded back into this file and deleted. There is no
+// math_win.sr anymore -- and no win32 layer at all: math never had one. The
+// pre-split file opened with `import * from win32.msvcrt;` but never called a
+// CRT function -- every body below is pure Silver arithmetic, so the fold
+// drops the import instead of carrying it (mirroring std/time_win.sr's
+// treatment of time.sr's vestigial msvcrt import). No osType() gates and no
+// `os` import either: with no DLL work there is nothing to gate, and the
+// canonical shape (v2 rule 6) leaves the public functions as the only
+// functions, their bodies inline.
 //
-// The gate uses osType() (std/os.sr) instead of the native `os.type` query
-// because the self-hosted backend's builtin `os` dispatch covers only
-// os.name/os.version/os.build today -- `os.type` miscompiles there in both
-// spellings (property access yields a null string, the call form falls into
-// builtin dispatch and returns garbage). osType() is plain Silver: it
-// returns the OSTypes.WINDOWS contract value on every implementation without
-// needing native support, and it can be switched to the native query once
-// mini_cg learns a `type` branch.
+// BODIES: every function below is the verbatim pre-split implementation
+// (math_win.sr carried them byte-for-byte; the fold restores them). The
+// private helpers keep their pre-split names (fact, expHelper) and the
+// cross-function call shapes -- sin/cos call pow/fact, pow calls expHelper,
+// expHelper calls ln, round calls floor/ceil, and sqrt/ln call the bare
+// `abs`, which resolves to the float64 overload (the pre-split overload tie;
+// probed: routing those inner abs calls to the int overload changes ln's
+// iteration count and with it the observable results).
 //
-// The else branch of every gate is unreachable on this backend (silverc only
-// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
-// a future non-Windows backend the fallback follows the module's numeric
-// style: 0.0 for the float entries, 0 for the int abs overload.
-//
-// VESTIGIAL IMPORT DROPPED: the pre-split file opened with
-// `import * from win32.msvcrt;` but never called a CRT function -- every
-// body was pure Silver arithmetic. The backend (math_win.sr) therefore
-// grants no DLL exports at all, mirroring std/time_win.sr's treatment of
-// time.sr's vestigial msvcrt import.
-//
-// DISPATCH NOTE (per compiler, unchanged by this split): silverc-rs answers
+// DISPATCH NOTE (per compiler, unchanged by the fold): silverc-rs answers
 // every qualified `math.<fn>(...)` call with its native builtins before any
 // symbol lookup -- codegen.rs lowers a `math.`-prefixed call straight into
 // stdlib::math::gen_math_call (msvcrt IAT sentinels for cos/sin/tan/pow/
 // sqrt/floor/ceil/round/ln/log10, inline sign-bit clear for abs, rand for
 // random, inline compares for max/min, a GP loop for sum, a compile-time
 // fold for eval) -- and "math" is in rs's builtin_modules_set, so
-// `import * from math;` never resolves to a file and this wrapper (and the
-// backend) are never read there. The self-hosted compiler has no math
-// intercept at all: "math" is only on the driver's hand-prepend/visibility
-// lists (compiler_driver.sr / visibility.sr), the source is collected from
-// std/math.sr, and the qualified calls dispatch to these globals, which
-// forward into the internal backend behind the gate. Both paths keep the
-// user-observable behavior each compiler had before the split.
+// `import * from math;` never resolves to a file and this file is never read
+// there. The self-hosted compiler has no math intercept at all: "math" is
+// only on the driver's hand-prepend/visibility lists (compiler_driver.sr /
+// visibility.sr), the source is collected from std/math.sr, and the
+// qualified calls dispatch to these globals directly. Both paths keep the
+// user-observable behavior each compiler had before the backend split and
+// after it -- the fold changes no dispatch, only removes one file hop.
 //
 // FLOAT64 PARITY NOTE: the numeric results travel as IEEE-754 bit patterns
 // in GP registers end-to-end (see mini_cg float paths / rs codegen float
-// handling). The wrapper's `return mathWin<Fn>(...)` forwarders add one
-// plain call frame on top of the pre-split qualified call; the value crosses
-// it as raw bits exactly like the pre-split intra-module helper calls
-// (pow/fact/expHelper) did, so no conversion is introduced on either path.
-// The bodies themselves are byte-for-byte lifts, so the self-hosted
-// observable results -- including its pre-existing float64 lowering quirks
-// (float compound assignment inside loops, the overload tie that sends the
-// backend's inner abs calls to the int body, float64 constants printing via
-// the int const path) -- are pinned by the A/B probes against the pre-split
-// build. The PI/E constants stay here unchanged: they are pure data, never
-// reach the backend, and their (pre-existing) self-hosted print behavior is
-// part of the pinned surface.
-//
-// UNGATED ENTRIES (io.sr precedent): tan/log10/hypot are pure delegation to
-// this module's own gated primitives (sin/cos, ln, sqrt), so they keep their
-// pre-split `<<` one-liner global shapes ungated and inherit the gate
-// through those calls -- the exact shape io.sr's input() alias uses for
-// readLine. The one-liner shape is load-bearing, not just cosmetic: A/B
-// probes showed routing log10 through a regular gated body that forwards
-// into a backend mathWinLog10 crosses its argument with sibling calls'
-// arguments in the flattened self-hosted aggregate, while the pre-split
-// one-liner-over-same-file-functions shape reproduces the pre-split results
-// exactly. eval() and the MathEvalParser class are likewise pure Silver --
-// integer arithmetic, string indexing and throw only, no backend touch --
-// so they keep their pre-split ungated shape too.
+// handling). The bodies themselves are byte-for-byte the pre-split ones, so
+// the self-hosted observable results -- including its pre-existing float64
+// lowering quirks (float compound assignment inside loops, the overload tie
+// that sends the inner abs calls to the float body, float64 constants
+// printing via the int const path) -- are pinned by the A/B probes against
+// the pre-split build. The PI/E constants are pure data, never gate-hop, and
+// their (pre-existing) self-hosted print behavior is part of the pinned
+// surface. tan/log10/hypot keep their pre-split `<<` one-liner global shapes
+// (ungated pure delegation to this module's own primitives); eval() and the
+// MathEvalParser class are likewise pure Silver -- integer arithmetic,
+// string indexing and throw only -- and keep their pre-split shapes.
 
 public const float64 PI = 3.141592653589793;
 public const float64 E = 2.718281828459045;
 
 public float64 abs(float64 x) {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinAbsF64(x);
-    }
-    return 0.0;
+    if (x < 0.0) { return -x; }
+    return x;
 }
 
 public int abs(int x) {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinAbsInt(x);
-    }
-    return 0;
+    if (x < 0) { return -x; }
+    return x;
+}
+
+private float64 fact(int n) {
+    float64 r = 1.0;
+    for (int i = 2; i <= n; i++) { r *= float64(i); }
+    return r;
 }
 
 public float64 sin(float64 x) {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinSin(x);
+    float64 r = 0.0;
+    int sign = 1;
+    for (int i = 0; i < 15; i++) {
+        int n = 2 * i + 1;
+        float64 term = pow(x, n) / fact(n);
+        if (sign > 0) { r += term; } else { r -= term; }
+        sign = -sign;
     }
-    return 0.0;
+    return r;
 }
 
 public float64 cos(float64 x) {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinCos(x);
+    float64 r = 0.0;
+    int sign = 1;
+    for (int i = 0; i < 15; i++) {
+        int n = 2 * i;
+        float64 term = pow(x, n) / fact(n);
+        if (sign > 0) { r += term; } else { r -= term; }
+        sign = -sign;
     }
-    return 0.0;
+    return r;
 }
 
 public float64 tan(float64 x) << sin(x) / cos(x);
 
 public float64 pow(float64 base, float64 exp) {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinPow(base, exp);
+    if (exp == 0.0) { return 1.0; }
+    if (exp == 1.0) { return base; }
+    if (exp == 2.0) { return base * base; }
+    bool negExp = exp < 0.0;
+    if (negExp) { exp = -exp; }
+    int e = int(exp);
+    float64 frac = exp - float64(e);
+    float64 r = 1.0;
+    for (int i = 0; i < e; i++) { r *= base; }
+    if (frac > 0.0) {
+        r *= expHelper(base, frac, 20);
     }
-    return 0.0;
+    if (negExp) { r = 1.0 / r; }
+    return r;
+}
+
+private float64 expHelper(float64 base, float64 exp, int terms) {
+    float64 lnBase = ln(base);
+    float64 x = lnBase * exp;
+    float64 r = 1.0;
+    float64 term = 1.0;
+    for (int i = 1; i <= terms; i++) {
+        term *= x / float64(i);
+        r += term;
+    }
+    return r;
 }
 
 public float64 sqrt(float64 x) {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinSqrt(x);
+    if (x <= 0.0) { return 0.0; }
+    float64 guess = x / 2.0;
+    for (int i = 0; i < 50; i++) {
+        float64 next = (guess + x / guess) / 2.0;
+        if (abs(next - guess) < 1e-15) { break; }
+        guess = next;
     }
-    return 0.0;
+    return guess;
 }
 
 public float64 floor(float64 x) {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinFloor(x);
-    }
-    return 0.0;
+    int n = int(x);
+    if (float64(n) > x) { return float64(n - 1); }
+    return float64(n);
 }
 
 public float64 ceil(float64 x) {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinCeil(x);
-    }
-    return 0.0;
+    int n = int(x);
+    if (float64(n) < x) { return float64(n + 1); }
+    return float64(n);
 }
 
 public float64 round(float64 x) {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinRound(x);
-    }
-    return 0.0;
+    float64 f = x - floor(x);
+    if (f < 0.5) { return floor(x); }
+    return ceil(x);
 }
 
 public float64 max(float64 a, float64 b) {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinMax(a, b);
-    }
-    return 0.0;
+    if (a > b) { return a; }
+    return b;
 }
 
 public float64 min(float64 a, float64 b) {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinMin(a, b);
-    }
-    return 0.0;
+    if (a < b) { return a; }
+    return b;
 }
 
 public float64 random() {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinRandom();
-    }
-    return 0.0;
+    int seed = 42;
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    return float64(seed) / 2147483648.0;
 }
 
 public float64 ln(float64 x) {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinLn(x);
+    if (x <= 0.0) { return -1e308; }
+    float64 y = (x - 1.0) / (x + 1.0);
+    float64 r = 0.0;
+    float64 term = y;
+    for (int i = 1; i < 100; i += 2) {
+        r += term / float64(i);
+        if (abs(term / float64(i)) < 1e-15) { break; }
+        term *= y * y;
     }
-    return 0.0;
+    return 2.0 * r;
 }
 
 public float64 log10(float64 x) << ln(x) / 2.302585092994046;
 
 public float64 exp(float64 x) {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinExp(x);
+    float64 r = 1.0;
+    float64 term = 1.0;
+    for (int i = 1; i <= 30; i++) {
+        term *= x / float64(i);
+        r += term;
     }
-    return 0.0;
+    return r;
 }
 
 public float64 hypot(float64 a, float64 b) << sqrt(a * a + b * b);
 
 public float64 sum(float64[] arr) {
-    if (osType() == OSTypes.WINDOWS) {
-        return mathWinSum(arr);
-    }
-    return 0.0;
+    float64 s = 0.0;
+    for (int i = 0; i < arr.length; i++) { s += arr[i]; }
+    return s;
 }
 
 // math.eval(expression) evaluates a string containing a mathematical
