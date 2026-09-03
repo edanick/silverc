@@ -1,22 +1,28 @@
-import * from os;
-import * from ssh_win;
+import * from net;
 
 mod export ssh;
 
-// DOCS -- public `ssh` module (UNIFIED_CORE_LIBRARY.md Phase 2). This is the
-// unified, portable front of the SSH library. It contains ZERO win32
-// imports: every ws2_32 call moved into the internal Windows backend
-// std/ssh_win.sr, and every entry that touches the network routes through
-// the OS gate `if (osType() == OSTypes.WINDOWS)` before calling it
-// (osType() is std/os.sr's plain-Silver stand-in -- see that file for why
-// the gate does not use the native os.type query).
+// DOCS -- public `ssh` module (UNIFIED_CORE_LIBRARY.md §4, the CANONICAL
+// FOLD SHAPE). This is the unified, portable front of the SSH library. It
+// contains ZERO OS code: no win32 imports, no `#on` regions, no osType()
+// gates -- every byte on the wire is sent through the universal socket core
+// std/net.sr (connectRaw/sendRawLen/recvRaw/closeRaw/setRecvTimeoutRaw),
+// whose Windows regions hold the ws2_32 calls. This module is pure SSH
+// protocol logic and would compile unchanged on any backend that provides
+// net.
 //
-// The else side of every gate is unreachable on this backend (silverc only
-// emits Windows PEs and osType() is the compile-time WINDOWS constant). For
-// a future non-Windows backend the fallbacks follow the module's failure
-// style: login/authWithKey are silent no-ops, exec() returns "",
-// isLoggedIn() stays false, getLastReply() stays "", serverVersion() stays
-// "".
+// TRANSPORT (the fold): the pre-fold Windows backend std/ssh_win.sr carried
+// the aliased ws2_32 grants (socket/connect/recv/send/closesocket/inet_addr/
+// setsockopt/WSAStartup as sshWinRaw*) plus the 30 s SO_RCVTIMEO arming;
+// all of that now lives in net.sr's regions. login()/exec()/close() arm the
+// timeout right after each connectRaw (net.setRecvTimeoutRaw, 30000 ms --
+// the pre-fold sshWinConnect arming), preserving the pre-fold "every socket
+// has a 30 s receive timeout" bound. The recv loops call
+// net.recvRaw(fd, 4096) -- the pre-fold sshWinReceive(fd, 4096) shape -- and
+// the senders call net.sendRawLen with the pre-split byte counts. The
+// pre-fold sshWin* helpers returned "" on both recv error AND zero-extended
+// SOCKET_ERROR (`n <= 0 || n > 2147483647`); net.recvRaw normalizes first
+// and then reports "" for `n <= 0` -- the same observable graceful shape.
 //
 // DISPATCH (per compiler, probed): `ssh` is builtin-reserved on NEITHER
 // compiler -- silverc-rs has no `ssh` anywhere in src/ (win32.rs's DLL
@@ -29,9 +35,7 @@ mod export ssh;
 // (std/ssh.sr); no native dispatch exists to preserve. (ssh.sr's entry in
 // silverc.srp's exclude list only keeps it out of the compiler's own
 // aggregate build -- the same posture as smtp.sr/pop.sr/imap.sr; it does
-// not make `ssh` a builtin. ssh_win.sr is NOT excluded: its sshWin* names
-// collide with nothing in the aggregate namespace, exactly like
-// pop_win.sr/smtp_win.sr/imap_win.sr.)
+// not make `ssh` a builtin.)
 //
 // PRE-SPLIT STATE (probed 2026-08 against this file's git HEAD copy, fresh
 // -o names on both compilers): the old std/ssh.sr NEVER compiled under
@@ -43,7 +47,7 @@ mod export ssh;
 // line 41, exit 1. The parser never reached the later phantoms, but they
 // were equally dead: `addr.sin_port = (this.port & 0xFF) << 8 | (this.port
 // >> 8) & 0xFF` rides the sockaddr_in phantom (the network-order port swap
-// it intended now lives in sshWinFillSockaddr), the bare
+// it intended now lives in the net.sr sockaddr packing), the bare
 // `socket`/`connect`/`recv`/`closesocket` calls were never granted (the
 // pre-split `import * from win32.ws2_32` grants names that exec() never
 // qualified or defined -- and `AF_INET`/`SOCK_STREAM` resolve to nothing on
@@ -85,7 +89,8 @@ mod export ssh;
 //   into an int[2] qword buffer (with the pre-split intended network-order
 //   port swap), and DLL returns normalized with the two-sided
 //   `v < 0 || v > 2147483647` check (the self-host zero-extends
-//   SOCKET_ERROR to 4294967295; see std/ssh_win.sr).
+//   SOCKET_ERROR to 4294967295; the pre-fold std/ssh_win.sr transport, now
+//   inside net.sr's regions).
 // - login(): pre-split an empty no-op. It now performs the RFC 4253
 //   version exchange: connect, read and validate the server's
 //   "SSH-..." banner (bannerOk; RFC 4253 permits the server to send other
@@ -106,7 +111,8 @@ mod export ssh;
 //   `<cmd>\r\n` as a plain line and reads one bounded reply before
 //   closing, returning the raw bytes (see HONESTY NOTE; "" on any failure
 //   -- the pre-split connect-failure shape).
-// - Bounded reads: every socket gets a 30 s SO_RCVTIMEO (std/ssh_win.sr).
+// - Bounded reads: every socket gets a 30 s SO_RCVTIMEO (net.setRecvTimeoutRaw,
+//   armed after each connectRaw).
 //   The pre-split file had no timeout and would have hung on a silent peer;
 //   every accumulation loop below is bounded at 16 x 4096 bytes (~64 KB)
 //   until its stop condition (a complete CRLF line carrying "SSH-", or the
@@ -290,13 +296,13 @@ class client {
     // Against a non-SSH listener the banner check fails first and the
     // outcome is equally graceful.
     public void login(string user, string pass) {
-        if (osType() != OSTypes.WINDOWS) { return; }
-        this.sock = sshWinConnect(this.host, this.port);
+        this.sock = net.connectRaw(this.host, this.port);
         if (this.sock < 0) {
             this.sock = -1;
             this.lastReply = "";
             return;
         }
+        net.setRecvTimeoutRaw(this.sock, 30000);
         this.readBanner();
         if (!bannerOk(this.lastReply)) {
             this.fail();
@@ -323,30 +329,30 @@ class client {
     // (NOT a decrypted result -- see HONESTY NOTE); "" on any failure
     // (the pre-split connect-failure shape).
     public string exec(string cmd) {
-        if (osType() != OSTypes.WINDOWS) { return ""; }
         string banner = clientBanner();
-        int sock = sshWinConnect(this.host, this.port);
+        int sock = net.connectRaw(this.host, this.port);
         if (sock < 0) { return ""; }
-        sshWinSend(sock, banner + "\r\n", banner.length + 2);
+        net.setRecvTimeoutRaw(sock, 30000);
+        net.sendRawLen(sock, banner + "\r\n", banner.length + 2);
         string acc = "";
         for (int guard = 0; guard < 16; guard++) {
-            string chunk = sshWinReceive(sock, 4096);
+            string chunk = net.recvRaw(sock, 4096);
             if (chunk.length <= 0) { break; }
             acc += chunk;
             if (bannerIndex(acc) >= 0 && lineEndIndex(acc) >= 0) { break; }
         }
         if (!bannerOk(acc)) {
-            sshWinClose(sock);
+            net.closeRaw(sock);
             return "";
         }
-        sshWinSend(sock, cmd + "\r\n", cmd.length + 2);
+        net.sendRawLen(sock, cmd + "\r\n", cmd.length + 2);
         string reply = "";
         for (int guard2 = 0; guard2 < 16; guard2++) {
-            string chunk2 = sshWinReceive(sock, 4096);
+            string chunk2 = net.recvRaw(sock, 4096);
             if (chunk2.length <= 0) { break; }
             reply += chunk2;
         }
-        sshWinClose(sock);
+        net.closeRaw(sock);
         return reply;
     }
 
@@ -369,8 +375,8 @@ class client {
     // pre-split body was empty -- dead text). Silent and idempotent when
     // no session is open.
     public void close() {
-        if (this.sock >= 0 && osType() == OSTypes.WINDOWS) {
-            sshWinClose(this.sock);
+        if (this.sock >= 0) {
+            net.closeRaw(this.sock);
         }
         this.sock = -1;
         this.loggedIn = false;
@@ -381,7 +387,7 @@ class client {
     // instead.
     private void sendLine(string line) {
         if (this.sock < 0) { return; }
-        sshWinSend(this.sock, line + "\r\n", line.length + 2);
+        net.sendRawLen(this.sock, line + "\r\n", line.length + 2);
     }
 
     // Accumulates reads into lastReply until a complete line carrying
@@ -391,7 +397,7 @@ class client {
     private void readBanner() {
         string acc = "";
         for (int guard = 0; guard < 16; guard++) {
-            string chunk = sshWinReceive(this.sock, 4096);
+            string chunk = net.recvRaw(this.sock, 4096);
             if (chunk.length <= 0) { break; }
             acc += chunk;
             if (bannerIndex(acc) >= 0 && lineEndIndex(acc) >= 0) { break; }
@@ -404,7 +410,7 @@ class client {
     private void fail() {
         this.loggedIn = false;
         if (this.sock >= 0) {
-            sshWinClose(this.sock);
+            net.closeRaw(this.sock);
         }
         this.sock = -1;
     }
