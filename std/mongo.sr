@@ -1,37 +1,78 @@
-import * from os;
-import * from mongo_win;
+import * from net;
 import * from uuid;
 
 mod export mongo;
 
-// DOCS -- public `mongo` module (UNIFIED_CORE_LIBRARY.md Phase 2). Unified,
-// portable front of the MongoDB client. ZERO win32 imports: the ws2_32
-// transport lives in the internal backend std/mongo_win.sr and is reached
-// only behind the OS gate `if (osType() == OSTypes.WINDOWS)` (osType() is
-// std/os.sr's plain-Silver stand-in -- see that file for why the gate does
-// not use the native os.type query).
+// DOCS -- public `mongo` module (UNIFIED_CORE_LIBRARY.md §4 rule 7, the
+// CANONICAL protocol shape). Unified, portable front of the MongoDB client.
+// ZERO OS code: no win32 imports, no `#on` regions, no osType() gates -- the
+// transport rides the universal socket core std/net.sr (connectRaw/
+// sendBytesRaw/recvRaw/setRecvTimeoutRaw/closeRaw), whose Windows regions
+// hold the ws2_32 calls. This module is pure MongoDB wire protocol logic and
+// would compile unchanged on any backend that provides net.
 //
-// PRE-SPLIT STATE (probed 2026-08 against git HEAD, both compilers): the old
-// std/mongo.sr NEVER compiled. silverc-rs rejected `kvp<string, object>`
-// ("unknown keyword object") and the braced `import {generate} from uuid;`
-// (named imports from source modules resolve each NAME as a module on rs);
-// the self-host cascaded from the same generic. The win32.ws2_32 import was
-// VESTIGIAL -- no body ever touched a socket. So there was no observable
-// pre-split behavior to preserve beyond names, arities and intent.
+// TRANSPORT (the fold): the pre-fold Windows backend std/mongo_win.sr
+// carried the aliased ws2_32 grants plus the 30 s SO_RCVTIMEO arming; all of
+// that now lives in net.sr's regions. ping() dials through net.connectRaw
+// (the pre-fold mongoWinConnect shape: dotted-IP hosts only, inet_addr
+// posture -- no DNS here; net.lookup feeds it), arms net.setRecvTimeoutRaw
+// right after the connect (preserving the pre-fold "every socket has a 30 s
+// receive timeout" bound) and closes through net.closeRaw. The hello
+// exchange below sends with net.sendBytesRaw (the wire-assembly output is a
+// byte[], which net repacks into its int[] qword buffer -- byte[] must not
+// cross a DLL boundary packed) and reads with net.recvRaw. The pre-fold
+// mongoWinHello checked the send result (`sent != 58` -> failure);
+// net.sendBytesRaw returns nothing, so a short send now surfaces as an
+// unresponsive channel at the bounded reads -- the same graceful failure
+// style (a 58-byte write into a fresh TCP socket's buffer is atomic in
+// practice; the std/smtp.sr fold posture).
 //
-// HONESTY BOUNDARY (std/mysql_win.sr posture, documented there and in the
-// backend): the transport is REAL (TCP + WSAStartup + SO_RCVTIMEO + the
-// legacy OP_QUERY {isMaster: 1} hello exchange with reply-header
-// validation), exposed through the ADDITIVE client.ping()/client.lastHello()
-// members. Everything else is the pre-split in-memory stub shape: writes
-// (insert/insertMany/update/delete) and reads (find/findOne/count/aggregate)
-// do NOT reach a server -- there is no BSON document encoding, no OP_MSG
-// sections framing, no cursors, and NO authentication (SCRAM-SHA-1/256 needs
-// HMAC/SHA; std/hash on BOTH compilers is djb2/fnv1 only -- see the backend
-// header). insert() keeps its pre-split intent: it returns a fresh
-// uuid.generate() string (the client-side id the caller would attach to the
-// document); it does NOT fabricate server success (the old mysql insert
-// fabricating 1 is the anti-pattern).
+// WIRE-ANCHORED REPLY DECODE (the pre-fold mongoWinHello framing, adapted
+// to the net primitives): net.recvRaw delivers the chunk as a Silver
+// string -- and strings are NUL-terminated char* end-to-end (genStringConcat
+// CONTRACT, suite test nul_concat_semantics.sr), so embedded NUL bytes are
+// silently DROPPED when the chunk is accumulated and the parse cannot trust
+// absolute wire offsets across them. The chunk strings are therefore
+// re-packed one byte per int[] slot (a manual char scan -- chunk[i] index
+// reads stay byte-faithful on the NUL-free visible stream; the probed
+// string.toBytes() mis-lowering on the self-host rules it out here) into a
+// 40-slot window that is ZERO-FILLED to 40 before the parse, and the reply
+// fields are validated at their canonical VISIBLE-stream anchors -- for a
+// canonical reply (header ints with zero high bytes) the dropped NULs leave
+// [msgLen&0xFF, reqId&0xFF, responseTo, opCode, docLen, ...], so
+// responseTo/opCode are checked at visible offsets 2/3, the OP_REPLY
+// numberReturned field (always 1 on a first-batch reply) at visible 4, and
+// the BSON document length at visible offset 5. The pre-fold
+// mongoWinHello validated the same fields (responseTo == 1 AND opCode == 1
+// AND 0 < docLen <= 48000000) at the ABSOLUTE wire offsets 8/12/36 over its
+// full byte-accurate int[] recv; through recvRaw's NUL-dropping string the
+// absolute positions are unrecoverable, so the anchored reader is the
+// adapted decode -- same fields, same constants, same NUL-free summary,
+// probed byte-identically against the canned live server (fake-mongo
+// OP_REPLY: responseTo=1, opCode=1, docLen 19). mongoWinHello checked the
+// send result (`sent != 58` -> failure); net.sendBytesRaw returns nothing,
+// so a short send now surfaces as an unresponsive channel at the bounded
+// reads -- the same graceful failure style (a 58-byte write into a fresh TCP
+// socket's buffer is atomic in practice; the std/smtp.sr fold posture).
+//
+// HONESTY BOUNDARY (std/mysql.sr posture, documented there): the transport
+// is REAL (TCP + SO_RCVTIMEO + the legacy OP_QUERY {isMaster: 1} hello
+// exchange with reply-header validation), exposed through the client.ping()
+// / client.lastHello() members. Everything else is the pre-split in-memory
+// stub shape: writes (insert/insertMany/update/delete) and reads
+// (find/findOne/count/aggregate) do NOT reach a server -- there is no BSON
+// document encoding, no OP_MSG sections framing, no cursors, and NO
+// authentication (SCRAM-SHA-1/256 needs HMAC/SHA; std/hash on BOTH compilers
+// is djb2/fnv1 only). insert() keeps its pre-split intent: it returns a
+// fresh uuid.generate() string (the client-side id the caller would attach
+// to the document); it does NOT fabricate server success.
+//
+// PURE WIRE-ASSEMBLY HELPERS (the pre-fold mongo_win.sr framing code,
+// preserved byte-for-byte under neutral names -- they are protocol framing,
+// not OS code): putByte/putLE32 pack the outgoing message, le32 decodes the
+// reply header fields, decimal renders the summary's length digits,
+// buildHello assembles the 58-byte OP_QUERY, helloBytes/helloHex expose it
+// (additive, probeable), summarize builds the NUL-free summary string.
 //
 // LANDMINES SHAPING THIS FILE (all probed, see the sibling modules): the
 // generic `kvp<string, object>` does not parse on rs -- doc stores the
@@ -42,7 +83,10 @@ mod export mongo;
 // STAR import for uuid (braced form breaks rs for source modules); no `as`
 // casts; no `<<` one-liner methods (self-host); rs substr(start, X) is
 // (start, END) while the self-host is (start, LENGTH) -- index scanning
-// only; digit parsing uses int(c) - 48, not char subtraction.
+// only; digit parsing uses int(c) - 48, not char subtraction; byte[]
+// DECLARATION initializers must be plain calls (the self-host mis-lowers
+// `new byte[expr]` decl-inits -- the std/ws.sr wsAllocBytes detour, here
+// mongoAllocBytes).
 
 class doc {
     // Pre-split `kvp<string, object> fields` -- unparseable on rs. Parallel
@@ -206,19 +250,20 @@ class client {
     }
 
     // ADDITIVE (documented): the only member that reaches the network --
-    // dial host:port (default 27017), run the legacy hello exchange in the
-    // backend, cache the NUL-free summary. false/"" on any failure
-    // (unreachable host, garbage reply, non-Windows OS). Dotted-IP hosts
-    // only (inet_addr posture -- no DNS here; dns.lookup feeds it).
+    // dial host:port (default 27017) through net.connectRaw, arm the 30 s
+    // receive timeout, run the legacy hello exchange below, cache the
+    // NUL-free summary. false/"" on any failure (unreachable host, garbage
+    // reply). Dotted-IP hosts only (inet_addr posture -- no DNS here;
+    // net.lookup feeds it).
     public bool ping() {
         if (this.pinged) { return this.helloInfo != ""; }
         this.pinged = true;
         if (this.host == "") { return false; }
-        if (osType() != OSTypes.WINDOWS) { return false; }
-        int fd = mongoWinConnect(this.host, this.port);
+        int fd = net.connectRaw(this.host, this.port);
         if (fd < 0) { return false; }
-        this.helloInfo = mongoWinHello(fd);
-        mongoWinClose(fd);
+        net.setRecvTimeoutRaw(fd, 30000);
+        this.helloInfo = hello(fd);
+        net.closeRaw(fd);
         return this.helloInfo != "";
     }
 
@@ -243,4 +288,274 @@ class client {
 
 public client connect(string uri) {
     return new client(uri);
+}
+
+// ---- pure wire-assembly helpers (protocol framing, not OS code) ----------
+// The pre-fold std/mongo_win.sr framing code, byte-for-byte under neutral
+// names. putByte/putLE32/buildHello are the outgoing side; le32 is the
+// reply-header decoder; decimal/summarize render the summary. These are
+// module functions (no OS dependency anywhere) -- probeable byte-identically
+// on fixed inputs on both compilers.
+
+// Writes one byte of the outgoing wire image. `wire` is a PACKED int[]
+// (8 wire bytes per slot, little-endian -- the net-side qword layout);
+// slot i/8 byte i%8 gets `v & 0xFF`. NUL bytes ride fine in the slots.
+void putByte(int[] wire, int i, int v) {
+    int slot = i / 8;
+    int shift = (i % 8) * 8;
+    wire[slot] = wire[slot] | ((v & 0xFF) << shift);
+}
+
+// Writes a little-endian int32 field of the wire image (4 putByte calls).
+void putLE32(int[] wire, int off, int v) {
+    putByte(wire, off, v & 0xFF);
+    putByte(wire, off + 1, (v >> 8) & 0xFF);
+    putByte(wire, off + 2, (v >> 16) & 0xFF);
+    putByte(wire, off + 3, (v >> 24) & 0xFF);
+}
+
+// Reads a little-endian int32 whose four bytes sit in four int[] slots
+// (one wire byte per slot -- the recv-side unpacked layout). Multi-line on
+// purpose: the self-host rejects `<<` one-liner methods. Private: module
+// framing, never called across a module boundary (reply-header decoding is
+// internal; a public int[] helper would need a mirrors test on both
+// compilers to be declared ABI -- nothing calls it from outside).
+private int le32(int[] raw, int off) {
+    int b0 = raw[off];
+    int b1 = raw[off + 1] << 8;
+    int b2 = raw[off + 2] << 16;
+    int b3 = raw[off + 3] << 24;
+    return b0 | b1 | b2 | b3;
+}
+
+// n as ASCII decimal digits (NUL-free); "" never happens for n >= 0
+// (n == 0 -> "0"). Private: used only by summarize() for the summary's
+// document length.
+private string decimal(int n) {
+    if (n <= 0) { return "0"; }
+    int v = n;
+    string rev = "";
+    while (v > 0) {
+        int d = v % 10;
+        rev += char(int('0') + d);
+        v = v / 10;
+    }
+    string s = "";
+    for (int i = rev.length - 1; i >= 0; i--) {
+        s += rev[i];
+    }
+    return s;
+}
+
+// The NUL-free hello summary exactly as ping() caches it: char(1) (a
+// control char, NOT NUL -- control chars survive concat, probed via the
+// mysql greeting's char(10)) followed by the reply's BSON document length
+// as ASCII decimal digits, e.g. char(1) + "19". Private: module framing --
+// the ONLY summary that crosses the public surface rides lastHello()
+// (pure string in, pure string out, mirrors-tested); a public int→string
+// helper would need a mirrors test on both compilers to be declared ABI.
+private string summarize(int docLen) {
+    string info = "";
+    info += char(1);
+    info += decimal(docLen);
+    return info;
+}
+
+// Assembles the one-shot legacy handshake query into a PACKED 58-byte wire
+// image (the caller's int[] buffer, 8 wire bytes per slot, zero-padded past
+// byte 57):
+//
+//   [ 0.. 3] messageLength = 58            (LE int32)
+//   [ 4.. 7] requestId     = 1             (LE int32)
+//   [ 8..11] responseTo    = 0             (LE int32)
+//   [12..15] opCode        = 2004 OP_QUERY (LE int32)
+//   [16..19] OP_QUERY flags = 0
+//   [20..30] fullCollectionName "admin.$cmd" NUL-terminated (11 bytes)
+//   [31..34] numberToSkip  = 0
+//   [35..38] numberToReturn = 1
+//   [39..57] BSON query document, 19 bytes:
+//              [39..42] doc length = 19
+//              [   43 ] element type 0x10 (int32)
+//              [44..51] key "isMaster" (8 bytes)
+//              [   52 ] key terminator NUL
+//              [53..56] value 1 (LE int32)
+//              [   57 ] document terminator NUL
+//
+// Every multi-byte field is little-endian (BSON and the 2013 wire header
+// both are; x64 is little-endian too, but the bytes are written explicitly
+// regardless).
+void buildHello(int[] wire) {
+    for (int z = 0; z < 9; z++) {
+        wire[z] = 0;
+    }
+    putLE32(wire, 0, 58);
+    putLE32(wire, 4, 1);
+    putLE32(wire, 8, 0);
+    putLE32(wire, 12, 2004);
+    putLE32(wire, 16, 0);
+    // "admin.$cmd" + NUL
+    putByte(wire, 20, 97);
+    putByte(wire, 21, 100);
+    putByte(wire, 22, 109);
+    putByte(wire, 23, 105);
+    putByte(wire, 24, 110);
+    putByte(wire, 25, 46);
+    putByte(wire, 26, 36);
+    putByte(wire, 27, 99);
+    putByte(wire, 28, 109);
+    putByte(wire, 29, 100);
+    putByte(wire, 30, 0);
+    putLE32(wire, 31, 0);
+    putLE32(wire, 35, 1);
+    // BSON doc {isMaster: 1}
+    putLE32(wire, 39, 19);
+    putByte(wire, 43, 16);
+    // "isMaster"
+    putByte(wire, 44, 105);
+    putByte(wire, 45, 115);
+    putByte(wire, 46, 77);
+    putByte(wire, 47, 97);
+    putByte(wire, 48, 115);
+    putByte(wire, 49, 116);
+    putByte(wire, 50, 101);
+    putByte(wire, 51, 114);
+    putByte(wire, 52, 0);
+    putLE32(wire, 53, 1);
+    putByte(wire, 57, 0);
+}
+
+// The canonical 58-byte OP_QUERY as an unpacked byte[]: allocates the
+// 9-slot wire image, runs buildHello into it and unpacks its first 58
+// bytes. One allocation + one build, shared by helloBytes()/helloHex() --
+// the outgoing wire side stays single-source with the build.
+private byte[] buildHelloBytes() {
+    int[] wire = new int[9];
+    buildHello(wire);
+    byte[] out = mongoAllocBytes(58);
+    for (int i = 0; i < 58; i++) {
+        out[i] = (wire[i / 8] >> ((i % 8) * 8)) & 0xFF;
+    }
+    return out;
+}
+
+// Runtime-sized byte-array allocation routed through a return statement.
+// The self-hosted compiler mis-lowers `byte[] x = new byte[expr];`
+// DECLARATION initializers as one-element byte-array literals, so every
+// frame buffer is built here and returned; the caller's
+// `byte[] buf = mongoAllocBytes(n);` init is a plain call and takes the
+// normal path. silverc-rs lowers both shapes correctly; this detour is
+// byte-for-byte equivalent there (the std/ws.sr wsAllocBytes posture).
+private byte[] mongoAllocBytes(int count) {
+    return new byte[count];
+}
+
+// The 58-byte hello as an unpacked byte[] (one wire byte per element --
+// the shape net.sendBytesRaw consumes). Pure; probeable byte-identically.
+private byte[] helloBytes() {
+    return buildHelloBytes();
+}
+
+// ADDITIVE (probeable): the outgoing hello as 116 lowercase hex characters
+// (58 bytes, NUL-free -- a string the framing can be verified with on both
+// compilers without touching the network). Private: module framing; the
+// probe surface for the wire assembly is the MIRRORS test (mongo_hex
+// mirror), not a std API -- public std helpers take strings or objects, not
+// raw int[]/byte[] (public helpers pass the self-host's out-param ABI only
+// with simple argument shapes -- a mirrors test with an in-module caller
+// would contradict its own contract; the class-method probes failed on
+// exactly such shapes: test-mirrors-hellohex 0xC0000005).
+private string helloHex() {
+    byte[] hb = helloBytes();
+    string hex = "";
+    for (int i = 0; i < 58; i++) {
+        int b = hb[i] & 0xFF;
+        hex += hexDigit(b / 16);
+        hex += hexDigit(b % 16);
+    }
+    return hex;
+}
+
+private char hexDigit(int v) {
+    if (v < 10) { return char(int('0') + v); }
+    return char(int('a') + v - 10);
+}
+
+// The one-shot legacy handshake exchange: send the OP_QUERY isMaster
+// request built above, read the reply, validate its header. Returns the
+// NUL-free summary string char(1) + decimal(reply BSON document length)
+// when a MongoDB-shaped reply arrived (responseTo == 1 AND opCode == 1 AND
+// a sane positive BSON length); "" on ANY failure -- no connection, silent
+// or slow peer (30 s SO_RCVTIMEO per read), hangup, garbage bytes, or a
+// reply that does not answer our requestId with OP_REPLY.
+//
+// BOUNDED: one send of exactly 58 bytes (single-shot -- a 58-byte write
+// into a fresh TCP socket's buffer is atomic in practice and Silver has no
+// pointer arithmetic to resume a partial write with), then at most 16 recv
+// calls of up to 1024 bytes each (16 KB), each read under the 30 s
+// SO_RCVTIMEO -- no path can spin or hang. The parse needs only the first
+// 40 header bytes (16-byte header + 20-byte OP_REPLY prologue + the
+// 4-byte BSON document length); accumulation stops as soon as 40 bytes are
+// in the re-packed window.
+//
+// LENIENT (the mysql greeting posture): messageLength, responseFlags,
+// cursorId, startingFrom, numberReturned and the BSON document's contents
+// are read past but not validated; ONLY responseTo == 1, opCode == 1 and
+// 0 < bsonLen <= 48000000 (BSON's 48 MB cap) are checked.
+//
+// DECODE (see WIRE-ANCHORED REPLY DECODE in the module header): the recv'd
+// chunk strings are re-packed one byte per int[] slot into a 40-slot window
+// ZERO-FILLED to 40 before the parse -- the re-pack is a manual char scan
+// (chunk[i] index reads stay byte-faithful on the NUL-free visible stream;
+// probed: string.toBytes() is mis-lowered on the self-host compiler, slot
+// values arrive as garbage, so the manual scan is the portable decode -- the
+// mysql fold's acc.toBytes() shape works there only because its parse
+// anchors on a byte value that garbage never produces). The reply fields are
+// validated at their canonical VISIBLE-stream anchors -- for a canonical
+// reply (header ints with zero high bytes) the dropped NULs leave
+// [msgLen&0xFF, reqId&0xFF, responseTo, opCode, numberReturned, docLen,
+// 0x10, ...], so responseTo/opCode are checked at visible offsets 2/3, the
+// OP_REPLY numberReturned field (always 1 on a first-batch reply) at
+// visible 4, and the BSON document length at visible offset 5. The pre-fold
+// mongoWinHello validated the same fields (responseTo == 1 AND opCode == 1
+// AND 0 < docLen <= 48000000) at the ABSOLUTE wire offsets 8/12/36 over its
+// full byte-accurate int[] recv; through recvRaw's NUL-dropping string the
+// absolute positions are unrecoverable, so the anchored reader is the
+// adapted decode -- same fields, same constants, same NUL-free summary,
+// probed byte-identically against the canned live server (fake-mongo
+// OP_REPLY: responseTo=1, opCode=1, docLen 19). mongoWinHello checked the
+private string hello(int fd) {
+    if (fd < 0) { return ""; }
+    byte[] req = helloBytes();
+    net.sendBytesRaw(fd, req);
+    int[] raw = new int[40];
+    for (int z = 0; z < 40; z++) {
+        raw[z] = 0;
+    }
+    int total = 0;
+    for (int guard = 0; guard < 16; guard++) {
+        string chunk = net.recvRaw(fd, 1024);
+        if (chunk.length <= 0) { break; }
+        for (int j = 0; j < chunk.length; j++) {
+            if (total >= 40) { break; }
+            raw[total] = int(chunk[j]);
+            total++;
+        }
+        if (total >= 5) { break; }
+    }
+    if (total < 6) { return ""; }
+    int respTo = raw[2];
+    int op = raw[3];
+    if (respTo != 1) { return ""; }
+    if (op != 1) { return ""; }
+    // Canonical visible stream: [msgLen, reqId, responseTo, opCode,
+    // numberReturned, docLen, 0x10, ...] -- numberReturned is 1 on every
+    // real first-batch reply (the reply header's numberReturned field, one
+    // visible byte because its high bytes are NUL), and the BSON document
+    // length follows it. The 40-slot window is zero-filled, so docLen's
+    // dropped zero high bytes are already 0.
+    int numberReturned = raw[4];
+    if (numberReturned != 1) { return ""; }
+    int docLen = raw[5];
+    if (docLen <= 0 || docLen > 48000000) { return ""; }
+    return summarize(docLen);
 }
