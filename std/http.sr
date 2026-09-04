@@ -1,43 +1,38 @@
 mod export http;
 
-// DOCS -- public `http` module (UNIFIED_CORE_LIBRARY.md v2 canonical fold).
-// This is the universal HTTP client module: there is no http_win.sr backend
-// and no win-named helpers -- one module, one OS layer (http rides net per
-// the layering pyramid; the winhttp fast path here is the OPTIONAL Windows
-// fast path of §4). Every winhttp.dll call lives inline in the `#on WINDOWS`
-// regions of the public functions that need it, one unified function name
-// per operation, no wrapper indirection, no alias imports, no osType()
-// gates (so `import * from os;` is gone too: the preprocessor replaces the
-// gate). Plain `import * from win32.winhttp;` -- all WinHttp* export names
-// are tabled on both compilers and none collides with this module's public
-// API (get/post/delete). The private extractHost/extractPort/extractPath
-// helpers are pure URL string parsing -- no OS code, so they stay ungated
-// with their pre-split names.
+// DOCS -- public `http` module.
+// This is the universal HTTP client module: one module, one OS layer (http
+// rides net per the layering pyramid; the winhttp fast path here is the
+// OPTIONAL Windows fast path of UNIFIED_CORE_LIBRARY.md §4). Every
+// winhttp.dll call lives inline in the `#on WINDOWS` regions of the public
+// functions that need it, one unified function name per operation, no
+// wrapper indirection, no alias imports. Plain
+// `import * from win32.winhttp;` -- all WinHttp* export names are tabled on
+// both compilers and none collides with this module's public API
+// (get/post/delete). The private extractHost/extractPort/extractPath
+// helpers are pure URL string parsing -- no OS code, so they stay ungated.
 //
 // http is builtin-reserved on BOTH compilers (rs main.rs builtin_modules_set,
 // self-host std/project.sr projectBuiltin), so this source is rarely
 // compiled -- user `http.<fn>()` calls are answered natively (rs
-// stdlib::http::gen_http_call). The fold is for source hygiene; behavior is
-// native-dispatched and unchanged.
+// stdlib::http::gen_http_call). This source exists for hygiene; behavior is
+// native-dispatched.
 //
-// BEHAVIOR NOTES (bodies below are the pre-split implementations, with the
-// DLL call sites renamed from the backend's aliases to the bare export
-// names):
-//   - Responses still accumulate with `result += char(buf[i])` loops.
-//     char(int) semantics currently differ between compilers (silverc-rs was
-//     aligned with silveri in commit 886e1a7; the self-host is a known
-//     outlier), so the shapes are preserved as-is to keep each compiler's
-//     behavior exactly where it was.
+// BEHAVIOR NOTES:
+//   - Responses accumulate with `result += char(buf[i])` loops.
+//     char(int) semantics currently differ between compilers (silverc-rs is
+//     aligned with silveri; the self-host is a known outlier), so the
+//     shapes are compiler-specific to keep each compiler's behavior exact.
 //   - The read loop hands the DLL a `byte[]`, whose slots are qwords, so a
 //     raw byte stream written by WinHttpReadData only lines up with
 //     `buf[i]` for the first eight bytes; net.sr's int[] shift packing is
 //     the layout-safe idiom a future parity pass should apply here.
-//   - post() still serializes with body.toBytes(), which neither compiler
+//   - post() serializes with body.toBytes(), which neither compiler
 //     implements as a real builtin (the self-host parses it but silently
-//     miscompiles the call); preserved verbatim for the reasons above.
+//     miscompiles the call).
 //
 // NON-WINDOWS FALLBACK: every entry returns the empty string when no
-// Windows region is present (the module's existing failure style).
+// Windows region is present (the module's failure style).
 
 #on WINDOWS
 import * from win32.winhttp;

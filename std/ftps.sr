@@ -2,59 +2,43 @@ import * from net;
 
 mod export ftps;
 
-// DOCS -- public `ftps` module (UNIFIED_CORE_LIBRARY.md §4 rule 7, the v2
-// canonical fold). This is a PROTOCOL module: it contains ZERO OS code and
-// no preprocessor regions -- every byte on the wire moves through the
-// universal socket core std/net.sr (connectRaw/sendRawLen/recvRaw/closeRaw).
-// The aliased 8-grant ws2_32 transport that used to live in the v1 backend
-// std/ftps_win.sr (deleted) is now net's, inside net's own `#on WINDOWS`
-// regions. win-prefixed helpers, alias imports and osType() gates are gone
-// with it.
+// DOCS -- public `ftps` module (UNIFIED_CORE_LIBRARY.md §4 rule 7). This is
+// a PROTOCOL module: it contains ZERO OS code and no preprocessor regions
+// -- every byte on the wire moves through the universal socket core
+// std/net.sr (connectRaw/sendRawLen/recvRaw/closeRaw); the ws2_32 code
+// lives inside net's own `#on WINDOWS` regions.
 //
-// DISPATCH (per compiler, probed): `ftps` is builtin-reserved on NEITHER
-// compiler -- silverc-rs's builtin_modules_set (src/main.rs:81 lists
+// DISPATCH: `ftps` is builtin-reserved on NEITHER compiler --
+// silverc-rs's builtin_modules_set (src/main.rs:81 lists
 // fs/json/yaml/env/url/hash/path/bom/console/math/http only) and the
 // self-hosted compiler's visBuiltinModule (compiler/visibility.sr:605) plus
 // its driver prepend list all exclude it. Both compilers resolve
 // `import * from ftps;` as an ORDINARY SOURCE module (std/ftps.sr); no
-// native dispatch exists to preserve. (The "ftps://" strings in both
-// compilers' url builtins are URL-scheme checks, unrelated to this module.)
+// native dispatch exists. (The "ftps://" strings in both compilers' url
+// builtins are URL-scheme checks, unrelated to this module.)
 //
-// PRE-SPLIT STATE (probed against the untouched std/ftps.sr before the
-// first rewrite): the old file NEVER compiled under either compiler.
-// silverc-rs died with `Expected 'LeftParen' but found 'Dot'` and the
-// self-hosted compiler with `Parse error ... expected ( but found .` -- both
-// at the phantom `struct sockaddr_in addr;` / `&addr` connect call (a
-// syntax that exists in no compiler), with `AF_INET`/`SOCK_STREAM`
-// resolving to nothing. The download/upload parameters named `local` are a
-// further landmine (`local` is a reserved memory-safety keyword on
-// silverc-rs). Every body was therefore dead text -- there was NO
-// observable pre-split behavior to preserve beyond names, arities and
-// intent.
+// TLS: TLS support is stored-and-inert. The enums exist and
+// setTLS/setCA/setVerifyMode initialize their fields to defaults, but no
+// TLS stack exists behind this module -- no handshake, no certificate
+// code, no SCHANNEL grant (a real TLS stack is a separate feature). What
+// login/transfer actually do: login() opens a bare socket and runs the
+// plain USER/PASS exchange (no AUTH TLS), download() streams RETR over
+// the PASV data channel into the local file, and upload() sends STOR and
+// the file bytes over the data channel. Consequence: this client speaks
+// PLAIN FTP on the wire. Against an FTPS-only server that demands AUTH
+// TLS before authentication, login() fails gracefully at the USER step
+// and the server's reply is surfaced through getLastReply(); against a
+// classic FTP server it works end to end.
 //
-// TLS STORY (honest): the pre-split TLS support was DEAD STORAGE, not a
-// stub and not an implementation. The enums existed and setTLS/setCA/
-// setVerifyMode wrote private fields, but NOTHING ever read them: login()
-// was a bare socket+connect (no AUTH TLS, no handshake, no certificate code
-// anywhere in the file), and download()/upload() were empty. This fold
-// preserves exactly that shape: the knobs are still stored and still inert
-// (no SCHANNEL grant, no handshake invented -- a real TLS stack is a
-// separate feature). Consequence: this client speaks PLAIN FTP on the
-// wire. Against an FTPS-only server that demands AUTH TLS before
-// authentication, login() fails gracefully at the USER step and the
-// server's reply is surfaced through getLastReply(); against a classic
-// FTP server it works end to end.
-//
-// DEAD -> LIVE (what the protocol wiring made actually work, mirroring the
-// std/ftp.sr fold):
+// TRANSPORT:
 // - The control channel: net.connectRaw + USER/PASS. login() reads and
 //   validates the greeting (220), sends USER (331, or 230 = server skips
 //   PASS) and PASS (230), and records the outcome in isLoggedIn()/
-//   getLastReply() (both ADDITIVE -- the pre-split surface had no way to
-//   report anything; same additions as std/ftp.sr). Against a non-FTP
-//   listener the login fails gracefully: the server's banner (or "" after
-//   a silent disconnect) is surfaced through getLastReply() and the
-//   process exits cleanly. No exceptions anywhere.
+//   getLastReply(). getLastReply() exposes the raw last server reply;
+//   isLoggedIn() is true only after a fully accepted USER/PASS exchange.
+//   Against a non-FTP listener the login fails gracefully: the server's
+//   banner (or "" after a silent disconnect) is surfaced through
+//   getLastReply() and the process exits cleanly. No exceptions anywhere.
 // - list(): opens a real PASV data channel (net.connectRaw for the second
 //   connection), sends LIST and returns the data-channel lines split on
 //   "\r\n" (a trailing CRLF yields a trailing "" element -- the same shape
@@ -65,47 +49,41 @@ mod export ftps;
 //   compilers (std/crypto.sr and std/csv.sr use the same shape).
 // - Bounded reads: every socket this module opens -- control and data
 //   alike -- gets a 30 s receive timeout via net.setRecvTimeoutRaw(fd,
-//   30000) (net arms SO_RCVTIMEO; previously the v1 backend armed the same
-//   30 s value). readReply()'s accumulation loop is additionally bounded
-//   at 16 iterations and readAll() at 4096 x 64 KB (~256 MB) so no path
-//   can spin forever even against a peer that never closes.
+//   30000) (net arms SO_RCVTIMEO). readReply()'s accumulation loop is
+//   additionally bounded at 16 iterations and readAll() at 4096 x 64 KB
+//   (~256 MB) so no path can spin forever even against a peer that never
+//   closes.
 // - QUIT: close() sends QUIT and closes immediately without waiting for
 //   the 221, so a dead peer cannot stall close().
 //
-// STANDALONE (checked): the pre-split std/ftps.sr imported ONLY
-// win32.ws2_32 -- it did NOT import ftp or share code with it. This fold
-// keeps ftps standalone: the pure protocol helpers below are copied
-// verbatim from std/ftp.sr's probed helpers (and re-probed byte-identical
-// for ftps on both compilers) rather than imported, avoiding the
-// cross-module int[]-helper dispatch trap documented in std/ftp.sr. Do not
-// "deduplicate" them across the two modules without re-proving the
-// cross-module dispatch on silverc-rs.
+// SCOPE: ftps is STANDALONE -- it imports only net and does not import
+// ftp or share code with it. The pure protocol helpers below are copies
+// of std/ftp.sr's helpers (verified byte-identical for ftps on both
+// compilers) rather than imports, avoiding the cross-module int[]-helper
+// dispatch trap documented in std/ftp.sr. Do not "deduplicate" them
+// across the two modules without re-proving the cross-module dispatch on
+// silverc-rs.
 //
-// API PRESERVATION (every public name/arity of the pre-split file,
-// unchanged): enum TLSMode { Explicit, Implicit } and enum VerifyMode
-// { None, Strict } -- resyntaxed as `def X = enum { ... };` because a
-// top-level C-style `enum X { ... }` is REJECTED by silverc-rs ("Unexpected
+// PUBLIC API: enum TLSMode { Explicit, Implicit } and enum VerifyMode
+// { None, Strict } -- spelled `def X = enum { ... };` because a top-level
+// C-style `enum X { ... }` is REJECTED by silverc-rs ("Unexpected
 // token 'Enum'"; the self-host accepts both forms, probed). The observable
 // values are identical either way: members auto-increment from 0
 // (DOCS/212), so Explicit=0/Implicit=1 and None=0/Strict=1 on both
-// compilers. client.construct(string host, int port) (the pre-split ctor
-// takes the port, so unlike std/ftp.sr no additive setPort is needed);
-// setTLS(TLSMode); setCA(string); setVerifyMode(VerifyMode) (all three
-// stored-and-inert, the pre-split TLS shape); login(string user, string
-// pass); list(string path) -> string[]; download(string remote, string
-// localPath); upload(string localPath, string remote) (the pre-split
-// parameter was spelled `local` -- a reserved word on silverc-rs; parameter
-// names are invisible to positional callers, so the observable API is
-// unchanged); close(). The private sendCmd/recvResp helper names are
-// preserved; recvResp keeps its raw-bytes shape (the multi-line reply
-// accumulation lives in the private readReply, the std/ftp.sr shape).
-// ADDITIVE (the std/ftp.sr precedent, documented): getLastReply() returns
-// the raw text of the last control-channel reply ("" before the first read
-// -- the graceful-failure surface), isLoggedIn() is true only after a fully
-// accepted USER/PASS exchange. Also additive and invisible: the private
-// lastReply/loggedIn fields, and construct() now initializes sock to -1 and
-// caPath to "" (the pre-split construct left them uninitialized -- a NULL
-// deref had close() ever run on a never-connected client).
+// compilers. client.construct(string host, int port) takes the port, so
+// unlike std/ftp.sr no setPort is needed; setTLS(TLSMode); setCA(string);
+// setVerifyMode(VerifyMode) (all three stored-and-inert); login(string
+// user, string pass); list(string path) -> string[]; download(string
+// remote, string localPath); upload(string localPath, string remote)
+// (the second parameter is spelled localPath, not `local` -- `local` is a
+// reserved word on silverc-rs; parameter names are invisible to
+// positional callers); close(). getLastReply() exposes the raw last
+// server reply; isLoggedIn() is true only after a fully accepted
+// USER/PASS exchange. The private sendCmd/recvResp helpers keep their
+// raw-bytes shapes; the multi-line reply accumulation lives in the
+// private readReply (the std/ftp.sr shape), and construct() initializes
+// sock to -1 and caPath to "" so close() on a never-connected client is
+// safe.
 //
 // CALLER NOTES: instantiate the client with `var c = new client(...);` --
 // a lowercase class arriving from a star-imported module cannot be spelled
@@ -114,9 +92,9 @@ mod export ftps;
 // works on both, probed). Strings returned across this module's boundary
 // (getLastReply) should be assigned to a local before being concatenated
 // into larger expressions (silverc-rs stringifies the return pointer in
-// expression position; see std/dns.sr's RS-ONLY CALLER LANDMINE). There is
-// no server class -- the pre-split file never had one and none was
-// invented (use std/ftp.sr's server if a plain-FTP listener is needed).
+// expression position; see std/dns.sr's RS-ONLY CALLER LANDMINE). There
+// is no server class (use std/ftp.sr's server if a plain-FTP listener is
+// needed).
 
 def TLSMode = enum { Explicit, Implicit };
 
@@ -243,9 +221,8 @@ class client {
         this.loggedIn = false;
     }
 
-    // Stored and NEVER read (the pre-split TLS shape, preserved verbatim):
-    // no handshake consults tlsMode, so Explicit vs Implicit changes
-    // nothing. Kept so the public API stays identical.
+    // Stored and NEVER read: no handshake consults tlsMode, so Explicit vs
+    // Implicit changes nothing. No TLS stack exists behind this module.
     public void setTLS(TLSMode mode) { this.tlsMode = mode; }
 
     // Stored and NEVER read: no certificate store exists in this module.
@@ -255,21 +232,21 @@ class client {
     // TLS layer to verify against).
     public void setVerifyMode(VerifyMode mode) { this.verifyMode = mode; }
 
-    // ADDITIVE (the std/ftp.sr precedent): the raw text of the last server
-    // reply on the control channel ("" before the first read). This is the
-    // graceful-failure surface: against a non-FTP listener it holds the
-    // banner the peer sent, or "" when the peer said nothing and closed.
+    // The raw text of the last server reply on the control channel (""
+    // before the first read). This is the graceful-failure surface:
+    // against a non-FTP listener it holds the banner the peer sent, or ""
+    // when the peer said nothing and closed.
     public string getLastReply() {
         return this.lastReply;
     }
 
-    // ADDITIVE: true only after a fully accepted USER/PASS exchange (or a
+    // True only after a fully accepted USER/PASS exchange (or a
     // 230 login-without-PASS).
     public bool isLoggedIn() {
         return this.loggedIn;
     }
 
-    // PLAIN FTP on the wire (see the TLS STORY above): no AUTH TLS is sent.
+    // PLAIN FTP on the wire (see TLS above): no AUTH TLS is sent.
     // An FTPS-only server that requires TLS before authentication fails the
     // USER step gracefully here.
     public void login(string user, string pass) {
@@ -317,9 +294,8 @@ class client {
 
     // NOTE: the second parameter is spelled localPath, not `local` -- `local`
     // is a reserved word on silverc-rs ("Expected expression" wherever it
-    // appears as an identifier), a pre-split landmine (the old signature
-    // used it). Parameter names are invisible to positional callers, so the
-    // observable API is unchanged.
+    // appears as an identifier). Parameter names are invisible to positional
+    // callers.
     public void download(string remote, string localPath) {
         if (!this.loggedIn) { return; }
         int data = this.openData();
@@ -360,7 +336,7 @@ class client {
     }
 
     // One bounded read of the control channel (raw bytes as a string; ""
-    // on disconnect/timeout -- pre-split recvResp shape).
+    // on disconnect/timeout).
     private string recvResp() {
         if (this.sock < 0) { return ""; }
         return recvRaw(this.sock, 4096);

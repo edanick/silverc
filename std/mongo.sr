@@ -3,32 +3,26 @@ import * from uuid;
 
 mod export mongo;
 
-// DOCS -- public `mongo` module (UNIFIED_CORE_LIBRARY.md §4 rule 7, the
-// CANONICAL protocol shape). Unified, portable front of the MongoDB client.
-// ZERO OS code: no win32 imports, no `#on` regions, no osType() gates -- the
-// transport rides the universal socket core std/net.sr (connectRaw/
-// sendBytesRaw/recvRaw/setRecvTimeoutRaw/closeRaw), whose Windows regions
-// hold the ws2_32 calls. This module is pure MongoDB wire protocol logic and
-// would compile unchanged on any backend that provides net.
+// DOCS -- public `mongo` module (UNIFIED_CORE_LIBRARY.md §4 rule 7). A
+// PROTOCOL module and the unified, portable front of the MongoDB client.
+// ZERO OS code: no win32 imports, no `#on` regions -- the transport rides
+// the universal socket core std/net.sr (connectRaw/sendBytesRaw/recvRaw/
+// setRecvTimeoutRaw/closeRaw), whose Windows regions hold the ws2_32 calls.
+// This module is pure MongoDB wire protocol logic and compiles unchanged on
+// any backend that provides net.
 //
-// TRANSPORT (the fold): the pre-fold Windows backend std/mongo_win.sr
-// carried the aliased ws2_32 grants plus the 30 s SO_RCVTIMEO arming; all of
-// that now lives in net.sr's regions. ping() dials through net.connectRaw
-// (the pre-fold mongoWinConnect shape: dotted-IP hosts only, inet_addr
-// posture -- no DNS here; net.lookup feeds it), arms net.setRecvTimeoutRaw
-// right after the connect (preserving the pre-fold "every socket has a 30 s
-// receive timeout" bound) and closes through net.closeRaw. The hello
-// exchange below sends with net.sendBytesRaw (the wire-assembly output is a
-// byte[], which net repacks into its int[] qword buffer -- byte[] must not
-// cross a DLL boundary packed) and reads with net.recvRaw. The pre-fold
-// mongoWinHello checked the send result (`sent != 58` -> failure);
-// net.sendBytesRaw returns nothing, so a short send now surfaces as an
-// unresponsive channel at the bounded reads -- the same graceful failure
-// style (a 58-byte write into a fresh TCP socket's buffer is atomic in
-// practice; the std/smtp.sr fold posture).
+// TRANSPORT: ping() dials through net.connectRaw (dotted-IP hosts only,
+// inet_addr posture -- no DNS here; net.lookup feeds it), arms
+// net.setRecvTimeoutRaw right after the connect so every socket has a 30 s
+// receive timeout, and closes through net.closeRaw. The hello exchange
+// below sends with net.sendBytesRaw (the wire-assembly output is a byte[],
+// which net repacks into its int[] qword buffer -- byte[] must not cross a
+// DLL boundary packed) and reads with net.recvRaw. net.sendBytesRaw returns
+// nothing, so a short send surfaces as an unresponsive channel at the
+// bounded reads -- a graceful failure (a 58-byte write into a fresh TCP
+// socket's buffer is atomic in practice; the std/smtp.sr posture).
 //
-// WIRE-ANCHORED REPLY DECODE (the pre-fold mongoWinHello framing, adapted
-// to the net primitives): net.recvRaw delivers the chunk as a Silver
+// WIRE-ANCHORED REPLY DECODE: net.recvRaw delivers the chunk as a Silver
 // string -- and strings are NUL-terminated char* end-to-end (genStringConcat
 // CONTRACT, suite test nul_concat_semantics.sr), so embedded NUL bytes are
 // silently DROPPED when the chunk is accumulated and the parse cannot trust
@@ -42,41 +36,32 @@ mod export mongo;
 // [msgLen&0xFF, reqId&0xFF, responseTo, opCode, docLen, ...], so
 // responseTo/opCode are checked at visible offsets 2/3, the OP_REPLY
 // numberReturned field (always 1 on a first-batch reply) at visible 4, and
-// the BSON document length at visible offset 5. The pre-fold
-// mongoWinHello validated the same fields (responseTo == 1 AND opCode == 1
-// AND 0 < docLen <= 48000000) at the ABSOLUTE wire offsets 8/12/36 over its
-// full byte-accurate int[] recv; through recvRaw's NUL-dropping string the
-// absolute positions are unrecoverable, so the anchored reader is the
-// adapted decode -- same fields, same constants, same NUL-free summary,
-// probed byte-identically against the canned live server (fake-mongo
-// OP_REPLY: responseTo=1, opCode=1, docLen 19). mongoWinHello checked the
-// send result (`sent != 58` -> failure); net.sendBytesRaw returns nothing,
-// so a short send now surfaces as an unresponsive channel at the bounded
-// reads -- the same graceful failure style (a 58-byte write into a fresh TCP
-// socket's buffer is atomic in practice; the std/smtp.sr fold posture).
+// the BSON document length at visible offset 5 (responseTo == 1 AND
+// opCode == 1 AND 0 < docLen <= 48000000), probed byte-identically against
+// the canned live server (fake-mongo OP_REPLY: responseTo=1, opCode=1,
+// docLen 19).
 //
 // HONESTY BOUNDARY (std/mysql.sr posture, documented there): the transport
 // is REAL (TCP + SO_RCVTIMEO + the legacy OP_QUERY {isMaster: 1} hello
 // exchange with reply-header validation), exposed through the client.ping()
-// / client.lastHello() members. Everything else is the pre-split in-memory
-// stub shape: writes (insert/insertMany/update/delete) and reads
+// / client.lastHello() members. Everything else is the in-memory stub shape:
+// writes (insert/insertMany/update/delete) and reads
 // (find/findOne/count/aggregate) do NOT reach a server -- there is no BSON
 // document encoding, no OP_MSG sections framing, no cursors, and NO
 // authentication (SCRAM-SHA-1/256 needs HMAC/SHA; std/hash on BOTH compilers
-// is djb2/fnv1 only). insert() keeps its pre-split intent: it returns a
-// fresh uuid.generate() string (the client-side id the caller would attach
-// to the document); it does NOT fabricate server success.
+// is djb2/fnv1 only). insert() returns a fresh uuid.generate() string (the
+// client-side id the caller attaches to the document); it does NOT
+// fabricate server success.
 //
-// PURE WIRE-ASSEMBLY HELPERS (the pre-fold mongo_win.sr framing code,
-// preserved byte-for-byte under neutral names -- they are protocol framing,
-// not OS code): putByte/putLE32 pack the outgoing message, le32 decodes the
-// reply header fields, decimal renders the summary's length digits,
-// buildHello assembles the 58-byte OP_QUERY, helloBytes/helloHex expose it
-// (additive, probeable), summarize builds the NUL-free summary string.
+// PURE WIRE-ASSEMBLY HELPERS (protocol framing, not OS code):
+// putByte/putLE32 pack the outgoing message, le32 decodes the reply header
+// fields, decimal renders the summary's length digits, buildHello assembles
+// the 58-byte OP_QUERY, helloBytes/helloHex expose it (probeable),
+// summarize builds the NUL-free summary string.
 //
 // LANDMINES SHAPING THIS FILE (all probed, see the sibling modules): the
-// generic `kvp<string, object>` does not parse on rs -- doc stores the
-// proven parallel string[] idiom (std/sql.sr precedent); class-body field
+// generic `kvp<string, object>` does not parse on rs -- doc uses the
+// parallel string[] idiom (std/sql.sr precedent); class-body field
 // initializers do not parse on rs (assign in construct); `char(0)` not
 // '\0'; `.length` PROPERTY form (the `.length()` call form reads garbage on
 // the self-host); `.push` arrays MUST `= []` decl-init inside construct;
@@ -89,10 +74,10 @@ mod export mongo;
 // mongoAllocBytes).
 
 class doc {
-    // Pre-split `kvp<string, object> fields` -- unparseable on rs. Parallel
-    // arrays instead (sql.sr precedent); initialized in construct so the
-    // first set() cannot hit the uninitialized-kvp AV the sql agent probed
-    // on headers.sr.
+    // `kvp<string, object> fields` does not parse on rs. Parallel arrays
+    // instead (sql.sr precedent); initialized in construct so the first
+    // set() cannot hit the uninitialized-kvp access violation probed on
+    // headers.sr.
     string[] keys;
     string[] vals;
 
@@ -101,10 +86,9 @@ class doc {
         this.vals = [];
     }
 
-    // ADDITIVE (documented): the pre-split doc could only read an
-    // uninitialized map (always null -> ""); without a setter the class is
-    // dead weight. set() + has() make get() meaningful. Values are stored
-    // stringified -- the pre-split get() returned val.toString().
+    // set() + has() make get() meaningful; without a setter the class is
+    // dead weight (an empty doc reads every key as ""). Values are stored
+    // stringified -- get() returns val.toString().
     public void set(string key, string val) {
         if (this.has(key)) {
             int i = this.indexOf(key);
@@ -121,7 +105,7 @@ class doc {
         return this.vals[i];
     }
 
-    // ADDITIVE (documented).
+    // Reports whether the key is present.
     public bool has(string key) {
         return this.indexOf(key) >= 0;
     }
@@ -143,8 +127,7 @@ class cursor {
         this.idx = 0;
     }
 
-    // ADDITIVE (documented): pre-split had no way to fill a cursor; keeps
-    // the in-module shape honest without inventing server behavior.
+    // Appends one document to the cursor's result list.
     public void add(doc d) {
         this.docs.push(d);
     }
@@ -249,12 +232,11 @@ class client {
         this.port = portOut;
     }
 
-    // ADDITIVE (documented): the only member that reaches the network --
-    // dial host:port (default 27017) through net.connectRaw, arm the 30 s
-    // receive timeout, run the legacy hello exchange below, cache the
-    // NUL-free summary. false/"" on any failure (unreachable host, garbage
-    // reply). Dotted-IP hosts only (inet_addr posture -- no DNS here;
-    // net.lookup feeds it).
+    // The only member that reaches the network -- dial host:port (default
+    // 27017) through net.connectRaw, arm the 30 s receive timeout, run the
+    // legacy hello exchange below, cache the NUL-free summary. false/"" on
+    // any failure (unreachable host, garbage reply). Dotted-IP hosts only
+    // (inet_addr posture -- no DNS here; net.lookup feeds it).
     public bool ping() {
         if (this.pinged) { return this.helloInfo != ""; }
         this.pinged = true;
@@ -267,15 +249,14 @@ class client {
         return this.helloInfo != "";
     }
 
-    // ADDITIVE (documented): the cached hello summary -- char(1) control
-    // char + the reply BSON document length in ASCII decimal; "" before a
-    // successful ping().
+    // The cached hello summary -- char(1) control char + the reply BSON
+    // document length in ASCII decimal; "" before a successful ping().
     public string lastHello() { return this.helloInfo; }
 
-    // ADDITIVE (documented): the parsed URI pieces (defaults: empty host,
-    // 27017 port). Named hostName/portNumber on purpose -- a getter whose
-    // name equals its field is resolved as a FIELD READ by both compilers
-    // (probed: rs prints the instance pointer, the self-host prints empty).
+    // The parsed URI pieces (defaults: empty host, 27017 port). Named
+    // hostName/portNumber on purpose -- a getter whose name equals its
+    // field is resolved as a FIELD READ by both compilers (probed: rs
+    // prints the instance pointer, the self-host prints empty).
     public string hostName() { return this.host; }
     public int portNumber() { return this.port; }
 
@@ -291,8 +272,7 @@ public client connect(string uri) {
 }
 
 // ---- pure wire-assembly helpers (protocol framing, not OS code) ----------
-// The pre-fold std/mongo_win.sr framing code, byte-for-byte under neutral
-// names. putByte/putLE32/buildHello are the outgoing side; le32 is the
+// putByte/putLE32/buildHello are the outgoing side; le32 is the
 // reply-header decoder; decimal/summarize render the summary. These are
 // module functions (no OS dependency anywhere) -- probeable byte-identically
 // on fixed inputs on both compilers.
@@ -455,7 +435,7 @@ private byte[] helloBytes() {
     return buildHelloBytes();
 }
 
-// ADDITIVE (probeable): the outgoing hello as 116 lowercase hex characters
+// Exposes the outgoing hello as 116 lowercase hex characters
 // (58 bytes, NUL-free -- a string the framing can be verified with on both
 // compilers without touching the network). Private: module framing; the
 // probe surface for the wire assembly is the MIRRORS test (mongo_hex
@@ -508,21 +488,16 @@ private char hexDigit(int v) {
 // (chunk[i] index reads stay byte-faithful on the NUL-free visible stream;
 // probed: string.toBytes() is mis-lowered on the self-host compiler, slot
 // values arrive as garbage, so the manual scan is the portable decode -- the
-// mysql fold's acc.toBytes() shape works there only because its parse
+// mysql module's acc.toBytes() shape works there only because its parse
 // anchors on a byte value that garbage never produces). The reply fields are
 // validated at their canonical VISIBLE-stream anchors -- for a canonical
 // reply (header ints with zero high bytes) the dropped NULs leave
 // [msgLen&0xFF, reqId&0xFF, responseTo, opCode, numberReturned, docLen,
 // 0x10, ...], so responseTo/opCode are checked at visible offsets 2/3, the
 // OP_REPLY numberReturned field (always 1 on a first-batch reply) at
-// visible 4, and the BSON document length at visible offset 5. The pre-fold
-// mongoWinHello validated the same fields (responseTo == 1 AND opCode == 1
-// AND 0 < docLen <= 48000000) at the ABSOLUTE wire offsets 8/12/36 over its
-// full byte-accurate int[] recv; through recvRaw's NUL-dropping string the
-// absolute positions are unrecoverable, so the anchored reader is the
-// adapted decode -- same fields, same constants, same NUL-free summary,
+// visible 4, and the BSON document length at visible offset 5 --
 // probed byte-identically against the canned live server (fake-mongo
-// OP_REPLY: responseTo=1, opCode=1, docLen 19). mongoWinHello checked the
+// OP_REPLY: responseTo=1, opCode=1, docLen 19).
 private string hello(int fd) {
     if (fd < 0) { return ""; }
     byte[] req = helloBytes();

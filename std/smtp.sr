@@ -2,152 +2,85 @@ import * from net;
 
 mod export smtp;
 
-// DOCS -- public `smtp` module (UNIFIED_CORE_LIBRARY.md §4, the CANONICAL
-// FOLD SHAPE). This is the universal, portable front of the SMTP library.
-// It contains ZERO OS code: no win32 imports, no `#on` regions, no osType()
-// gates -- every byte on the wire is sent through the universal socket core
-// std/net.sr (connectRaw/sendRawLen/recvRaw/closeRaw/setRecvTimeoutRaw),
-// whose Windows regions hold the ws2_32 calls. This module is pure SMTP
-// protocol logic and would compile unchanged on any backend that provides
-// net.
+// DOCS -- public `smtp` module (UNIFIED_CORE_LIBRARY.md §4). This is the
+// universal, portable front of the SMTP library. It is a PROTOCOL module
+// and contains ZERO OS code: no win32 imports, no `#on` regions -- every
+// byte on the wire is sent through the universal socket core std/net.sr
+// (connectRaw/sendRawLen/recvRaw/closeRaw/setRecvTimeoutRaw), whose Windows
+// regions hold the ws2_32 calls. This module is pure SMTP protocol logic
+// and compiles unchanged on any backend that provides net.
 //
-// TRANSPORT (the fold): the pre-fold Windows backend std/smtp_win.sr carried
-// the aliased ws2_32 grants (socket/connect/recv/send/closesocket/inet_addr/
-// setsockopt/WSAStartup as smtpWinRaw*) plus the 30 s SO_RCVTIMEO arming;
-// all of that now lives in net.sr's regions. login() arms the timeout right
-// after connectRaw (net.setRecvTimeoutRaw) and send()/close() re-arm it on
-// their first socket use, preserving the pre-fold "every socket has a 30 s
-// receive timeout" bound. The recv loop itself (recvResp) calls
-// net.recvRaw(fd, 4096) -- the pre-fold smtpWinReceive(fd, 4096) shape --
-// and the sender (sendCmd/send's DATA phase) calls net.sendRawLen with the
-// pre-split byte counts. The pre-fold smtpWin* helpers returned "" on both
-// recv error AND zero-extended SOCKET_ERROR (`n <= 0 || n > 2147483647`);
-// net.recvRaw normalizes first and then reports "" for `n <= 0` -- the same
-// observable graceful shape.
+// TRANSPORT: login() arms a 30 s SO_RCVTIMEO right after connectRaw
+// (net.setRecvTimeoutRaw) and send()/close() re-arm it on their first
+// socket use -- every socket has a 30 s receive timeout. The recv loop
+// itself (recvResp) calls net.recvRaw(fd, 4096) and the sender
+// (sendCmd/send's DATA phase) calls net.sendRawLen. net.recvRaw normalizes
+// a zero-extended SOCKET_ERROR to 4294967295 (`n <= 0 || n > 2147483647`)
+// and then reports "" for `n <= 0` -- recv error and disconnect share the
+// same graceful shape.
 //
-// FAIL-STOP NOTE: with the fold, a connect failure surfaces as fd -1 and a
-// failed send path as an unresponsive channel -- both handled by the same
-// graceful failure style as before (login returns silently, getLastReply()
-// stays "" or holds the server's last words, no exceptions anywhere).
+// FAIL-STOP STYLE: a connect failure surfaces as fd -1 and a failed send
+// path as an unresponsive channel -- login returns silently, getLastReply()
+// stays "" or holds the server's last words, no exceptions anywhere.
 //
-// DISPATCH (per compiler, probed): `smtp` is builtin-reserved on NEITHER
-// compiler -- silverc-rs's builtin_modules_set (src/main.rs:81 lists
-// fs/json/yaml/env/url/hash/path/bom/console/math/http only) and the
-// self-hosted compiler's visBuiltinModule (compiler/visibility.sr:605) plus
-// its driver prepend list all exclude it. Both compilers resolve
-// `import * from smtp;` as an ORDINARY SOURCE module (std/smtp.sr); no
-// native dispatch exists to preserve. (smtp.sr's entry in silverc.srp's
-// exclude list only keeps it out of the compiler's own aggregate build --
-// the same posture as ftp.sr/ftps.sr; it does not make `smtp` a builtin.)
+// DISPATCH: `smtp` is builtin-reserved on NEITHER compiler -- silverc-rs's
+// builtin_modules_set (src/main.rs:81 lists fs/json/yaml/env/url/hash/path/
+// bom/console/math/http only) and the self-hosted compiler's
+// visBuiltinModule (compiler/visibility.sr:605) plus its driver prepend
+// list all exclude it. Both compilers resolve `import * from smtp;` as an
+// ORDINARY SOURCE module (std/smtp.sr); no native dispatch exists.
+// (smtp.sr's entry in silverc.srp's exclude list only keeps it out of the
+// compiler's own aggregate build -- the same posture as ftp.sr/ftps.sr; it
+// does not make `smtp` a builtin.)
 //
-// PRE-SPLIT STATE (probed against this file's git HEAD copy before the
-// rewrite): the old std/smtp.sr NEVER compiled under either compiler.
-// silverc-rs died with "unknown keyword sockaddr_in at line 27" plus
-// "Expected expression" and a cascade through lines 57/58/87; the
-// self-hosted compiler died with the same "unknown keyword sockaddr_in"
-// plus a "forgot semicolon" cascade. The phantom syntax (`struct sockaddr_in
-// addr;` / `&addr`) exists in no compiler; `AF_INET`/`SOCK_STREAM` resolve
-// to nothing (neither name is in either compiler's ws2_32 export table:
-// WSAStartup WSACleanup socket bind listen accept recv send shutdown
-// closesocket connect select setsockopt ioctlsocket htons inet_addr
-// getaddrinfo freeaddrinfo WSAGetLastError only); `(cmd + "\r\n").toBytes()`
-// is a phantom method; `new byte[1024]` is the byte[] decl-init landmine;
-// send()'s Content-Type used a string ternary (if/else required); and
-// attach() pushed into `attachments`, declared without an initializer --
-// a NULL-array deref had it ever run. Every body was therefore dead text --
-// there was NO observable pre-split behavior to preserve beyond names,
-// arities and intent.
+// LOGIN FLOW: greeting (220), EHLO (250, with a HELO fallback for servers
+// that reject EHLO), AUTH LOGIN (334), base64 user (334), base64 pass
+// (235); every step is read and validated, and the outcome is recorded in
+// isLoggedIn()/getLastReply(). The credentials are encoded by the module's
+// own b64Encode (see its note: encoding.base64Encode is a runtime crasher).
+// Against a non-SMTP listener the login fails gracefully: the server's
+// banner (or "" after a silent disconnect) is surfaced through
+// getLastReply() and the process exits cleanly. No exceptions anywhere.
 //
-// DEAD -> LIVE (what this split made actually work, mirroring the
-// std/ftp.sr / std/ftps.sr splits):
-// - The control channel: socket + connect over ws2_32 with WSAStartup (the
-//   pre-split file never initialized winsock), the sockaddr_in image packed
-//   into an int[2] qword buffer, and DLL returns normalized with the
-//   two-sided `v < 0 || v > 2147483647` check (the self-host zero-extends
-//   SOCKET_ERROR to 4294967295; see std/smtp_win.sr).
-// - login(): pre-split it fired five unchecked sends/recvs (EHLO, AUTH
-//   LOGIN, base64 user, base64 pass) and stayed silent about failure. It
-//   now reads and validates the greeting (220), EHLO (250, with the
-//   task-prescribed HELO fallback for servers that reject EHLO), AUTH LOGIN
-//   (334), the base64 user (334) and the base64 pass (235), and records the
-//   outcome in isLoggedIn()/getLastReply() (both ADDITIVE -- the pre-split
-//   surface had no way to report anything; same additions as std/ftp.sr).
-//   The credentials are encoded by the module's own additive b64Encode:
-//   the pre-split encoding.base64Encode dependency is a runtime crasher on
-//   both compilers (phantom string.toBytes() -- see the b64Encode note
-//   below). Against a non-SMTP listener the login fails gracefully: the
-//   server's banner (or "" after a silent disconnect) is surfaced through
-//   getLastReply() and the process exits cleanly. No exceptions anywhere.
-// - send(): pre-split it pipelined MAIL FROM/RCPT TO/DATA with zero checks.
-//   Each step is now read and validated (250 / 250 / 354 / 250) and the
-//   message is sent RAW (no trailing command CRLF): the pre-split
-//   sendCmd(msg) shape appended a stray CRLF after the message's own
-//   "\r\n.\r\n" terminator. The message assembly itself moved verbatim into
-//   the pure additive buildMessage() helper (single source of truth, and
-//   probeable byte-identical on both compilers).
-// - Bounded reads: every socket gets a 30 s SO_RCVTIMEO (std/smtp_win.sr).
-//   The pre-split file had no timeout and would have hung on a silent peer;
-//   readReply()'s accumulation loop is additionally bounded at 16
-//   iterations so no path can spin forever.
-// - close(): sends QUIT and closes immediately without waiting for the 221
-//   (the std/ftp.sr/ftps.sr shape), so a dead peer cannot stall close();
-//   the pre-split recvResp() after QUIT is dropped (it never ran anyway --
-//   the file never compiled).
+// SEND FLOW: MAIL FROM 250 -> RCPT TO 250 -> DATA 354 -> message 250, each
+// step read and validated. The message (buildMessage) is sent RAW -- it
+// already ends with "\r\n.\r\n", so no command CRLF is appended after it.
+// Bounded reads: every socket gets a 30 s SO_RCVTIMEO, and readReply()'s
+// accumulation loop is additionally capped at 16 iterations so no path can
+// spin forever. close() sends QUIT and closes immediately without waiting
+// for the 221, so a dead peer cannot stall close().
 //
-// NOT INVENTED: startTLS() keeps its pre-split empty body -- a stored-noop
-// with no TLS stack behind it (same honest posture as std/ftps.sr's TLS
-// knobs; a real STARTTLS upgrade is a separate feature). attach() keeps its
-// pre-split surface and still stores without effect: the pre-split send()
-// never read `attachments` and no MIME multipart was invented, so send()
-// emits the plain single-part message exactly as pre-split intended (the
-// field IS initialized now -- see API PRESERVATION -- so attach() no longer
-// derefs a NULL array). There is no server class -- the pre-split file
-// never had one and none was invented.
+// SCOPE: startTLS() is a stored no-op -- no TLS stack exists behind this
+// module (a real STARTTLS upgrade is a separate feature). attach() stores
+// its path without effect -- send() never reads `attachments` and no MIME
+// multipart exists, so send() emits the plain single-part message. There
+// is no server class.
 //
-// API PRESERVATION (every public name/arity of the pre-split file,
-// unchanged): class client -- construct(string host, int port);
-// startTLS(); login(string user, string pass); setFrom(string addr)
-// (pre-split `from` -- a lexer keyword on both compilers, see RENAMED
-// MEMBERS); setTo(string addr) (pre-split `to`, same); cc(string addr);
-// subject(string s); body(string b); html(string h); attach(string path);
-// send(); close(). The private
-// sendCmd/recvResp helper names are preserved; recvResp keeps its
-// raw-bytes shape (the multi-line reply accumulation lives in the new
-// private readReply, the std/ftp.sr shape). ADDITIVE (the std/ftp.sr
-// precedent, documented): client.getLastReply() returns the raw text of
-// the last server reply ("" before the first read -- the
-// graceful-failure surface); client.isLoggedIn() is true only after a
-// fully accepted EHLO/HELO + AUTH LOGIN exchange; free functions
-// replyCode(resp) (first three digits as int, -1 on malformed),
-// replyComplete(resp) (true once a terminating "nnn " line is present --
-// SMTP multi-line replies use the same RFC "nnn-text ... nnn space" shape
-// as FTP) and buildMessage(from, to, cc, subject, bodyText, isHtml)
-// (assembles the RFC 5322 message exactly as send() puts it on the wire,
-// "\r\n.\r\n" terminated -- Cc line only when cc is non-empty,
-// text/html vs text/plain by if/else) are pure and probeable. Also
-// additive and invisible: the private lastReply/loggedIn fields, and
-// construct() now initializes every field (sock to -1, strings to "",
-// attachments to []) -- the pre-split construct set only host/port, so
-// send()'s `this.ccAddr.length()` and close()'s closesocket(this.sock)
-// were NULL derefs had the file ever run.
+// PUBLIC API: class client -- construct(string host, int port);
+// startTLS(); login(string user, string pass); setFrom(string addr);
+// setTo(string addr); cc(string addr); subject(string s); body(string b);
+// html(string h); attach(string path); send(); close(); isLoggedIn();
+// getLastReply(); free functions replyCode(resp) (first three digits as
+// int, -1 on malformed), replyComplete(resp) (true once a terminating
+// "nnn " line is present -- SMTP multi-line replies use the same RFC
+// "nnn-text ... nnn space" shape as FTP) and buildMessage(from, to, cc,
+// subject, bodyText, isHtml) (assembles the RFC 5322 message exactly as
+// send() puts it on the wire, "\r\n.\r\n" terminated -- Cc line only when
+// cc is non-empty, text/html vs text/plain by if/else) -- all pure.
+// isLoggedIn() is true only after a fully accepted EHLO/HELO + AUTH LOGIN
+// exchange (through the 235 acceptance); getLastReply() returns the raw
+// text of the last server reply ("" before the first read). recvResp is a
+// single bounded read; the multi-line reply accumulation lives in the
+// private readReply. The private lastReply/loggedIn fields round out the
+// surface; construct() initializes every field (sock to -1, strings to "",
+// attachments to []) so no member is ever uninitialized.
 //
-// RENAMED MEMBERS (forced, documented -- the ftp/ftps `local`-parameter
-// exception class, but harsher): the pre-split setter methods `from(addr)`
-// and `to(addr)` CANNOT be declared on EITHER compiler, because `from` and
-// `to` are lexer keywords on both (silverc-rs src/token.rs:456 `"from" =>
-// TokenKind::From` and :482 `"to" => TokenKind::To`; self-host
-// compiler/lexer.sr:684 `"from"` and :711 `"to"`, both used by the
-// `import ... from ...` statement). The pre-split file's rs cascade proves
-// it: "57:21: Expected 'RightBrace' but found 'LeftParen'" (the `from(`
-// paren) and "58:19: Expected 'identifier' but found 'To'" -- those two
-// lines were the pre-split setters, misattributed to cascade noise before
-// this split isolated them. No spelling of those names exists as
-// identifiers, so unlike a parameter rename there is no aliasing escape
-// hatch; the setters are declared as setFrom(addr)/setTo(addr). No caller
-// could ever have used the old names (the file never compiled anywhere),
-// so the observable API loses nothing. The remaining setter names (cc,
-// subject, body, html, attach) are NOT keywords on either compiler and
-// keep their pre-split spellings verbatim.
+// NAMING: the setters are setFrom/setTo because `from` and `to` are lexer
+// keywords on both compilers (the `import ... from ...` statement uses
+// them -- silverc-rs src/token.rs:456/:482, self-host compiler/lexer.sr:
+// 684/:711), so `from(addr)`/`to(addr)` cannot be declared anywhere. The
+// remaining setter names (cc, subject, body, html, attach) are not
+// keywords on either compiler.
 //
 // CALLER NOTES: instantiate the client with `var c = new client(...);` --
 // a lowercase class arriving from a star-imported module cannot be spelled
@@ -158,8 +91,7 @@ mod export smtp;
 // local before being concatenated into larger expressions (silverc-rs
 // stringifies the return pointer in expression position; see std/dns.sr's
 // RS-ONLY CALLER LANDMINE). smtp's own b64Encode is same-module, so
-// login() has no cross-module string call at all (see the b64Encode note
-// for why the pre-split encoding dependency is gone).
+// login() has no cross-module string call at all.
 
 public int replyCode(string resp) {
     if (resp.length < 3) { return -1; }
@@ -198,10 +130,9 @@ public bool replyComplete(string resp) {
 // Assembles the RFC 5322 message exactly as send() puts it on the wire:
 // From/To/optional-Cc/Subject/Content-Type headers, a blank line, the body,
 // and the SMTP "\r\n.\r\n" DATA terminator (which is why the caller sends
-// the result RAW -- no command CRLF is appended). Pure; probeable
-// byte-identical on both compilers. ADDITIVE (the message assembly moved
-// here verbatim from the dead pre-split send() body; the string ternary it
-// used became if/else).
+// the result RAW -- no command CRLF is appended). text/html vs text/plain
+// by if/else (string-typed ternaries avoided). Pure; probeable
+// byte-identical on both compilers.
 public string buildMessage(string fromAddr, string toAddr, string ccAddr, string subject, string bodyText, bool isHtml) {
     string msg = "From: " + fromAddr + "\r\n";
     msg += "To: " + toAddr + "\r\n";
@@ -221,21 +152,17 @@ private bool isDigit(int c) {
 }
 
 // Base64 encoder for the AUTH LOGIN credentials. Pure and probeable.
-// ADDITIVE, and it replaces a dead dependency: the pre-split file imported
-// std/encoding and called encoding.base64Encode(user)/... in login(), but
-// that function is a runtime CRASHER on both compilers (probed 2026-08: a
-// minimal `encoding.base64Encode("silveruser")` program dies 0xC0000005 on
-// silverc-rs and 0xC0000409 on the self-host) because encoding.sr builds on
-// the phantom `string.toBytes()` method -- the exact phantom the std/ftp.sr
-// PRE-SPLIT STATE notes flag in the old ftp bodies. encoding.sr is outside
-// this split's file scope, so smtp carries its own 10-line implementation
-// instead: it indexes the input string directly (strings ARE packed byte
-// buffers -- data[i] reads one byte), needing no toBytes() at all, and the
-// `import * from encoding;` line is gone. Byte-exact RFC 4648 output with
-// '=' padding (probed against the known vectors c2lsdmVydXNlcg== /
-// c2lsdmVycGFzcw== on both compilers). The `<<` work happens inside this
-// multi-line body only -- one-liner methods with shifts are a self-host
-// landmine.
+// Deliberately local to this module rather than a call into std/encoding:
+// encoding.base64Encode is a runtime CRASHER on both compilers (probed
+// 2026-08: a minimal `encoding.base64Encode("silveruser")` program dies
+// 0xC0000005 on silverc-rs and 0xC0000409 on the self-host) because
+// encoding.sr builds on the phantom `string.toBytes()` method. This
+// implementation indexes the input string directly (strings ARE packed byte
+// buffers -- data[i] reads one byte), needing no toBytes() at all.
+// Byte-exact RFC 4648 output with '=' padding (probed against the known
+// vectors c2lsdmVydXNlcg== / c2lsdmVycGFzcw== on both compilers). The `<<`
+// work happens inside this multi-line body only -- one-liner methods with
+// shifts are a self-host landmine.
 public string b64Encode(string data) {
     string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     int len = data.length;
@@ -293,29 +220,28 @@ class client {
         this.attachments = [];
     }
 
-    // Stored NO-OP (the pre-split empty body, preserved verbatim): no TLS
-    // stack exists behind this module, so calling it changes nothing. Kept
-    // so the public API stays identical.
+    // Stored no-op: no TLS stack exists behind this module, so calling it
+    // changes nothing. Kept so the public API stays identical.
     public void startTLS() { }
 
-    // ADDITIVE (the std/ftp.sr precedent): the raw text of the last server
-    // reply on the control channel ("" before the first read). This is the
-    // graceful-failure surface: against a non-SMTP listener it holds the
-    // banner the peer sent, or "" when the peer said nothing and closed.
+    // The raw text of the last server reply on the control channel (""
+    // before the first read). This is the graceful-failure surface: against
+    // a non-SMTP listener it holds the banner the peer sent, or "" when the
+    // peer said nothing and closed.
     public string getLastReply() {
         return this.lastReply;
     }
 
-    // ADDITIVE: true only after a fully accepted greeting + EHLO/HELO +
-    // AUTH LOGIN exchange (through the 235 acceptance).
+    // True only after a fully accepted greeting + EHLO/HELO + AUTH LOGIN
+    // exchange (through the 235 acceptance).
     public bool isLoggedIn() {
         return this.loggedIn;
     }
 
-    // AUTH LOGIN flow (the pre-split intent): greeting 220, EHLO 250 with a
-    // HELO fallback, AUTH LOGIN 334, base64 user 334, base64 pass 235.
-    // Every step is read and validated; on any mismatch fail() drops the
-    // connection and the server's last words stay in getLastReply().
+    // AUTH LOGIN flow: greeting 220, EHLO 250 with a HELO fallback, AUTH
+    // LOGIN 334, base64 user 334, base64 pass 235. Every step is read and
+    // validated; on any mismatch fail() drops the connection and the
+    // server's last words stay in getLastReply().
     public void login(string user, string pass) {
         this.sock = net.connectRaw(this.host, this.port);
         if (this.sock < 0) {
@@ -362,28 +288,25 @@ class client {
         this.loggedIn = true;
     }
 
-    // RENAMED from the pre-split `from(addr)`: `from` is a lexer keyword on
-    // both compilers (import statement), so the old spelling cannot be
-    // declared anywhere -- see RENAMED MEMBERS.
+    // `from` is a lexer keyword on both compilers (import statement), so
+    // this setter is spelled setFrom -- see NAMING in the header.
     public void setFrom(string addr) { this.fromAddr = addr; }
 
-    // RENAMED from the pre-split `to(addr)`: `to` is a lexer keyword on
-    // both compilers -- see RENAMED MEMBERS.
+    // `to` is a lexer keyword on both compilers, so this setter is spelled
+    // setTo -- see NAMING in the header.
     public void setTo(string addr) { this.toAddr = addr; }
     public void cc(string addr) { this.ccAddr = addr; }
     public void subject(string s) { this.subj = s; }
     public void body(string b) { this.bodyContent = b; this.isHtml = false; }
     public void html(string h) { this.bodyContent = h; this.isHtml = true; }
 
-    // Stores the path; send() never reads it (the pre-split shape -- no
-    // MIME multipart was invented). The array IS initialized now, so this
-    // push no longer derefs a NULL array (see API PRESERVATION).
+    // Stores the path; send() never reads it (no MIME multipart exists, so
+    // send() emits the plain single-part message).
     public void attach(string path) { this.attachments.push(path); }
 
     // MAIL FROM 250 -> RCPT TO 250 -> DATA 354 -> message 250. The message
     // (buildMessage) is sent RAW: it already ends with "\r\n.\r\n", so the
-    // one-line-command CRLF must NOT be appended (the pre-split sendCmd
-    // shape added a stray CRLF after the dot terminator). A failed step
+    // one-line-command CRLF must NOT be appended after it. A failed step
     // returns silently; getLastReply() holds the server's last words.
     public void send() {
         if (!this.loggedIn) { return; }
@@ -406,10 +329,8 @@ class client {
         if (replyCode(this.lastReply) != 250) { return; }
     }
 
-    // Sends QUIT and closes immediately without waiting for the 221 (the
-    // std/ftp.sr/ftps.sr shape), so a dead peer cannot stall close(). The
-    // pre-split recvResp() after QUIT is dropped (it never ran -- the file
-    // never compiled).
+    // Sends QUIT and closes immediately without waiting for the 221, so a
+    // dead peer cannot stall close().
     public void close() {
         if (this.sock >= 0) {
             this.sendCmd("QUIT");
@@ -428,7 +349,7 @@ class client {
     }
 
     // One bounded read of the control channel (raw bytes as a string; ""
-    // on disconnect/timeout -- pre-split recvResp shape).
+    // on disconnect/timeout).
     private string recvResp() {
         if (this.sock < 0) { return ""; }
         return net.recvRaw(this.sock, 4096);

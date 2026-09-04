@@ -2,147 +2,73 @@ import * from net;
 
 mod export pop;
 
-// DOCS -- public `pop` module (UNIFIED_CORE_LIBRARY.md §4, the CANONICAL
-// FOLD SHAPE). This is the universal, portable front of the POP3 library.
-// It contains ZERO OS code: no win32 imports, no `#on` regions, no osType()
-// gates -- every byte on the wire is sent through the universal socket core
-// std/net.sr (connectRaw/sendRawLen/recvRaw/closeRaw/setRecvTimeoutRaw),
-// whose Windows regions hold the ws2_32 calls. This module is pure POP3
-// protocol logic and would compile unchanged on any backend that provides
-// net.
+// DOCS -- public `pop` module (UNIFIED_CORE_LIBRARY.md §4). This is the
+// universal, portable front of the POP3 library. It is a PROTOCOL module
+// and contains ZERO OS code: no win32 imports, no `#on` regions -- every
+// byte on the wire is sent through the universal socket core std/net.sr
+// (connectRaw/sendRawLen/recvRaw/closeRaw/setRecvTimeoutRaw), whose Windows
+// regions hold the ws2_32 calls. This module is pure POP3 protocol logic
+// and compiles unchanged on any backend that provides net.
 //
-// TRANSPORT (the fold): the pre-fold Windows backend std/pop_win.sr carried
-// the aliased ws2_32 grants (socket/connect/recv/send/closesocket/inet_addr/
-// setsockopt/WSAStartup as popWinRaw*) plus the 30 s SO_RCVTIMEO arming;
-// all of that now lives in net.sr's regions. login() arms the timeout right
-// after connectRaw (net.setRecvTimeoutRaw) and count()/list()/retrieve()/
-// remove()/quit() re-arm it on their first socket use, preserving the
-// pre-fold "every socket has a 30 s receive timeout" bound. The recv loops
-// themselves (recvLine) call net.recvRaw(fd, 4096) -- the pre-fold
-// popWinReceive(fd, 4096) shape -- and the sender (sendLine) calls
-// net.sendRawLen with the pre-split byte counts. The pre-fold popWin*
-// helpers returned "" on both recv error AND zero-extended SOCKET_ERROR
-// (`n <= 0 || n > 2147483647`); net.recvRaw normalizes first and then
-// reports "" for `n <= 0` -- the same observable graceful shape.
+// TRANSPORT: login() arms a 30 s SO_RCVTIMEO right after connectRaw
+// (net.setRecvTimeoutRaw) and count()/list()/retrieve()/remove()/quit()
+// re-arm it on their first socket use -- every socket has a 30 s receive
+// timeout. The recv loops themselves (recvLine) call net.recvRaw(fd, 4096)
+// and the sender (sendLine) calls net.sendRawLen. net.recvRaw normalizes a
+// zero-extended SOCKET_ERROR to 4294967295 (`n <= 0 || n > 2147483647`) and
+// then reports "" for `n <= 0` -- recv error and disconnect share the same
+// graceful shape.
 //
-// FAIL-STOP NOTE: with the fold, a connect failure surfaces as fd -1 and a
-// failed read path as an unresponsive channel -- both handled by the same
-// graceful failure style as before (login returns silently, getLastReply()
-// stays "" or holds the server's last words, no exceptions anywhere).
+// FAIL-STOP STYLE: a connect failure surfaces as fd -1 and a failed read
+// path as an unresponsive channel -- login returns silently, getLastReply()
+// stays "" or holds the server's last words, no exceptions anywhere.
 //
-// DISPATCH (per compiler, probed): `pop` is builtin-reserved on NEITHER
-// compiler -- silverc-rs's builtin_modules_set (src/main.rs:81 lists
-// fs/json/yaml/env/url/hash/path/bom/console/math/http only) and the
-// self-hosted compiler's visBuiltinModule (compiler/visibility.sr:605 lists
-// fs/json/yaml/llmai/LLMAI/os/project/exception/bom/process/notifications/
-// env/url/hash/path/console/math/http) plus its driver prepend list all
-// exclude it. Both compilers resolve `import * from pop;` as an ORDINARY
-// SOURCE module (std/pop.sr); no native dispatch exists to preserve.
-// (pop.sr's entry in silverc.srp's exclude list only keeps it out of the
-// compiler's own aggregate build -- the same posture as smtp.sr/ftp.sr; it
-// does not make `pop` a builtin. pop_win.sr is NOT excluded: its popWin*
-// names collide with nothing in the aggregate namespace, exactly like
-// smtp_win.sr.)
+// DISPATCH: `pop` is builtin-reserved on NEITHER compiler -- silverc-rs's
+// builtin_modules_set (src/main.rs:81 lists fs/json/yaml/env/url/hash/path/
+// bom/console/math/http only) and the self-hosted compiler's
+// visBuiltinModule (compiler/visibility.sr:605 lists fs/json/yaml/llmai/
+// LLMAI/os/project/exception/bom/process/notifications/env/url/hash/path/
+// console/math/http) plus its driver prepend list all exclude it. Both
+// compilers resolve `import * from pop;` as an ORDINARY SOURCE module
+// (std/pop.sr); no native dispatch exists. (pop.sr's entry in silverc.srp's
+// exclude list only keeps it out of the compiler's own aggregate build --
+// the same posture as smtp.sr/ftp.sr; it does not make `pop` a builtin.)
 //
-// PRE-SPLIT STATE (probed against this file's git HEAD copy before the
-// rewrite, fresh -o names on both compilers): the old std/pop.sr NEVER
-// compiled under either compiler. silverc-rs died at line 26 with
-// "26:9: Expected expression", "unknown keyword sockaddr_in at line 26,
-// column 16" and "unknown keyword addr at line 26, column 28" (the line-26
-// `struct sockaddr_in addr;` phantom); the self-hosted compiler died with
-// the same "unknown keyword sockaddr_in" plus "unknown keyword addr" and a
-// "you forgot to put a semicolon" cascade, all at line 26. The parser never
-// reached the later phantoms, but they were equally dead: `(cmd +
-// "\r\n").toBytes()` (line 39) is the phantom string method the std/ftp.sr /
-// std/smtp.sr PRE-SPLIT notes flag (and the crasher behind
-// encoding.base64Encode), `new byte[1024]` (line 44) is the byte[]
-// declaration-initializer landmine, `int(resp.substr(space + 1, space2 -
-// space - 1))` (line 59) rides the rs substr(start,X)=(start,END) vs
-// self-host substr(start,X)=(start,LENGTH) disagreement, and recvLine()'s
-// `char(buf[i])` scan over a recv buffer never executed. `AF_INET`/
-// `SOCK_STREAM` resolve to nothing (neither name is in either compiler's
-// ws2_32 export table). Every body was therefore dead text -- there was NO
-// observable pre-split behavior to preserve beyond names, arities and
-// intent.
+// SCOPE: plain-text USER/PASS only -- POP3 USER/PASS needs no base64, which
+// also sidesteps the encoding.base64Encode runtime crasher (phantom
+// string.toBytes(); see std/smtp.sr's b64Encode note). No AUTH/APOP/STLS
+// (APOP is an MD5 scheme and AUTH PLAIN would need base64), no UIDL/TOP/
+// RSET/NOOP, no TLS, no server class. message keeps exactly four fields:
+// sender/subject/body/raw. Bounded reads: readReply()'s accumulation loop
+// is capped at 16 iterations and readMulti() at 16 x 4096 bytes (~64 KB per
+// command) so no path can spin forever. RETR reads the full multi-line
+// response; byte-stuffed leading dots ("..") inside the body are preserved
+// verbatim (no de-stuffing).
 //
-// DEAD -> LIVE (what this split made actually work, mirroring the
-// std/smtp.sr / std/ftp.sr splits):
-// - The control channel: socket + connect over ws2_32 with WSAStartup (the
-//   pre-split file never initialized winsock), the sockaddr_in image packed
-//   into an int[2] qword buffer, and DLL returns normalized with the
-//   two-sided `v < 0 || v > 2147483647` check (the self-host zero-extends
-//   SOCKET_ERROR to 4294967295; see std/pop_win.sr).
-// - login(): pre-split it fired three unchecked read/send pairs (greeting,
-//   USER, PASS) and stayed silent about failure. Each step is now read and
-//   validated (+OK required at every step); the outcome is recorded in
-//   isLoggedIn()/getLastReply() (both ADDITIVE -- the pre-split surface had
-//   no way to report anything; same additions as std/smtp.sr/std/ftp.sr).
-//   Plain-text USER/PASS only: POP3 USER/PASS needs no base64, so the
-//   encoding.base64Encode runtime crasher (phantom string.toBytes(), 0xC0000005
-//   rs / 0xC0000409 self-host -- see std/smtp.sr's b64Encode note) is avoided
-//   entirely; no b64 was carried and the encoding import never existed here.
-//   Against a non-POP3 listener the login fails gracefully: the server's
-//   banner (or "" after a silent disconnect) is surfaced through
-//   getLastReply() and the process exits cleanly. No exceptions anywhere.
-// - count(): pre-split it parsed STAT's reply through the substr landmine
-//   and int()-casts. It now validates +OK and parses "+OK <count> <octets>"
-//   with the pure statCount() digit scan (probeable, substr-free); a
-//   malformed reply returns 0 (the pre-split malformed-reply result).
-// - retrieve(): pre-split it read exactly ONE reply line and wrapped it in a
-//   message -- the RETR status line, never the message. It now reads the
-//   full multi-line response (bounded readMulti loop until the ".\r\n"
-//   terminator) and fills sender/subject/body via the pure headerValue()/
-//   messageBody() helpers (the pre-split fields existed but were never
-//   populated -- dead). Byte-stuffed leading dots ("..") inside the body are
-//   preserved verbatim (no de-stuffing was invented); the body is the text
-//   between the first blank line and the "\r\n.\r\n" terminator.
-// - quit(): sends QUIT and closes immediately without waiting for the +OK
-//   (the std/smtp.sr/ftp.sr shape), so a dead peer cannot stall quit(); the
-//   pre-split recvLine() after QUIT is dropped (it never ran anyway -- the
-//   file never compiled).
-// - Bounded reads: every socket gets a 30 s SO_RCVTIMEO (std/pop_win.sr).
-//   The pre-split file had no timeout and would have hung on a silent peer;
-//   readReply()'s accumulation loop is bounded at 16 iterations and
-//   readMulti() at 16 x 4096 bytes (~64 KB per command -- 64x the pre-split
-//   1024-byte single recvLine()) so no path can spin forever.
-//
-// NOT INVENTED: no AUTH/APOP/STLS (the pre-split intent was plain USER/PASS;
-// APOP is an MD5 scheme and AUTH PLAIN would need base64 -- the encoding
-// crasher -- so neither was invented); no UIDL/TOP/RSET/NOOP; no TLS; no
-// server class (the pre-split file never had one and none was invented);
-// message keeps exactly its pre-split four fields -- no uid/size/msgNum
-// fields were added.
-//
-// API PRESERVATION (every public name/arity of the pre-split file,
-// unchanged): class message -- public fields sender/subject/body/raw,
+// PUBLIC API: class message -- public fields sender/subject/body/raw,
 // construct(string raw); class client -- construct(string host, int port);
-// login(string user, string pass); count() -> int; retrieve(int id) ->
-// message; quit(). The private sendLine/recvLine helper names are preserved
-// (recvLine keeps its raw-bytes shape -- one bounded read; the accumulation
-// lives in the new private readReply/readMulti, the std/smtp.sr shape). NO
-// RENAMES were needed (unlike smtp's from/to): every pre-split name
-// (message, client, login, count, retrieve, quit, sendLine, recvLine and the
-// message fields) is keyword-free on both compilers -- checked against
-// silverc-rs src/token.rs and self-host compiler/lexer.sr.
-// ADDITIVE (the std/smtp.sr/std/ftp.sr precedent, documented): client.
-// isLoggedIn() is true only after a fully accepted greeting + USER + PASS
-// exchange; client.getLastReply() returns the raw text of the last server
-// reply ("" before the first read -- the graceful-failure surface);
-// client.remove(int id) issues DELE and returns true on +OK (spelled
-// `remove` -- DELE marks a message for deletion at QUIT); client.list()
-// issues LIST and returns the data lines ("id octets" strings) split on
-// "\r\n"; free helpers isOk(resp)/isErr(resp) (status-prefix checks),
-// multiLineComplete(resp) (true once the ".\r\n" terminator is present),
-// statCount(resp)/statSize(resp) (the two STAT numbers, -1 on malformed),
-// headerValue(text, name) (RFC 822 header value, "" if absent -- pass
-// "From:"/"Subject:" with the colon) and messageBody(retrResp) (text between
-// the header blank line and the ".\r\n" terminator) are pure and probeable.
-// Also additive and invisible: the private lastReply/loggedIn fields, the
-// private readReply/readMulti/fail/lineEndFrom/lineEndIndex/terminatorIndex/
-// blankLineIndex/sliceRange/statNumber plumbing, and construct() now
-// initializes every field (sock to -1, strings to "", loggedIn to false) --
-// the pre-split construct set only host/port, so quit()'s closesocket
-// would have derefed an uninitialized handle had the file ever run.
+// login(string user, string pass); count() -> int; list() -> string[];
+// retrieve(int id) -> message; remove(int id) -> bool; quit();
+// isLoggedIn(); getLastReply(); free helpers isOk(resp)/isErr(resp)
+// (status-prefix checks), multiLineComplete(resp) (true once the ".\r\n"
+// terminator is present), statCount(resp)/statSize(resp) (the two STAT
+// numbers, -1 on malformed), headerValue(text, name) (RFC 822 header value,
+// "" if absent -- pass "From:"/"Subject:" with the colon) and
+// messageBody(retrResp) (text between the header blank line and the
+// ".\r\n" terminator) -- all pure. isLoggedIn() is true only after a fully
+// accepted greeting + USER + PASS exchange; getLastReply() returns the raw
+// text of the last server reply ("" before the first read); remove(int id)
+// issues DELE and returns true on +OK (DELE marks a message for deletion at
+// QUIT); list() issues LIST and returns the data lines ("id octets"
+// strings) split on "\r\n". recvLine is a single bounded read; the
+// accumulation lives in the private readReply/readMulti. The private
+// lastReply/loggedIn fields and the private
+// readReply/readMulti/fail/lineEndFrom/lineEndIndex/terminatorIndex/
+// blankLineIndex/sliceRange/statNumber plumbing round out the surface;
+// construct() initializes every field (sock to -1, strings to "", loggedIn
+// to false), so no member is ever uninitialized. Every public name above is
+// keyword-free on both compilers (checked against silverc-rs src/token.rs
+// and self-host compiler/lexer.sr).
 //
 // CALLER NOTES: instantiate the client with `var c = new client(...);` --
 // a lowercase class arriving from a star-imported module cannot be spelled
@@ -165,7 +91,7 @@ public bool isOk(string resp) {
     return resp[0] == 43 && resp[1] == 79 && resp[2] == 75;
 }
 
-// True when `resp` starts with POP3's "-ERR" failure marker. ADDITIVE, the
+// True when `resp` starts with POP3's "-ERR" failure marker. Pure; the
 // diagnostic mirror of isOk.
 public bool isErr(string resp) {
     if (resp.length < 4) { return false; }
@@ -182,9 +108,8 @@ public bool multiLineComplete(string resp) {
 }
 
 // First number of a STAT reply "+OK <count> <octets>" (-1 on malformed).
-// Deliberately a digit scan: the pre-split parse rode the rs
-// substr(start,X)=(start,END) vs self-host (start,LENGTH) disagreement and
-// int()-casts of substrings. Pure; probeable.
+// Deliberately a digit scan: substr-free and int()-cast-free, so it parses
+// identically on both compilers. Pure; probeable.
 public int statCount(string resp) {
     return statNumber(resp, 1);
 }
@@ -199,8 +124,7 @@ public int statSize(string resp) {
 // scans line by line, matches `headerName` (pass it WITH the colon, e.g.
 // "From:") at a line start, skips one space after the colon and returns the
 // rest of that line. No folding support (continuation lines are not joined).
-// Pure; probeable. ADDITIVE (the pre-split sender/subject fields existed but
-// were never populated).
+// Pure; probeable.
 public string headerValue(string text, string headerName) {
     int nameLen = headerName.length;
     int pos = 0;
@@ -227,8 +151,7 @@ public string headerValue(string text, string headerName) {
 // Body text of a RETR response: everything between the first blank line
 // (the RFC 822 header/body separator) and the "\r\n.\r\n" terminator
 // ("" when either is missing). Byte-stuffed ".." lines are preserved
-// verbatim. Pure; probeable. ADDITIVE (the pre-split body field existed but
-// was never populated).
+// verbatim. Pure; probeable.
 public string messageBody(string retrResp) {
     int blank = blankLineIndex(retrResp);
     if (blank < 0) { return ""; }
@@ -264,25 +187,22 @@ class client {
         this.loggedIn = false;
     }
 
-    // ADDITIVE (the std/smtp.sr/std/ftp.sr precedent): the raw text of the
-    // last server reply on the control channel ("" before the first read).
-    // This is the graceful-failure surface: against a non-POP3 listener it
-    // holds the banner the peer sent, or "" when the peer said nothing and
-    // closed.
+    // The raw text of the last server reply on the control channel (""
+    // before the first read). This is the graceful-failure surface: against
+    // a non-POP3 listener it holds the banner the peer sent, or "" when the
+    // peer said nothing and closed.
     public string getLastReply() {
         return this.lastReply;
     }
 
-    // ADDITIVE: true only after a fully accepted greeting + USER + PASS
-    // exchange.
+    // True only after a fully accepted greeting + USER + PASS exchange.
     public bool isLoggedIn() {
         return this.loggedIn;
     }
 
     // Greeting + USER + PASS flow, every step validated (+OK required).
     // On any mismatch fail() drops the connection and the server's last
-    // words stay in getLastReply(). Plain-text USER/PASS only (no base64 --
-    // see DEAD -> LIVE).
+    // words stay in getLastReply(). Plain-text USER/PASS only (no base64).
     public void login(string user, string pass) {
         this.sock = net.connectRaw(this.host, this.port);
         if (this.sock < 0) {
@@ -312,8 +232,7 @@ class client {
     }
 
     // STAT: validated +OK, then the pure statCount() digit scan. Returns 0
-    // on any failure or malformed reply (the pre-split malformed-reply
-    // result).
+    // on any failure or malformed reply.
     public int count() {
         if (!this.loggedIn) { return 0; }
         if (this.sock < 0) { return 0; }
@@ -327,8 +246,7 @@ class client {
     }
 
     // LIST (no argument): the multi-line response's data lines ("id octets"
-    // strings), split on "\r\n". Returns [] on any failure. ADDITIVE (the
-    // pre-split surface had no listing entry).
+    // strings), split on "\r\n". Returns [] on any failure.
     public string[] list() {
         string[] empty = [];
         if (!this.loggedIn) { return empty; }
@@ -348,8 +266,7 @@ class client {
     // RETR: reads the full multi-line response and fills the message's
     // sender/subject/body via the pure helpers (raw keeps the whole
     // response, status line and terminator included). On any failure the
-    // message is returned empty (raw "" -- the pre-split shape on a dead
-    // read, since its recvLine() returned "" which fed construct).
+    // message is returned empty (raw "").
     public message retrieve(int id) {
         string raw = "";
         if (this.sock >= 0 && this.loggedIn) {
@@ -366,8 +283,7 @@ class client {
     }
 
     // DELE: marks `id` for deletion (effective at QUIT per RFC 1939).
-    // Returns true on +OK, false on any failure. ADDITIVE (the pre-split
-    // surface had no deletion entry).
+    // Returns true on +OK, false on any failure.
     public bool remove(int id) {
         if (!this.loggedIn) { return false; }
         if (this.sock < 0) { return false; }
@@ -377,10 +293,8 @@ class client {
         return isOk(this.lastReply);
     }
 
-    // Sends QUIT and closes immediately without waiting for the +OK (the
-    // std/smtp.sr/ftp.sr shape), so a dead peer cannot stall quit(). The
-    // pre-split recvLine() after QUIT is dropped (it never ran -- the file
-    // never compiled).
+    // Sends QUIT and closes immediately without waiting for the +OK, so a
+    // dead peer cannot stall quit().
     public void quit() {
         if (this.sock >= 0) {
             this.sendLine("QUIT");
@@ -399,7 +313,7 @@ class client {
     }
 
     // One bounded read of the control channel (raw bytes as a string; ""
-    // on disconnect/timeout -- pre-split recvLine shape).
+    // on disconnect/timeout).
     private string recvLine() {
         if (this.sock < 0) { return ""; }
         return net.recvRaw(this.sock, 4096);
@@ -448,8 +362,8 @@ class client {
 
 // Index of the first "\r\n" at or after `startIdx` (the \r's index; -1 when
 // absent). Private plumbing for the line-oriented scans. The parameter is
-// spelled startIdx -- `from` is a lexer keyword on both compilers (the
-// smtp/ftp RENAMED MEMBERS landmine; never a parameter name either).
+// spelled startIdx -- `from` is a lexer keyword on both compilers (never a
+// parameter name).
 private int lineEndFrom(string s, int startIdx) {
     for (int i = startIdx; i + 1 < s.length; i++) {
         if (s[i] == 13 && s[i + 1] == 10) { return i; }

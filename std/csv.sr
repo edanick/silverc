@@ -1,74 +1,56 @@
 mod export csv;
 import {readString, writeString} from fs;
 
-// UNIFIED_CORE_LIBRARY.md §7.4 item 15 -- uninitialized-kvp latent-bug fix.
+// DOCS -- public `csv` module.
 //
-// PRE-FIX STATE (probed 2026-09, fresh -o builds on both compilers): the
-// file COMPILED on both (`kvp<string, string>` parses on both; the fs
-// import resolves) but nothing in it ran:
-// - row: `private kvp<string, string> fields;` was NEVER initialized (the
-//   construct never assigned it). silverc-rs silently swallowed the
-//   construction (the construct ran to completion and row.get() returned
-//   "(null)"); the self-hosted compiler died INSIDE the construct's first
-//   fields.set() (an import-only probe ran fine, so the crash is
-//   per-construction, not module load).
-// - writer: had NO construct at all, so `headers`/`currentRow`/`rows` were
-//   three null string[] fields; the first row() call's this.rows.push()
-//   access-violated 0xC0000005 on BOTH compilers (probed: a writer probe
-//   died before its first printline on both).
-// - document: construct() was empty, so `headers`/`rows` were null; parse()
-//   pushes into doc.rows -- the same null-deref latent bug.
-// - save(): built a `string[] vals;` (uninitialized local) and pushed into
-//   it -- the same latent shape.
-// There was no working pre-fix behavior to preserve beyond the API surface.
+// Pure Silver -- no OS code, no preprocessor regions. All storage fields
+// are `= []`-initialized inside their constructs (row's former kvp storage
+// is two parallel string[] arrays, the same shape sql.sr's row and
+// mongo.sr's doc use; http_server.sr's local headermap is the same shape),
+// and every plain string[] field gets an explicit `= []`. Uninitialized
+// class storage is a latent trap on both compilers: silverc-rs silently
+// swallows writes to it and the self-hosted compiler dies inside the
+// construct's first store, so the parallel-array shape is mandatory here.
+// Field NAMES of the private storages are not public, so the shapes are
+// invisible to callers.
 //
-// FIX (the established std-split idiom, probed working on both compilers):
-// every storage field is `= []`-initialized inside construct() -- row's kvp
-// becomes two parallel string[] arrays (std/sql.sr's row and std/mongo.sr's
-// doc precedent; http_server.sr's local headermap is the same shape), and
-// every plain string[] field gets an explicit `= []`. Field NAMES of the
-// private storages are not public, so the retypes are invisible.
-//
-// API PRESERVATION (every public name/arity/return of the pre-split file,
-// unchanged): class row -- construct(string[], string[]), get(string) ->
-// string (the matching value, or null when the name is absent -- the
-// kvp.get contract the pre-split delegation targeted, same as sql.sr's
-// row); class document -- construct(), public string[] headers, public
-// row[] rows; class writer -- header(string[]), row(string[]),
-// stringify() -> string; free functions parse(string) -> document,
-// load(string) -> document, save(string, document). The writer's
-// CSV-quoting rule is preserved verbatim (quote when the value contains a
-// comma, quote, or newline; internal quotes doubled).
+// API (see each declaration): class row -- construct(string[], string[]),
+// get(string) -> string (the matching value, or null when the name is
+// absent -- the same contract sql.sr's row gives); class document --
+// construct(), public string[] headers, public row[] rows; class writer --
+// header(string[]), row(string[]), addLine(string), stringify() -> string;
+// free functions parse(string) -> document, load(string) -> document,
+// save(string, document). The writer's CSV-quoting rule: quote when the
+// value contains a comma, quote, or newline; internal quotes doubled.
 //
 // LANDMINES SHAPING THE BODIES (all probed, see the sibling modules): the
 // `.length` PROPERTY form everywhere (the `.length()` CALL form reads
-// garbage on the self-host; the pre-split used the call form); string
-// fields/elements copied to locals before concatenation (rs stringifies
-// the pointer in expression position).
+// garbage on the self-host); string fields/elements copied to locals
+// before concatenation (rs stringifies the pointer in expression
+// position).
 //
-// CLASS-NAME/METHOD-NAME COLLISION LANDMINE (probed 2026-09, NEW compiler
-// finding): on the SELF-HOSTED compiler, a method whose name equals a
-// class declared in the same file is a SILENT NO-OP when invoked -- the
-// body never runs (probed standalone: class `row` + `wcopy.row(string[])`
-// -> the push count stayed 0 and a printline at the top of the body never
-// appeared; silverc-rs ran the same probe correctly). Declaration order
-// does not matter; the class being merely declared is enough; single-file
-// AND module-aggregate builds are both affected. csv's PUBLIC API contains
-// the collision by design (class `row` AND writer.row), so writer.row
-// cannot be fixed from this file: on the self-host it is a silent no-op
-// (rows never append; stringify() then emits only the header line). On
-// silverc-rs writer.row works fully. WORKAROUND so the FILE-level API
-// still works everywhere: save() no longer calls w.row() -- it serializes
-// through the ADDITIVE collision-free writer.addLine(string) (same
-// private quoteField helper both paths share), so save/load round trips
-// are byte-identical on BOTH compilers; only a hand-rolled
+// CLASS-NAME/METHOD-NAME COLLISION LANDMINE (probed 2026-09): on the
+// SELF-HOSTED compiler, a method whose name equals a class declared in the
+// same file is a SILENT NO-OP when invoked -- the body never runs (probed
+// standalone: class `row` + `wcopy.row(string[])` -> the push count stayed
+// 0 and a printline at the top of the body never appeared; silverc-rs ran
+// the same probe correctly). Declaration order does not matter; the class
+// being merely declared is enough; single-file AND module-aggregate builds
+// are both affected. csv's PUBLIC API contains the collision by design
+// (class `row` AND writer.row), so writer.row cannot be fixed from this
+// file: on the self-host it is a silent no-op (rows never append;
+// stringify() then emits only the header line). On silverc-rs writer.row
+// works fully. WORKAROUND so the FILE-level API still works everywhere:
+// save() serializes through the collision-free writer.addLine(string)
+// (both paths share the private quoteField helper), so save/load round
+// trips are byte-identical on BOTH compilers; only a hand-rolled
 // writer.row()+stringify() chain is self-host-dead (use save(), or add
 // lines via addLine).
 class row {
-    // Pre-split `private kvp<string, string> fields;` -- uninitialized on
-    // both compilers (rs swallowed writes, sh died in the construct).
-    // Parallel arrays instead: one entry per header, inserted in header
-    // order.
+    // Storage as two parallel arrays: one entry per header, inserted in
+    // header order. Both arrays are `= []`-initialized in the construct --
+    // uninitialized class storage is a latent trap on both compilers (see
+    // the module header).
     private string[] names;
     private string[] values;
 
@@ -82,9 +64,8 @@ class row {
     }
 
     // The value stored under `name`, or null when the name is absent (the
-    // kvp.get contract the pre-split delegation targeted -- sql.sr row
-    // keeps the same contract). save() only queries the document's own
-    // headers, so well-formed documents never hit the null.
+    // same contract sql.sr's row gives). save() only queries the
+    // document's own headers, so well-formed documents never hit the null.
     public string get(string name) {
         for (int i = 0; i < this.names.length; i++) {
             if (this.names[i] == name) { return this.values[i]; }
@@ -108,10 +89,11 @@ class writer {
     private string[] currentRow;
     private string[] rows;
 
-    // NEW (uninitialized-storage fix): the pre-split class had no construct
-    // at all, so all three fields were null and the first this.rows.push()
-    // died on both compilers. currentRow stays declared (private, unused by
-    // the pre-split methods) and is initialized with the rest.
+    // All three fields are `= []`-initialized here -- uninitialized class
+    // storage is a latent trap on both compilers, and the first
+    // this.rows.push() on null storage access-violates. currentRow is
+    // private and reserved for future use; it is initialized with the
+    // rest.
     construct() {
         this.headers = [];
         this.currentRow = [];
@@ -120,7 +102,7 @@ class writer {
 
     public void header(string[] h) { this.headers = h; }
 
-    // The pre-split quoting+append path. On the self-host this member is a
+    // Quote-and-append one CSV line. On the self-host this member is a
     // SILENT NO-OP (its name collides with the class `row` -- see the
     // collision landmine in the module header); silverc-rs runs it fully.
     public void row(string[] values) {
@@ -133,10 +115,9 @@ class writer {
         this.rows.push(line);
     }
 
-    // ADDITIVE (documented): appends one already-serialized CSV line -- the
-    // collision-free path save() serializes through (see the collision
-    // landmine). The line is appended verbatim; callers quote via
-    // quoteField first.
+    // Appends one already-serialized CSV line -- the collision-free path
+    // save() serializes through (see the collision landmine). The line is
+    // appended verbatim; callers quote via quoteField first.
     public void addLine(string line) {
         this.rows.push(line);
     }
@@ -194,7 +175,7 @@ public void save(string path, document doc) {
             string h = doc.headers[hi];
             vals.push(r.get(h));
         }
-        // Serialized through addLine, NOT w.row(): the row-name collision
+        // Serialized through addLine, not w.row(): the row-name collision
         // makes w.row a silent no-op on the self-host (see the module
         // header) -- save() must work on both compilers.
         string line = "";

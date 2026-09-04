@@ -6,25 +6,24 @@ import * from win32.kernel32;
 
 import {Exception} from exception;
 
-// DOCS -- public `async` module (UNIFIED_CORE_LIBRARY.md v2 canonical fold).
-// The former internal Windows backend std/async_win.sr was folded back into
-// this file and deleted. There is no async_win.sr anymore -- one module, one
-// OS layer (async -> win32.kernel32). The one DLL-backed effect this module
-// exposes -- the millisecond wait behind sleep()/timeout(), a kernel32!Sleep
-// -- lives INSIDE each public function body behind a `#on WINDOWS` region
-// (v2 rule 6): one unified function name, no win-prefixed helpers, no
-// wrapper indirection. The osType() runtime gates and the `os` import are
-// gone (the preprocessor replaces them); no #else and no LINUX/MAC
+// DOCS -- public `async` module (UNIFIED_CORE_LIBRARY.md §4). This is the
+// universal async module -- one module, one OS layer
+// (async -> win32.kernel32). The one DLL-backed effect this module exposes
+// -- the millisecond wait behind sleep()/timeout(), a kernel32!Sleep --
+// lives INSIDE each public function body behind a `#on WINDOWS` region
+// (§4 rule 6): one unified function name, no win-prefixed helpers, no
+// wrapper indirection. OS selection is compile-time via the preprocessor;
+// the module does not use the runtime `os` check. No #else and no LINUX/MAC
 // placeholders -- the other-OS regions get filled on their own machines
 // later.
 //
 // PLAIN IMPORT: the kernel32 grant is a plain full-table
-// `import * from win32.kernel32;` inside its own region -- alias imports are
-// removed in v2. Sleep is present in BOTH compilers' kernel32 export tables
+// `import * from win32.kernel32;` inside its own region -- no alias
+// imports. Sleep is present in BOTH compilers' kernel32 export tables
 // (silverc-rs src/win32.rs and the self-hosted compiler/mini_cg.sr kernel32
 // tables), so the plain grant resolves without any table change.
 //
-// DISPATCH (per compiler, probed -- unchanged by the fold):
+// DISPATCH (per compiler, probed):
 // `async` is a RESERVED KEYWORD token on silverc-rs (token.rs maps "async" =>
 // TokenKind::Async) and the parser's module-name position only accepts
 // Identifier, so `mod export async;` and `import * from async;` are hard
@@ -34,9 +33,8 @@ import {Exception} from exception;
 // per-compiler call interception exists: on the self-hosted compiler, where
 // `async` is an ordinary identifier (the lexer's keywordKind table has no
 // async entry), every `async.*` call resolves to the collected
-// globals/classes of this module. The module is SELF-HOST-ONLY, exactly as
-// it was through the split era (it never compiled on silverc-rs -- same
-// keyword rejection).
+// globals/classes of this module. The module is SELF-HOST-ONLY: it does not
+// compile on silverc-rs (the keyword rejection above).
 //
 // WHY THE WAITS DO NOT DELEGATE TO time (deviation, documented): delegation
 // is unexpressible on the self-hosted compiler -- a module-qualified call
@@ -46,35 +44,30 @@ import {Exception} from exception;
 // local `now` routes correctly, so the name collision is the trigger). The
 // import-alias escape (`import {sleep as timeSleep} from time;`) is
 // win32-only on the self-host ("aliased import names (X as Y) are only
-// allowed on win32 imports" -- probed). The fold therefore follows the
-// canonical shape: the module owns its kernel32!Sleep grant in its own
-// region and calls Sleep(ms) inline -- the exact shape std/time.sr uses for
-// its own waits.
+// allowed on win32 imports" -- probed). This module therefore owns its
+// kernel32!Sleep grant in its own region and calls Sleep(ms) inline -- the
+// same shape std/time.sr uses for its own waits.
 //
-// PRE-SPLIT STATE (probed against git HEAD before this split): the old file
-// NEVER compiled anywhere. silverc-rs rejected the module name itself
-// (above); the self-hosted compiler rejected the body -- `private
-// void callback();` (a fn-typed prop) fails with "expected { but found ;",
-// and the old-style `void cb()` parameter on GLOBAL functions fails with
-// "expected { but found (" (both probed). The file also sat in silverc.srp's
-// exclude list. Every public name/arity below is preserved unchanged; the
-// bodies are the closest forms the CURRENT grammar accepts (probe matrix,
-// both compilers):
+// GRAMMAR NOTES (probe matrix, both compilers): the fn-callback shapes below
+// are the closest forms the CURRENT grammar accepts. Fn-typed props do not
+// parse on the self-host (`private void callback();` fails with "expected {
+// but found ;"), and the C-style `void cb()` parameter on GLOBAL functions
+// fails with "expected { but found (" (both probed):
 //
-// - GLOBAL functions take function-typed parameters ONLY in the DOCS/259
-//   spelling `void () name` (both compilers accept it; the old `void name()`
+// - GLOBAL functions take function-typed parameters ONLY in the DOCS
+//   spelling `void () name` (both compilers accept it; the `void name()`
 //   spelling is rejected on both -- probed). `run` and `task` use it, and
 //   invoking the parameter (`mainFunc()`) is probed end-to-end through the
 //   module-qualified call `async.run((void () { ... }))`.
-// - CLASS CONSTRUCTORS are the mirror image: the DOCS/259 spelling
+// - CLASS CONSTRUCTORS are the mirror image: the DOCS spelling
 //   `construct(void () c)` is rejected on BOTH compilers ("expected { but
 //   found c" self-host / "Expected 'identifier' but found 'LeftParen'"
-//   silverc-rs), while the old spelling `construct(void cb())` parses and
-//   compiles on the self-host. The task constructor therefore keeps the old
-//   spelling -- the only fn-param form constructors accept.
+//   silverc-rs), while `construct(void cb())` parses and compiles on the
+//   self-host. The task constructor therefore uses that spelling -- the
+//   only fn-param form constructors accept.
 // - FN-TYPED PROPS do not parse on either compiler (probed), so the callback
 //   slot is `private object callback` -- the object-slot idiom std/thread.sr
-//   used; a `void ()` value flows into the object slot unchanged (an 8-byte
+//   uses; a `void ()` value flows into the object slot unchanged (an 8-byte
 //   address on both compilers).
 // - OBJECT-SLOT CALL-THROUGH is a SILENT NO-OP on the self-hosted compiler
 //   (probed): `this.callback()` compiles, exits 0, and never runs the body --
@@ -85,10 +78,10 @@ import {Exception} from exception;
 // - STORING A CALLBACK (task/setJob): a function-typed value cannot be
 //   declared as a global/local (bare `object x;` is rejected on the
 //   self-host; `object` is a param/prop type only), so the slot lives on the
-//   instance. The free function `task(...)` fills it through a public
-//   `setJob(void () c)` method -- an ADDITIVE member, the pre-split class had
-//   no setter -- because it is the probe-proven route (ctor-param store
-//   works only for a direct `new task((void () { ... }))` at the call site).
+//   instance. The free function `task(...)` fills it through the public
+//   `setJob(void () c)` method because it is the probe-proven route
+//   (ctor-param store works only for a direct `new task((void () { ... }))`
+//   at the call site).
 //   All three working spellings (probed end-to-end, exit 0, body fires):
 //       task t = task((void () { ... }));   // free function, BARE name
 //       task t = new task((void () { ... })); t.awaitResult();
@@ -109,17 +102,16 @@ import {Exception} from exception;
 //   name (the star import brings it in) or construct with `new task(...)`
 //   directly; only qualified calls that STORE the fn argument are affected.
 //
-// SEMANTICS NOTES (pre-existing, preserved): task.result is never assigned
+// SEMANTICS NOTES: task.result is never assigned
 // anywhere -- awaitResult() runs the callback and returns the (empty) result
 // string, and `all` collects those empties; making the callback able to
 // produce a value needs a string-returning fn type (`string () name`), which
 // no compiler supports today, so the gap is documented rather than
 // redesigned. task.completed/isDone() are likewise never set -- the fields
-// exist since the pre-split file and keep their (inert) shape. Both stay so
-// the public surface keeps its pre-split names; the only additive member is
-// setJob (see STORING A CALLBACK above). TimeoutException is
-// declared-but-never-thrown, exactly as it was pre-split; it is kept because
-// it is part of the public surface.
+// are inert. Both stay so the public surface keeps its names; setJob is the
+// one method added beyond the original shape (see STORING A CALLBACK above).
+// TimeoutException is declared-but-never-thrown; it is part of the public
+// surface.
 
 class task {
     private bool completed;

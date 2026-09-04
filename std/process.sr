@@ -1,29 +1,27 @@
 mod export process;
 
-// DOCS -- public `process` module (UNIFIED_CORE_LIBRARY.md v2 canonical
-// fold). This is the universal process module: the former internal Windows
-// backend std/process_win.sr was folded back into this file and deleted.
-// There is no process_win.sr anymore -- one module, one OS layer
+// DOCS -- public `process` module (UNIFIED_CORE_LIBRARY.md §4). This is the
+// universal process module -- one module, one OS layer
 // (process -> win32.user32 + win32.kernel32).
 //
-// CANONICAL SHAPE (v2 rule 6): the raw OS calls live INSIDE the public
-// function bodies (Process.getFocusedProcess, run, pipe.write/read) behind
-// `#on WINDOWS` regions -- one unified function name, no win-prefixed
-// helpers, no wrapper indirection. The osType() runtime gates and the `os`
-// import are gone (the preprocessor replaces them); no #else and no
-// LINUX/MAC placeholders -- the other-OS regions get filled on their own
-// machines later. For a future non-Windows backend the fallbacks follow the
-// module's failure style: getFocusedProcess() returns an all-zero/empty
-// Process, run() returns the zero result, pipe.read() returns "" and
-// pipe.write() is a silent no-op.
+// SHAPE (UNIFIED_CORE_LIBRARY.md §4 rule 6): the raw OS calls live INSIDE the
+// public function bodies (Process.getFocusedProcess, run, pipe.write/read)
+// behind `#on WINDOWS` regions -- one unified function name, no
+// win-prefixed helpers, no wrapper indirection. OS selection is compile-time
+// via the preprocessor; the module does not use the runtime `os` check. No
+// #else and no LINUX/MAC placeholders -- the other-OS regions get filled on
+// their own machines later. For a future non-Windows backend the fallbacks
+// follow the module's failure style: getFocusedProcess() returns an
+// all-zero/empty Process, run() returns the zero result, pipe.read()
+// returns "" and pipe.write() is a silent no-op.
 //
 // NOT gated on purpose (no DLL behind them): the `result`, `ProcessWindow`
 // and `Process` class declarations and constructors, pipe's declarations and
-// its flush() stub (pre-split no-op body, kept verbatim).
+// its flush() stub (no-op body).
 //
 // PLAIN IMPORTS: user32 + kernel32 are granted through plain full-table
-// `import * from win32.<dll>;` regions -- alias imports are removed in v2.
-// All ten exports the fold needs are present in BOTH compilers' tables
+// `import * from win32.<dll>;` regions -- no alias imports. All ten exports
+// the module needs are present in BOTH compilers' tables
 // (silverc-rs/src/win32.rs and the self-host win32ExportTable):
 // GetForegroundWindow/GetWindowTextA/GetWindowThreadProcessId on user32;
 // OpenProcess/QueryFullProcessImageNameA/CloseHandle/CreatePipe/
@@ -32,55 +30,48 @@ mod export process;
 // sentinel intercept (codegen.rs -> stdlib::process::gen_process_call,
 // runtime-patched to the same DLL exports), CloseHandle/CreatePipe/
 // CreateProcessA/ReadFile/WriteFile through the dynamic IAT import path --
-// the same DLL calls the aliased backend made pre-fold.
+// the same DLL calls.
 //
-// BUFFER IDIOM (cross-compiler proven, was std/process_win.sr): NUL-
-// terminated Win32 string data (window title, process image path, pipe
-// bytes) uses preallocated writable string buffers -- strings lower to dense
-// char buffers on every backend, so an index reads one raw byte and a bare
-// call passes the char pointer straight across the boundary. Decode loops
-// compare against char(0), never the '\0' literal -- BOTH compilers' lexers
-// resolve that escape to the digit character '0' (0x30). Struct-free by
-// design: this module needs no int[] qword-slot buffers because none of its
-// calls take a struct (the pre-split null STARTUPINFO/PROCESS_INFORMATION
-// shape is preserved verbatim, see run).
+// BUFFER IDIOM (cross-compiler proven): NUL-terminated Win32 string data
+// (window title, process image path, pipe bytes) uses preallocated writable
+// string buffers -- strings lower to dense char buffers on every backend, so
+// an index reads one raw byte and a bare call passes the char pointer
+// straight across the boundary. Decode loops compare against char(0), never
+// the '\0' literal -- BOTH compilers' lexers resolve that escape to the
+// digit character '0' (0x30). Struct-free by design: this module needs no
+// int[] qword-slot buffers because none of its calls take a struct (run
+// passes null for both STARTUPINFO and PROCESS_INFORMATION, see run).
 //
-// PRESERVED PRE-SPLIT MECHANICS (probed against git HEAD before the split,
-// carried through the fold verbatim):
-// - Process.getFocusedProcess(): the query order and failure ladder are
-//   unchanged -- null foreground HWND leaves the whole Process zero/empty;
-//   OpenProcess failure or a failed image-name query leaves path/filename
-//   empty while handle/title/id stay set (the pre-split backend closed the
-//   process handle right after the query, before the ok check -- same
-//   order here). The filename slash-scan is pure Silver, as pre-split.
-// - run(): the CreatePipe/CreateProcessA call shape is preserved VERBATIM,
-//   including the null lpProcessInformation -- CreateProcessA requires a
-//   real PROCESS_INFORMATION pointer to write, so the call faults the
-//   process (0xC0000005) on the self-hosted compiler on success AND failure
-//   paths (probed pre-split: exit code -1073741819 with a breadcrumb after
-//   the call never reached). This is the preserved historical behavior, not
-//   a regression -- the pre-split API never returned on any compiler (the
-//   failure path crashed before returning, and silverc-rs users cannot even
-//   declare the lowercase `result` type outside the module: rs statement
-//   parsing only accepts lowercase type names declared in the same file).
-//   The spawn-failure result ({exitCode = -1, stderr = "Failed to create
-//   process"}) is produced directly on the created == 0 branch, replacing
-//   the pre-split ["1", msg] backend protocol with the same observable
-//   values.
-// - pipe: the class stays as dead as pre-split -- its handles are private
-//   with an empty constructor and no binding API, so write()/read() operate
-//   on unbound handles exactly as before (probed pre-split: WriteFile/
-//   ReadFile fail on the zero handle, read() returns ""). The pre-split
-//   data.toBytes() round trip in write() was already replaced by passing
-//   the string straight across the boundary (the documented string-buffer
-//   idiom; same bytes).
+// MECHANICS (probed):
+// - Process.getFocusedProcess(): null foreground HWND leaves the whole
+//   Process zero/empty; OpenProcess failure or a failed image-name query
+//   leaves path/filename empty while handle/title/id stay set. The process
+//   handle closes right after the query, before the ok check. The filename
+//   slash-scan is pure Silver.
+// - run(): the CreatePipe/CreateProcessA call shape passes null for every
+//   optional argument, including lpProcessInformation -- CreateProcessA
+//   requires a real PROCESS_INFORMATION pointer to write, so the call faults
+//   the process (0xC0000005) on the self-hosted compiler on success AND
+//   failure paths (probed: exit code -1073741819 with a breadcrumb after the
+//   call never reached). This is documented behavior, not a regression --
+//   the API never returns on any compiler (the failure path crashes before
+//   returning, and silverc-rs users cannot even declare the lowercase
+//   `result` type outside the module: rs statement parsing only accepts
+//   lowercase type names declared in the same file). The spawn-failure
+//   result ({exitCode = -1, stderr = "Failed to create process"}) is
+//   produced directly on the created == 0 branch.
+// - pipe: a dead class -- its handles are private with an empty constructor
+//   and no binding API, so write()/read() operate on unbound handles
+//   (probed: WriteFile/ReadFile fail on the zero handle, read() returns "").
+//   The string crosses the boundary straight from its dense char buffer
+//   (the documented string-buffer idiom; same bytes as a byte[] conversion).
 //
-// DISPATCH NOTE (per compiler, probed, unchanged by the fold): on
+// DISPATCH NOTE (per compiler, probed): on
 // silverc-rs every `Process.getFocusedProcess()` / `process.getFocusedProcess()`
 // call is intercepted BEFORE this source body and emitted natively
 // (codegen.rs routes both spellings to stdlib::process::gen_focused_process,
 // whose object layout contract -- path, filename, id, window -- the class
-// below preserves exactly), so the static body below is dead code there;
+// below implements exactly), so the static body below is dead code there;
 // the self-hosted compiler has no such intercept and executes it. The
 // self-hosted driver hand-prepends this file into standalone compiles when
 // the user source imports "process" (compiler_driver.sr), and excludes the
@@ -88,9 +79,9 @@ mod export process;
 // `run(...)` / `pipe` / `result` calls resolve to this module's globals on
 // both compilers -- although on silverc-rs a user file cannot DECLARE a
 // lowercase `result`/`pipe` typed variable (rs statement parsing only
-// accepts lowercase type names declared in the same file), so the pre-split
-// rs surface was effectively Process.getFocusedProcess plus the native
-// bare-win32 sentinel path; nothing about that surface changed.
+// accepts lowercase type names declared in the same file), so the rs
+// surface is effectively Process.getFocusedProcess plus the native
+// bare-win32 sentinel path.
 
 #on WINDOWS
 import * from win32.user32;
@@ -126,11 +117,10 @@ class Process {
         this.window = new ProcessWindow();
     }
 
-    // Pre-split body shape preserved: null foreground HWND leaves the whole
-    // Process zero/empty; a failed OpenProcess or image-name query leaves
-    // path/filename empty while handle/title/id stay set. The filename
-    // slash-scan is pure Silver and stays; every DLL call is inline in the
-    // region below.
+    // Body shape: null foreground HWND leaves the whole Process zero/empty;
+    // a failed OpenProcess or image-name query leaves path/filename empty
+    // while handle/title/id stay set. The filename slash-scan is pure Silver
+    // and stays; every DLL call is inline in the region below.
     public static Process getFocusedProcess() {
         Process result = new Process();
         #on WINDOWS
@@ -139,8 +129,7 @@ class Process {
             result.window.handle = hwnd;
             // Writable 512-space title buffer; GetWindowTextA returns the
             // copied length (excluding the NUL it writes), so the decode
-            // loop bounds on len and stops at char(0) for safety
-            // (pre-split loop shape).
+            // loop bounds on len and stops at char(0) for safety.
             string titleBuf = "";
             for (int i = 0; i < 512; i++) { titleBuf += " "; }
             int titleLen = GetWindowTextA(hwnd, titleBuf, 512);
@@ -154,9 +143,8 @@ class Process {
             int hProcess = OpenProcess(0x1000, 0, pid);
             if (hProcess != 0) {
                 // Writable 1024-space path buffer; the length in/out is the
-                // pre-split int len = 1024 pattern. The process handle
-                // closes right after the query, before the ok check
-                // (pre-split order).
+                // int len = 1024 pattern. The process handle closes right
+                // after the query, before the ok check.
                 string pathBuf = "";
                 for (int i = 0; i < 1024; i++) { pathBuf += " "; }
                 int len = 1024;
@@ -191,9 +179,8 @@ class pipe {
     public void write(string data) {
         #on WINDOWS
         // Unbound-handle write (dead class, see header): WriteFile fails on
-        // the zero handle exactly as pre-split. The string crosses the
-        // boundary as its dense char buffer -- one 8-byte slot per Silver
-        // string, same bytes as the old byte[] conversion.
+        // the zero handle. The string crosses the boundary as its dense
+        // char buffer -- one 8-byte slot per Silver string.
         WriteFile(this.hWrite, data, data.length, null, null);
         #off
     }
@@ -203,9 +190,9 @@ class pipe {
     public string read() {
         string out = "";
         #on WINDOWS
-        // Unbound-handle read (dead class, see header): pre-split 4096-byte
-        // buffer and byte-wise decode; ReadFile fails on the zero handle so
-        // n stays 0 and "" is returned.
+        // Unbound-handle read (dead class, see header): a 4096-space buffer
+        // and byte-wise decode; ReadFile fails on the zero handle so n
+        // stays 0 and "" is returned.
         string buf = "";
         for (int i = 0; i < 4096; i++) { buf += " "; }
         int n = 0;
@@ -224,11 +211,10 @@ public result run(string cmd, string[] args) {
     string fullCmd = cmd;
     for (int i = 0; i < args.length; i++) { fullCmd += " " + args[i]; }
     // CreatePipe defaults, bInheritHandles = 1, and the null-heavy
-    // CreateProcessA argument list are the pre-split shapes VERBATIM
-    // (including the null lpProcessInformation -- see the header for the
-    // preserved fault-on-every-path consequence). On both branches the pipe
-    // handles close exactly as the pre-split failure/success paths closed
-    // them.
+    // CreateProcessA argument list pass null for every optional argument,
+    // including lpProcessInformation -- see the header for the
+    // fault-on-every-path consequence. On both branches the pipe handles
+    // close before run() returns.
     int hReadOut = 0;
     int hWriteOut = 0;
     CreatePipe(&hReadOut, &hWriteOut, null, 0);

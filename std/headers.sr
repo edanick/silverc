@@ -1,46 +1,35 @@
 mod export headers;
 
-// UNIFIED_CORE_LIBRARY.md §7.4 item 15 -- uninitialized-kvp latent-bug fix.
+// DOCS -- public `headers` module.
 //
-// PRE-FIX STATE (probed 2026-09, fresh -o builds on both compilers): the file
-// COMPILED everywhere (`kvp<string, string[]>` parses on both) but the
-// multimap's single field `private kvp<string, string[]> data;` was NEVER
-// initialized (construct() was empty), so every touch of it was undefined.
-// silverc-rs silently swallowed the early reads (get/has on the fresh field
-// returned null/"") and then access-violated 0xC0000005 as soon as the
-// multimap was used further (second get / getAll / serialize -- the kvp is
-// garbage, not an object); the self-hosted compiler access-violated
-// 0xC0000005 on the FIRST touching operation (set or has). There was no
-// working pre-fix behavior to preserve beyond the API surface.
+// Pure Silver -- no OS code, no preprocessor regions. The multimap's
+// storage is two parallel `= []`-initialized string[] arrays (the same
+// shape std/http_server.sr's local headermap, std/mongo.sr's doc and
+// std/sql.sr's row use). Each (key, value) pair is one entry; a key added
+// N times appears N times. Keys are stored lowered (name.toLower()).
+// Uninitialized class storage is a latent trap on both compilers:
+// silverc-rs silently swallows early reads and access-violates once the
+// storage is used further, and the self-hosted compiler access-violates on
+// the FIRST touching operation -- hence the explicit initialization.
 //
-// FIX (the established std-split idiom, probed working on both compilers):
-// the map-like field is replaced by two parallel `= []`-initialized string[]
-// arrays -- std/http_server.sr's local headermap (which was written to get
-// AWAY from this multimap), std/mongo.sr's doc and std/sql.sr's row all use
-// the same shape. Each (key, value) pair is one entry; a key added N times
-// appears N times. Keys are stored lowered (name.toLower()), exactly like
-// the pre-split set/add/get paths lowercased before touching the kvp.
-//
-// API PRESERVATION (every public name/arity/return of the pre-split file,
-// unchanged): class header -- public name/value fields, construct(string,
-// string); class multimap -- construct(), get(string) -> string (first value
-// for the name, "" when absent), getAll(string) -> string[] (ALL values for
-// the name in insertion order, null when absent -- the pre-split
-// delegation's kvp.get contract, which the pre-split code itself null-
-// checked), has(string) -> bool, set(string, string) (replaces any existing
-// entry with the single new value), add(string, string) (appends one more
-// value for the name), remove(string), serialize() -> string; free function
-// parse(string) -> multimap. get/add/serialize output is byte-identical to
-// the pre-split formulas (first value; one "Cap: value\r\n" line per value
-// with the first letter of the lowered key capitalized).
+// API (see each declaration): class header -- public name/value fields,
+// construct(string, string); class multimap -- construct(), get(string) ->
+// string (first value for the name, "" when absent), getAll(string) ->
+// string[] (ALL values for the name in insertion order, null when absent),
+// has(string) -> bool, set(string, string) (stores the single new value
+// under the name, discarding prior entries), add(string, string) (appends
+// one more value for the name), remove(string), serialize() -> string; free
+// function parse(string) -> multimap. serialize() emits one
+// "Cap: value\r\n" line per value with the first letter of the lowered key
+// capitalized.
 //
 // LANDMINES SHAPING THE BODIES (all probed, see the sibling modules): the
-// serialize() string ternary is gone (string ternaries are landmined on the
-// self-host -- the reason http_server.sr re-typed its own serializer); the
-// `.length` PROPERTY form everywhere (the `.length()` CALL form reads
-// garbage on the self-host); substr only in the dual-correct forms
-// substr(0, n) and single-argument tails; string fields copied to locals
-// before concatenation.
+// serialize() bodies use if/else instead of string ternaries (string
+// ternaries are landmined on the self-host -- the reason http_server.sr
+// writes its own serializer that way); the `.length` PROPERTY form
+// everywhere (the `.length()` CALL form reads garbage on the self-host);
+// substr only in the dual-correct forms substr(0, n) and single-argument
+// tails; string fields copied to locals before concatenation.
 //
 // DISPATCH (probed): `headers` is builtin-reserved on NEITHER compiler --
 // silverc-rs's builtin_modules_set (src/main.rs:81 lists fs/json/yaml/env/
@@ -49,7 +38,7 @@ mod export headers;
 // `import * from headers;` as an ORDINARY SOURCE module from disk
 // (std\headers.sr candidates); the module is also excluded from the
 // compiler's own aggregate build (silverc.srp). No native dispatch exists,
-// so there is no per-compiler call interception to preserve.
+// so there is no per-compiler call interception to worry about.
 
 class header {
     public string name;
@@ -59,9 +48,9 @@ class header {
 }
 
 class multimap {
-    // Pre-split `private kvp<string, string[]> data;` -- uninitialized, and
-    // the generic does not even have a working runtime on either compiler.
-    // Parallel arrays instead (see the header); one entry per (key, value).
+    // Storage as two parallel arrays -- one entry per (key, value). Both
+    // are `= []`-initialized in the construct; uninitialized class storage
+    // is a latent trap on both compilers (see the module header).
     private string[] keys;
     private string[] vals;
 
@@ -70,8 +59,7 @@ class multimap {
         this.vals = [];
     }
 
-    // The first value stored under `name`, "" when absent (pre-split
-    // contract: the pre-split get() returned vals[0] or "").
+    // The first value stored under `name`, "" when absent.
     public string get(string name) {
         string key = name.toLower();
         for (int i = 0; i < this.keys.length; i++) {
@@ -81,9 +69,7 @@ class multimap {
     }
 
     // Every value stored under `name`, in insertion order; null when the
-    // name is absent (the pre-split delegation returned the kvp's stored
-    // list, which was null for absent names -- the pre-split code
-    // null-checked the result, so the contract is preserved).
+    // name is absent (callers null-check the result).
     public string[] getAll(string name) {
         string key = name.toLower();
         string[] out = [];
@@ -102,9 +88,8 @@ class multimap {
         return false;
     }
 
-    // Replaces every entry for (the lowered) name with the single value --
-    // the pre-split set() semantics (kvp.set stored a fresh one-element
-    // list, discarding prior values).
+    // Stores the single new value under (the lowered) name, discarding
+    // prior entries.
     public void set(string name, string value) {
         string key = name.toLower();
         this.removeKey(key);
@@ -112,8 +97,7 @@ class multimap {
         this.vals.push(value);
     }
 
-    // Appends one more value for name (pre-split add(): existing list got a
-    // push, or set() on a fresh name). get() keeps returning the first
+    // Appends one more value for name. get() keeps returning the first
     // inserted value; serialize() emits every value.
     public void add(string name, string value) {
         this.keys.push(name.toLower());
@@ -137,10 +121,10 @@ class multimap {
         this.vals = keepVals;
     }
 
-    // The pre-split serialize format, preserved verbatim minus its string
-    // ternary and `.length()` call forms: one "Name: value\r\n" line per
-    // entry, in insertion order, with the first letter of the lowered key
-    // capitalized; an empty key emits ": value\r\n".
+    // The serialize format: one "Name: value\r\n" line per entry, in
+    // insertion order, with the first letter of the lowered key
+    // capitalized; an empty key emits ": value\r\n". Written with if/else
+    // rather than a string ternary (see the module header's landmine note).
     public string serialize() {
         string result = "";
         for (int i = 0; i < this.keys.length; i++) {

@@ -1,75 +1,58 @@
 mod export crypto;
 import * from fs;
 
-// DOCS -- public `crypto` module (UNIFIED_CORE_LIBRARY.md v2 canonical fold).
-// This is the universal crypto module: there is no crypto_win.sr backend and
-// no win-named helpers -- one module, one OS layer (crypto -> win32.advapi32
-// + win32.msvcrt). The canonical shape puts each raw OS call INSIDE its
-// public/private function's body behind a `#on WINDOWS` ... `#off` region:
-// one unified function name, no wrapper indirection, no `#else`, no
-// LINUX/MAC placeholders (the non-Windows regions get filled on their own
-// machines later). The osType() runtime gates are gone: the preprocessor
-// replaces them, so `import * from os;` is not needed here.
+// DOCS -- public `crypto` module.
+// This is the universal crypto module: all OS code lives inline in
+// `#on WINDOWS` regions inside the function bodies -- one module, one OS
+// layer (crypto -> win32.advapi32 + win32.msvcrt), one unified function
+// name per operation, no wrapper indirection. Regions are flat
+// `#on WINDOWS` ... `#off` blocks: no `#else`, no LINUX/MAC placeholders
+// (the non-Windows regions get filled on their own machines later). The
+// module needs no `import * from os;`: OS selection is the compiler
+// preprocessor's job, and the runtime `os.type` check is a user-facing
+// feature.
 //
 // IMPORT SHAPE: everything in this module is tabled on both compilers except
 // the Crypt* trio -- advapi32 does not export-register CryptAcquireContextA/
 // CryptGenRandom/CryptReleaseContext in either compiler's per-DLL export
 // table (only the Reg*/GetUserNameA registry set), so the star form cannot
-// answer them; they are bound instead through PLAIN single-export grants
+// answer them; they are bound through PLAIN single-export grants
 // (`import { CryptAcquireContextA, ... } from win32.advapi32;` -- no `as Y`
-// aliasing), which resolve by local name on both compilers exactly the way
-// the pre-fold backend's grants did, with the PE import keeping the real
-// export. rand IS tabled (msvcrt) on both compilers, so it takes the
-// canonical star form. Everything else in this file is pure Silver and
-// keeps its pre-fold shape ungated.
+// aliasing), which resolve by local name on both compilers, with the PE
+// import keeping the real export. rand IS tabled (msvcrt) on both
+// compilers, so it takes the star form. Everything else in this file is
+// pure Silver, with no regions.
 //
-// BASE64 NOTE (deviation, documented): the pre-fold file delegated its
-// aes*/rsa* payloads to encoding.base64Encode/base64Decode, but
-// std/encoding.sr is broken on BOTH compilers (its `data.toBytes()` opening
-// crashes the self-host at runtime and yields an empty/garbage string on
-// silverc-rs), and no std module or test exercises it successfully --
-// pre-fold this was unreachable because importing crypto itself failed
-// everywhere (see PRE-FOLD STATE below). Since encoding.sr is outside this
-// fold's file scope, the base64 codec lives here as private pure-Silver
-// helpers (cryptoBase64Encode/cryptoBase64Decode) implementing the standard
+// BASE64 NOTE: aes*/rsa* payloads are base64 strings, but std/encoding.sr
+// is broken on BOTH compilers (its `data.toBytes()` opening crashes the
+// self-host at runtime and yields an empty/garbage string on silverc-rs),
+// and no std module or test exercises it successfully. The base64 codec
+// therefore lives here as private pure-Silver helpers
+// (cryptoBase64Encode/cryptoBase64Decode) implementing the standard
 // RFC 4648 alphabet with '=' padding, built only from primitives probed
 // byte-identical on both compilers (string indexing, int shifts/masks,
-// string += char, char() casts). This restores the functions' documented
-// contract (aesEncrypt = base64("data:key"), rsaEncrypt = base64(data),
-// aesDecrypt = the "data" part of the decoded payload) instead of
-// preserving a crash; if encoding.sr is ever fixed, these helpers can
-// delegate to it again.
+// string += char, char() casts). The functions' documented contract is
+// aesEncrypt = base64("data:key"), rsaEncrypt = base64(data), aesDecrypt =
+// the "data" part of the decoded payload. If encoding.sr is ever fixed,
+// these helpers can delegate to it.
 //
-// RNG NOTE: the pre-fold file called `time.random(...)` for salt/key
-// material -- a function that exists NOWHERE (not in std/time.sr, not as a
-// builtin on either compiler), so those calls were dead. The pre-fold
-// `import {random} from time;` line was part of that dead wiring and is not
-// carried over. UNIFIED_CORE_LIBRARY.md's audit already attributed an msvcrt
-// rand() to this module, so the range-random routes through the
-// cryptoRandomRange region into msvcrt rand. Swapping the CRT rand for a
-// stronger unified RNG (and making bcryptHash actually hash) remains future
-// work; this fold does not redesign either.
+// RNG NOTE: salt/key material routes through the module's
+// cryptoRandomRange (msvcrt rand inside its Windows region). Swapping the
+// CRT rand for a stronger unified RNG (and making bcryptHash actually
+// hash) is future work.
 //
-// PRE-FOLD STATE (important for A/B baselines): before the v1 split, a user
-// file importing crypto failed to compile on BOTH compilers -- silverc-rs
-// rejected this file's old `import {a, b} from encoding;` lines (the braced
-// form names native modules per DOCS/213, so resolution failed with unknown
-// module "base64Encode"/...), and the self-hosted compiler parsed the file
-// but died in codegen on the backend-less Crypt* calls inside randomBytes.
-// The deterministic results -- base64 payloads, round-trip equality,
-// key/salt lengths, the bcrypt prefix/length/verify contract -- follow the
-// documented API contract. One pre-existing compiler asymmetry remains
-// (unchanged by this fold, needs no compiler work here): silverc-rs cannot
-// consume exported CLASS types from source modules (rsaKeyPair as a
-// user-local type fails with the standard rs parser error "unknown keyword
-// rsaKeyPair"), so rsaGenerate's return value is only directly usable on
-// the self-hosted compiler; the string-based rsaEncrypt/rsaDecrypt pair
-// works everywhere.
+// COMPILER NOTE: silverc-rs cannot consume exported CLASS types from
+// source modules (rsaKeyPair as a user-local type fails with the standard
+// rs parser error "unknown keyword rsaKeyPair"), so rsaGenerate's return
+// value is only directly usable on the self-hosted compiler; the
+// string-based rsaEncrypt/rsaDecrypt pair works everywhere. The
+// deterministic results -- base64 payloads, round-trip equality, key/salt
+// lengths, the bcrypt prefix/length/verify contract -- follow the
+// documented API contract.
 //
 // NON-WINDOWS FALLBACK: randomBytes returns a zero-filled array of the
 // requested length and cryptoRandomRange returns its minimum when no
-// Windows region is present (the module's existing failure style --
-// pre-fold the acquire-failure path also returned the zeroed array).
+// Windows region is present.
 
 #on WINDOWS
 import { CryptAcquireContextA, CryptGenRandom, CryptReleaseContext } from win32.advapi32;
@@ -97,9 +80,7 @@ private int cryptoRandomRange(int min, int max) {
 }
 
 // Standard RFC 4648 base64 with '=' padding; private portable codec (see
-// BASE64 NOTE). Works purely on string indexing, int arithmetic and string
-// += char appends. if/else bodies everywhere -- the self-host rejects
-// string ternaries.
+// BASE64 NOTE).
 private string cryptoBase64Encode(string data) {
     string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     string result = "";

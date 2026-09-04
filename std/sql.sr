@@ -2,35 +2,29 @@ import * from net;
 
 mod export sql;
 
-// DOCS -- public `sql` module (UNIFIED_CORE_LIBRARY.md §4, the CANONICAL
-// FOLD SHAPE). This is the unified, portable front of the generic SQL client
+// DOCS -- public `sql` module (UNIFIED_CORE_LIBRARY.md §4). This is the
+// portable front of the generic SQL client
 // library. It is a PROTOCOL module (§4 rule 7): it contains ZERO OS code --
-// no win32 imports, no `#on` regions, no osType() gates, no win-prefixed
-// helpers -- and every byte on the wire is sent through the universal socket
+// no win32 imports, no `#on` regions, no os module gates -- and every byte
+// on the wire is sent through the universal socket
 // core std/net.sr (connectRaw/sendRawLen/recvRaw/closeRaw/
-// setRecvTimeoutRaw), whose Windows regions hold the ws2_32 calls. The
-// pre-fold internal Windows backend std/sql_win.sr (the aliased ws2_32
-// grants plus the 30 s SO_RCVTIMEO arming) is deleted; all of that now
-// lives in net.sr's regions, so this module is pure SQL-transport logic and
-// would compile unchanged on any backend that provides net.
+// setRecvTimeoutRaw), whose Windows regions hold the ws2_32 calls. This
+// module is pure SQL-transport logic and would compile unchanged on any
+// backend that provides net.
 //
-// TRANSPORT (the fold): the pre-fold backend's sqlWinConnect(host, port)
-// (WSAStartup + socket + inet_addr + connect + SO_RCVTIMEO) is now
-// net.connectRaw(host, port) followed by net.setRecvTimeoutRaw(sock, 30000);
-// its sqlWinSend (the int[] packing send) is net.sendRawLen(sock, line,
-// line.length + 2); its sqlWinReceive is net.recvRaw(sock, 4096); its
-// sqlWinClose is net.closeRaw(sock). net.recvRaw normalizes the DLL return
+// TRANSPORT: connect(host, port) is net.connectRaw(host, port) followed by
+// net.setRecvTimeoutRaw(sock, 30000); the int[] packing send is
+// net.sendRawLen(sock, line, line.length + 2); the receive is
+// net.recvRaw(sock, 4096); the close is net.closeRaw(sock).
+// net.recvRaw normalizes the DLL return
 // first and then reports "" for `n <= 0` -- the same observable graceful
-// shape the pre-fold sqlWinReceive's `n <= 0 || n > 2147483647` produced
-// (both compilers). No SQL wire protocol of any kind exists here or anywhere
+// shape a raw `n <= 0 || n > 2147483647` check produces (both compilers).
+// No SQL wire protocol of any kind exists here or anywhere
 // (see the honesty note below) -- the module sends the SQL text as one
 // CRLF-terminated line per statement and surfaces the raw reply through
 // getLastReply().
 //
-// The else side of the old osType() gates is gone with the gates (the
-// pre-fold fallbacks were unreachable on this backend: silverc only emits
-// Windows PEs and osType() was the compile-time WINDOWS constant). The
-// failure style is unchanged: execute/query are silent no-ops that leave
+// FAILURE STYLE: execute/query are silent no-ops that leave
 // getLastReply() "" and return an empty result whenever the connStr names no
 // reachable Server/Port, close() stays a no-op.
 //
@@ -41,63 +35,25 @@ mod export sql;
 // fs/json/yaml/llmai/LLMAI/os/project/exception/bom/process/notifications/
 // env/url/hash/path/console/math/http) plus its driver prepend list all
 // exclude it. Both compilers resolve `import * from sql;` as an ORDINARY
-// SOURCE module (std/sql.sr); no native dispatch exists to preserve.
+// SOURCE module (std/sql.sr); no native dispatch exists.
 // (sql.sr's entry in silverc.srp's exclude list only keeps it out of the
 // compiler's own aggregate build -- the same posture as smtp.sr/pop.sr/
 // imap.sr/ssh.sr; it does not make `sql` a builtin.)
 //
-// PRE-SPLIT STATE (probed 2026-08 against this file's git HEAD copy, fresh
-// -o names on both compilers): UNLIKE the pre-split ssh/imap files, the old
-// std/sql.sr COMPILED on both compilers -- silverc-rs exited 0 while warning
-// "unresolved call(s) trap at runtime: SQLExecDirect [in class connection]
-// [in fn execute]"; the self-hosted compiler exited 0 with NO warning at all
-// (it does not check unresolved calls). At RUNTIME the pre-split file was
-// dead or crashed on every path that did anything:
-// - execute(): called SQLExecDirect -- an ODBC API that lives in odbc32.dll,
-//   which is NOT among either compiler's DLL modules (win32.rs's table is
-//   kernel32/user32/ws2_32/winhttp/wininet/msvcrt/advapi32/shell32/version/
-//   registry), so the name was never grantable from `import *
-//   from win32.ws2_32`; rs documented the outcome itself (runtime trap
-//   warning) and the self-host emitted the call silently unresolved. The
-//   pre-split call shape (connStr, sql) did not even match ODBC's
-//   (StatementHandle, StatementText, TextLength) signature -- cargo-cult
-//   dead text.
-// - query(): STACK-OVERFLOWED (0xC00000FD) on BOTH compilers before returning
-//   -- root-caused under OVERLOAD DISPATCH BUG below (the two-arg overload's
-//   `this.query(sql)` delegation re-dispatches to itself).
-// - result: `private row[] rows;` was declared WITHOUT an initializer and
-//   never assigned, so hasNext()'s `this.rows.length()` was a null-array
-//   deref had query() ever returned, and next()'s unguarded
-//   `this.rows[this.idx]` was an out-of-bounds read on the (always empty)
-//   rows. Additionally `this.rows.length()` is the .length() CALL form,
-//   which is itself broken on the self-host for class-element arrays (see
-//   the ARRAY-LENGTH landmine below) -- a second latent crash.
-// - row: `private kvp<string, string> fields;` was NEVER initialized (the
-//   construct was empty), so get(name) read an uninitialized kvp. Probed via
-//   the identical shape in std/headers.sr's multimap: on silverc-rs the
-//   uninitialized kvp silently swallows writes (mm.set("a","b") then
-//   mm.get("a") returns "" -- the set no-ops) and .get on the fresh field
-//   returns null; on the self-host the same probe is an ACCESS VIOLATION
-//   (0xC0000005). No row instance was ever reachable anyway (result.rows
-//   was never populated), so get() was unreachable dead text.
-// - connect()/close(): the ONLY paths that worked -- connect wrapped the
-//   connStr in a connection and close() was an empty no-op. No socket call,
-//   no WSAStartup, no timeout, no framing existed anywhere in the file.
-//
 // HONESTY NOTE -- this is NOT a SQL client for any real server: there is NO
-// SQL wire protocol here and NONE was invented. Real SQL servers each speak
+// SQL wire protocol here and none is invented. Real SQL servers each speak
 // their own protocol (MySQL handshake, Postgres startup message, TDS, the
-// SQLite file format -- the last not even a socket protocol), and the
-// pre-split text contained no framing for ANY of them (nothing to preserve).
-// A real implementation for one dialect is a separate feature ticket. What
-// this split made live is exactly the pre-split intent's transport: the
+// SQLite file format -- the last not even a socket protocol), and no
+// framing for any of them exists in this file. A real implementation for
+// one dialect is a separate feature ticket. What this module implements is
+// exactly the transport: the
 // connStr's `Server=`/`Host=` and `Port=` keys are parsed with the pure
 // connValue/connHost/connPort helpers (ODBC-standard connection-string keys
 // -- string parsing, NOT a wire protocol), each execute()/query() opens one
 // real TCP connection (ssh exec()'s per-call shape), sends the SQL text as a
 // single CRLF-terminated line, reads the reply bounded (16 x 4096 bytes with
 // a 30 s SO_RCVTIMEO -- no path can hang), closes the socket and surfaces
-// the raw reply bytes through the ADDITIVE getLastReply(). result.rows stay
+// the raw reply bytes through getLastReply(). result.rows stay
 // EMPTY on this build -- there is no row framing to interpret the reply
 // with, so hasNext() is false and next() null; parsing peer bytes into rows
 // would be inventing a protocol. Against a fake listener (or a real server
@@ -107,9 +63,9 @@ mod export sql;
 // resolution, same as std/ssh.sr's client); a missing/empty Server or Port
 // fails the connect gracefully (execute/query become silent no-ops).
 //
-// OVERLOAD DISPATCH BUG (compiler-level, probed 2026-08 on BOTH compilers
+// OVERLOAD DISPATCH BUG (compiler-level, probed on BOTH compilers
 // with identical results -- reported here so the compiler team can pick it
-// up; NO compiler change was made for this split): same-name METHOD
+// up): same-name METHOD
 // overloads with DIFFERENT ARITIES dispatch by NAME to the LAST-DECLARED
 // overload, ignoring arity. Evidence (standalone probes, both compilers):
 // with `exec(string)` declared before `exec(string, object[])`, the ONE-arg
@@ -117,59 +73,56 @@ mod export sql;
 // declaration order reversed, the TWO-arg call `c.exec("B", [])` printed
 // "first1:B" (the one-arg body ran). A same-name delegation inside an
 // overload body (`this.query(sql)` inside the two-arg query) therefore
-// re-dispatches to ITSELF and recurses forever -- this is what made the
-// pre-split query() stack-overflow on both compilers. This also explains why
+// re-dispatches to ITSELF and recurses forever. (This also explains why
 // std/ssh.sr's authWithKey(string,string)/authWithKey(string,string,string)
-// pair "probed working": both bodies were empty no-ops, so the mis-dispatch
-// was invisible. WORKAROUND IN THIS FILE (no compiler change): the two-arg
+// pair "probes working": both bodies are empty no-ops, so the mis-dispatch
+// stays invisible.) HOW THIS FILE HANDLES IT (no compiler change): the two-arg
 // execute/query overloads do NOT delegate to this.execute/this.query -- each
 // calls a differently-named private implementation (runStatement/runQuery)
 // and carries its params unused, so both overloads of a name are
 // behaviorally identical and the name-only dispatch lands safely whichever
 // overload it picks.
 //
-// ARRAY-LENGTH LANDMINE (self-host, probed 2026-08): the `.length()` CALL
+// ARRAY-LENGTH LANDMINE (self-host): the `.length()` CALL
 // form on CLASS-element arrays (row[] and any user-class element type) reads
 // garbage on the self-hosted compiler (probed: an empty `= []`-assigned
 // elemD[] field reported 9442192; a 1-element local reported 18 then 19;
 // silverc-rs reported the correct 0/1 on the same sources), while the
 // `.length` PROPERTY form is correct on BOTH compilers (the std/guard.sr
-// posture -- this.vars.length everywhere). The pre-split hasNext()'s
-// `this.rows.length()` was therefore a THIRD latent crash on the self-host.
-// This file uses the property form for row[] exclusively (string[] keeps the
+// posture -- this.vars.length everywhere). This file uses the property form
+// for row[] exclusively (string[] keeps the
 // call form where csv.sr precedent uses it -- the breakage is specific to
 // class-element arrays).
 //
-// KVP LANDMINE (probed 2026-08): an UNINITIALIZED `kvp<K,V>` field is not
+// KVP LANDMINE (probed): an UNINITIALIZED `kvp<K,V>` field is not
 // usable -- rs silently swallows set() and get() returns null; the self-host
 // access-violates on the first set() (probed via std/headers.sr's multimap,
 // which carries the same uninitialized-kvp latent bug -- NOT fixed here,
 // that file is out of this task's scope, as is std/sqlite.sr's copy of the
-// same pattern). This file's row replaces the kvp with two parallel
+// same pattern). This file's row uses two parallel
 // `= []`-initialized string[] arrays (the guard.sr/csv-writer posture) and
 // keeps get()'s contract: the matching value, or null when the name is
-// absent (the kvp.get contract the pre-split delegation targeted).
+// absent (the kvp.get contract).
 //
-// API PRESERVATION (every public name/arity of the pre-split file,
-// unchanged): class row -- construct(), get(string) -> string; class result
+// PUBLIC API: class row -- construct(), get(string) -> string; class result
 // -- construct(), hasNext() -> bool, next() -> row; class connection --
 // construct(string), execute(string), execute(string, object[]), query(string)
 // -> result, query(string, object[]) -> result, close(); free function
-// connect(string) -> connection. NO RENAMES were needed: every pre-split
-// name (row, result, connection, get, hasNext, next, execute, query, close,
-// connect) is keyword-free on both compilers -- checked against silverc-rs
+// connect(string) -> connection. Every name (row, result, connection, get,
+// hasNext, next, execute, query, close, connect) is keyword-free on both
+// compilers -- checked against silverc-rs
 // src/token.rs (read_identifier_or_keyword, lines 427-495) and the self-host
 // compiler/lexer.sr (keywordKind, lines 656-718). The dangerous SQL-adjacent
 // identifiers are clear: `from`/`to`/`match` are keywords on both and appear
 // nowhere in this API; `select`/`insert` are keywords on NEITHER and are not
 // member names here anyway (SQL text is caller-supplied data, not API).
-// `object[]` params survive verbatim (the type parses on both compilers --
-// probed). The pre-split declaration ORDER of the overload pairs is kept
+// `object[]` params survive as-is (the type parses on both compilers --
+// probed). The declaration ORDER of the overload pairs is kept
 // (one-arg first, two-arg second), which under the dispatch bug means the
 // two-arg bodies serve every call shape -- they are behaviorally identical
 // to the one-arg bodies by construction (see the dispatch bug note).
 //
-// ADDITIVE (the std/ssh.sr precedent, documented): connection.getLastReply()
+// ADDITIONAL SURFACE (the std/ssh.sr precedent): connection.getLastReply()
 // returns the raw text of the last reply bytes read from the peer (""
 // before the first statement, after a failed connect, or when the peer said
 // nothing); row.has(name) is the containment test (get returns null for
@@ -182,17 +135,15 @@ mod export sql;
 // case-insensitively, "" when absent) and its wrappers connHost(connStr)
 // (Server, falling back to Host) and connPort(connStr) (Port as a decimal,
 // 0 when absent/non-numeric/> 65535) -- are pure and probeable
-// byte-identically on both compilers. Also additive and invisible: the
-// private lastReply field (initialized in construct -- the pre-split
-// connection had no such state), the private runStatement/runQuery/readBounded
-// plumbing, and construct() now also initializes row's arrays (the pre-split
-// construct left the kvp field uninitialized -- see the KVP landmine).
+// byte-identically on both compilers. Also invisible internals: the
+// private lastReply field (initialized in construct), the private
+// runStatement/runQuery/readBounded
+// plumbing, and construct() also initializes row's arrays.
 // Method calls inside this class ALWAYS carry an explicit `this.`: probed on
 // silverc-rs, an unqualified call to a private METHOD (readBounded inside
 // runStatement) is resolved as a FREE function and emitted UNRESOLVED
 // ("unresolved call(s) trap at runtime: readBounded [in class connection]
-// [in fn runStatement]") -- the same warning shape the pre-split file's
-// SQLExecDirect produced.
+// [in fn runStatement]").
 //
 // CALLER NOTES: instantiate with `var c = connect(...);` -- a lowercase class
 // arriving from a star-imported module cannot be spelled as a local's type on
@@ -205,12 +156,12 @@ mod export sql;
 // returns null once exhausted (and always on this build -- rows stay empty
 // until a real protocol lands); row.get returns null for absent names --
 // check row.has() first. There is NO session: every statement is one
-// connect/send/read/close cycle (the ssh exec() shape) and close() is the
-// pre-split no-op kept verbatim (nothing to close between statements).
+// connect/send/read/close cycle (the ssh exec() shape) and close() is a
+// no-op (nothing to close between statements).
 
 // Escapes `v` as an SQL string literal: wrapped in single quotes with every
 // internal single quote doubled (the SQL-standard doubling; dialect-specific
-// backslash escapes are NOT invented). ADDITIVE, pure; probeable
+// backslash escapes are NOT invented). Pure; probeable
 // byte-identically on both compilers.
 public string escapeLiteral(string v) {
     string outS = "'";
@@ -226,7 +177,7 @@ public string escapeLiteral(string v) {
 }
 
 // Escapes `name` as an SQL identifier: wrapped in double quotes with every
-// internal double quote doubled. ADDITIVE, pure; probeable.
+// internal double quote doubled. Pure; probeable.
 public string escapeIdentifier(string name) {
     string outS = "\"";
     for (int i = 0; i < name.length; i++) {
@@ -242,7 +193,7 @@ public string escapeIdentifier(string name) {
 
 // The value of the first `key=value;` pair in the ODBC-style connection
 // string (keys compared case-insensitively), "" when the key is absent.
-// ADDITIVE, pure; probeable.
+// Pure; probeable.
 public string connValue(string connStr, string key) {
     int n = connStr.length;
     string keyL = key.toLower();
@@ -265,7 +216,7 @@ public string connValue(string connStr, string key) {
 
 // The connection string's host: its `Server=` value, falling back to
 // `Host=`; "" when neither is present (the caller's connect then fails
-// gracefully). ADDITIVE, pure; probeable.
+// gracefully). Pure; probeable.
 public string connHost(string connStr) {
     string v = connValue(connStr, "server");
     if (v.length > 0) { return v; }
@@ -274,7 +225,7 @@ public string connHost(string connStr) {
 
 // The connection string's `Port=` value as a decimal; 0 when absent,
 // non-numeric, or above 65535 (an invalid port fails the connect
-// gracefully). ADDITIVE, pure; probeable.
+// gracefully). Pure; probeable.
 public int connPort(string connStr) {
     string v = connValue(connStr, "port");
     int n = 0;
@@ -296,8 +247,8 @@ class row {
         this.values = [];
     }
 
-    // The pre-split API: the value stored under `name`, or null when absent
-    // (the kvp.get contract the pre-split delegation targeted). On this
+    // The value stored under `name`, or null when absent
+    // (the kvp.get contract). On this
     // build rows are never populated (no row framing exists -- see the
     // honesty note), so every get() returns null; the parallel-array
     // implementation exists so a future protocol can fill rows without an
@@ -311,7 +262,7 @@ class row {
         return null;
     }
 
-    // ADDITIVE: true when `name` is present (get returns null for absent
+    // True when `name` is present (get returns null for absent
     // names, so has() is the non-null check callers want).
     public bool has(string name) {
         for (int i = 0; i < this.names.length; i++) {
@@ -332,18 +283,17 @@ class result {
         this.rows = [];
     }
 
-    // The pre-split API, made safe: the `.length` PROPERTY form (the
+    // Row iteration: the `.length` PROPERTY form (the
     // .length() CALL form reads garbage on the self-host for class-element
-    // arrays -- see the ARRAY-LENGTH landmine; the pre-split used the call
-    // form on a never-initialized array -- a null-deref besides). False on
+    // arrays -- see the ARRAY-LENGTH landmine; the call form also breaks on
+    // a never-initialized array -- a null-deref besides). False on
     // this build (rows stay empty until a real protocol lands).
     public bool hasNext() {
         return this.idx < this.rows.length;
     }
 
-    // The pre-split API, made safe: the pre-split unguarded
-    // `this.rows[this.idx]` was an out-of-bounds read on the empty rows;
-    // this guard returns null once exhausted (and always on this build).
+    // The row at the cursor, advancing it; the guard returns null once
+    // exhausted (and always on this build).
     public row next() {
         if (this.idx >= this.rows.length) { return null; }
         row r = this.rows[this.idx];
@@ -361,7 +311,7 @@ class connection {
         this.lastReply = "";
     }
 
-    // ADDITIVE (the std/ssh.sr getLastReply precedent): the raw text of the
+    // The raw text of the
     // last reply bytes read from the peer -- "" before the first statement,
     // after a failed connect, or when the peer said nothing and closed.
     // This is the graceful-failure surface: against a non-SQL listener it
@@ -370,7 +320,7 @@ class connection {
         return this.lastReply;
     }
 
-    // The pre-split one-arg execute, made live: one per-statement connect /
+    // One per-statement connect /
     // send / bounded read / close cycle (see the honesty note -- the SQL
     // text goes out as one CRLF-terminated line and the raw reply, if any,
     // lands in getLastReply()). Silent no-op when the connStr names no
@@ -382,16 +332,16 @@ class connection {
         this.runStatement(sql);
     }
 
-    // The pre-split two-arg execute; params are carried unused exactly as
-    // the pre-split body carried them (it delegated and dropped them).
-    // Deliberately does NOT call this.execute(sql) -- that delegation
-    // re-dispatches to the last-declared same-name overload (itself) and
-    // recurses forever on BOTH compilers (the pre-split query() crash).
+    // Two-arg execute; params are carried unused (no client-side
+    // substitution). Deliberately does NOT call this.execute(sql) -- that
+    // delegation re-dispatches to the last-declared same-name overload
+    // (itself) and recurses forever on both compilers (see the dispatch bug
+    // note).
     public void execute(string sql, object[] params) {
         this.runStatement(sql);
     }
 
-    // The pre-split one-arg query: runs the statement like execute() and
+    // Runs the statement like execute() and
     // returns a result whose rows stay EMPTY on this build (no row framing
     // exists to interpret the reply -- see the honesty note); the raw reply
     // is in getLastReply().
@@ -399,13 +349,13 @@ class connection {
         return this.runQuery(sql);
     }
 
-    // The pre-split two-arg query; params carried unused, no same-name
+    // Two-arg query; params carried unused, no same-name
     // delegation (see the dispatch bug note).
     public result query(string sql, object[] params) {
         return this.runQuery(sql);
     }
 
-    // Pre-split empty stub, preserved verbatim: there is no session socket
+    // No-op: there is no session socket
     // to close -- every statement owns one connect/send/read/close cycle and
     // closes it before returning.
     public void close() { }
@@ -415,7 +365,7 @@ class connection {
     // send / bounded read / close cycle through the net primitives (see the
     // TRANSPORT note): connectRaw to the connStr's host:port, the 30 s
     // receive timeout armed right after, the SQL line sent CRLF-terminated
-    // with sendRawLen's explicit length (the pre-fold sqlWinSend shape), the
+    // with sendRawLen's explicit length, the
     // bounded reply read, closeRaw before returning. Silent no-op when the
     // connStr names no reachable Server/Port.
     private void runStatement(string sql) {
@@ -453,9 +403,9 @@ class connection {
     }
 }
 
-// The pre-split free function, verbatim: wraps the connStr in a connection.
-// No network happens here (the pre-split shape -- connections happen
-// per-statement, see the honesty note).
+// Wraps the connStr in a connection.
+// No network happens here -- connections happen
+// per-statement (see the honesty note).
 public connection connect(string connStr) {
     return new connection(connStr);
 }

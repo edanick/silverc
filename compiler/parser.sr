@@ -174,13 +174,12 @@ class Parser {
             || this.strEq(cur.text, "int32") || this.strEq(cur.text, "int64")
             || this.strEq(cur.text, "float64") || this.strEq(cur.text, "string")
             || this.strEq(cur.text, "boolean")) { return false; }
-        // UNIFIED_CORE_LIBRARY.md §7.4 #9: any `T ident` (or `T[] ident`,
-        // `T? ident`, `<T> ident`) declaration shape is accepted — the
-        // declaration type name is validated later (type checker / codegen
-        // resolve it against the flattened aggregate), mirroring the rs
-        // compiler's decl-shape heuristic (silverc-rs 7ca4ca7).  This covers
-        // imported classes the parser has not reached yet and same-file
-        // classes declared after use.
+        // Any `T ident` (or `T[] ident`, `T? ident`, `<T> ident`)
+        // declaration shape is accepted — the declaration type name is
+        // validated later (type checker / codegen resolve it against the
+        // flattened aggregate), mirroring the rs compiler's decl-shape
+        // heuristic.  This covers imported classes the parser has not
+        // reached yet and same-file classes declared after use.
         if (nk == 7 && this.pos + 2 < this.tokens.length && this.tokens[this.pos + 2].kind == 100) {
             // `T name (` is a function-signature shape — legacy sources use
             // non-keyword return spellings there; leave it to parseFunction.
@@ -546,8 +545,8 @@ class Parser {
         // function: allowed for zero-arg calls only (the stored address is
         // called, arguments cannot be passed).
         if (this.anonWalkDepth == 0 && call.childCount() == 0 && this.fnPtrCallScopeHas(name)) { return; }
-        // Dotted names (dotted-new attempts, UNIFIED_CORE_LIBRARY.md 7.4 #8)
-        // are never free functions of this pass — in anonymous bodies too:
+        // Dotted names (dotted-new candidates) are never free functions of
+        // this pass — in anonymous bodies too:
         // codegen resolves them through the module namespace or reports
         // `Unknown type '<name>'`, matching the reference compiler for known
         // and unknown modules.
@@ -753,11 +752,10 @@ class Parser {
         if (this.strEq(name, "GetWindowThreadProcessId") || this.strEq(name, "OpenProcess")) { return true; }
         if (this.strEq(name, "QueryFullProcessImageNameA") || this.strEq(name, "CloseHandle")) { return true; }
         if (this.strEq(name, "getFocusedProcessDataNative")) { return true; }
-        // UNIFIED_CORE_LIBRARY.md phase 2 -- std/os.sr's plain-Silver
-        // `osType()` gate helper. The `os` module is builtin-reserved in the
-        // self-hosted compiler, so the source defining osType is never
-        // collected; the backend mirrors silverc-rs's native os.type
-        // contract instead (compile-time OSTypes.WINDOWS constant).
+        // std/os.sr defines `osType()` as plain Silver, but the `os` module
+        // is builtin-reserved in the self-hosted compiler, so its source is
+        // never collected; the backend provides the native os.type contract
+        // (compile-time OSTypes.WINDOWS constant).
         if (this.strEq(name, "osType")) { return true; }
         if (this.strEq(name, "__binaryMetadataStatus") || this.strEq(name, "__binaryMetadataField")) { return true; }
         if (this.strEq(name, "__binaryMetadataStatusNative") || this.strEq(name, "__binaryMetadataFieldNative")) { return true; }
@@ -1298,10 +1296,10 @@ class Parser {
             }
             node.typeHint = src;
         }
-        // UNIFIED_CORE_LIBRARY.md phase 2 -- `X as Y` import aliasing. An
-        // alias binds a DLL export under a different local call name, which
-        // only carries meaning on win32 imports; on a Silver-module import
-        // it would silently rebind the module's own symbols, so reject it.
+        // `X as Y` import aliasing. An alias binds a DLL export under a
+        // different local call name, which only carries meaning on win32
+        // imports; on a Silver-module import it would silently rebind the
+        // module's own symbols, so reject it.
         if (this.importHasAlias(node) && !this.importSourceIsWin32(node.typeHint)) {
             this.recordError("aliased import names (X as Y) are only allowed on win32 imports, at line " + node.line.toString() + ", column " + node.col.toString());
         }
@@ -1312,10 +1310,9 @@ class Parser {
         return node;
     }
 
-    // One name inside an import list: `export` or `export as local`
-    // (UNIFIED_CORE_LIBRARY.md phase 2). The alias local rides on the
-    // node's strVal with isAlias set, keeping the import node shape
-    // unchanged for every other consumer.
+    // One name inside an import list: `export` or `export as local`.
+    // The alias local rides on the node's strVal with isAlias set, keeping
+    // the import node shape unchanged for every other consumer.
     private Node parseImportNameNode() {
         Node nameNode = new Node();
         nameNode.name = this.advance().text;
@@ -1367,8 +1364,7 @@ class Parser {
                 return;
             }
             // Aliased grants answer only to the LOCAL name (the alias), so
-            // the diagnostics walk must accept the alias, never the export
-            // (UNIFIED_CORE_LIBRARY.md phase 2).
+            // the diagnostics walk must accept the alias, never the export.
             this.win32GrantNames.add(this.importLocalName(node));
             for (int j2 = 0; j2 < node.childCount(); j2++) {
                 this.win32GrantNames.add(this.importLocalName(node.child(j2)));
@@ -2860,7 +2856,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             // the constructor path -- silverc-rs distinguishes the two at
             // parse level and resolves the DLL export first.
             ctor.isStatic = true;
-            // Dotted-new (UNIFIED_CORE_LIBRARY.md 7.4 #8): a qualified class
+            // Dotted-new: a qualified class
             // name `new mod.Class(args)` — any chain depth, the last segment
             // is the class. Joined into a single dotted call name; codegen
             // resolves it through the module's flattened namespace. Each
@@ -2876,7 +2872,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 // that many zeroed slots.  A non-literal size expression
                 // marks an op=2 runtime-sized allocation node (child 0 = the
                 // size expression) that codegen lowers through the same
-                // HeapAlloc shape silverc-rs emits — net_win.sr's
+                // HeapAlloc shape silverc-rs emits — net.sr's
                 // `new int[slots]` buffers depend on it.
                 this.advance();
                 Node sizeExpr = this.parseExpr(0);

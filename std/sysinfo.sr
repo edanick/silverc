@@ -2,15 +2,14 @@ import * from env;
 
 mod export sysinfo;
 
-// DOCS -- public `sysinfo` module (UNIFIED_CORE_LIBRARY.md v2 canonical
-// fold). This is the universal system-information library: there is no
-// sysinfo_win.sr backend and no win-named helpers -- one module, one OS layer
-// (sysinfo -> win32.kernel32 + win32.advapi32). The canonical shape puts each
-// raw OS call INSIDE its public function's body behind a `#on WINDOWS` ...
-// `#off` region: one unified function name, no wrapper indirection, no
-// `#else`, no LINUX/MAC placeholders (the non-Windows regions get filled on
-// their own machines later). The osType() runtime gates are gone: the
-// preprocessor replaces them, so `import * from os;` is not needed here.
+// DOCS -- public `sysinfo` module. This is the universal system-information
+// library -- one module, one OS layer (sysinfo -> win32.kernel32 +
+// win32.advapi32), no win-named helpers. Each raw OS call lives INSIDE its
+// public function's body behind a `#on WINDOWS` ... `#off` region: one
+// unified function name, no wrapper indirection, no `#else`, no LINUX/MAC
+// placeholders (the non-Windows regions get filled on their own machines
+// later). OS selection is compile-time via the preprocessor regions, so the
+// runtime `os.type` check is not used here.
 //
 // IMPORT ORDER NOTE: GetUserNameA's true home is advapi32.dll (kernel32
 // does not export it -- an exe importing it from kernel32 dies at load with
@@ -24,13 +23,11 @@ mod export sysinfo;
 // cpuUsage() (stub), processName() (stub), networkIPs() (stub),
 // memoryUsed()/diskUsagePercent() (pure derivations through gated calls),
 // os() (returns "windows" unconditionally -- silverc only emits Windows PEs),
-// and homeDir()/tempDir()/env() (pure `env` std delegation). os() dropped the
-// pre-fold dead GetVersionEx(null) call; cpuModel() reads the kernel's
-// ProcessorNameString registry value instead of the untabled
-// msvcrt!__cpuid intrinsic; lang() preserves the pre-split LANGID byte math
-// verbatim, including its quirk of emitting the high/low LANGID bytes, "-",
-// then the same two bytes again (five chars, e.g. "\x09\x04-\x09\x04" for
-// en-US = 0x0409). Changing it would change the documented API result.
+// and homeDir()/tempDir()/env() (pure `env` std delegation). cpuModel()
+// reads the kernel's ProcessorNameString registry value. lang() emits the
+// high/low LANGID bytes, "-", then the same two bytes again (five chars,
+// e.g. "\x09\x04-\x09\x04" for en-US = 0x0409); that quirk is the documented
+// API result.
 //
 // BUFFER IDIOMS (cross-compiler proven): fixed-size Win32 struct queries use
 // int[] qword-slot buffers -- Silver arrays store one 8-byte element per
@@ -49,8 +46,8 @@ mod export sysinfo;
 // BOTH compilers' lexers resolve that escape to the digit character '0'
 // (0x30), which would truncate every name at its first zero digit.
 // GlobalMemoryStatusEx / GetDiskFreeSpaceExA / GetSystemInfo calls are
-// deliberately DUPLICATED per function (no helpers) per the canonical fold
-// shape.
+// deliberately DUPLICATED per function (no helpers) -- one unified public
+// function per operation with its OS code inline.
 
 // Writable string buffer of n bytes (spaces) for NUL-terminated Win32 data.
 string blankBuf(int n) {

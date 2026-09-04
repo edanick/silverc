@@ -1,27 +1,25 @@
 mod export console;
 
-// DOCS -- public `console` module (UNIFIED_CORE_LIBRARY.md §4, the CANONICAL
-// FOLD SHAPE). This is the universal, portable console library. There is no
-// console_win.sr backend -- the kernel32 calls live inline in the `#on
-// WINDOWS` region of the public function that needs them, one unified
-// function name per operation, no win-prefixed helpers, no wrapper
-// indirection, no alias imports, no osType() gates.
+// DOCS -- public `console` module. This is the universal, portable console
+// library -- one module, one OS layer (console -> win32.kernel32). The
+// kernel32 calls live inline in the `#on WINDOWS` region of the public
+// function that needs them, one unified function name per operation, no
+// win-prefixed helpers, no wrapper indirection, no alias imports; OS
+// selection is compile-time via the preprocessor regions, so the runtime
+// `os.type` check is not used here.
 //
-// BEHAVIOR NOTES (bodies are moved verbatim from the pre-fold implementations
-// so behavior is unchanged): the three attribute writers fetch the
-// STD_OUTPUT_HANDLE pseudo-handle (GetStdHandle(-11), the exact constant the
-// pre-fold module used) and forward the masked color to
-// kernel32!SetConsoleTextAttribute -- foreground masks the low nibble,
-// background masks and shifts it into the high nibble, reset restores the
-// default light-gray-on-black attribute 7. The handle lands in a local first
-// because nested grant calls as arguments are not a shape the backends rely
-// on. setTitle/getTitle/clear, rgb/bgRgb and the color-tag helpers are pure
-// Silver -- ANSI control sequences and string building through the
-// print/printline builtins with no DLL backing -- so they are NOT gated
-// (DOCS/245: ANSI is safe for redirected output) and keep their original
-// shape.
+// BEHAVIOR NOTES: the three attribute writers fetch the
+// STD_OUTPUT_HANDLE pseudo-handle (GetStdHandle(-11)) and forward the masked
+// color to kernel32!SetConsoleTextAttribute -- foreground masks the low
+// nibble, background masks and shifts it into the high nibble, reset
+// restores the default light-gray-on-black attribute 7. The handle lands in
+// a local first because nested grant calls as arguments are not a shape the
+// backends rely on. setTitle/getTitle/clear, rgb/bgRgb and the color-tag
+// helpers are pure Silver -- ANSI control sequences and string building
+// through the print/printline builtins with no DLL backing -- so they are
+// NOT gated (ANSI is safe for redirected output).
 //
-// DISPATCH NOTE (unchanged by this fold): silverc-rs answers console calls
+// DISPATCH NOTE: silverc-rs answers console calls
 // with its native builtin (src/stdlib/console.rs gen_console_call) before any
 // module source is consulted, and it never collects this file (console is in
 // main.rs's builtin_modules_set), so the DLL-backed bodies below are dead
@@ -30,8 +28,8 @@ mod export console;
 // builtins and dispatches those calls to these globals. The `console.title`
 // property is the one native sliver on the self-hosted side too: mini_cg
 // answers a read with the documented empty-string fallback and rewrites a
-// write into a setTitle call that lands on this file, exactly as before the
-// fold. Both paths produce the same behavior as the pre-fold module.
+// write into a setTitle call that lands on this file. Both paths produce
+// the same behavior.
 
 public const int Black = 0;
 public const int DarkBlue = 1;
@@ -75,7 +73,7 @@ public void reset() {
 
 public void foreground(int color) { setForeground(color); }
 
-// DOCS/245: terminal title and clear-screen helpers. ANSI control sequences
+// Terminal title and clear-screen helpers. ANSI control sequences
 // are safe for redirected output and work in Windows Terminal/conhost.
 public void setTitle(string value) {
     print("\x1b]0;" + value + "\x07");

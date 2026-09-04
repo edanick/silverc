@@ -1,8 +1,7 @@
-import * from os;
 
 mod export system_tray;
 
-// DOCS/249 -- System Tray Icon (UNIFIED_CORE_LIBRARY.md Phase 2).
+// DOCS -- System Tray Icon.
 //
 // The `TrayIcon` class wraps shell32!Shell_NotifyIconA (NIM_ADD / NIM_MODIFY /
 // NIM_DELETE).  silverc-rs emits the real Win32 sequence for the
@@ -18,19 +17,17 @@ mod export system_tray;
 // `handle` is the opaque native HWND of the hidden helper window (0 once the
 // icon has been disposed, or when the current backend is a no-op).
 //
-// UNIFIED_CORE_LIBRARY.md Phase 2 -- this is the unified, portable front of
-// the tray library. It contains ZERO win32 imports and ZERO DLL grants --
-// and, unlike the smtp/gui/mongo/... pairs, there is NO system_tray_win
-// backend file at all. Every native touch below is a compiler-synthesized
-// bare bridge (trayAdd/traySetTooltip/trayDelete/trayRemove/traySetMenu/
-// trayRunLoop/trayPollMenu/trayPollClick), dispatched BY NAME from any
-// module on both compilers (probed 2026-08-31), so there are no win32.*
-// grants to isolate behind a backend and nothing for one to carry. Per the
-// split rule ("backend ONLY IF real DLL grants are needed") the split adds
-// the osType() OS gate and the dispatch/parity documentation only; the
-// observable behavior is unchanged (re-probed byte-identical post-split).
+// This is the unified, portable front of the tray library. It contains ZERO
+// win32 imports and ZERO DLL grants: every native touch below is a
+// compiler-synthesized bare bridge (trayAdd/traySetTooltip/trayDelete/
+// trayRemove/traySetMenu/trayRunLoop/trayPollMenu/trayPollClick), dispatched
+// BY NAME from any module on both compilers, so there are no win32.*
+// grants to isolate and no backend file to carry them. Every bridge call
+// sits inside a `#on WINDOWS ... #off` preprocessor region (the preprocessor
+// replaces the old osType() runtime gates -- see UNIFIED_CORE_LIBRARY.md);
+// on Windows builds the calls are bit-identical to the old gated ones.
 //
-// DISPATCH (per compiler, verified in source 2026-08-31; THIS IS WHY THE
+// DISPATCH (per compiler; THIS IS WHY THE
 // BARE BRIDGE CALLS BELOW ARE SAFE -- preserve exactly):
 //
 // - silverc-rs: `system_tray` is NOT builtin-reserved (src/main.rs:81
@@ -42,12 +39,12 @@ mod export system_tray;
 //   the real Win32 sequence: shell32!Shell_NotifyIconA (NIM_ADD /
 //   NIM_MODIFY / NIM_DELETE with a NOTIFYICONDATAA), a generated tray
 //   WndProc (WM_DESTROY -> PostQuitMessage, WM_APP+1 left-click counting,
-//   right-click popup menu), and the hidden "SilverTrayWindow" helper window
-//   via the DOCS/248 gui sentinels. The user32 menu/click imports
+//   right-click popup menu), and the hidden "SilverTrayWindow" helper window.
+//   The user32 menu/click imports
 //   (CreatePopupMenu, AppendMenuA, TrackPopupMenu, DestroyMenu,
 //   SetForegroundWindow, GetCursorPos, PostMessageA) are registered by the
 //   compiler itself (stdlib/system_tray.rs emit_tray_imports, IAT indices
-//   107..=113) alongside the DOCS/247 notification imports -- no win32.*
+//   107..=113) alongside the notification imports -- no win32.*
 //   Silver grant exists or is needed anywhere in this module.
 //
 // - self-hosted silverc: `system_tray` is NOT builtin-reserved either
@@ -61,18 +58,12 @@ mod export system_tray;
 //   :7049-7058 lowers them to no-ops returning 0, so the class links and
 //   runs without a native tray shell.
 //
-// - silveri (context, no changes allowed in this split): whole-module
+// - silveri: whole-module
 //   behavior is the interpreter's own concern; this file is not read there.
 //
-// OS GATE: every bridge call routes through `if (osType() == OSTypes.WINDOWS)`
-// (osType() is std/os.sr's plain-Silver stand-in -- NEVER the native os.type
-// query: the self-host's os builtin dispatch only covers os.name/os.version/
-// os.build, and parser.sr:739 + mini_cg.sr:7112 answer bare osType() calls
-// natively while mini_cg.sr:3291-3301 answers OSTypes members; on silverc-rs
-// the sibling std/os.sr collected next to this file provides both). The gate
-// is the compile-time WINDOWS constant on this backend, so the gated calls
-// are bit-identical to the pre-split ungated ones. The else side is
-// unreachable today (silverc only emits Windows PEs); for a future
+// REGIONS: every bridge call sits inside `#on WINDOWS ... #off` (the
+// preprocessor replaces the old osType() runtime gates). The non-Windows
+// side is unreachable today (silverc only emits Windows PEs); for a future
 // non-Windows backend the class degrades to a headless state record: the
 // constructor leaves `handle` 0, show/hide still maintain the `shown` flag,
 // setTooltip/setMenu still record the requested strings, and every bridge
@@ -85,28 +76,26 @@ mod export system_tray;
 // It opens with `import * from win32.user32;` (vestigial -- the bare bridges
 // are name-intercepted before any win32 grant resolution, so the grant
 // carries nothing the bridges need) and calls the same eight bare bridges
-// ungated. That copy is OUT OF SCOPE for this split and was left untouched;
-// both copies expose the identical public API below and both compile under
-// both compilers. This file is the copy the self-host collects (and the one
-// rs collects when resolution lands on silverc\std, e.g. cwd = silverc\).
+// ungated. Both copies expose the identical public API below and both
+// compile under both compilers. This file is the copy the self-host collects
+// (and the one rs collects when resolution lands on silverc\std, e.g.
+// cwd = silverc\).
 //
-// API PRESERVATION (every public name of the pre-split file, unchanged):
+// API SURFACE (every public name, unchanged):
 // class TrayMenuItem (title/id construct, getTitle, getId); class TrayIcon
 // (name/icon construct, getName, getIcon, getTooltip, getHandle, isShown,
 // setTooltip, show, hide, dispose, setMenu, getMenu, run, pollClick,
 // pollMenu). The classes stay defined IN this wrapper because user code
 // bare-news them here (cross-module instances are a probed rs landmine).
-// No additions: the DOCS/249 onClick/onMenu callback design was never
-// implemented and is not invented here (anon-fn closure capture is a
+// No additions: the onClick/onMenu callback design lives only in the design
+// doc and is not invented here (anon-fn closure capture is a
 // documented compiler landmine).
 //
-// DEAD VS LIVE (probed 2026-08-31 with fresh -o binaries on both compilers,
-// pre- and post-split outputs byte-identical):
-// - silverc-rs: the whole class is LIVE -- the probe performed one real
+// DEAD VS LIVE (per compiler):
+// - silverc-rs: the whole class is LIVE -- the bridge performs a real
 //   add + tooltip-modify + menu-register + hide/show + dispose cycle
-//   (fire-and-forget, auto-cleaned via trayRemove; run() was compile-proof
-//   only because trayRunLoop BLOCKS on this backend: a GetMessageA pump
-//   until WM_QUIT or a pending tray event).
+//   (fire-and-forget, auto-cleaned via trayRemove; run() blocks on this
+//   backend: a GetMessageA pump until WM_QUIT or a pending tray event).
 // - self-hosted silverc: the bridges are NO-OPS by design
 //   (mini_cg.sr:7049-7058) -- the class is a headless state record there:
 //   handle stays 0, pollClick/pollMenu answer 0/"".
@@ -141,9 +130,9 @@ class TrayIcon {
         this.handle = 0;
         this.shown = true;
         this.menu = [];
-        if (osType() == OSTypes.WINDOWS) {
-            this.handle = trayAdd(name, icon);
-        }
+        #on WINDOWS
+        this.handle = trayAdd(name, icon);
+        #off
         // Non-Windows fallback: no tray backend yet, `handle` stays 0
         // ("no icon") and every method below guards on it.
     }
@@ -156,31 +145,31 @@ class TrayIcon {
 
     public void setTooltip(string t) {
         this.tooltip = t;
-        if (osType() == OSTypes.WINDOWS) {
-            if (this.shown && this.handle != 0) { traySetTooltip(this.handle, t); }
-        }
+        #on WINDOWS
+        if (this.shown && this.handle != 0) { traySetTooltip(this.handle, t); }
+        #off
     }
 
     public void show() {
         if (!this.shown) {
-            if (osType() == OSTypes.WINDOWS) {
-                this.handle = trayAdd(this.tooltip, this.icon);
-            }
+            #on WINDOWS
+            this.handle = trayAdd(this.tooltip, this.icon);
+            #off
             this.shown = true;
         }
     }
 
     public void hide() {
-        if (osType() == OSTypes.WINDOWS) {
-            if (this.shown && this.handle != 0) { trayDelete(this.handle); }
-        }
+        #on WINDOWS
+        if (this.shown && this.handle != 0) { trayDelete(this.handle); }
+        #off
         this.shown = false;
     }
 
     public void dispose() {
-        if (osType() == OSTypes.WINDOWS) {
-            if (this.handle != 0) { trayRemove(this.handle); }
-        }
+        #on WINDOWS
+        if (this.handle != 0) { trayRemove(this.handle); }
+        #off
         this.handle = 0;
         this.shown = false;
     }
@@ -197,9 +186,9 @@ class TrayIcon {
             if (i > 0) { titles = titles + "\n"; }
             titles = titles + items[i].getTitle();
         }
-        if (osType() == OSTypes.WINDOWS) {
-            if (this.handle != 0) { traySetMenu(this.handle, titles); }
-        }
+        #on WINDOWS
+        if (this.handle != 0) { traySetMenu(this.handle, titles); }
+        #off
     }
 
     public TrayMenuItem[] getMenu() { return this.menu; }
@@ -208,24 +197,28 @@ class TrayIcon {
     // live silverc-rs backend (GetMessageA pump) -- callers re-enter to
     // poll; no-op on the self-host.
     public void run() {
-        if (osType() == OSTypes.WINDOWS) { trayRunLoop(); }
+        #on WINDOWS
+        trayRunLoop();
+        #off
     }
 
     // Number of left-clicks since the last poll (resets the counter).
     public int pollClick() {
-        if (osType() == OSTypes.WINDOWS) { return trayPollClick(); }
+        #on WINDOWS
+        return trayPollClick();
+        #off
         return 0;
     }
 
     // The `id` of the last selected menu item ("" when none / dismissed).
     public string pollMenu() {
-        if (osType() == OSTypes.WINDOWS) {
-            int cmd = trayPollMenu();
-            if (cmd >= 1 && cmd <= this.menu.length) {
-                TrayMenuItem item = this.menu[cmd - 1];
-                return item.getId();
-            }
+        #on WINDOWS
+        int cmd = trayPollMenu();
+        if (cmd >= 1 && cmd <= this.menu.length) {
+            TrayMenuItem item = this.menu[cmd - 1];
+            return item.getId();
         }
+        #off
         return "";
     }
 }

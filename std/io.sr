@@ -1,41 +1,35 @@
 mod export io;
 
-// DOCS -- public `io` module (UNIFIED_CORE_LIBRARY.md v2 canonical fold).
-// This is the universal standard-input module: there is no io_win.sr backend
-// and no win-named helpers -- one module, one OS layer (io -> win32.kernel32).
-// The canonical shape puts the raw OS calls INSIDE the public readLine
-// body behind a `#on WINDOWS` ... `#off` region: one unified function name,
-// no wrapper indirection, no `#else`, no LINUX/MAC placeholders (the
-// non-Windows regions get filled on their own machines later). The osType()
-// runtime gate is gone: the preprocessor replaces it, so
-// `import * from os;` is not needed here. Plain
-// `import * from win32.kernel32;` -- alias imports are removed in v2;
-// neither GetStdHandle nor ReadFile collides with this module's public API
-// (readLine/input).
+// DOCS -- public `io` module (see UNIFIED_CORE_LIBRARY.md).
+// This is the universal standard-input module: one module, one OS layer
+// (io -> win32.kernel32). The raw OS calls live INSIDE the public readLine
+// body behind a `#on WINDOWS` ... `#off` region -- one unified function
+// name, no win-prefixed helpers, no wrapper indirection. There is no
+// `#else` and no LINUX/MAC placeholders in std; the non-Windows regions get
+// filled on their own machines later. The preprocessor selects the OS code
+// at compile time, so `import * from os;` is not needed here. The kernel32
+// grant is a plain `import * from win32.kernel32;`; neither GetStdHandle
+// nor ReadFile collides with this module's public API (readLine/input).
 //
-// BEHAVIOR NOTES (the body is the pre-split io.sr readLine implementation so
-// behavior is unchanged): readLine fetches the STD_INPUT_HANDLE pseudo-handle
-// (GetStdHandle(-10), the exact constant the pre-split module used) and then
-// reads one byte per kernel32!ReadFile call, appending chars until '\n',
-// stripping '\r' -- the byte-at-a-time loop, the empty-string-on-invalid-
-// handle early return, and the stop-on-zero-bytes-read end-of-stream check
-// are all exactly the pre-split shape. The handle lands in a local first
-// because nested grant calls as arguments are not a shape the backends rely
-// on. One mechanical adjustment inherited from the v1 split: the old
-// `byte[] buf[1];` fixed-declaration is spelled `byte[] buf = new byte[1];`
-// (the codebase-standard allocation idiom).
+// BEHAVIOR NOTES: readLine fetches the STD_INPUT_HANDLE pseudo-handle
+// (GetStdHandle(-10)) and then reads one byte per kernel32!ReadFile call,
+// appending chars until '\n' and stripping '\r'. The byte-at-a-time loop,
+// the empty-string-on-invalid-handle early return, and the stop-on-zero-
+// bytes-read end-of-stream check define the behavior. The handle lands in a
+// local first because nested grant calls as arguments are not a shape the
+// backends rely on. Allocations use the codebase-standard idiom
+// `byte[] buf = new byte[1];`.
 //
-// DISPATCH NOTE (per compiler, unchanged by this fold): the self-hosted
-// compiler intercepts plain `input` and `readLine` calls with its native
-// genInputCall builtin (mini_cg: GetStdHandle(-10) + one ReadFile into a
-// 4096-byte heap buffer) before this module's globals are consulted, so the
-// readLine body below is reached there only via `io.readLine()` member calls
-// -- the receiver "io" is not a builtin-module receiver, so those fall
-// through to this file exactly as they hit the pre-split implementation.
+// DISPATCH NOTE (per compiler): the self-hosted compiler intercepts plain
+// `input` and `readLine` calls with its native genInputCall builtin
+// (mini_cg: GetStdHandle(-10) + one ReadFile into a 4096-byte heap buffer)
+// before this module's globals are consulted, so the readLine body below is
+// reached there only via `io.readLine()` member calls -- the receiver "io"
+// is not a builtin-module receiver, so those fall through to this file.
 // silverc-rs has no native readLine and its native `input` stub (codegen.rs
 // gen_input) only fires when no user-defined `input` is in scope: once
 // `import * from io;` resolves, io's own functions win the func_labels
-// dispatch. Both paths produce the same behavior as the pre-split module.
+// dispatch. Both paths produce the same behavior.
 
 #on WINDOWS
 import * from win32.kernel32;

@@ -2,93 +2,72 @@ import * from net;
 
 mod export ftp;
 
-// DOCS -- public `ftp` module (UNIFIED_CORE_LIBRARY.md §4 rule 7, the v2
-// canonical fold). This is a PROTOCOL module: it contains ZERO OS code and no
-// preprocessor regions -- every byte on the wire moves through the universal
-// socket core std/net.sr (connectRaw/sendRawLen/recvRaw/closeRaw and
-// listenRaw/acceptRaw for the stub server). The ws2_32 code that used to live
-// in the v1 backend std/ftp_win.sr (deleted) is now net's, inside net's own
-// `#on WINDOWS` regions. win-prefixed helpers, alias imports and osType()
-// gates are gone with it.
+// DOCS -- public `ftp` module (UNIFIED_CORE_LIBRARY.md §4 rule 7). This is
+// a PROTOCOL module: it contains ZERO OS code and no preprocessor regions
+// -- every byte on the wire moves through the universal socket core
+// std/net.sr (connectRaw/sendRawLen/recvRaw/closeRaw and
+// listenRaw/acceptRaw for the stub server); the ws2_32 code lives inside
+// net's own `#on WINDOWS` regions.
 //
-// DISPATCH (per compiler, probed): `ftp` is builtin-reserved on NEITHER
-// compiler -- silverc-rs's builtin_modules_set (src/main.rs:81 lists
+// DISPATCH: `ftp` is builtin-reserved on NEITHER compiler --
+// silverc-rs's builtin_modules_set (src/main.rs:81 lists
 // fs/json/yaml/env/url/hash/path/bom/console/math/http only) and the
 // self-hosted compiler's visBuiltinModule (compiler/visibility.sr:605) plus
 // its driver prepend list all exclude it. Both compilers resolve
-// `import * from ftp;` as an ORDINARY SOURCE module (std\ftp.sr); no native
-// dispatch exists to preserve.
+// `import * from ftp;` as an ORDINARY SOURCE module (std/ftp.sr); no native
+// dispatch exists.
 //
-// PRE-SPLIT STATE (probed against this file's git HEAD before the rewrite):
-// the old std/ftp.sr NEVER compiled under either compiler. silverc-rs
-// reported `struct sockaddr_in addr;` at lines 17/87 ("unknown keyword
-// sockaddr_in"), the phantom `(cmd + "\r\n").toBytes()` (line 30), the
-// `new byte[4096]` declaration initializer (line 35), and the download/
-// upload parameters named `local` (lines 54/59 -- `local` is a reserved
-// memory-safety keyword on silverc-rs: any use as an identifier dies with
-// "Expected expression"), plus brace-cascade errors; the self-hosted
-// compiler rejected the same struct lines and cascaded. Every body was
-// therefore dead text -- there was NO observable pre-split behavior to
-// preserve beyond names, arities and intent.
-//
-// DEAD -> LIVE (what the protocol wiring made actually work):
+// TRANSPORT:
 // - The control channel: net.connectRaw + USER/PASS. login() reads and
-//   validates the greeting (220), USER (331, or 230 = server skips PASS),
-//   PASS (230) and records the outcome in isLoggedIn()/getLastReply()
-//   (both ADDITIVE -- the pre-split surface had no way to report anything).
-//   Against a non-FTP listener the login fails gracefully: the server's
-//   banner (or "" after a silent disconnect) is surfaced through
-//   getLastReply() and the process exits cleanly. No exceptions anywhere.
+//   validates the greeting (220), USER (331, or 230 = server skips PASS)
+//   and PASS (230), and records the outcome in isLoggedIn()/getLastReply().
+//   getLastReply() exposes the raw last server reply; isLoggedIn() is true
+//   only after a fully accepted USER/PASS exchange. Against a non-FTP
+//   listener the login fails gracefully: the server's banner (or "" after
+//   a silent disconnect) is surfaced through getLastReply() and the
+//   process exits cleanly. No exceptions anywhere.
 // - PASV data channel: list()/download()/upload() parse the PASV reply
-//   (replyCode/replyComplete/pasvHost/pasvPort, all probed byte-identical
-//   on fixed inputs) and open a real second connection with net.connectRaw.
+//   (replyCode/replyComplete/pasvHost/pasvPort) and open a real second
+//   connection with net.connectRaw.
 // - download(): streams the data channel until EOF and writes that to the
 //   local file. upload(): sends STOR and the file bytes over the data
 //   channel. The fs.* receiver is the native/builtin fs on both compilers
 //   (std/crypto.sr and std/csv.sr use the same shape).
 // - Bounded reads: every socket this module opens -- control and data
 //   alike -- gets a 30 s receive timeout via net.setRecvTimeoutRaw(fd,
-//   30000) (net arms SO_RCVTIMEO; previously the v1 backend armed the same
-//   30 s value). readReply()'s accumulation loop is additionally bounded at
-//   16 iterations and readAll() at 4096 x 64 KB (~256 MB) so no path can
-//   spin forever.
+//   30000) (net arms SO_RCVTIMEO). readReply()'s accumulation loop is
+//   additionally bounded at 16 iterations and readAll() at 4096 x 64 KB
+//   (~256 MB) so no path can spin forever.
 // - QUIT: close() sends QUIT and closes immediately without waiting for
-//   the 221 (pre-split shape -- it never read the reply either), so a dead
-//   peer cannot stall close().
+//   the 221, so a dead peer cannot stall close().
 //
-// NOT INVENTED: the `server` class keeps exactly its pre-split surface
-// (addUser/start/wait) and behavior -- wait() accepts connections one at a
-// time, sends the pre-split greeting TRUNCATED at 20 of its 22 bytes
-// ("220 FTP Server ready" without the CRLF -- the pre-split send length is
-// preserved verbatim via net.sendRawLen), and closes the client. It still
-// never authenticates (addUser is a no-op: the pre-split body wrote into an
-// uninitialized `kvp` field -- a NULL deref had it ever run; the field is
-// gone), never serves files, and wait() never returns (pre-split
-// `while (true)` shape; never call it from a probe or test: it blocks the
-// process by design). There is no single-shot accept, no AUTH/TLS, no
-// EPSV/PORT fallback. The listen backlog is now net.listenRaw's (10) --
-// listenRaw carries the only listen() call, so the pre-split private
-// backlog 5 is superseded by the socket core's value.
+// SERVER: the `server` class surface is addUser/start/wait. wait()
+// accepts connections one at a time, sends the greeting TRUNCATED at 20 of
+// its 22 bytes ("220 FTP Server ready" without the CRLF -- via
+// net.sendRawLen) and closes the client. It never authenticates (addUser
+// is a no-op that records credentials nowhere), never serves files, and
+// wait() never returns (infinite accept loop; never call it from a probe
+// or test: it blocks the process by design). There is no single-shot
+// accept, no AUTH/TLS, no EPSV/PORT fallback. The listen backlog is
+// net.listenRaw's (10) -- listenRaw carries the only listen() call.
 //
-// API PRESERVATION (every public name/arity of the pre-split file,
-// unchanged): client.construct(string host) -- port fixed at 21, the
-// pre-split hard-coded value; a NEW additive setPort(int) exists for
-// probes/hosts that need another port (the std/dns.sr setHost precedent);
+// PUBLIC API: client.construct(string host) -- port fixed at 21, the
+// hard-coded default; setPort(int) exists alongside it for probes/hosts
+// that need another port (the std/dns.sr setHost precedent);
 // login(string user, string pass); list(string path) -> string[];
 // download(string remote, string local); upload(string local, string
 // remote); close(). server.construct(string root, int port) (root is
-// stored and unused, as pre-split); addUser(string user, string pass,
-// string permissions); start(); wait(). The private sendCmd/recvResp
-// helper names are preserved; recvResp keeps its raw-bytes shape (the
-// multi-line reply accumulation lives in the private readReply).
+// stored and unused); addUser(string user, string pass, string
+// permissions); start(); wait(). The private sendCmd/recvResp helpers
+// keep their raw-bytes shapes; the multi-line reply accumulation lives in
+// the private readReply.
 //
 // CALLER NOTES: strings returned across this module's boundary
 // (getLastReply) should be assigned to a local before being concatenated
 // into larger expressions (silverc-rs stringifies the return pointer in
 // expression position; see std/dns.sr's RS-ONLY CALLER LANDMINE). list()
 // returns the data-channel lines split on "\r\n", so a trailing CRLF
-// yields a trailing "" element -- the same shape the pre-split split()
-// produced.
+// yields a trailing "" element from split().
 
 public int replyCode(string resp) {
     if (resp.length < 3) { return -1; }
@@ -206,22 +185,22 @@ class client {
         this.loggedIn = false;
     }
 
-    // ADDITIVE (the std/dns.sr setHost precedent): the pre-split client had
-    // no way to leave port 21; probes and hosts against non-standard ports
-    // set this before login().
+    // Hosts on non-standard ports set this before login(); the constructor
+    // keeps the hard-coded default of 21 (the std/dns.sr setHost
+    // precedent).
     public void setPort(int p) {
         this.port = p;
     }
 
-    // ADDITIVE: the raw text of the last server reply on the control
-    // channel ("" before the first read). This is the graceful-failure
-    // surface: against a non-FTP listener it holds the banner the peer
-    // sent, or "" when the peer said nothing and closed.
+    // The raw text of the last server reply on the control channel (""
+    // before the first read). This is the graceful-failure surface:
+    // against a non-FTP listener it holds the banner the peer sent, or ""
+    // when the peer said nothing and closed.
     public string getLastReply() {
         return this.lastReply;
     }
 
-    // ADDITIVE: true only after a fully accepted USER/PASS exchange (or a
+    // True only after a fully accepted USER/PASS exchange (or a
     // 230 login-without-PASS).
     public bool isLoggedIn() {
         return this.loggedIn;
@@ -272,9 +251,8 @@ class client {
 
     // NOTE: the second parameter is spelled localPath, not `local` -- `local`
     // is a reserved word on silverc-rs ("Expected expression" wherever it
-    // appears as an identifier; probed), another pre-split landmine (the old
-    // signature used it). Parameter names are invisible to positional
-    // callers, so the observable API is unchanged.
+    // appears as an identifier). Parameter names are invisible to positional
+    // callers.
     public void download(string remote, string localPath) {
         if (!this.loggedIn) { return; }
         int data = this.openData();
@@ -315,7 +293,7 @@ class client {
     }
 
     // One bounded read of the control channel (raw bytes as a string; ""
-    // on disconnect/timeout -- pre-split recvResp shape).
+    // on disconnect/timeout).
     private string recvResp() {
         if (this.sock < 0) { return ""; }
         return recvRaw(this.sock, 4096);
@@ -387,11 +365,9 @@ class server {
         this.sock = -1;
     }
 
-    // No-op: credentials are recorded nowhere. The pre-split body wrote
-    // into an uninitialized `kvp` field (a NULL deref had it ever run) and
-    // the server never authenticated nor served files; no split invents
-    // that. The `permissions` argument stays accepted and ignored
-    // (pre-split arity).
+    // No-op: credentials are recorded nowhere. The server does not
+    // authenticate and does not serve files. The `permissions` argument
+    // is accepted and ignored.
     public void addUser(string user, string pass, string permissions) {
     }
 
@@ -402,10 +378,9 @@ class server {
         this.sock = listenRaw(this.port);
     }
 
-    // Accept loop with the pre-split shape: per client, send the greeting
-    // TRUNCATED at 20 of its 22 bytes ("220 FTP Server ready" without the
-    // CRLF -- the pre-split send length preserved verbatim through
-    // net.sendRawLen) and close. NEVER RETURNS (pre-split `while (true)`);
+    // Accept loop: per client, send the greeting TRUNCATED at 20 of its
+    // 22 bytes ("220 FTP Server ready" without the CRLF -- via
+    // net.sendRawLen) and close. NEVER RETURNS (infinite accept loop);
     // never call it from a probe or test: it blocks the process by design.
     public void wait() {
         if (this.sock < 0) { this.start(); }

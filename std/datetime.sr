@@ -1,73 +1,61 @@
 mod export datetime;
 
-// DOCS -- public `datetime` module (UNIFIED_CORE_LIBRARY.md v2 canonical
-// fold). This is the universal date/time module: the former internal Windows
-// backend std/datetime_win.sr was folded back into this file and deleted.
-// There is no datetime_win.sr anymore -- one module, one OS layer
-// (datetime -> win32.kernel32).
-//
-// CANONICAL SHAPE (v2 rule 6): the raw OS calls live INSIDE the public
+// DOCS -- public `datetime` module (see UNIFIED_CORE_LIBRARY.md).
+// This is the universal date/time module: one module, one OS layer
+// (datetime -> win32.kernel32). The raw OS calls live INSIDE the public
 // function bodies (the `now` constructor and utcNow) behind `#on WINDOWS`
 // regions -- one unified function name, no win-prefixed helpers, no wrapper
-// indirection. The osType() runtime gates and the `os` import are gone (the
-// preprocessor replaces them); no #else and no LINUX/MAC placeholders -- the
-// other-OS regions get filled on their own machines later (a future
-// non-Windows backend would leave the zero-field constructor path; every
-// field is still assigned on every path because the self-hosted backend does
-// not zero fresh object memory).
+// indirection. There is no `#else` and no LINUX/MAC placeholders in std;
+// the other-OS regions get filled on their own machines later (a
+// non-Windows backend must assign every field on every path, because the
+// self-hosted backend does not zero fresh object memory). The preprocessor
+// selects the OS code at compile time, so there is no `os` import here.
 //
 // PLAIN IMPORT: the kernel32 grant is a plain full-table
-// `import * from win32.kernel32;` inside its own region -- alias imports are
-// removed in v2. GetLocalTime and GetSystemTime are present in BOTH
-// compilers' kernel32 export tables (silverc-rs/src/win32.rs and the
-// self-host win32ExportTable), so the plain grant resolves without any table
-// change.
+// `import * from win32.kernel32;` inside its own region. GetLocalTime and
+// GetSystemTime are present in BOTH compilers' kernel32 export tables
+// (silverc-rs/src/win32.rs and the self-host win32ExportTable), so the
+// plain grant resolves without any table change.
 //
-// MEMORY LAYOUT (silverc-rs codegen, unchanged by the fold): Silver arrays
-// are [cap, len, elem...] with 8-byte elements and a variable holding the
-// element-0 address, so an int[] doubles as a packed qword buffer for DLL
-// calls. SYSTEMTIME is 8 consecutive u16 words (wYear, wMonth, wDayOfWeek,
-// wDay, wHour, wMinute, wSecond, wMilliseconds) = 16 bytes, packed into one
-// int[2]: slot 0 holds words 0-3, slot 1 words 4-7. The unpack shifts each
-// field back out; the wDayOfWeek word is never needed by the public API and
-// is not returned. All extracted fields are u16, so the sign bit of either
-// slot stays clear and the shifts never see a negative operand.
+// MEMORY LAYOUT (silverc-rs codegen): Silver arrays are [cap, len, elem...]
+// with 8-byte elements and a variable holding the element-0 address, so an
+// int[] doubles as a packed qword buffer for DLL calls. SYSTEMTIME is 8
+// consecutive u16 words (wYear, wMonth, wDayOfWeek, wDay, wHour, wMinute,
+// wSecond, wMilliseconds) = 16 bytes, packed into one int[2]: slot 0 holds
+// words 0-3, slot 1 words 4-7. The unpack shifts each field back out; the
+// wDayOfWeek word is never needed by the public API and is not returned.
+// All extracted fields are u16, so the sign bit of either slot stays clear
+// and the shifts never see a negative operand.
 //
-// OPERATOR NOTE: the pre-split file declared the difference operation as
-// `public duration operator-(now other)`. Silver has no operator overloading
-// -- SPEC.md defines no `operatorX` member syntax and no compiler ever
-// accepted that line (it has failed to parse since the file's initial
-// commit, so no runtime behavior existed to preserve). The operation now
-// lives under its legal name `diff`, body unchanged: `a.diff(b)` yields
-// a's epoch minus b's epoch in milliseconds (negative when b is later),
-// exactly what the pre-split operator body computed.
+// OPERATOR NOTE: the difference operation is `public duration diff(now
+// other)` -- Silver has no operator overloading (SPEC.md defines no
+// `operatorX` member syntax). `a.diff(b)` yields a's epoch minus b's epoch
+// in milliseconds (negative when b is later).
 //
-// UNIX NOTE: the pre-split unix() sketched GetSystemTime +
-// SystemTimeToFileTime + epoch arithmetic, but SystemTimeToFileTime exists
-// in neither compiler's kernel32 export table (and that body never compiled
-// anywhere either). unix() is now pure Silver: it applies the standard
-// civil-date algorithm (days_from_civil) to the instance's own fields --
-// which is also what the module's only caller expected, since `diff`
-// subtracts the two RECEIVERS rather than two wall-clock reads. Every
-// intermediate stays positive for any SYSTEMTIME year (wYear >= 1601), so
-// truncating division behaves like floor division and the result is seconds
-// since 1970-01-01T00:00:00 UTC with the instance fields read as UTC.
+// UNIX NOTE: unix() is pure Silver: it applies the standard civil-date
+// algorithm (days_from_civil) to the instance's own fields -- which is also
+// what the module's only caller expects, since `diff` subtracts the two
+// RECEIVERS rather than two wall-clock reads. SystemTimeToFileTime is not
+// in either compiler's kernel32 export table, so no DLL path participates.
+// Every intermediate stays positive for any SYSTEMTIME year (wYear >=
+// 1601), so truncating division behaves like floor division and the result
+// is seconds since 1970-01-01T00:00:00 UTC with the instance fields read as
+// UTC.
 //
-// CONSTRUCTOR NOTE: the pre-split file declared two constructors per class
-// (`construct()` + a parameterized one). Both compiler backends lower every
-// constructor of a class to the single symbol `<Class>__construct` -- the
-// last-declared overload wins and a zero-argument `new X()` then calls it
-// with garbage arguments (verified with minimal probes on both compilers),
-// so overloaded constructors cannot express this API. Instead each class
-// declares ONE constructor with trailing default parameters (a supported
-// mechanism -- codegen materializes missing trailing args for `new`):
-// `new now()` still means "current local time" (the -1 sentinel selects the
-// GetLocalTime region) and `new now(y,m,d,h,mi,s)` a fixed moment.
+// CONSTRUCTOR NOTE: overloaded constructors cannot express this API -- both
+// compiler backends lower every constructor of a class to the single symbol
+// `<Class>__construct`, the last-declared overload wins, and a zero-argument
+// `new X()` then calls it with garbage arguments (verified with minimal
+// probes on both compilers). Each class therefore declares ONE constructor
+// with trailing default parameters (a supported mechanism -- codegen
+// materializes missing trailing args for `new`): `new now()` means "current
+// local time" (the -1 sentinel selects the GetLocalTime region) and
+// `new now(y,m,d,h,mi,s)` a fixed moment.
 //
-// FORMAT NOTE: the specifier pads use if/else locals instead of the
-// string ternary `(cond ? "0" : "") + field`: the self-hosted backend
-// garbles string-typed ternaries concatenated with an int field (probe:
-// the ternary arm collapses to "" and the field value is lost), while the
+// FORMAT NOTE: the specifier pads use if/else locals; the string ternary
+// `(cond ? "0" : "") + field` is avoided because the self-hosted backend
+// garbles string-typed ternaries concatenated with an int field (probe: the
+// ternary arm collapses to "" and the field value is lost), while the
 // if/else shape compiles identically on both backends.
 
 #on WINDOWS
@@ -100,8 +88,7 @@ class now {
             #on WINDOWS
             // GetLocalTime fills the packed SYSTEMTIME buffer with the
             // caller's LOCAL time; the shifts unpack {year, month, day,
-            // hour, minute, second, millisecond} (the pre-split
-            // datetimeWinLocalFields + unpack mechanics, moved inline).
+            // hour, minute, second, millisecond}.
             int[] st = new int[2];
             GetLocalTime(st);
             this.year = st[0] & 0xFFFF;
@@ -188,8 +175,7 @@ public now utcNow() {
     now n = new now();
     #on WINDOWS
     // GetSystemTime fills the packed SYSTEMTIME buffer with wall-clock UTC
-    // and the shifts overwrite the constructor's local-time fields (the
-    // pre-split datetimeWinUtcFields mechanics, moved inline).
+    // and the shifts overwrite the constructor's local-time fields.
     int[] st = new int[2];
     GetSystemTime(st);
     n.year = st[0] & 0xFFFF;

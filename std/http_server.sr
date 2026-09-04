@@ -2,104 +2,71 @@ import * from net;
 
 mod export http_server;
 
-// DOCS -- public `http_server` module (UNIFIED_CORE_LIBRARY.md §4 rule 7,
-// the CANONICAL protocol shape). This is the unified, portable front of the
-// HTTP server library. It contains ZERO OS code: no win32 imports, no `#on`
-// regions, no osType() gates, no win-prefixed helpers -- the transport rides
-// the universal socket core std/net.sr (listenRaw/acceptRaw/sendRaw/recvRaw/
-// closeRaw), whose Windows regions hold the ws2_32 calls. The pre-fold
-// internal Windows backend std/http_server_win.sr is deleted; its transport
-// (WSAStartup, the INADDR_ANY bind, listen backlog 10, the 30 s SO_RCVTIMEO,
-// the qword packing, the DLL-return normalization) now lives in net.sr's
-// regions. This module is pure HTTP
-// protocol logic and would compile unchanged on any backend that provides
-// net.
+// DOCS -- public `http_server` module.
+// This is the portable HTTP server library (UNIFIED_CORE_LIBRARY.md §4
+// rule 7, the canonical protocol shape). It contains ZERO OS code: no
+// win32 imports, no `#on` regions, no win-named helpers -- the transport
+// rides the universal socket core std/net.sr (listenRaw/acceptRaw/sendRaw/
+// recvRaw/closeRaw), whose Windows regions hold the ws2_32 calls
+// (WSAStartup, the INADDR_ANY bind, listen backlog 10, the 30 s
+// SO_RCVTIMEO, the qword packing, the DLL-return normalization). This
+// module is pure HTTP protocol logic and compiles unchanged on any backend
+// that provides net.
 //
-// DISPATCH (per compiler, probed): `http_server` is builtin-reserved on
-// NEITHER compiler -- silverc-rs's builtin_modules_set (src/main.rs lists
+// DISPATCH: `http_server` is builtin-reserved on NEITHER compiler --
+// silverc-rs's builtin_modules_set (src/main.rs lists
 // fs/json/yaml/env/url/hash/path/bom/console/math/http only) and the
 // self-hosted compiler's visBuiltinModule (compiler/visibility.sr) plus its
 // driver lists all exclude it. Both compilers resolve `import * from
-// http_server;` as an ORDINARY SOURCE module (std/http_server.sr); no native
-// dispatch exists to preserve. (http_server.sr's entry in silverc.srp's
+// http_server;` as an ORDINARY SOURCE module (std/http_server.sr); no
+// native dispatch is involved. (http_server.sr's entry in silverc.srp's
 // exclude list only keeps it out of the compiler's own aggregate build -- it
 // does not make `http_server` a builtin.)
 //
-// PRE-SPLIT STATE (probed 2026-08 against this file's git HEAD copy, both
-// compilers): the old std/http_server.sr NEVER compiled under either
-// compiler. silverc-rs rejected the `void callbackFunc(request, response)`
-// fn-parameter at line 96 ("you forgot a comma" / "Missing close
-// parenthesis" -- the fn type carries ARGUMENT types, which no compiler
-// accepts; DOCS/259's `void () name` is the only fn-parameter shape and it
-// is zero-argument), the `struct sockaddr_in addr;` local at line 100
-// ("Expected 'LeftBrace' but found Identifier(addr)") and cascaded through
-// line 128; the self-hosted compiler died with "Parse error ... expected {
-// but found (" at the same fn-parameter (reported against the aggregate
-// line 292). Also unexpressible: `AF_INET`/`SOCK_STREAM`/`SOL_SOCKET`/
-// `SO_REUSEADDR` resolve to nothing (neither name is in either compiler's
-// ws2_32 export table: WSAStartup WSACleanup socket bind listen accept recv
-// send shutdown closesocket connect select setsockopt ioctlsocket htons
-// inet_addr getaddrinfo freeaddrinfo WSAGetLastError only -- the constants
-// are passed as literals now: 2/1/0xFFFF/0x0004). Every body was therefore
-// dead text -- there was NO observable pre-split behavior to preserve
-// beyond names, arities and intent.
+// TRANSPORT: listenRaw = socket + bind(INADDR_ANY) + listen(10) over ws2_32
+// with WSAStartup, the sockaddr_in image packed into an int[2] qword buffer
+// inside net.sr's region, and the 30 s SO_RCVTIMEO armed by
+// net.setRecvTimeoutRaw right after the listen (inherited by every accepted
+// client -- see listenNow), so a client that connects and goes silent
+// cannot hang the accept loop.
 //
-// DEAD -> LIVE (what this fold made actually work, mirroring the
-// std/ws.sr / std/net.sr / std/smtp.sr arcs):
-// - The transport: listenRaw = socket + bind(INADDR_ANY) + listen(10) over
-//   ws2_32 with WSAStartup (the pre-split file never initialized winsock),
-//   the sockaddr_in image packed into an int[2] qword buffer inside net.sr's
-//   region, and the 30 s SO_RCVTIMEO armed by net.setRecvTimeoutRaw right
-//   after the listen (inherited by every accepted client -- see listenNow),
-//   so a client that connects and goes silent cannot hang the accept loop
-//   (the pre-split file had no timeout -- and never ran).
-// - serve(): pre-split it took `(int port, void callbackFunc(request,
-//   response))`. The fn-parameter CANNOT carry the (request, response)
-//   payload on either compiler (see PRE-SPLIT STATE); per the std/ws.sr
-//   port it is re-typed to the DOCS/259 zero-arg spelling and the payload
-//   flows through the NEW accessors instead -- inside the handler, build
-//   the request from currentRaw() and the response from currentSocket()
-//   (see THE HANDLER CONTRACT below).
-//   serve() keeps the pre-split infinite `while (true)` accept loop: it
-//   never returns by design (never call it from a probe or test).
-// - serveBounded(port, handler, maxRequests) is NEW (additive): the same
-//   loop bounded to exactly maxRequests accept attempts, closing the
-//   listening socket before it returns -- the probe/test path.
-// - request parsing: the pre-split construct parsed the request line with
-//   substr spans that are WRONG on silverc-rs (rs substr(start, X) is
-//   (start, END) while the self-host is (start, LENGTH); the pre-split
-//   `first.substr(i1 + 1, i2 - i1 - 1)` produced garbage on rs). The parse
-//   is rewritten as pure index scanning over char codes; the only substr
-//   spans kept are the dual-correct (start, end-exclusive) forms -- they
-//   denote the same character range under BOTH semantics -- plus single-
-//   argument tails. Line/header splits are manual CR/LF scans (no
-//   string.split): the std/headers.sr multimap this module used to depend
-//   on compiles on both compilers but its runtime shapes are landmined
-//   (string ternaries, the `.length()` call form that reads garbage on the
-//   self-host), so the wrapper now carries its own local headermap class
-//   built on the probed parallel string[] idiom (std/mongo.sr doc
-//   precedent).
-// - Response building moved verbatim from the dead send() body into the
-//   ADDITIVE pure render(body) helper (single source of truth, probeable
-//   byte-identically on both compilers -- the std/ws.sr encodeFrame
-//   precedent); send() renders then writes through net.sendRaw (the
-//   backend's hsWinSend body: the string is packed byte-for-byte into int[]
-//   qword slots before send() -- byte[] must not cross the DLL boundary
-//   packed). Connection: close is sent per response and the client socket is
-//   closed after the handler returns --
-//   HTTP keep-alive is NOT implemented (the pre-split file already sent
-//   `Connection: close`; documented, not a regression).
+// SCOPE: serve() takes `(int port, void () handler)` -- the fn-parameter is
+// zero-arg because the fn type cannot carry argument types on either
+// compiler (DOCS/259's `void () name` is the only accepted shape). The
+// payload flows through the accessors -- inside the handler, build the
+// request from currentRaw() and the response from currentSocket() (see THE
+// HANDLER CONTRACT below).
+// serve() keeps the infinite `while (true)` accept loop: it never returns
+// by design (never call it from a probe or test).
+// serveBounded(port, handler, maxRequests) runs the same loop bounded to
+// exactly maxRequests accept attempts, closing the listening socket before
+// it returns -- the probe/test path.
+// Request parsing is pure index scanning over char codes; line/header
+// splits are manual CR/LF scans (no string.split). Multi-part substr use
+// sticks to the portable forms -- substr(0, n), single-argument tails, and
+// the slice(start, endExclusive) helper -- since rs substr(start, X) is
+// (start, END) while the self-host is (start, LENGTH). On a malformed
+// request the request fields stay "". This module carries its own local
+// headermap class built on the parallel string[] idiom (std/mongo.sr
+// precedent), whose set/add/get/getAll/has/serialize surface mirrors the
+// std/headers multimap.
+// Response building is centralized in the pure render(body) helper (single
+// source of truth, byte-identical on both compilers -- the std/ws.sr
+// encodeFrame precedent); send() renders then writes through net.sendRaw
+// (the string is packed byte-for-byte into int[] qword slots before send()
+// -- byte[] must not cross the DLL boundary packed). Connection: close is
+// sent per response and the client socket is closed after the handler
+// returns -- HTTP keep-alive is NOT implemented.
 //
-// NOT INVENTED: response.json(object) keeps its pre-split name/arity but is
-// a stored NO-OP: the pre-split body called json.stringify(data), and
-// `json.stringify` is a RUNTIME CRASHER on BOTH compilers (probed 2026-08:
+// BEHAVIOR: response.json(object) is a stored NO-OP: `json.stringify` is a
+// runtime crasher on BOTH compilers (probed 2026-08:
 // `json.stringify("hello")` alone dies 0xC0000005 on silverc-rs AND on the
 // self-host; `object` locals are additionally rejected at parse time on
 // both). No stringification exists to delegate to, so the member sends
 // nothing; callers should format their JSON as text and use send()
-// (`send("{\"ok\":true}")`). The pre-split `Content-Length` used the
-// `body.length()` CALL form -- property form now (the call form reads
-// garbage on the self-host).
+// (`send("{\"ok\":true}")`). Content-Length uses the property form
+// `body.length` (the `.length()` call form reads garbage on the
+// self-host).
 //
 // THE HANDLER CONTRACT (probed end-to-end on both compilers -- this is the
 // only supported way to write a handler; the probe evidence is cited per
@@ -150,43 +117,41 @@ mod export http_server;
 //   assigned to a local first: `"p=" + req.path` stringifies the field
 //   POINTER on rs (probed: prints a number), while
 //   `string p = req.path;` + `"p=" + p` prints the text on both.
-// - The handler must call send()/html()/redirect() exactly as the
-//   pre-split callback had to; a handler that sends nothing leaves the
-//   client with an empty connection (closed after the handler returns).
-//   send() is self-contained (it carries the socket fd), so calling it on
-//   the fresh instance is safe on both compilers.
-// - For request HEADERS use the additive requestHeader(name) free function
+// - The handler must call send()/html()/redirect() to respond; a handler
+//   that sends nothing leaves the client with an empty connection (the
+//   socket is closed after the handler returns). send() is self-contained
+//   (it carries the socket fd), so calling it on the fresh instance is
+//   safe on both compilers.
+// - For request HEADERS use the requestHeader(name) free function
 //   (same-module parse) instead of poking req.headers from the handler.
 //
-// API PRESERVATION (every public name/arity of the pre-split file,
-// unchanged): class request -- public fields method/path/version/body
-// (construct(string raw) preserved); class response -- construct(int sock),
+// PUBLIC API: class request -- public fields method/path/version/body
+// (construct(string raw)); class response -- construct(int sock),
 // status(int code) -> response, header(string name, string value) ->
-// response, send(string body), json(object data) (see NOT INVENTED),
-// html(string content), redirect(string url); free function serve. The
-// private sendRaw(string, int) helper's body lives on as the net.sendRaw
-// write in send().
+// response, send(string body), json(object data) (see BEHAVIOR),
+// html(string content), redirect(string url); free function serve. send()
+// writes through net.sendRaw.
 //
 // FORCED EXCEPTIONS (documented):
 // - request.headers is typed `headermap` (this module's local class, with
-//   the get/has/getAll/set/add/serialize surface) instead of the
-//   std/headers `multimap` -- the pre-split field could never be used (the
-//   file never compiled anywhere) and the multimap's runtime shapes are
-//   landmined (see DEAD -> LIVE). Field NAME preserved.
-// - serve's fn-parameter is `void ()` (zero-arg) instead of
+//   the get/has/getAll/set/add/serialize surface) rather than the
+//   std/headers `multimap` -- the multimap's runtime shapes are landmined
+//   (string ternaries, the `.length()` call form that reads garbage on the
+//   self-host). The public field name is `headers`.
+// - serve's fn-parameter is `void ()` (zero-arg) rather than
 //   `void (request, response)` -- the arg-carrying fn type parses on
-//   NEITHER compiler (PRE-SPLIT STATE); the payload flows through the
-//   accessors per THE HANDLER CONTRACT.
+//   NEITHER compiler; the payload flows through the accessors per THE
+//   HANDLER CONTRACT.
 //
-// ADDITIVE (all documented, all probeable): serveBounded(port, handler,
-// maxRequests) -- bounded accept loop, closes the listening socket when
-// done; response.render(body) -- the pure response-text builder (status
-// line, serialized headers, default Content-Type, Content-Length,
-// Connection: close, body) with NO socket write; currentRaw() /
-// currentSocket() / requestHeader(name) -- the handler accessors; class
-// headermap and class server -- infrastructure (server is the state holder
-// behind the free functions; both are ordinary classes a user could name,
-// but the handler contract above is the supported surface).
+// MODULE SURFACE: serveBounded(port, handler, maxRequests) -- bounded
+// accept loop, closes the listening socket when done; response.render(body)
+// -- the pure response-text builder (status line, serialized headers,
+// default Content-Type, Content-Length, Connection: close, body) with NO
+// socket write; currentRaw() / currentSocket() / requestHeader(name) -- the
+// handler accessors; class headermap and class server -- infrastructure
+// (server is the state holder behind the free functions; both are ordinary
+// classes a user could name, but the handler contract above is the
+// supported surface).
 
 class headermap {
     string[] names;
@@ -211,7 +176,7 @@ class headermap {
     }
 
     // Replaces every entry for (the lowered) name with one value -- the
-    // std/headers multimap.set semantics (kvp.set replaced the value list).
+    // std/headers multimap.set semantics (set overwrites the value list).
     public void set(string name, string value) {
         string key = name.toLower();
         this.removeKey(key);
@@ -251,8 +216,7 @@ class headermap {
         return false;
     }
 
-    // The std/headers multimap.serialize format, preserved verbatim (minus
-    // its string ternary and `.length()` call forms): every entry emitted
+    // The std/headers multimap.serialize format: every entry emitted
     // as "Name: value\r\n" with the first letter of the lowered key
     // capitalized; an empty key emits ": value\r\n".
     public string serialize() {
@@ -278,9 +242,8 @@ class request {
     public headermap headers;
 
     // Parses one raw HTTP/1.1 request (request line, headers, body). Pure
-    // index scanning over char codes -- see DEAD -> LIVE for why the
-    // pre-split substr spans could not be kept. On a malformed request the
-    // fields stay "" (the pre-split early returns left them null).
+    // index scanning over char codes -- see the portable-substr note below.
+    // On a malformed request the fields stay "".
     construct(string raw) {
         this.method = "";
         this.path = "";
@@ -303,11 +266,11 @@ class request {
         }
         if (i1 < 0 || i2 < 0 || i1 == i2) { return; }
         this.method = first.substr(0, i1);
-        // Index-sliced spans (slice(start, endExclusive)): the ONLY portable
+        // Index-sliced spans (slice(start, endExclusive)): the only portable
         // substr forms are substr(0, n) and single-argument tails -- for any
         // other start the rs (start, END) and self-host (start, LENGTH)
-        // semantics diverge (probed 2026-08: substr(i1+1, i2) yielded the
-        // right span on rs and an OVERRUN on the self-host).
+        // semantics diverge (substr(i1+1, i2) yields the right span on rs
+        // and an overrun on the self-host).
         this.path = slice(first, i1 + 1, i2);
         this.version = first.substr(i2 + 1);
         int hdrEnd = -1;
@@ -357,7 +320,7 @@ class response {
 
     // Renders the full response text and writes it on the client socket.
     // The write routes through net.sendRaw (its Windows region holds the
-    // ws2_32 send -- see DEAD -> LIVE); on a socket of -1 nothing is sent.
+    // ws2_32 send); on a socket of -1 nothing is sent.
     public void send(string body) {
         this.body = body;
         string resp = this.render(body);
@@ -366,11 +329,11 @@ class response {
         }
     }
 
-    // Stored NO-OP (see NOT INVENTED in the module header): the pre-split
-    // body called json.stringify(data), which is a runtime crasher on both
-    // compilers (probed 2026-08, 0xC0000005 both) and `object` locals do
-    // not parse on either. No stringification exists to delegate to, so
-    // the member sends nothing; format JSON as text and use send().
+    // Stored NO-OP (see BEHAVIOR in the module header): `json.stringify`
+    // is a runtime crasher on both compilers (probed 2026-08, 0xC0000005
+    // both) and `object` locals do not parse on either. No stringification
+    // exists to delegate to, so the member sends nothing; format JSON as
+    // text and use send().
     public void json(object data) { }
 
     public void html(string content) {
@@ -383,13 +346,12 @@ class response {
         this.send("Moved to " + url);
     }
 
-    // ADDITIVE (the pure response builder, moved verbatim from the dead
-    // pre-split send() body): status line, serialized headers, the default
-    // Content-Type when none was set, Content-Length (property form -- the
-    // pre-split .length() call form reads garbage on the self-host),
-    // "Connection: close" (keep-alive is NOT implemented -- the pre-split
-    // file already sent close), a blank line, and the body. NO socket
-    // write -- probeable byte-identically on both compilers.
+    // The pure response builder: status line, serialized headers, the
+    // default Content-Type when none was set, Content-Length (property
+    // form -- the `.length()` call form reads garbage on the self-host),
+    // "Connection: close" (keep-alive is NOT implemented), a blank line,
+    // and the body. NO socket write -- probeable byte-identically on both
+    // compilers.
     public string render(string body) {
         string resp = "HTTP/1.1 " + this.statusCode + " " + this.statusText + "\r\n";
         resp += this.headers.serialize();
@@ -433,19 +395,18 @@ class server {
         this.port = p;
     }
 
-    // Binds and listens (the pre-split "HTTP server listening on port N" /
-    // "Failed to bind to port N" messages preserved verbatim). The socket
-    // comes from net.listenRaw: WSAStartup + socket + bind(INADDR_ANY) +
-    // listen(10) live in its Windows region (see DEAD -> LIVE); the 30 s
-    // receive timeout is armed here right after a successful listen
-    // (net.setRecvTimeoutRaw -- the pre-fold hsWinListen armed SO_RCVTIMEO
-    // on the listener itself, and every accepted client inherits it, so a
-    // client that connects and goes silent cannot hang the accept loop past
-    // 30 s). One posture note: the pre-fold listener also set SO_REUSEADDR;
-    // net owns the socket posture now and exposes no generic setsockopt
-    // primitive, so REUSEADDR rides with net.listenRaw's shape (fresh probe
-    // ports make it immaterial; a TIME_WAIT rebinding listener would fail
-    // bind and print the failure line, the pre-fold failure path).
+    // Binds and listens ("HTTP server listening on port N" on success /
+    // "Failed to bind to port N" on failure). The socket comes from
+    // net.listenRaw: WSAStartup + socket + bind(INADDR_ANY) + listen(10)
+    // live in its Windows region; the 30 s receive timeout is armed here
+    // right after a successful listen (net.setRecvTimeoutRaw arms
+    // SO_RCVTIMEO on the listener itself, and every accepted client
+    // inherits it, so a client that connects and goes silent cannot hang
+    // the accept loop past 30 s). SO_REUSEADDR posture: net owns the
+    // socket posture and exposes no generic setsockopt primitive, so
+    // REUSEADDR rides with net.listenRaw's shape (fresh probe ports make
+    // it immaterial; a TIME_WAIT rebinding listener fails bind and prints
+    // the failure line).
     public void listenNow() {
         this.listenFd = net.listenRaw(this.port);
         if (this.listenFd < 0) {
@@ -457,11 +418,10 @@ class server {
     }
 
     // One accept-dispatch cycle: accept (net.acceptRaw), read the request
-    // (single net.recvRaw up to 8192 bytes -- the pre-split shape; an
-    // oversized request truncates exactly as it would have), store it as the
-    // current request, fire the zero-arg handler, then close the client
-    // (net.closeRaw -- Connection: close). Returns true only when a request
-    // was dispatched.
+    // (single net.recvRaw up to 8192 bytes; an oversized request
+    // truncates), store it as the current request, fire the zero-arg
+    // handler, then close the client (net.closeRaw -- Connection: close).
+    // Returns true only when a request is dispatched.
     public bool acceptOnce() {
         if (this.listenFd < 0) { return false; }
         int client = net.acceptRaw(this.listenFd);
@@ -478,15 +438,16 @@ class server {
         return true;
     }
 
-    // The pre-split serve loop shape: never returns.
+    // The serve loop: infinite `while (true)` accepts; never returns.
     public void serveLoop() {
         while (true) {
             this.acceptOnce();
         }
     }
 
-    // ADDITIVE: exactly maxRequests accept attempts, then the listening
-    // socket is closed and the call returns -- the probe/test path.
+    // Bounded serve: exactly maxRequests accept attempts, then the
+    // listening socket is closed and the call returns -- the probe/test
+    // path.
     public void serveBoundedLoop(int maxRequests) {
         for (int i = 0; i < maxRequests; i++) {
             this.acceptOnce();
@@ -511,9 +472,9 @@ class server {
 // theServer's methods from inside this module).
 private server theServer = new server(0);
 
-// The pre-split free function (first argument preserved; the fn-parameter
-// re-typed per FORCED EXCEPTIONS). Infinite loop -- never returns (use
-// serveBounded when the process must continue afterwards).
+// The free serve function (fn-parameter typed per FORCED EXCEPTIONS).
+// Infinite loop -- never returns (use serveBounded when the process must
+// continue afterwards).
 public void serve(int port, void () handler) {
     theServer.setPort(port);
     theServer.handle(handler);
@@ -521,8 +482,8 @@ public void serve(int port, void () handler) {
     theServer.serveLoop();
 }
 
-// ADDITIVE: the bounded serve -- exactly maxRequests accept attempts, then
-// the listening socket is closed and the call returns. The probe/test path
+// The bounded serve: exactly maxRequests accept attempts, then the
+// listening socket is closed and the call returns. The probe/test path
 // for serve.
 public void serveBounded(int port, void () handler, int maxRequests) {
     theServer.setPort(port);
@@ -531,7 +492,7 @@ public void serveBounded(int port, void () handler, int maxRequests) {
     theServer.serveBoundedLoop(maxRequests);
 }
 
-// ADDITIVE accessor (THE HANDLER CONTRACT): the raw bytes of the in-flight
+// Accessor (THE HANDLER CONTRACT): the raw bytes of the in-flight
 // request. The handler builds its request with
 // `var req = new request(http_server.currentRaw());` -- bare-new from the
 // string free-function return is the probed-exact shape on both compilers
@@ -541,7 +502,7 @@ public string currentRaw() {
     return theServer.curRawPub();
 }
 
-// ADDITIVE accessor (THE HANDLER CONTRACT): the in-flight client socket.
+// Accessor (THE HANDLER CONTRACT): the in-flight client socket.
 // Pass it to `new response(...)` in the handler; int free-function returns
 // are probed value-exact on both compilers (unlike an accessor-returned
 // response instance, whose methods are silent no-ops on rs -- probed).
@@ -549,7 +510,7 @@ public int currentSocket() {
     return theServer.curFdPub();
 }
 
-// ADDITIVE accessor: the named header of the current request ("" when
+// Accessor: the named header of the current request ("" when
 // absent or no request is in flight). Same-module parse -- the supported
 // way to read headers from a handler.
 public string requestHeader(string name) {
@@ -568,7 +529,7 @@ private string slice(string s, int start, int endExclusive) {
 }
 
 // Trims spaces/tabs from both ends (manual scan -- no string.trim
-// dependency; the std/headers parse used trim()).
+// dependency).
 private string trimSpaces(string s) {
     int a = 0;
     int b = s.length - 1;
@@ -582,8 +543,9 @@ private string trimSpaces(string s) {
 }
 
 // Parses one "\r\n"-separated header block into m (manual CR/LF scans --
-// see DEAD -> LIVE for why string.split is not used). Malformed lines
-// (no colon) are skipped, exactly like the std/headers parse.
+// see the portable-substr note in request's construct for why string.split
+// is not used). Malformed lines (no colon) are skipped, exactly like the
+// std/headers parse.
 private void parseHeaderBlock(headermap m, string block) {
     int i = 0;
     while (i < block.length) {

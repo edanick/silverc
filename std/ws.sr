@@ -3,23 +3,21 @@ import * from net;
 
 mod export ws;
 
-// DOCS -- public `ws` module (UNIFIED_CORE_LIBRARY.md §4 rule 6, the
-// CANONICAL FOLD SHAPE). This is a PROTOCOL module: it carries ZERO OS code
-// and NO `#on` regions -- every socket operation routes through the public
-// raw-handle primitives of the universal `net` socket core module (the old
-// std/ws_win.sr aliased-ws2_32 backend is deleted; its OS code lives in
-// net.sr's regions now). No win32 imports, no win-prefixed helpers, no
-// osType() gates.
+// DOCS -- public `ws` module (UNIFIED_CORE_LIBRARY.md §4 rule 7). This is a
+// PROTOCOL module: it carries ZERO OS code and NO `#on` regions -- every
+// socket operation routes through the public raw-handle primitives of the
+// universal `net` socket core module (whose Windows regions hold the
+// ws2_32 calls). No win32 imports.
 //
 // DISPATCH (per compiler, probed): `ws` is builtin-reserved on NEITHER
 // compiler -- silverc-rs's builtin_modules_set (src/main.rs lists
 // fs/json/yaml/env/url/hash/path/bom/console/math/http only), the self-hosted
 // compiler's visBuiltinModule (compiler/visibility.sr) and its driver
 // prepend list all exclude it. Both compilers resolve `import * from ws;`
-// as an ORDINARY SOURCE module (std\ws.sr candidates); no native dispatch
-// exists to preserve.
+// as an ORDINARY SOURCE module (std\ws.sr candidates); there is no native
+// dispatch for it.
 //
-// TRANSPORT (probed end-to-end in this fold): ws rides net's raw primitives.
+// TRANSPORT: ws rides net's raw primitives.
 // connect() -> net.connectRaw(host, port); send/receive -> net.sendBytesRaw
 // (frames are byte[] and may contain 0x00 bytes a Silver string cannot
 // carry -- net.sendRaw's string path would truncate them) and net.recvRaw
@@ -27,24 +25,22 @@ mod export ws;
 // net.listenRaw / net.acceptRaw. WSAStartup, the ws2_32 sockaddr packing,
 // and the two-sided 32-bit DLL-return normalization are net.sr's business.
 //
-// CLASS-SHADOW NOTE (probed, same posture as the pre-existing dns/async
-// `task` collision): this module and net both define `class socket` (and ws
-// adds `class server`), and the aggregate is a flat namespace. Program order
+// CLASS-SHADOW NOTE (same posture as the dns/async `task` collision): this
+// module and net both define `class socket` (and ws adds `class server`),
+// and the aggregate is a flat namespace. Program order
 // puts net BEFORE ws (imports resolve depth-first), so in a program that
 // imports ws -- directly or transitively -- ws's own `socket`/`server`
 // classes are the LAST registered and win construction (`new socket(...)`)
 // and method dispatch (`Class__method`). A program importing BOTH modules
-// and trying to use net.socket objects would see ws's method set; that
-// combination has no working pre-fold precedent either way (net's socket
-// and ws's socket never coexisted before this fold).
+// and trying to use net.socket objects would see ws's method set; the two
+// socket classes are not interchangeable.
 //
-// PRESERVED BEHAVIOR (byte-for-byte, from the pre-fold split):
-// - encodeFrame's byte layout is preserved EXACTLY (0x81 FIN+text, 7-bit /
-//   16-bit / 64-bit big-endian length, unmasked payload) -- probed
+// FRAME FORMAT:
+// - encodeFrame's byte layout (0x81 FIN+text, 7-bit /
+//   16-bit / 64-bit big-endian length, unmasked payload) is probed
 //   byte-identical on fixed inputs. Per RFC 6455 client-to-server frames
-//   MUST be masked; the historical algorithm never masked and this fold
-//   keeps it unmasked so the byte layout stays verifiable (documented
-//   limitation, not a regression: the pre-split file never ran either).
+//   MUST be masked; this implementation sends unmasked so the byte layout
+//   stays verifiable (documented limitation).
 // - decodeFrame parses one frame (opcode/FIN byte, mask bit, 7/16/64-bit
 //   length, 4-byte unmasking key when the mask bit is set) and returns the
 //   payload string; 64-bit lengths use the low 32 bits. Silver strings
@@ -53,22 +49,21 @@ mod export ws;
 //   path has; NUL-free frames (the common text case) decode fully.
 // - Callback parameters keep the DOCS/259 spelling `void () name` (the only
 //   fn-parameter shape either compiler accepts, methods included). A
-//   `void ()` parameter is invoked with ZERO arguments, so the historical
+//   `void ()` parameter is invoked with ZERO arguments, so the natural
 //   payloads (onMessage's message text, onConnection's client socket) are
-//   delivered through the public receive()/accept() accessors instead; the
-//   loss is documented at each site.
-// - connect(): URL parsing keeps the pre-split shape (independent `ws://`
-//   and `wss://` prefix strips -- the second if re-tests the stripped host,
-//   preserving the pre-split quirk; ws:// defaults to port 80, wss:// to
-//   443) with the probed parsePort digit-scan (falls back to the scheme
-//   default on garbage). `wss://` still opens a PLAIN TCP socket on 443
-//   (pre-split de-facto behavior -- the same posture net.sr's tls_client
-//   documents; no TLS stack is invoked).
-// - The HTTP-upgrade handshake keeps the pre-split request text verbatim
-//   (same fixed Sec-WebSocket-Key constant "dGhlIHNhbXBsZSBub25jZQ==") and
-//   its post-send `recv` + discard of the 101 response (no status
-//   validation, as before).
-// - server.wait() keeps the pre-split `while (true) { time.sleep(1000); }`
+//   delivered through the public receive()/accept() accessors instead;
+//   the limitation is documented at each site.
+// - connect(): URL parsing handles `ws://` and `wss://` independently
+//   (each if re-tests the host after the previous strip -- ws:// defaults
+//   to port 80, wss:// to 443) with the parsePort digit-scan (falls back to
+//   the scheme default on garbage). `wss://` opens a PLAIN TCP socket on
+//   443 (the same posture net.sr's tls_client documents; no TLS stack is
+//   invoked).
+// - The HTTP-upgrade handshake sends its fixed request text (fixed
+//   Sec-WebSocket-Key constant "dGhlIHNhbXBsZSBub25jZQ==") and
+//   post-send does a `recv` + discard of the 101 response (no status
+//   validation).
+// - server.wait() is the `while (true) { time.sleep(1000); }`
 //   never-returning shape. It is part of the public surface; never call it
 //   from a probe or test: it blocks the process by design. The
 //   module-qualified `time.sleep` call is safe (this module defines no
@@ -83,18 +78,18 @@ class socket {
         this.connected = true;
     }
 
-    // Fires the callback immediately on registration (the pre-split
-    // onOpen body was exactly `callback();` -- no state machine existed
-    // to hook into, and none is invented here).
+    // Fires the callback immediately on registration -- the body is
+    // exactly `callback();` (there is no connection state machine to hook
+    // into).
     public void onOpen(void () callback) {
         callback();
     }
 
     // Loop-receives frames until the peer disconnects or sends a close
     // frame (opcode 8), firing the callback once per decoded TEXT frame
-    // (opcode 1). The historical `void callback(string data)` payload
-    // cannot be expressed (`void () name` parameters take no arguments on
-    // either compiler); the decoded payload of the LAST frame is available
+    // (opcode 1). The `void () name` parameters take no arguments on
+    // either compiler, so the message text is not passed to the callback;
+    // the decoded payload of the LAST frame is available
     // through receive() semantics -- call receive() directly instead of
     // onMessage when the message text matters.
     public void onMessage(void () callback) {
@@ -116,8 +111,7 @@ class socket {
         }
     }
 
-    // Fires the callback immediately on registration (pre-split body:
-    // `callback();`).
+    // Fires the callback immediately on registration (body: `callback();`).
     public void onClose(void () callback) {
         callback();
     }
@@ -128,9 +122,8 @@ class socket {
     }
 
     // Receives one frame and returns its decoded payload ("" on disconnect,
-    // error, or close frame). The pre-split class had no single-shot
-    // receive; onMessage's loop was the only read path. Mirrors
-    // net.socket.receive(maxLen).
+    // error, or close frame). The single-shot read path; onMessage is the
+    // looping one. Mirrors net.socket.receive(maxLen).
     public string receive(int maxLen) {
         string raw = net.recvRaw(this.fd, maxLen);
         if (raw.length <= 0) {
@@ -150,8 +143,7 @@ class socket {
         net.closeRaw(this.fd);
     }
 
-    // Encodes one unmasked text frame. Byte layout is the historical
-    // algorithm verbatim:
+    // Encodes one unmasked text frame. Byte layout:
     //   len < 126   -> [0x81, len, payload...]
     //   len < 65536 -> [0x81, 126, len>>8, len&0xFF, payload...]
     //   otherwise   -> [0x81, 127, 8 big-endian length bytes, payload...]
@@ -236,10 +228,9 @@ class server {
     }
 
     // Accepts clients forever, firing the zero-arg callback once per
-    // connection. The historical `void callback(socket client)` parameter
-    // cannot be expressed (DOCS/259 params take no arguments); the accepted
-    // client handle is neither delivered nor closed, exactly like the
-    // pre-split loop. Use start() + accept() for the functional path.
+    // connection. The callback parameters take no arguments (DOCS/259
+    // `void () name`), so the accepted client handle is neither delivered
+    // nor closed. Use start() + accept() for the functional path.
     public void onConnection(void () callback) {
         if (this.fd < 0) { this.fd = net.listenRaw(this.port); }
         if (this.fd < 0) { return; }
@@ -251,15 +242,14 @@ class server {
         }
     }
 
-    // Binds and listens (backlog 10, the pre-split hard-coded value).
+    // Binds and listens (backlog 10, hard-coded).
     public void start() {
         this.fd = net.listenRaw(this.port);
     }
 
     // Accepts one client and returns it as a socket (null on failure).
-    // The pre-split class had no single-shot accept; onConnection's
-    // infinite loop was the only accept path and its callback could not
-    // carry the client. Mirrors net.listener.accept().
+    // The single-shot accept path; onConnection is the looping one and
+    // its callback cannot carry the client. Mirrors net.listener.accept().
     public socket accept() {
         if (this.fd < 0) { this.fd = net.listenRaw(this.port); }
         if (this.fd < 0) { return null; }
@@ -268,7 +258,7 @@ class server {
         return new socket(client);
     }
 
-    // Never returns (pre-split shape); blocks the process by design.
+    // Never returns; blocks the process by design.
     public void wait() {
         while (true) { time.sleep(1000); }
     }

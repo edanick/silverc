@@ -3,30 +3,29 @@ import { SystemFunction036 as RtlGenRandom } from win32.advapi32;
 mod export uuid;
 
 // DOCS -- std `uuid` module. Pure Silver formatting over the advapi32
-// CSPRNG. Two fixes vs the pre-split file (which never compiled anywhere):
+// CSPRNG. Two interop facts shape the code:
 //
-// 1. GRANT: RtlGenRandom was called with NO import grant (both compilers
-//    reject that: "unknown method RtlGenRandom"). The conventional
+// 1. GRANT: calls need an import grant -- both compilers reject an
+//    ungated call ("unknown method RtlGenRandom"). The conventional
 //    RtlGenRandom name is not a real export -- advapi32 exports it as
 //    SystemFunction036 (documented alias), so the grant aliases the real
 //    export to the conventional name: the PE import keeps
 //    advapi32!SystemFunction036 while the calls below stay readable.
 //
 // 2. BUFFER LAYOUT: Silver arrays are [cap, len, elem...] with 8-byte
-//    elements, so a byte[] crosses a DLL boundary as a QWORD buffer (the
-//    std/ws_win.sr + std/mysql_win.sr probed posture: "byte[] must NOT
-//    cross a DLL boundary as a packed buffer"). The pre-split file passed a
-//    byte[16] to RtlGenRandom and read bytes[i] -- contiguous 16 bytes land
-//    in the first two qword slots, so bytes[1] would have read the low byte
-//    of random byte 8, not byte 1. The CSPRNG now writes into a packed
-//    int[2] (two qwords = 16 wire bytes) and the byte values are unpacked
-//    into int[16] one-per-slot with shifts -- the proven mysql/mongo
-//    backend layout. x64 is little-endian; byte i lives at packed slot i/8,
-//    byte position i%8 (shifted low-to-high).
+//    elements, so a byte[] crosses a DLL boundary as a QWORD buffer --
+//    a byte[] must NOT cross a DLL boundary as a packed buffer (the
+//    probed ws + mysql posture). A packed byte[16] handed to the CSPRNG
+//    puts contiguous 16 bytes in the first two qword slots, so bytes[1]
+//    would read the low byte of random byte 8, not byte 1. The CSPRNG
+//    instead writes into a packed int[2] (two qwords = 16 wire bytes) and
+//    the byte values are unpacked into one-per-slot arrays with shifts --
+//    the proven mysql/mongo layout. x64 is little-endian; byte i lives at
+//    packed slot i/8, byte position i%8 (shifted low-to-high).
 //
-// Also: `s.length()` call form -> `.length` property (the property form is
-// the only string-length spelling std sources use; the call form reads
-// garbage on the self-host for arrays and was never the std convention).
+// Also: string length is spelled as the `.length` property (the property
+// form is the only string-length spelling std sources use; the call form
+// reads garbage on the self-host for arrays).
 //
 // `char(0)` is not used here; `'\0'` would lex as '0' anyway (both
 // compilers' lexer quirk, see std/sysinfo.sr).
@@ -39,7 +38,7 @@ class uuid {
 
     // 16 random bytes via the CSPRNG. The byte[] result holds one byte per
     // element slot (values 0..255 stored into the qword slots -- assignment
-    // is safe; only DLL-side CONTIGUOUS packed reads were the trap above).
+    // is safe; only DLL-side CONTIGUOUS packed reads are the trap above).
     public byte[] toBytes() {
         int[] packed = new int[2];
         RtlGenRandom(packed, 16);

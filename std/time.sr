@@ -1,36 +1,33 @@
 mod export time;
 
-// DOCS -- public `time` module (UNIFIED_CORE_LIBRARY.md v2 canonical fold).
-// This is the universal timing module: the former internal Windows backend
-// std/time_win.sr was folded back into this file and deleted. There is no
-// time_win.sr anymore -- one module, one OS layer (time -> win32.kernel32).
-//
-// CANONICAL SHAPE (v2 rule 6): the raw OS calls live INSIDE each public
+// DOCS -- public `time` module (see UNIFIED_CORE_LIBRARY.md).
+// This is the universal timing module: one module, one OS layer
+// (time -> win32.kernel32). The raw OS calls live INSIDE each public
 // function body behind a `#on WINDOWS` region -- one unified function name,
-// no win-prefixed helpers, no wrapper indirection. The osType() runtime
-// gates and the `os` import are gone (the preprocessor replaces them); no
-// #else and no LINUX/MAC placeholders -- the other-OS regions get filled on
-// their own machines later.
+// no win-prefixed helpers, no wrapper indirection. There is no `#else` and
+// no LINUX/MAC placeholders in std; the other-OS regions get filled on
+// their own machines later. The preprocessor selects the OS code at compile
+// time, so there is no `os` import here (the runtime `os.type` check is a
+// user-facing feature).
 //
 // PLAIN IMPORT: the kernel32 grant is a plain full-table
-// `import * from win32.kernel32;` inside its own region -- alias imports are
-// removed in v2. Sleep, QueryPerformanceCounter and QueryPerformanceFrequency
-// are present in BOTH compilers' kernel32 export tables
-// (silverc-rs/src/win32.rs and the self-host win32ExportTable), so the plain
-// grant resolves without any table change. The QPC int64 out-param (&int64)
-// pattern is the pre-split one, kept exactly as it worked behind the aliased
-// grants; the QPC double derivation (count / freq * 1000.0) moved in
-// verbatim.
+// `import * from win32.kernel32;` inside its own region. Sleep,
+// QueryPerformanceCounter and QueryPerformanceFrequency are present in BOTH
+// compilers' kernel32 export tables (silverc-rs/src/win32.rs and the
+// self-host win32ExportTable), so the plain grant resolves without any
+// table change. The QPC int64 out-param pattern (`&int64`) feeds each
+// 64-bit counter by address; now() derives milliseconds as
+// (count / freq * 1000.0).
 //
-// DISPATCH NOTE (per compiler, unchanged by this fold): silverc-rs answers
-// bare `sleep(...)` / `now(...)` calls with native builtins (SENTINEL_SLEEP
-// and the gen_now emitter) -- but gen_call consults func_labels FIRST, so
-// with this module collected (its functions registered) the bodies below run
-// and hit the same kernel32 exports; the self-hosted compiler has no such
-// builtins and dispatches `time.*` to these globals directly. Both paths
-// produce the same behavior. The sleep pair keeps the public API's exact int
-// and uint overloads instead of funnelling both through one typed parameter
-// -- kernel32!Sleep takes the millisecond count either way.
+// DISPATCH NOTE (per compiler): silverc-rs answers bare `sleep(...)` /
+// `now(...)` calls with native builtins (SENTINEL_SLEEP and the gen_now
+// emitter) -- but gen_call consults func_labels FIRST, so with this module
+// collected (its functions registered) the bodies below run and hit the
+// same kernel32 exports; the self-hosted compiler has no such builtins and
+// dispatches `time.*` to these globals directly. Both paths produce the
+// same behavior. The sleep pair keeps the public API's exact int and uint
+// overloads instead of funnelling both through one typed parameter --
+// kernel32!Sleep takes the millisecond count either way.
 //
 // STOPWATCH (DOCS/259 -- anonymous function parameters): the receiver
 // declares a function-typed parameter `void () job` -- an 8-byte address

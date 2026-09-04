@@ -2,187 +2,141 @@ import * from net;
 
 mod export imap;
 
-// DOCS -- public `imap` module (UNIFIED_CORE_LIBRARY.md §4, the CANONICAL
-// FOLD SHAPE). This is the unified, portable front of the IMAP4rev1 library.
-// It contains ZERO OS code: no win32 imports, no `#on` regions, no osType()
-// gates -- every byte on the wire is sent through the universal socket core
-// std/net.sr (connectRaw/sendRawLen/recvRaw/closeRaw/setRecvTimeoutRaw),
-// whose Windows regions hold the ws2_32 calls. This module is pure IMAP
-// protocol logic and would compile unchanged on any backend that provides
-// net.
+// DOCS -- public `imap` module (UNIFIED_CORE_LIBRARY.md §4). This is the
+// portable front of the IMAP4rev1 library. It contains ZERO OS code: no
+// win32 imports, no `#on` regions -- every byte on the wire is sent through
+// the universal socket core std/net.sr
+// (connectRaw/sendRawLen/recvRaw/closeRaw/setRecvTimeoutRaw), whose
+// Windows regions hold the ws2_32 calls. This module is pure IMAP protocol
+// logic and compiles unchanged on any backend that provides net.
 //
-// TRANSPORT (the fold): the pre-fold Windows backend std/imap_win.sr carried
-// the aliased ws2_32 grants (socket/connect/recv/send/closesocket/inet_addr/
-// setsockopt/WSAStartup as imapWinRaw*) plus the 30 s SO_RCVTIMEO arming;
-// all of that now lives in net.sr's regions. login() arms the timeout right
-// after connectRaw (net.setRecvTimeoutRaw, 30000 ms -- the pre-fold
-// imapWinConnect arming) and select()/search()/fetch()/list()/logout()
-// re-arm it on their first socket use, preserving the pre-fold "every socket
-// has a 30 s receive timeout" bound. The recv loop itself (recvResp) calls
-// net.recvRaw(fd, 4096) -- the pre-fold imapWinReceive(fd, 4096) shape --
-// and the sender (cmd) calls net.sendRawLen with the pre-split byte counts.
-// The pre-fold imapWin* helpers returned "" on both recv error AND
-// zero-extended SOCKET_ERROR (`n <= 0 || n > 2147483647`); net.recvRaw
-// normalizes first and then reports "" for `n <= 0` -- the same observable
-// graceful shape.
+// TRANSPORT: everything rides net. connectRaw dials, setRecvTimeoutRaw
+// arms a 30 s receive timeout right after the connect -- login() arms it
+// immediately after connectRaw (net.setRecvTimeoutRaw, 30000 ms) and
+// select()/search()/fetch()/list()/logout() re-arm it on their first
+// socket use, so every socket carries a 30 s receive timeout bound. The
+// recv loop itself (recvResp) calls net.recvRaw(fd, 4096) and the sender
+// (cmd) calls net.sendRawLen with exact byte counts. The receive path
+// returns "" on both recv error and zero-length reads: recvRaw normalizes
+// the DLL return first, then reports "" for `n <= 0`.
 //
-// DISPATCH (per compiler, probed): `imap` is builtin-reserved on NEITHER
-// compiler -- silverc-rs's builtin_modules_set (src/main.rs:81 lists
+// DISPATCH: `imap` is builtin-reserved on NEITHER compiler --
+// silverc-rs's builtin_modules_set (src/main.rs:81 lists
 // fs/json/yaml/env/url/hash/path/bom/console/math/http only) and the
-// self-hosted compiler's visBuiltinModule (compiler/visibility.sr:605 lists
-// fs/json/yaml/llmai/LLMAI/os/project/exception/bom/process/notifications/
-// env/url/hash/path/console/math/http) plus its driver prepend list all
-// exclude it. Both compilers resolve `import * from imap;` as an ORDINARY
-// SOURCE module (std/imap.sr); no native dispatch exists to preserve.
-// (imap.sr's entry in silverc.srp's exclude list only keeps it out of the
-// compiler's own aggregate build -- the same posture as smtp.sr/pop.sr; it
-// does not make `imap` a builtin.)
+// self-hosted compiler's visBuiltinModule (compiler/visibility.sr:605
+// lists fs/json/yaml/llmai/LLMAI/os/project/exception/bom/process/
+// notifications/env/url/hash/path/console/math/http) plus its driver
+// prepend list all exclude it. Both compilers resolve
+// `import * from imap;` as an ORDINARY SOURCE module (std/imap.sr); there
+// is no native dispatch for it. (imap.sr's entry in silverc.srp's exclude
+// list only keeps it out of the compiler's own aggregate build -- the same
+// posture as smtp.sr/pop.sr; it does not make `imap` a builtin.)
 //
-// PRE-SPLIT STATE (probed 2026-08 against this file's git HEAD copy, fresh
-// -o names on both compilers): the old std/imap.sr NEVER compiled under
-// either compiler. silverc-rs died with "28:9: Expected expression",
-// "unknown keyword sockaddr_in at line 28, column 16" and "unknown keyword
-// addr at line 28, column 28" (the line-28 `struct sockaddr_in addr;`
-// phantom), exit 1; the self-hosted compiler died with the same unknown
-// keywords plus a "you forgot to put a semicolon" cascade, all line 28,
-// exit 1. The parser never reached the later phantoms, but they were
-// equally dead: `string full = this.tag + " " + c + "\r\n"` rides the
-// string+int concat shape (no compiler source relies on it), `full.toBytes()`
-// is the phantom string method (the encoding.base64Encode crasher class --
-// see std/smtp.sr's b64Encode note), `new byte[4096]` is the byte[]
-// declaration-initializer landmine, `int[] ids;` is declared WITHOUT an
-// initializer and then pushed into (a NULL-array deref had it ever run),
-// `int(p)` casts split substrings, `resp.substr(start)` rides the rs
-// substr(start,X)=(start,END) vs self-host (start,LENGTH) disagreement, and
-// recvResp()'s `char(buf[i])` scan over a recv buffer never executed.
-// `AF_INET`/`SOCK_STREAM` resolve to nothing (neither name is in either
-// compiler's ws2_32 export table) and winsock was never initialized. Every
-// body was therefore dead text -- there was NO observable pre-split behavior
-// to preserve beyond names, arities and intent.
-//
-// DEAD -> LIVE (what this split made actually work, mirroring the
-// std/pop.sr / std/smtp.sr splits):
-// - The control channel: socket + connect over ws2_32 with WSAStartup (the
-//   pre-split file never initialized winsock), the sockaddr_in image packed
-//   into an int[2] qword buffer, and DLL returns normalized with the
-//   two-sided `v < 0 || v > 2147483647` check (the self-host zero-extends
-//   SOCKET_ERROR to 4294967295; the pre-fold std/imap_win.sr transport,
-//   now inside net.sr's regions).
+// WIRE BEHAVIOR:
+// - The control channel: socket + connect over ws2_32 with WSAStartup
+//   inside net.sr's Windows regions, the sockaddr_in image packed into an
+//   int[2] qword buffer, and DLL returns normalized with the two-sided
+//   `v < 0 || v > 2147483647` check (the self-host zero-extends
+//   SOCKET_ERROR to 4294967295).
 // - The tag discipline: IMAP is tag-based -- a command is `<tag> ARGS` and
 //   its completion is the line starting with that tag (`<tag> OK|NO|BAD
 //   ...`); untagged `* ...` lines interleave and must never be mistaken for
-//   the completion. Tags are the decimal counter the pre-split body
-//   intended (`this.tag + " "`), produced by the pure nextTag() helper
-//   (probeable). readTagged() accumulates reads until the CURRENT tag's
-//   line shows a status (replyStatus), the peer goes quiet, or 16 x 4096
-//   bytes (~64 KB) pass -- whichever comes first; a stale reply cannot leak
-//   into the next command (each read overwrites lastReply).
-// - login(): pre-split it fired two unchecked send/recv pairs and stayed
-//   silent about failure. It now reads and validates the greeting
-//   (`* OK` or `* PREAUTH` -- greetingOk()), sends LOGIN and requires the
-//   tagged OK, and records the outcome in isLoggedIn()/getLastReply()
-//   (both ADDITIVE -- the pre-split surface had no way to report anything;
-//   same additions as std/pop.sr/std/smtp.sr). Plain-text LOGIN only:
-//   the LOGIN command needs no base64, so the encoding.base64Encode runtime
-//   crasher (phantom string.toBytes(), 0xC0000005 rs / 0xC0000409 self-host
-//   -- see std/smtp.sr's b64Encode note) is avoided entirely; no b64 was
-//   carried and the encoding import never existed here. Against a
+//   the completion. Tags are the decimal counter produced by the pure
+//   nextTag() helper (probeable). readTagged() accumulates reads until the
+//   CURRENT tag's line shows a status (replyStatus), the peer goes quiet,
+//   or 16 x 4096 bytes (~64 KB) pass -- whichever comes first; a stale
+//   reply cannot leak into the next command (each read overwrites
+//   lastReply).
+// - login(): reads and validates the greeting (`* OK` or `* PREAUTH` --
+//   greetingOk()), sends LOGIN and requires the tagged OK, and records the
+//   outcome in isLoggedIn()/getLastReply(). Plain-text LOGIN only: the
+//   LOGIN command needs no base64, so the encoding.base64Encode runtime
+//   crasher (phantom string.toBytes(), 0xC0000005 rs / 0xC0000409
+//   self-host -- see std/smtp.sr's b64Encode note) is avoided entirely; no
+//   b64 is carried and the encoding import does not exist here. Against a
 //   non-IMAP listener the login fails gracefully: the peer's junk (or ""
 //   after a silent disconnect) is surfaced through getLastReply() and the
 //   process exits cleanly. No exceptions anywhere.
-// - select(): pre-split it sent SELECT and read one buffer blindly. It now
-//   waits for the tagged completion (untagged `* n EXISTS` etc. interleave
-//   first) and leaves the reply in getLastReply(); a NO/BAD keeps the
-//   session open (state unchanged), mirroring the pre-split void shape.
-// - search(): pre-split it parsed the reply with indexOf("SEARCH") +
-//   substr + int() casts of split parts (the substr landmine). It now
-//   requires the tagged OK and parses the `* SEARCH` untagged line with the
-//   pure searchIds() digit scan (probeable, substr-free); a malformed or
-//   failed reply returns [] (ids never from a dead read).
-// - fetch(): pre-split it wrapped ONE reply buffer in a message and never
-//   populated fromAddr/subject/body. It now requires the tagged OK, keeps
-//   the whole response in raw, and fills fromAddr/subject/body via the pure
-//   literalText()/messageBody()/headerValue() helpers: IMAP delivers the
-//   message as an RFC 3501 `{n}` literal (`* 1 FETCH (RFC822 {n}` + n raw
-//   bytes + `)`), literalText() extracts those n bytes, headerValue() the
-//   From:/Subject: headers, messageBody() the text after the header blank
-//   line (the pre-split fields existed but were never populated -- dead).
-// - logout(): pre-split it sent LOGOUT, read once and closed. The shape is
-//   preserved (send, one bounded tagged read for `* BYE` + tagged OK, then
-//   close) but every step is bounded, so a dead peer cannot stall logout().
-// - Bounded reads: every socket gets a 30 s SO_RCVTIMEO (net.setRecvTimeoutRaw,
-//   armed at connect and re-armed on each command entry).
-//   The pre-split file had no timeout and would have hung on a silent peer;
-//   readGreeting() is bounded at 16 reads (until the first complete CRLF
-//   line) and readTagged() at 16 x 4096 bytes (~64 KB per command), so no
-//   path can spin forever.
+// - select(): waits for the tagged completion (untagged `* n EXISTS` etc.
+//   interleave first) and leaves the reply in getLastReply(); a NO/BAD
+//   keeps the session open (state unchanged).
+// - search(): requires the tagged OK and parses the `* SEARCH` untagged
+//   line with the pure searchIds() digit scan (probeable, substr-free); a
+//   malformed or failed reply returns [] (ids never from a dead read).
+// - fetch(): requires the tagged OK, keeps the whole response in raw, and
+//   fills fromAddr/subject/body via the pure literalText()/
+//   messageBody()/headerValue() helpers: IMAP delivers the message as an
+//   RFC 3501 `{n}` literal (`* 1 FETCH (RFC822 {n}` + n raw bytes + `)`),
+//   literalText() extracts those n bytes, headerValue() the From:/Subject:
+//   headers, messageBody() the text after the header blank line.
+// - logout(): sends LOGOUT, reads one bounded tagged reply for `* BYE` +
+//   tagged OK, then closes. Every step is bounded, so a dead peer cannot
+//   stall logout().
+// - Bounded reads: every socket gets a 30 s SO_RCVTIMEO
+//   (net.setRecvTimeoutRaw, armed at connect and re-armed on each command
+//   entry). readGreeting() is bounded at 16 reads (until the first
+//   complete CRLF line) and readTagged() at 16 x 4096 bytes (~64 KB per
+//   command), so no path can spin forever.
 //
-// NOT INVENTED: no AUTHENTICATE/STARTTLS/TLS (the pre-split intent was
-// plain-text LOGIN; AUTH PLAIN would need base64 -- the encoding crasher --
-// so nothing was invented); no APPEND/STORE/EXPUNGE/COPY/STATUS/NOOP/
-// CAPABILITY/SUBSCRIBE; no mailbox create/delete/rename (select() is the
-// pre-split mailbox surface and list() -- see ADDITIVE -- is the LIST the
-// task's IMAP4rev1 protocol set names, nothing beyond it); no EXAMINE;
-// fetch() keeps the pre-split `FETCH n (RFC822)` text (RFC822 is the
-// RFC 3501 legacy alias of BODY[], which is what the pre-split body named);
-// message keeps exactly its pre-split four fields -- no uid/flags/size/
-// seqNum fields were added; search() keeps its pre-split single `criteria`
-// string (no seq-set builder, no charset argument).
+// SCOPE: no AUTHENTICATE/STARTTLS/TLS (plain-text LOGIN only; AUTH PLAIN
+// would need base64 -- the encoding crasher); no APPEND/STORE/EXPUNGE/
+// COPY/STATUS/NOOP/CAPABILITY/SUBSCRIBE; no mailbox create/delete/rename
+// (select() is the mailbox surface and list() is the LIST the task's
+// IMAP4rev1 protocol set names, nothing beyond it); no EXAMINE; fetch()
+// sends `FETCH n (RFC822)` text (RFC822 is the RFC 3501 legacy alias of
+// BODY[]); message has exactly four fields -- no uid/flags/size/seqNum
+// fields; search() takes a single `criteria` string (no seq-set builder,
+// no charset argument).
 //
-// API PRESERVATION (every public name/arity of the pre-split file,
-// unchanged): class message -- public fields fromAddr/subject/body/raw,
+// PUBLIC API: class message -- public fields fromAddr/subject/body/raw,
 // construct(string raw); class client -- construct(string host, int port);
 // login(string user, string pass); select(string mailbox);
 // search(string criteria) -> int[]; fetch(int id) -> message; logout().
-// The private cmd/recvResp helper names are preserved (cmd keeps its
-// send-tag-increment-return-full-line shape; recvResp keeps its raw-bytes
-// shape -- one bounded read; the accumulation lives in the new private
-// readGreeting/readTagged, the std/pop.sr shape). NO RENAMES were needed
-// (unlike smtp's from/to setters): every pre-split name (message, client,
-// login, select, search, fetch, logout, cmd, recvResp, and the message
-// fields fromAddr/subject/body/raw) is keyword-free on both compilers --
-// checked against silverc-rs src/token.rs and self-host compiler/lexer.sr
-// (`from`/`to`/`match` are keywords on both and appear nowhere here).
-// ADDITIVE (the std/pop.sr/std/smtp.sr precedent, documented):
-// client.getLastReply() returns the raw text of the last server reply (""
-// before the first read -- the graceful-failure surface);
-// client.isLoggedIn() is true only after an accepted greeting + tagged OK
-// LOGIN; client.list() issues `LIST "" "*"` and returns the raw untagged
-// `* LIST ...` lines split on nothing (whole lines as strings) -- [] on any
-// failure (the task's IMAP4rev1 protocol set names LIST; the pre-split
-// surface had no mailbox listing entry); free pure helpers -- nextTag(n)
-// (the decimal tag string; tag generation made probeable), greetingOk(resp)
-// (true iff the first line is `* OK` or `* PREAUTH`), replyStatus(resp,
-// tag) ("OK"/"NO"/"BAD" for the tagged reply line, "" when the tag's line
-// is absent or its word is not a status), replyOk(resp, tag) (replyStatus
-// is "OK" -- spelled as a char scan: the module contains NO string ==
-// comparisons, the self-host relies on strEq-style char scans), searchIds
-// (resp) (the ids of the `* SEARCH` untagged line, digit-scanned),
-// literalText(resp) (the bytes of the first `{n}` CRLF-bounded literal),
-// messageBody(resp) (the text after the literal's first blank line) and
-// headerValue(text, name) (RFC 822 header value, "" if absent -- pass
-// "From:"/"Subject:" with the colon) are pure and probeable. Also additive
-// and invisible: the private lastReply/loggedIn fields, the private
-// readGreeting/readTagged/fail plumbing, the private lineEndFrom/
-// blankLineIndex/sliceRange scan helpers, and construct() now initializes
-// every field (sock to -1, strings to "", loggedIn to false) -- the
-// pre-split construct set only host/port/tag, so logout()'s closesocket
-// would have derefed an uninitialized handle had the file ever run.
+// The private cmd/recvResp helpers: cmd keeps the send-tag-increment-
+// return-full-line shape; recvResp is the raw-bytes single bounded read;
+// the accumulation lives in the private readGreeting/readTagged. Every
+// public name (message, client, login, select, search, fetch, logout, and
+// the message fields fromAddr/subject/body/raw) is keyword-free on both
+// compilers -- checked against silverc-rs src/token.rs and self-host
+// compiler/lexer.sr (`from`/`to`/`match` are keywords on both and appear
+// nowhere here).
+// getLastReply(): the raw text of the last server reply ("" before the
+// first read -- the graceful-failure surface). isLoggedIn(): true only
+// after an accepted greeting + tagged OK LOGIN. list(): issues
+// `LIST "" "*"` and returns the raw untagged `* LIST ...` lines, whole
+// lines as strings -- [] on any failure (the task's IMAP4rev1 protocol set
+// names LIST). Free pure helpers -- nextTag(n) (the decimal tag string),
+// greetingOk(resp) (true iff the first line is `* OK` or `* PREAUTH`),
+// replyStatus(resp, tag) ("OK"/"NO"/"BAD" for the tagged reply line, ""
+// when the tag's line is absent or its word is not a status), replyOk
+// (resp, tag) (replyStatus is "OK" -- spelled as a char scan: the module
+// contains NO string == comparisons, the self-host relies on strEq-style
+// char scans), searchIds(resp) (the ids of the `* SEARCH` untagged line,
+// digit-scanned), literalText(resp) (the bytes of the first `{n}`
+// CRLF-bounded literal), messageBody(resp) (the text after the literal's
+// first blank line) and headerValue(text, name) (RFC 822 header value, ""
+// if absent -- pass "From:"/"Subject:" with the colon) are pure and
+// probeable. Module-internal: the private lastReply/loggedIn fields, the
+// private readGreeting/readTagged/fail plumbing, the private lineEndFrom/
+// blankLineIndex/sliceRange scan helpers, and construct()'s full field
+// initialization (sock to -1, strings to "", loggedIn to false), so
+// logout() never touches an uninitialized handle.
 //
 // CALLER NOTES: instantiate the client with `var c = new client(...);` --
 // a lowercase class arriving from a star-imported module cannot be spelled
 // as a local's type on silverc-rs (per-file parsing: `client c` dies with
 // "unknown keyword"; `new mod.client()` dies on BOTH compilers; `var`
-// works on both, probed via std/ftps.sr). fetch() returns a class instance
-// across the module boundary: assign it to a `var` and read the fields
-// from there (probed byte-identical on both compilers via the pop
-// retrieve() precedent). Strings returned across this module's boundary
-// (getLastReply and the free helpers) should be assigned to a local before
+// works on both; the same `var` pattern works in std/ftps.sr). fetch()
+// returns a class instance across the module boundary: assign it to a
+// `var` and read the fields from there (byte-identical on both compilers;
+// the same pattern as the pop retrieve() caller). Strings returned across
+// this module's boundary (getLastReply and the free helpers) should be
+// assigned to a local before
 // being concatenated into larger expressions (silverc-rs stringifies the
 // return pointer in expression position; see std/dns.sr's RS-ONLY CALLER
 // LANDMINE). The same applies to ELEMENTS of this module's cross-module
-// string[] return, client.list(): probed 2026-08, `printline("x=" + arr[i])`
-// printed raw heap pointers on silverc-rs while the self-host printed the
+// string[] return, client.list(): `printline("x=" + arr[i])`
+// prints raw heap pointers on silverc-rs while the self-host prints the
 // text -- `string s = arr[i]; printline("x=" + s);` is byte-identical on
 // both. search() returns [] and list() returns [] (never null) on
 // failure; fetch() returns a message with raw "" on failure; login()/
@@ -190,9 +144,8 @@ mod export imap;
 // char/int scans only -- no string == -- and callers wanting to test
 // replies should reuse replyStatus/replyOk rather than spelling ==.
 
-// Decimal tag string for the n-th command (`1`, `2`, ... -- the pre-split
-// `this.tag + " "` intent, made pure and probeable). Tags are client-chosen
-// atoms; decimal tags are valid and match nothing untagged.
+// Decimal tag string for the n-th command (`1`, `2`, ...). Tags are
+// client-chosen atoms; decimal tags are valid and match nothing untagged.
 public string nextTag(int n) {
     return n.toString();
 }
@@ -252,8 +205,7 @@ public bool replyOk(string resp, string tag) {
 }
 
 // The ids of the `* SEARCH` untagged line in `resp` (digit-scanned, [] when
-// the line is absent or carries no ids). Pure; probeable. Replaces the
-// pre-split indexOf/substr/int()-cast parse (see DEAD -> LIVE).
+// the line is absent or carries no ids). Pure; probeable.
 public int[] searchIds(string resp) {
     int[] ids = [];
     int pos = 0;
@@ -289,8 +241,7 @@ public int[] searchIds(string resp) {
 // Bytes of the first RFC 3501 literal in `resp`: the `{n}\r\n` marker's n
 // raw bytes ("" when no literal is present or the marker is malformed).
 // The byte count is authoritative -- no terminator guessing. Pure;
-// probeable. ADDITIVE (the pre-split fetch never populated the message
-// fields).
+// probeable.
 public string literalText(string resp) {
     for (int i = 0; i < resp.length; i++) {
         if (resp[i] == 123) {
@@ -318,8 +269,7 @@ public string literalText(string resp) {
 
 // Body text of a FETCH response's message: everything after the first blank
 // line (the RFC 822 header/body separator) of the `{n}` literal ("" when
-// either is missing). Pure; probeable. ADDITIVE (the pre-split body field
-// existed but was never populated).
+// either is missing). Pure; probeable.
 public string messageBody(string fetchResp) {
     string lit = literalText(fetchResp);
     if (lit.length <= 0) { return ""; }
@@ -332,8 +282,7 @@ public string messageBody(string fetchResp) {
 // scans line by line, matches `headerName` (pass it WITH the colon, e.g.
 // "From:") at a line start, skips one space after the colon and returns the
 // rest of that line. No folding support (continuation lines are not
-// joined). Pure; probeable. ADDITIVE (the pre-split fromAddr/subject fields
-// existed but were never populated).
+// joined). Pure; probeable.
 public string headerValue(string text, string headerName) {
     int nameLen = headerName.length;
     int pos = 0;
@@ -383,17 +332,16 @@ class client {
         this.loggedIn = false;
     }
 
-    // ADDITIVE (the std/pop.sr/std/smtp.sr precedent): the raw text of the
-    // last server reply on the control channel ("" before the first read).
-    // This is the graceful-failure surface: against a non-IMAP listener it
-    // holds the junk the peer sent, or "" when the peer said nothing and
-    // closed.
+    // The raw text of the last server reply on the control channel (""
+    // before the first read). This is the graceful-failure surface:
+    // against a non-IMAP listener it holds the junk the peer sent, or ""
+    // when the peer said nothing and closed.
     public string getLastReply() {
         return this.lastReply;
     }
 
-    // ADDITIVE: true only after an accepted greeting (`* OK`/`* PREAUTH`)
-    // plus a tagged-OK LOGIN.
+    // True only after an accepted greeting (`* OK`/`* PREAUTH`) plus a
+    // tagged-OK LOGIN.
     public bool isLoggedIn() {
         return this.loggedIn;
     }
@@ -401,7 +349,7 @@ class client {
     // Greeting + LOGIN flow, every step validated: `* OK`/`* PREAUTH`
     // greeting, then the tagged LOGIN reply must be OK. On any mismatch
     // fail() drops the connection and the peer's last words stay in
-    // getLastReply(). Plain-text LOGIN only (no base64 -- see DEAD -> LIVE).
+    // getLastReply(). Plain-text LOGIN only (no base64 -- see SCOPE).
     public void login(string user, string pass) {
         this.sock = net.connectRaw(this.host, this.port);
         if (this.sock < 0) {
@@ -426,8 +374,7 @@ class client {
 
     // SELECT: waits for the tagged completion (untagged `* n EXISTS` etc.
     // interleave first) and leaves the reply in getLastReply(). Silent on
-    // any failure (the pre-split void shape); the session stays open on
-    // NO/BAD.
+    // any failure; the session stays open on NO/BAD.
     public void select(string mailbox) {
         if (!this.loggedIn) { return; }
         net.setRecvTimeoutRaw(this.sock, 30000);
@@ -452,8 +399,7 @@ class client {
     // FETCH n (RFC822): requires the tagged OK, keeps the whole response
     // (status line, `{n}` literal and terminator included) in raw, and
     // fills fromAddr/subject/body via the pure helpers. On any failure the
-    // message is returned empty (raw "" -- the pre-split shape on a dead
-    // read, since its recvResp() returned "" which fed construct).
+    // message is returned empty (raw "").
     public message fetch(int id) {
         string raw = "";
         if (this.loggedIn && this.sock >= 0) {
@@ -471,9 +417,7 @@ class client {
     }
 
     // LIST "" "*": the raw untagged `* LIST ...` lines of the response
-    // (mailboxes, one per string). Returns [] on any failure. ADDITIVE (the
-    // task's IMAP4rev1 protocol set names LIST; the std/pop.sr additive
-    // list() precedent).
+    // (mailboxes, one per string). Returns [] on any failure.
     public string[] list() {
         string[] empty = [];
         if (!this.loggedIn) { return empty; }
@@ -488,9 +432,7 @@ class client {
 
     // LOGOUT: sends LOGOUT, reads the bounded tagged reply (`* BYE` then
     // tagged OK -- the status is not required) and closes. Every step is
-    // bounded, so a dead peer cannot stall logout() (the pre-split shape --
-    // send, read, closesocket -- preserved; the pre-split read just never
-    // ran, the file never compiled).
+    // bounded, so a dead peer cannot stall logout().
     public void logout() {
         if (this.sock >= 0) {
             net.setRecvTimeoutRaw(this.sock, 30000);
@@ -503,9 +445,9 @@ class client {
     }
 
     // Sends one tagged command line: `<tag> <c>\r\n`, tag incremented after
-    // the send (the pre-split cmd shape -- send, tag++, return the full
-    // line). No-op on a dead channel -- every caller pairs it with a
-    // bounded read, so the failure surfaces there instead.
+    // the send -- send, tag++, return the full line. No-op on a dead
+    // channel -- every caller pairs it with a bounded read, so the failure
+    // surfaces there instead.
     private string cmd(string c) {
         string full = nextTag(this.tag) + " " + c + "\r\n";
         if (this.sock >= 0) { net.sendRawLen(this.sock, full, full.length); }
@@ -514,7 +456,7 @@ class client {
     }
 
     // One bounded read of the control channel (raw bytes as a string; ""
-    // on disconnect/timeout -- pre-split recvResp shape).
+    // on disconnect/timeout).
     private string recvResp() {
         if (this.sock < 0) { return ""; }
         return net.recvRaw(this.sock, 4096);
@@ -566,8 +508,7 @@ class client {
 }
 
 // The raw untagged `* LIST ...` lines of a LIST response (one line per
-// string, CRLF stripped). Pure; probeable. ADDITIVE (list()'s parser --
-// the pre-split surface had no mailbox listing).
+// string, CRLF stripped). Pure; probeable; list()'s parser.
 public string[] listLines(string resp) {
     string[] lines = [];
     int pos = 0;
@@ -608,7 +549,7 @@ private int blankLineIndex(string s) {
 
 // Copies s[start .. end) character by character. Deliberately NOT substr:
 // rs's two-arg substr treats X as an END offset while the self-host treats
-// it as a LENGTH -- identical only when start is 0 (probed; see
+// it as a LENGTH -- identical only when start is 0 (see
 // silverc-rs/src/string_ops.rs emit_string_substring) -- and every caller
 // here slices from a nonzero offset.
 private string sliceRange(string s, int start, int end) {

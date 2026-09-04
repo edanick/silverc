@@ -1,34 +1,32 @@
 mod export threads;
 
-// DOCS -- public `threads` module (UNIFIED_CORE_LIBRARY.md v2 canonical
-// fold). This is the universal threading module: the former internal Windows
-// backend std/thread_win.sr was folded back into this file and deleted.
-// There is no thread_win.sr anymore -- one module, one OS layer
+// DOCS -- public `threads` module (UNIFIED_CORE_LIBRARY.md §4). This is the
+// universal threading module -- one module, one OS layer
 // (threads -> win32.kernel32).
 //
-// CANONICAL SHAPE (v2 rule 6): the raw OS calls live INSIDE the public
-// function bodies (Thread.start / Thread.join / sleep) behind `#on WINDOWS`
-// regions -- one unified function name, no win-prefixed helpers, no wrapper
-// indirection. The osType() runtime gates and the `os` import are gone (the
-// preprocessor replaces them); no #else and no LINUX/MAC placeholders -- the
-// other-OS regions get filled on their own machines later. For a future
-// non-Windows backend the fallbacks follow the module's existing failure
-// style: sleep() is a silent no-op, start() leaves the handle at 0 so
-// join() is a no-op too, and the spawn path reports failure through the 0
-// handle (the Win32 failure convention this module already used).
+// SHAPE (UNIFIED_CORE_LIBRARY.md §4 rule 6): the raw OS calls live INSIDE
+// the public function bodies (Thread.start / Thread.join / sleep) behind
+// `#on WINDOWS` regions -- one unified function name, no win-prefixed
+// helpers, no wrapper indirection. OS selection is compile-time via the
+// preprocessor; the module does not use the runtime `os` check. No #else
+// and no LINUX/MAC placeholders -- the other-OS regions get filled on their
+// own machines later. For a future non-Windows backend the fallbacks follow
+// the module's existing failure style: sleep() is a silent no-op, start()
+// leaves the handle at 0 so join() is a no-op too, and the spawn path
+// reports failure through the 0 handle (the Win32 failure convention).
 //
 // PLAIN IMPORT: the kernel32 grant is a plain full-table
-// `import * from win32.kernel32;` inside its own region -- alias imports are
-// removed in v2. TABLE STATUS: Sleep, WaitForSingleObject and CloseHandle
-// are tabled on BOTH compilers (silverc-rs/src/win32.rs and the self-host
+// `import * from win32.kernel32;` inside its own region -- no alias
+// imports. TABLE STATUS: Sleep, WaitForSingleObject and CloseHandle are
+// tabled on BOTH compilers (silverc-rs/src/win32.rs and the self-host
 // win32ExportTable), so the plain grant resolves them directly. CreateThread
 // is tabled on NEITHER, and the plain full-table grant resolves calls
 // strictly against the tables (silverc-rs win32::resolve scans
 // dll_exports first; the self-host win32Allowed checks win32TableHas) -- so
 // a CreateThread call through this import would fail to compile, which is
-// exactly the dead-spawn posture the pre-fold module documented (below).
+// the documented dead-spawn posture below.
 //
-// DISPATCH (per compiler, probed, unchanged by this fold): `threads` is
+// DISPATCH (per compiler, probed): `threads` is
 // builtin-reserved on NEITHER compiler -- silverc-rs main.rs
 // builtin_modules_set and the self-hosted std/project.sr projectBuiltin list
 // both exclude it, and neither codegen has any native `threads.*` intercept
@@ -40,29 +38,24 @@ mod export threads;
 // (MiniCg.emitFieldAccess) -- a pre-existing builtin, unrelated to this
 // module's API, which defines no `length` member.
 //
-// DEAD SPAWN MECHANISM (probed, preserved, stays dead -- documented): the
-// pre-split std/thread.sr passed its private trampoline to CreateThread as a
-// BARE FUNCTION NAME -- `CreateThread(null, 0, threadStart, this, 0, null)`.
+// DORMANT SPAWN MECHANISM (probed, stays dead -- documented): this module's
+// spawn entry passes its private trampoline to CreateThread as a BARE
+// FUNCTION NAME -- `CreateThread(null, 0, threadStart, this, 0, null)`.
 // Neither compiler supports function-name-as-value: an identifier that names
 // a function lowers to a null/garbage slot (silverc-rs gen_expr falls
 // through to `xor eax, eax` = 0; the self-hosted MiniCg loads [rbp+0], the
-// saved frame pointer). The pre-split file also used the pre-DOCS/259
-// C-style `function void()` syntax, which no longer parses, and sat in
-// silverc.srp's exclude list -- so it never compiled anywhere. The fold
-// keeps that posture: the spawn entry is unreachable dead text (a spawned
-// thread would jump to an invalid address and fault the process -- the
-// preserved historical behavior, not a regression), and CreateThread is not
-// callable through the plain grant anyway (see PLAIN IMPORT). Every public
-// signature keeps its name/arity/return type; the three shapes the language
-// cannot express (fn-typed ctor parameters, fn-typed props, arrays of fn
-// types -- all probed on both compilers pre-DOCS/259 and since ported) are
-// documented at their sites below.
+// saved frame pointer). The language also lacks the fn-typed constructor
+// parameters, fn-typed props and fn-type arrays this API shape calls for
+// (probed on both compilers), so the spawn entry is unreachable dead text:
+// a spawned thread would jump to an invalid address and fault the process.
+// CreateThread is additionally not callable through the plain grant (see
+// PLAIN IMPORT). Every public signature keeps its name/arity/return type;
+// the three inexpressible shapes are documented at their sites below.
 //
-// BOUNDED JOIN: join waits with the pre-split -1 (INFINITE) millisecond
-// count on the stored handle only; the public join() guards on
-// `this.handle != 0` first (pre-split guard, kept), so joining an
-// un-started Thread is a no-op and probes over this module can never hang
-// through it.
+// BOUNDED JOIN: join waits with a -1 (INFINITE) millisecond count on the
+// stored handle only; the public join() guards on `this.handle != 0`
+// first, so joining an un-started Thread is a no-op and probes over this
+// module can never hang through it.
 
 #on WINDOWS
 import * from win32.kernel32;
@@ -79,16 +72,15 @@ class Thread {
 
     public void start() {
         #on WINDOWS
-        // DEAD SPAWN (see header): the historical shape passed the private
+        // DORMANT SPAWN (see header): a spawn would pass the private
         // trampoline `threadStart` below as a bare function name --
         // `this.handle = CreateThread(null, 0, threadStart, this, 0,
         // null);` -- which both compilers lower to a null/garbage entry
-        // slot. It stays dead and UNCOMPILED: CreateThread is in neither
-        // compiler's kernel32 export table, so the plain full-table grant
-        // rejects the call, and the bare-function-name lowering would fault
-        // any spawned thread at the invalid address. Preserved as
-        // documented dead mechanism; this region intentionally holds no
-        // spawn call.
+        // slot. The path stays dead and UNCOMPILED: CreateThread is in
+        // neither compiler's kernel32 export table, so the plain full-table
+        // grant rejects the call, and the bare-function-name lowering would
+        // fault any spawned thread at the invalid address. This region
+        // intentionally holds no spawn call.
         #off
     }
 
@@ -114,13 +106,12 @@ class ThreadGroup {
         this.threads.add(t);
     }
 
-    // The pre-split one-liner spelling `public Thread at(int index) <<
+    // The one-liner spelling `public Thread at(int index) <<
     // this.threads[index];` does not parse on the self-hosted compiler:
     // `<<` single-line bodies are supported only for GLOBAL functions
     // (probed -- even a literal-return one-liner method fails with
-    // "expected ( but found void" at the next declaration; every std file
-    // using one-liner methods sits in silverc.srp's exclude list, so the
-    // gap was invisible). Same signature, explicit body:
+    // "expected ( but found void" at the next declaration). Same signature,
+    // explicit body:
     public Thread at(int index) {
         return this.threads[index];
     }
@@ -155,14 +146,13 @@ public void sleep(int ms) {
 }
 
 private int threadStart(object param) {
-    // DEAD SPAWN trampoline (see header): the historical body was
-    // `Thread t = param as Thread; t.fn(); return 0;` and the historical
-    // call site passed this trampoline to CreateThread as a bare function
-    // name. Neither statement can compile (`as` casts did not parse on
-    // either compiler when probed -- silverc-rs reported "Expected
-    // expression" at the `as` -- and `t.fn()` needs the fn-typed prop
-    // invocation), and the entry slot it was passed in lowered to
-    // null/garbage, so its historical work was unreachable anyway. The
-    // trampoline keeps its exact pre-split signature; nothing calls it.
+    // DORMANT SPAWN trampoline (see header): a spawn would run the body
+    // `Thread t = param as Thread; t.fn(); return 0;` and pass this
+    // trampoline to CreateThread as a bare function name. Neither statement
+    // can compile (`as` casts do not parse on either compiler -- silverc-rs
+    // reports "Expected expression" at the `as` -- and `t.fn()` needs the
+    // fn-typed prop invocation), and the entry slot lowers to null/garbage,
+    // so the trampoline's work is unreachable. The trampoline keeps its
+    // exact signature; nothing calls it.
     return 0;
 }

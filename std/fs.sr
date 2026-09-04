@@ -1,32 +1,28 @@
 mod export fs;
 
-// DOCS -- public `fs` module (UNIFIED_CORE_LIBRARY.md v2 canonical fold).
-// This is the universal file-system module: there is no fs_win.sr backend
-// and no win-named helpers -- one module, one OS layer (fs -> win32.kernel32).
-// The canonical shape puts each raw OS call INSIDE its public function's
-// body behind a `#on WINDOWS` ... `#off` region: one unified function name,
-// no wrapper indirection, no `#else`, no LINUX/MAC placeholders (the
-// non-Windows regions get filled on their own machines later). The osType()
-// runtime gates are gone: the preprocessor replaces them, so
-// `import * from os;` is not needed here. Plain
-// `import * from win32.kernel32;` -- alias imports are removed in v2. No
-// kernel32 export name (CreateFileA, ReadFile, ...) collides with this
-// module's public API.
+// DOCS -- public `fs` module (see UNIFIED_CORE_LIBRARY.md).
+// This is the universal file-system module: one module, one OS layer
+// (fs -> win32.kernel32). Each raw OS call lives INSIDE its public
+// function's body behind a `#on WINDOWS` ... `#off` region -- one unified
+// function name, no win-prefixed helpers, no wrapper indirection. There is
+// no `#else` and no LINUX/MAC placeholders in std; the non-Windows regions
+// get filled on their own machines later. The preprocessor selects the OS
+// code at compile time, so `import * from os;` is not needed here (the
+// runtime `os.type` check is a user-facing feature). The kernel32 grant is
+// a plain `import * from win32.kernel32;`; no kernel32 export name
+// (CreateFileA, ReadFile, ...) collides with this module's public API.
 //
-// The bodies below are the pre-split fs.sr implementations so behavior is
-// unchanged -- including FolderOps.list's FindFirstFileA enumeration quirk
-// (the handle-based loop never copies the WIN32_FIND_DATA name, so each
-// entry contributes ""). One mechanical adjustment inherited from the v1
-// split: the old `byte[] buf[size];` fixed-declaration is spelled
-// `byte[] buf = new byte[size];` (the codebase-standard allocation idiom).
+// FolderOps.list's FindFirstFileA enumeration quirk is intentional, do not
+// "fix": the handle-based loop never copies the WIN32_FIND_DATA name, so
+// each entry contributes "". Allocations use the codebase-standard idiom
+// `byte[] buf = new byte[size];`.
 //
-// DELEGATION QUIRK (intentional, do not "fix"): FileOps.readString still
-// calls fs.readString(path). When the self-hosted compiler compiles that
-// name it resolves to the compiler's builtin native readString, not to this
-// module's own function -- identical to pre-split behavior. The native path
-// allocates a raw byte buffer for ReadFile; compiling the old managed-array
-// implementation passed a Silver array header to Win32 and could crash on
-// ordinary instance reads.
+// DELEGATION QUIRK (intentional, do not "fix"): FileOps.readString calls
+// fs.readString(path). When the self-hosted compiler compiles that name it
+// resolves to the compiler's builtin native readString, not to this
+// module's own function. The delegation is required: the native path
+// allocates a raw byte buffer for ReadFile, while a Silver array header
+// passed to Win32 could crash on ordinary instance reads.
 
 #on WINDOWS
 import * from win32.kernel32;
@@ -55,9 +51,9 @@ class FileOps {
 
     public string readString(string path) {
         // Keep the instance API in parity with the native fs module. The
-        // native path allocates a raw byte buffer for ReadFile; compiling the
-        // old managed-array implementation passed a Silver array header to
-        // Win32 and could crash on ordinary instance reads.
+        // native path allocates a raw byte buffer for ReadFile; a Silver
+        // array header passed to Win32 could crash on ordinary instance
+        // reads.
         return fs.readString(path);
     }
 

@@ -2,21 +2,19 @@ import * from net;
 
 mod export dns;
 
-// DOCS -- public `dns` module (UNIFIED_CORE_LIBRARY.md §4 rule 6, the
-// CANONICAL FOLD SHAPE). This is a PROTOCOL module: it carries ZERO OS code
-// and NO `#on` regions -- name resolution routes through the public
-// `net.lookup(host, family)` primitive of the universal `net` socket core
-// module (getaddrinfo is a ws2_32 call and lives in net.sr's regions; the
-// old std/dns_win.sr backend is deleted). No win32 imports, no win-prefixed
-// helpers, no osType() gates.
+// DOCS -- public `dns` module (UNIFIED_CORE_LIBRARY.md §4 rule 7). This is
+// a PROTOCOL module: it carries ZERO OS code and NO `#on` regions -- name
+// resolution routes through the public `net.lookup(host, family)` primitive
+// of the universal `net` socket core module (getaddrinfo is a ws2_32 call
+// and lives in net.sr's regions). No win32 imports.
 //
 // DISPATCH (per compiler, probed): `dns` is builtin-reserved on NEITHER
 // compiler -- silverc-rs's builtin_modules_set (src/main.rs:81 lists
 // fs/json/yaml/env/url/hash/path/bom/console/math/http only) and the
 // self-hosted compiler's visBuiltinModule (compiler/visibility.sr:605) plus
 // its driver prepend list all exclude it. Both compilers resolve
-// `import * from dns;` as an ORDINARY SOURCE module (std\dns.sr); no native
-// dispatch exists to preserve.
+// `import * from dns;` as an ORDINARY SOURCE module (std\dns.sr); there is
+// no native dispatch for it.
 //
 // LOOKUP ROUTING (probed): cross-module call dispatch is by BARE NAME +
 // arity -- module qualifiers are dropped and the LAST declaration accepting
@@ -27,50 +25,41 @@ mod export dns;
 // trailing defaulted `family` parameter and THIS module calls the
 // two-argument shape `net.lookup(host, 2)` that only net's declaration
 // accepts (see net.sr's name-resolution section). net.lookup returns []
-// on any failure -- dns.lookup keeps that shape verbatim.
+// on any failure -- dns.lookup keeps that shape.
 //
-// PRE-SPLIT STATE (carried from the fold record): the pre-split dns.sr
-// NEVER compiled under either compiler, so no observable pre-fold behavior
-// exists beyond names, arities, return types and intent. The
-// empty-literal decl-init idiom (`string[] x = [];` before push) is kept
-// everywhere: an uninitialized `string[] mx;` + push is a NULL-array
-// access violation at runtime on silverc-rs (probed).
+// ARRAY INIT LANDMINE (probed): the empty-literal decl-init idiom
+// (`string[] x = [];` before push) is required everywhere: an
+// uninitialized `string[] mx;` + push is a NULL-array
+// access violation at runtime on silverc-rs.
 //
-// RS-ONLY CALLER LANDMINE (probed, pre-existing silverc-rs codegen bug):
+// RS-ONLY CALLER LANDMINE (probed, silverc-rs codegen bug):
 // a CROSS-MODULE string-returning call used directly inside an expression
 // stringifies the raw return pointer, e.g.
 // `print("ip: " + dns.reverse(ip))` prints a decimal address. Assign the
 // result to a local first:
 // `string r = dns.reverse(ip); print("ip: " + r);`
 //
-// API PRESERVATION (every public name/arity/return type, unchanged):
+// PUBLIC API:
 // - lookup: getaddrinfo-backed via net.lookup (AF_INET + SOCK_STREAM
-//   hints, dotted-quad rendering verbatim from the pre-split expression,
-//   [] on failure).
-// - resolveMX/resolveNS/resolveTXT/reverse: pure-Silver pre-split stubs,
-//   kept BYTE-IDENTICAL ("10 mail."+host / "ns1."+host / [] /
-//   "host-"+ip.replace(".","-")+".example.com"). They touch no sockets.
-// - resolveAsync + the local `task` class: the pre-split body
-//   `return new task(() => { lookup(host); });` is doubly unexpressible --
-//   `=>` lambdas are a parse error on both compilers, and the suite-proven
-//   `(void () { ... })` spelling does NOT capture enclosing locals (probed:
-//   "Undefined variable" on both compilers for a minimal capture fixture),
-//   so a callback job could never read `host`. The pre-split file also
-//   never imported the async module, so its `task` type was unresolved dead
-//   text on both compilers; importing async is not an option (silverc-rs
-//   lexes `async` as a keyword -- see std/async.sr's DISPATCH note -- so
-//   `import * from async;` cannot compile there). The module therefore
-//   defines a minimal local `task` class (the async.sr class shape: inert
-//   until awaited) that STORES the host and performs the lookup at
-//   awaitResult() time -- the closest expression of the pre-split intent
-//   ("a task that looks up host"), probed end-to-end (resolveAsync then
-//   awaitResult fires the lookup). The setHost method is ADDITIVE.
+//   hints, dotted-quad rendering, [] on failure).
+// - resolveMX/resolveNS/resolveTXT/reverse: pure-Silver stubs, no sockets
+//   ("10 mail."+host / "ns1."+host / [] /
+//   "host-"+ip.replace(".","-")+".example.com").
+// - resolveAsync + the local `task` class: a callback job cannot read
+//   enclosing locals -- the suite-proven `(void () { ... })` spelling does
+//   NOT capture them (probed: "Undefined variable" on both compilers for a
+//   minimal capture fixture). The async module cannot be imported either
+//   (silverc-rs lexes `async` as a keyword -- see std/async.sr's DISPATCH
+//   note -- so `import * from async;` cannot compile there). The module
+//   therefore defines a minimal local `task` class (the async.sr class
+//   shape: inert until awaited) that STORES the host and performs the
+//   lookup at awaitResult() time -- a task that looks up host, probed
+//   end-to-end (resolveAsync then awaitResult fires the lookup).
 //   CLASS-SHADOW NOTE (same posture as ws.socket/net.socket above): a
 //   program importing BOTH dns and async sees two `class task`
-//   declarations; async's is registered first, dns's wins. No such
-//   combination ever worked pre-fold -- neither module compiled -- and on
+//   declarations; async's is registered first, dns's wins -- and on
 //   silverc-rs the async module cannot be imported at all. awaitResult()
-//   returns "" (the async task.result was never assigned; async.sr
+//   returns "" (async task.result is never assigned; async.sr
 //   documents the same inert-shape posture).
 
 public string[] lookup(string host) {
@@ -107,9 +96,8 @@ class task {
         this.host = h;
     }
 
-    // Runs the lookup this task was created for (the pre-split job was
-    // `lookup(host)`) and returns "" -- the async task result shape
-    // (async.sr: task.result is never assigned).
+    // Runs the lookup assigned to this task and returns "" -- the
+    // async task result shape (async.sr: task.result is never assigned).
     public string awaitResult() {
         net.lookup(this.host, 2);
         return "";

@@ -1,15 +1,13 @@
 mod export notifications;
 
-// DOCS -- public `notifications` module (UNIFIED_CORE_LIBRARY.md v2
-// canonical fold). The former internal Windows backend
-// std/notifications_win.sr was folded back into this file and deleted.
-// There is no notifications_win.sr anymore. The one non-portable entry --
-// the toast dispatch behind show() -- lives INSIDE show()'s body behind a
-// `#on WINDOWS` region (v2 rule 6): one unified function name, no
-// win-prefixed helpers, no wrapper indirection. The osType() runtime gate
-// and the `os` import are gone (the preprocessor replaces them); no #else
-// and no LINUX/MAC placeholders -- the other-OS regions get filled on their
-// own machines later.
+// DOCS -- public `notifications` module (UNIFIED_CORE_LIBRARY.md §4). This
+// is the universal notifications module -- one module, one OS layer. The
+// one non-portable entry -- the toast dispatch behind show() -- lives
+// INSIDE show()'s body behind a `#on WINDOWS` region (§4 rule 6): one
+// unified function name, no win-prefixed helpers, no wrapper indirection.
+// OS selection is compile-time via the preprocessor; the module does not
+// use the runtime `os` check. No #else and no LINUX/MAC placeholders -- the
+// other-OS regions get filled on their own machines later.
 //
 // NO WIN32 IMPORT GRANTS -- and this is deliberate, probed 2026-08: the DLL
 // work is done by the COMPILER-SYNTHESIZED `nativeToastShow` bridge, not by
@@ -67,48 +65,37 @@ mod export notifications;
 //   either position -- it is (same posture as the exception/process
 //   prepends).
 //
-// - silveri (context, no changes in this fold): the `notifications` module
+// - silveri (context): the `notifications` module
 //   name is NOT in the interpreter's nativeModule list, so resolveImports
 //   PREPENDS this file's text when a script imports it; the evaluator also
 //   defines a `nativeToastShow` builtin no-op (eval.sr:306) that the
 //   prepended show() region call resolves to. The interpreter additionally
-//   keeps a `notifWinShow` no-op global (eval.sr:312) from the backend-file
-//   era -- with the fold that name no longer appears in any std source, so
-//   the intercept is inert (kept for direct-script-call compatibility; not
-//   part of this module's public API).
+//   keeps a `notifWinShow` no-op global (eval.sr:312) that no std source
+//   calls -- the intercept is inert (kept for direct-script-call
+//   compatibility; not part of this module's public API).
 //
-// PRE-SPLIT STATE (probed 2026-08 with fresh -o binaries on both compilers):
-// the old std/notifications.sr compiled and ran on both compilers -- the
-// NOTIFY: parity line printed byte-identically on silverc-rs and the
-// self-host (and the rs-built binary additionally performed the real shell32
-// balloon; the self-host binary's nativeToastShow is a compiler-lowered
-// no-op). show() already carried try/catch, so no failure path was
-// observable. The folds (backend split, then this canonical fold) only ever
-// changed the INTERNAL routing of the native bridge; every observable
-// behavior is preserved byte-identically (re-probed post-fold, outputs
-// cited in the module docs and report).
+// OBSERVABLE BEHAVIOR (probed 2026-08, byte-identical on the compilers that
+// run it): show() prints the NOTIFY: parity line and either performs the
+// real shell32 balloon (rs-built binary) or lowers the bridge to a no-op
+// (self-host, interpreter). show() carries try/catch, so no failure path is
+// observable.
 //
-// API PRESERVATION (every public name, unchanged through both folds):
-// constants DEFAULT=0, SHORT=1, LONG=2, SILENT=1; class Notification with
-// public fields title/body/icon/duration/sound/silent/group/tag/AppName
-// (field ORDER preserved -- rs mis-indexes cross-module field reads past
-// field 0, so these classes must stay defined IN this module where user
-// code bare-news them); class NotificationAction with public fields id/
-// title/arguments; free function show(Notification) printing the canonical
-// "NOTIFY: <title> | <body>" parity line before the region-dispatched
-// bridge call. No renames were needed (`show`, `Notification`,
+// PUBLIC SURFACE: constants DEFAULT=0, SHORT=1, LONG=2, SILENT=1; class
+// Notification with public fields title/body/icon/duration/sound/silent/
+// group/tag/AppName (field ORDER matters -- rs mis-indexes cross-module
+// field reads past field 0, so these classes must stay defined IN this
+// module where user code bare-news them); class NotificationAction with
+// public fields id/title/arguments; free function show(Notification)
+// printing the canonical "NOTIFY: <title> | <body>" parity line before the
+// region-dispatched bridge call. (`show`, `Notification`,
 // `NotificationAction`, `DEFAULT`/`SHORT`/`LONG`/`SILENT` are not keywords
-// on either compiler).
+// on either compiler.)
 //
-// ADDITIVE: none -- the surface is exactly the intended API (the DOCS/247
-// action/lifecycle extras live only in the design doc, never in this
-// module's code, and were not invented here).
-//
-// DEAD VS LIVE (post-fold, per compiler):
+// LIVENESS (per compiler):
 // - silverc-rs: constants/classes/show parity line are LIVE (probed); the
 //   bridge is LIVE and performs the real shell32 tray balloon
-//   (fire-and-forget, auto-expires; probed once live -- harmless,
-//   non-blocking, no dismissal required).
+//   (fire-and-forget, auto-expires; probed live -- harmless, non-blocking,
+//   no dismissal required).
 // - self-hosted silverc: constants/classes/show parity line are LIVE
 //   (probed); the bridge is a compiler-lowered NO-OP by design
 //   (mini_cg.sr:7440) -- the parity line is the entire observable behavior.
@@ -138,13 +125,13 @@ class NotificationAction {
     string arguments;
 }
 
-// The free function, verbatim surface: prints the canonical
+// The free function: prints the canonical
 // "NOTIFY: <title> | <body>" parity line every backend matches on, then
 // fires the compiler-synthesized toast bridge INSIDE the `#on WINDOWS`
-// region -- the folded-in body of the former backend leaf, now the only
-// function (v2 rule 6). The pre-split try/catch is preserved (the bridge
-// never throws on any backend, but the defensive shape stays exactly as it
-// has always been). String FIELD reads are captured into locals first --
+// region -- the only function, with the raw dispatch inline (§4 rule 6).
+// The try/catch wraps the bridge call (the bridge
+// never throws on any backend, but the defensive shape stays). String FIELD
+// reads are captured into locals first --
 // the probed-safe shape (rs stringifies field pointers in larger expression
 // positions). AppName flows to the bridge as the AppUserModelId for the
 // Action Center routing.

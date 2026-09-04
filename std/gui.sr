@@ -1,15 +1,16 @@
 // ---------------------------------------------------------------------------
 // gui - native Win32 window class for the self-hosted Silver compiler.
 //
-// UNIFIED_CORE_LIBRARY.md v2 canonical fold -- the universal gui module:
-// there is no gui_win.sr backend and no win-named helpers. The user32 calls
+// The universal gui module -- one module, one OS layer (gui ->
+// win32.user32 + win32.kernel32). The user32 calls
 // (RegisterClassExA is NOT needed -- the pre-registered "STATIC" window class
 // is used instead -- CreateWindowExA, GetSystemMetrics, SetWindowTextA,
 // LoadImageA, SendMessageA, ShowWindow, UpdateWindow, DestroyWindow) plus
 // kernel32's GetModuleHandleA live inline in the `#on WINDOWS` regions of
 // the Window class methods that need them, one unified method per
-// operation, no wrapper indirection, no alias imports, no osType() gates
-// (so `import * from os;` is gone too: the preprocessor replaces the gate).
+// operation, no wrapper indirection, no alias imports; OS selection is
+// compile-time via the preprocessor regions, so the runtime `os.type` check
+// is not used here and no `import * from os;` is needed.
 //
 // For a future non-Windows backend the fallback follows the module's handle
 // contract: the constructor never creates a window, so `handle` stays 0,
@@ -20,7 +21,7 @@
 // getTitle, getWidth, getHeight, getHandle, isVisible, getIcon) are
 // field-only and stay ungated.
 //
-// NATIVE-BRIDGE NOTE (per compiler, unchanged by this fold): the bare
+// NATIVE-BRIDGE NOTE (per compiler): the bare
 // guiCreateWindow/guiShow/guiHide/guiMaximize/guiMinimize/guiSetTitle/
 // guiClose/guiRunLoop/guiSetIcon/loadIcon names are native-intercepted on
 // BOTH compilers -- silverc-rs emits the real user32 sequences
@@ -29,8 +30,8 @@
 // never collide with any win32 export and any future call site lowers the
 // same way on both backends.
 //
-// BEHAVIOR PRESERVATION: each region below is the verbatim lift of the
-// gui_win.sr backend function it replaces:
+// BEHAVIOR: each `#on WINDOWS` region carries the full raw-OS sequence for
+// its method:
 //   - the constructor centers the window on the primary display via
 //     GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN) and creates it with
 //     CreateWindowExA + WS_OVERLAPPEDWINDOW (0x00CF0000) on the
@@ -39,12 +40,11 @@
 //   - setIcon loads the .ico via LoadImageA(LR_LOADFROMFILE |
 //     LR_DEFAULTSIZE = 0x50, IMAGE_ICON = 1) and only when that succeeded
 //     attaches it with SendMessageA(WM_SETICON = 0x80) for both ICON_BIG
-//     (1) and ICON_SMALL (0), exactly like the backend did.
+//     (1) and ICON_SMALL (0).
 //   - show() is ShowWindow(SW_SHOW = 5) followed by UpdateWindow so the
 //     client area paints immediately; hide() is ShowWindow(SW_HIDE = 0);
 //     close() is DestroyWindow.
-// The handle!=0 guards stay in the methods (as before); the regions trust
-// their caller the same way the backend did.
+// The handle!=0 guards stay in the methods; the regions trust their caller.
 //
 // TESTING NOTE: no method here pumps messages (this module has no run
 // loop), so constructing + showing + closing a Window never blocks and is

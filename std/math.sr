@@ -1,54 +1,43 @@
 mod export math;
 
-// DOCS -- public `math` module (UNIFIED_CORE_LIBRARY.md v2 canonical fold).
-// This is the pure-Silver numeric module: the former internal Windows backend
-// std/math_win.sr was folded back into this file and deleted. There is no
-// math_win.sr anymore -- and no win32 layer at all: math never had one. The
-// pre-split file opened with `import * from win32.msvcrt;` but never called a
-// CRT function -- every body below is pure Silver arithmetic, so the fold
-// drops the import instead of carrying it (mirroring std/time_win.sr's
-// treatment of time.sr's vestigial msvcrt import). No osType() gates and no
-// `os` import either: with no DLL work there is nothing to gate, and the
-// canonical shape (v2 rule 6) leaves the public functions as the only
-// functions, their bodies inline.
+// DOCS -- public `math` module (see UNIFIED_CORE_LIBRARY.md).
+// This is the pure-Silver numeric module: no win32 layer at all -- every
+// body is plain Silver arithmetic and the module opens with no DLL import
+// (not even msvcrt). With no DLL work there is nothing to gate and no `os`
+// import; the public functions are the only functions, their bodies inline.
 //
-// BODIES: every function below is the verbatim pre-split implementation
-// (math_win.sr carried them byte-for-byte; the fold restores them). The
-// private helpers keep their pre-split names (fact, expHelper) and the
-// cross-function call shapes -- sin/cos call pow/fact, pow calls expHelper,
-// expHelper calls ln, round calls floor/ceil, and sqrt/ln call the bare
-// `abs`, which resolves to the float64 overload (the pre-split overload tie;
-// probed: routing those inner abs calls to the int overload changes ln's
-// iteration count and with it the observable results).
+// BODIES: sin/cos call pow/fact, pow calls expHelper, expHelper calls ln,
+// round calls floor/ceil, and sqrt/ln call the bare `abs`, which resolves
+// to the float64 overload (probed: routing those inner abs calls to the int
+// overload changes ln's iteration count and with it the observable
+// results).
 //
-// DISPATCH NOTE (per compiler, unchanged by the fold): silverc-rs answers
-// every qualified `math.<fn>(...)` call with its native builtins before any
-// symbol lookup -- codegen.rs lowers a `math.`-prefixed call straight into
+// DISPATCH NOTE (per compiler): silverc-rs answers every qualified
+// `math.<fn>(...)` call with its native builtins before any symbol lookup
+// -- codegen.rs lowers a `math.`-prefixed call straight into
 // stdlib::math::gen_math_call (msvcrt IAT sentinels for cos/sin/tan/pow/
 // sqrt/floor/ceil/round/ln/log10, inline sign-bit clear for abs, rand for
 // random, inline compares for max/min, a GP loop for sum, a compile-time
-// fold for eval) -- and "math" is in rs's builtin_modules_set, so
-// `import * from math;` never resolves to a file and this file is never read
-// there. The self-hosted compiler has no math intercept at all: "math" is
-// only on the driver's hand-prepend/visibility lists (compiler_driver.sr /
-// visibility.sr), the source is collected from std/math.sr, and the
-// qualified calls dispatch to these globals directly. Both paths keep the
-// user-observable behavior each compiler had before the backend split and
-// after it -- the fold changes no dispatch, only removes one file hop.
+// constant fold for eval) -- and "math" is in rs's builtin_modules_set, so
+// `import * from math;` never resolves to a file and this file is never
+// read there. The self-hosted compiler has no math intercept at all: "math"
+// is only on the driver's hand-prepend/visibility lists
+// (compiler_driver.sr / visibility.sr), the source is collected from
+// std/math.sr, and the qualified calls dispatch to these globals directly.
+// Each compiler therefore runs its own implementation with its own
+// user-observable results.
 //
 // FLOAT64 PARITY NOTE: the numeric results travel as IEEE-754 bit patterns
 // in GP registers end-to-end (see mini_cg float paths / rs codegen float
-// handling). The bodies themselves are byte-for-byte the pre-split ones, so
-// the self-hosted observable results -- including its pre-existing float64
+// handling). The self-hosted observable results -- including its float64
 // lowering quirks (float compound assignment inside loops, the overload tie
 // that sends the inner abs calls to the float body, float64 constants
-// printing via the int const path) -- are pinned by the A/B probes against
-// the pre-split build. The PI/E constants are pure data, never gate-hop, and
-// their (pre-existing) self-hosted print behavior is part of the pinned
-// surface. tan/log10/hypot keep their pre-split `<<` one-liner global shapes
-// (ungated pure delegation to this module's own primitives); eval() and the
-// MathEvalParser class are likewise pure Silver -- integer arithmetic,
-// string indexing and throw only -- and keep their pre-split shapes.
+// printing via the int const path) -- are pinned by probe tests. The PI/E
+// constants are pure data, never gate-hop, and their self-hosted print
+// behavior is part of the pinned surface. tan/log10/hypot are `<<`
+// one-liner globals (ungated pure delegation to this module's own
+// primitives); eval() and the MathEvalParser class are likewise pure Silver
+// -- integer arithmetic, string indexing and throw only.
 
 public const float64 PI = 3.141592653589793;
 public const float64 E = 2.718281828459045;

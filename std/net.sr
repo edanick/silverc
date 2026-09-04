@@ -5,27 +5,25 @@ import { memcpy } from win32.msvcrt;
 
 mod export net;
 
-// DOCS -- public `net` module (UNIFIED_CORE_LIBRARY.md §4, the CANONICAL FOLD
-// SHAPE). This is the universal TCP socket core module: client, server, and
-// the raw-handle primitives the protocol modules (ssh, ftp, ws, smtp, ...)
-// build on. There is no net_win.sr backend -- every ws2_32 call lives inline
-// in the `#on WINDOWS` region of the public function that needs it, one
-// unified function name per operation, no win-prefixed helpers, no wrapper
-// indirection, no alias imports, no osType() gates.
+// DOCS -- public `net` module. This is the universal TCP socket core
+// module: client, server, and the raw-handle primitives the protocol
+// modules (ssh, ftp, ws, smtp, ...) build on. Every ws2_32 call lives
+// inline in the `#on WINDOWS` region of the public function that needs
+// it, one unified function name per operation, no win-prefixed helpers,
+// no wrapper indirection, no alias imports.
 //
-// NAME-COLLISION FINDING (probed on silverc-rs, see UNIFIED_CORE_LIBRARY.md
-// §4 rule 6 note): the module's own public free functions `connect(string,
-// int)` and `listen(int)` share their names with the ws2_32 exports
-// `connect`/`listen`, and user-defined symbols win resolution over DLL
-// exports in the flat namespace. Any bare `connect(sock, sa, 16)` /
-// `listen(sock, 10)` inside a region body therefore re-enters the module
-// function (arity dispatch: same-arity user decl intercepts; no-arity-match
-// user decl is a hard type-check error). The two raw exports are thus
-// UNREACHABLE by their real names inside this module -- a compiler-level
-// finding. Every ws2_32 export used here reaches the DLL: the module's own
-// connect(string, int) / listen(int) declarations win only their own arity
-// (resolution prefers the DLL export when no user declaration accepts the
-// argument count -- UNIFIED_CORE_LIBRARY.md §4 rule 6, both compilers), so
+// NAME-COLLISION FINDING (probed on both compilers): the module's own public
+// free functions `connect(string, int)` and `listen(int)` share their names
+// with the ws2_32 exports `connect`/`listen`, and user-defined symbols win
+// resolution over DLL exports in the flat namespace. Any bare
+// `connect(sock, sa, 16)` / `listen(sock, 10)` inside a region body
+// therefore re-enters the module function (arity dispatch: same-arity user
+// decl intercepts; no-arity-match user decl is a hard type-check error).
+// The two raw exports are thus UNREACHABLE by their real names inside this
+// module -- a compiler-level finding. Every ws2_32 export used here reaches
+// the DLL: the module's own connect(string, int) / listen(int) declarations
+// win only their own arity (resolution prefers the DLL export when no user
+// declaration accepts the argument count -- true on both compilers), so
 // openTcp/bindListen call connect(sock, sa, 16) / listen(sock, 10) directly.
 // Every OTHER export used here
 // (WSAStartup, socket, bind, accept, recv, send, closesocket, inet_addr)
@@ -48,11 +46,11 @@ mod export net;
 // 2147483647`) guards the inet_addr result: self-host zero-extends, rs
 // sign-extends.
 //
-// BEHAVIOR NOTES carried from the pre-split module: tls_client's connect()
-// opens a plain TCP socket and stores it as the context (the historical
-// phantom EncryptMessage/DecryptMessage calls had no implementation in any
-// compiler; setCA/setCert still store their paths). listener.listen backlog
-// stays at the original hard-coded 10.
+// BEHAVIOR NOTES: tls_client's connect() opens a plain TCP socket and
+// stores it as the context (EncryptMessage/DecryptMessage are
+// unimplemented in every compiler; setCA/setCert store their paths).
+// listener.listen's backlog is hard-coded at 10, the value bindListen
+// passes to the ws2_32 listen(sock, 10) call.
 
 class socket {
     private int fd;
@@ -274,7 +272,7 @@ public void sendBytesRaw(int fd, byte[] data) {
 // (clamped to data.length; no-op on len <= 0). Exists for wire shapes that
 // send a prefix of a known string -- e.g. ftp's server greeting, which
 // writes the first 20 of its 22 bytes ("220 FTP Server ready" without the
-// CRLF), preserving its pre-split byte count.
+// CRLF).
 public void sendRawLen(int fd, string data, int len) {
     #on WINDOWS
     if (len <= 0) { return; }
@@ -323,7 +321,7 @@ public void closeRaw(int fd) {
 // millisecond value as a DWORD in the low half of one int[] qword slot).
 // Protocol modules (ftp, ftps, ...) arm this on every socket they open so a
 // silent peer cannot hang a bounded read loop. The setsockopt result is
-// ignored (matching the pre-fold protocol backends).
+// ignored (matching the protocol modules' posture).
 public void setRecvTimeoutRaw(int fd, int ms) {
     #on WINDOWS
     int[] opt = new int[1];
@@ -335,11 +333,10 @@ public void setRecvTimeoutRaw(int fd, int ms) {
 // ---- module-private Windows bodies ----------------------------------------
 // openTcp/bindListen hold the shared WSAStartup + socket-creation sequences
 // for connectRaw/listenRaw. Resolution prefers the DLL export inside regions
-// whenever no user declaration accepts the argument count (UNIFIED_CORE_
-// LIBRARY.md §4 rule 6, implemented in both compilers), so the bare
-// connect(sock, sa, 16) / listen(sock, 10) calls below reach ws2_32 while
-// the module's public connect(string, int) / listen(int) keep winning their
-// own matching arities.
+// whenever no user declaration accepts the argument count (true on both
+// compilers), so the bare connect(sock, sa, 16) / listen(sock, 10) calls
+// below reach ws2_32 while the module's public connect(string, int) /
+// listen(int) keep winning their own matching arities.
 
 // WSAStartup + socket() + inet_addr + connect: returns the connected raw
 // descriptor, or -1 on failure.
@@ -401,7 +398,7 @@ int bindListen(int port) {
 // to 2 = AF_INET). Returns [] on any failure -- the shape a failing
 // getaddrinfo produces.
 //
-// NAME-COLLISION FINDING (this fold): the dns module also exports a public
+// NAME-COLLISION FINDING: the dns module also exports a public
 // one-argument `lookup(string)` and cross-module call dispatch is by BARE
 // NAME + arity (the LAST declaration accepting the argument count wins,
 // silverc-rs codegen.rs resolve_overload_symbol / self-host mini_cg.sr
