@@ -1,6 +1,6 @@
 mod export progress;
 
-import * from win32.kernel32;
+import * from time;
 
 // Compilation progress reporting (ported from silverc-rs src/progress.rs,
 // commit 74a3fe4). Prints one STDERR line per module processed so the user
@@ -11,23 +11,31 @@ import * from win32.kernel32;
 // `total` is discovered up front (entry + transitively resolved imports) by a
 // counting pass that mirrors the same import-resolution used by the real
 // collection, so the counts are exact and the last line always reads 100%.
+//
+// Timing rides the universal std time module: time.now() is QPC (monotonic,
+// float64 ms since boot-referenced counter), so successive readings are
+// strictly comparable — an equivalent monotonic basis to the GetTickCount
+// deltas this replaces (better, in fact: GetTickCount can jump with
+// wall-clock changes). Every site here is an elapsed delta, so the stamps
+// are held as float64 and truncated to whole milliseconds at use sites
+// (mirroring the driver's `int(time.now() - start)` shape).
 
 class ProgressReporter {
     private prop int total;
     private prop int processed;
-    private prop int startTick;
+    private prop float64 startTick;
     private prop bool enabled;
     // When the parsing phase finished (all per-module lines printed); used so
     // the codegen start line can report how long the parse phase took.
-    private prop int parseDoneTick;
+    private prop float64 parseDoneTick;
     private prop bool parseDoneSet;
 
     construct (int total) {
         this.total = total;
         this.processed = 0;
-        this.startTick = GetTickCount();
+        this.startTick = time.now();
         this.enabled = true;
-        this.parseDoneTick = 0;
+        this.parseDoneTick = 0.0;
         this.parseDoneSet = false;
     }
 
@@ -41,7 +49,7 @@ class ProgressReporter {
     }
 
     public int elapsedMs() {
-        int ms = GetTickCount() - this.startTick;
+        int ms = int(time.now() - this.startTick);
         if (ms < 0) { return 0; }
         return ms;
     }
@@ -68,7 +76,7 @@ class ProgressReporter {
     public void parseDone() {
         if (!this.parseDoneSet) {
             this.parseDoneSet = true;
-            this.parseDoneTick = GetTickCount();
+            this.parseDoneTick = time.now();
         }
     }
 
@@ -77,7 +85,7 @@ class ProgressReporter {
     public void phaseCodegen() {
         if (!this.enabled) { return; }
         if (this.parseDoneSet) {
-            int elapsedMs = this.parseDoneTick - this.startTick;
+            int elapsedMs = int(this.parseDoneTick - this.startTick);
             if (elapsedMs < 0) { elapsedMs = 0; }
             eprintln("codegen: emitting native code... (parsing took " + formatDuration(elapsedMs / 1000) + ")");
         } else {
@@ -135,7 +143,7 @@ class ProgressReporter {
     // Estimated time remaining: `elapsed / processed * remaining`, formatted
     // as a human duration.
     public string eta() {
-        int elapsedMs = GetTickCount() - this.startTick;
+        int elapsedMs = int(time.now() - this.startTick);
         if (elapsedMs < 0) { elapsedMs = 0; }
         int remaining = this.total - this.processed;
         if (remaining < 0) { remaining = 0; }
