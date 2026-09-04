@@ -1,9 +1,14 @@
 mod export bcache;
 
-import * from win32.kernel32;
-import * from win32.msvcrt;
 import * from token;
 import * from lexer;
+import * from env;
+import * from fs;
+
+#on WINDOWS
+import * from win32.kernel32;
+import * from win32.msvcrt;
+#off
 
 // OVERHAUL.md --cache-bytecode — persistent bytecode cache.
 //
@@ -512,8 +517,9 @@ class CacheSession {
 //   BcTextWriter — NUL-free text (.srbc.t / project.sbcri): a preallocated
 //                  writable string buffer appended in place with lstrcatA
 //                  and flushed with WriteFile, reset in place with
-//                  lstrcpyA("") — the same buffer mechanism bcEnvValue
-//                  relies on, so no per-piece allocation at all.
+//                  lstrcpyA("") — no per-piece allocation at all. The raw
+//                  calls sit in #on WINDOWS regions; there is no std
+//                  equivalent for in-place buffer append.
 // ---------------------------------------------------------------------------
 
 class BcBinWriter {
@@ -527,10 +533,13 @@ class BcBinWriter {
         this.path = outPath;
         this.buf = [];
         this.failed = 0;
+        this.handle = 0;
         this.scratch = outPath + ".part";
         ensureDirTree(bcDirname(outPath));
+        #on WINDOWS
         // CREATE_ALWAYS: every artifact is rewritten whole on change.
         this.handle = CreateFileA(outPath, 0x40000000, 0, null, 2, 0x80, 0);
+        #off
         if (this.handle == -1 || this.handle == 0) {
             this.handle = 0;
             this.failed = 1;
@@ -574,8 +583,10 @@ class BcBinWriter {
             file.writeBytes(this.scratch, this.buf);
             if (bcFileSize(this.scratch) == n) {
                 string carrier = file.readString(this.scratch);
+                #on WINDOWS
                 int w = 0;
                 WriteFile(this.handle, carrier, n, &w, null);
+                #off
             } else {
                 this.failed = 1;
             }
@@ -587,10 +598,12 @@ class BcBinWriter {
 
     public void close() {
         this.flush();
+        #on WINDOWS
         if (this.handle != 0) {
             CloseHandle(this.handle);
             this.handle = 0;
         }
+        #off
         if (file.exists(this.scratch)) { file.delete(this.scratch); }
     }
 }
@@ -605,6 +618,7 @@ class BcTextWriter {
         this.handle = 0;
         this.buf = "";
         ensureDirTree(bcDirname(outPath));
+        #on WINDOWS
         int h = CreateFileA(outPath, 0x40000000, 0, null, 2, 0x80, 0);
         if (h == -1 || h == 0) { return; }
         this.handle = h;
@@ -612,6 +626,7 @@ class BcTextWriter {
         // through the pointer), emptied in place so appends stay within it.
         this.buf = bcSpaces(4096);
         lstrcpyA(this.buf, "");
+        #off
     }
 
     public bool ok() {
@@ -624,27 +639,35 @@ class BcTextWriter {
         if (s.length == 0 || this.handle == 0) { return; }
         if (s.length >= 4000) {
             this.flush();
+            #on WINDOWS
             int w2 = 0;
             WriteFile(this.handle, s, s.length, &w2, null);
+            #off
             return;
         }
         if (this.buf.length + s.length > 4000) { this.flush(); }
+        #on WINDOWS
         lstrcatA(this.buf, s);
+        #off
     }
 
     public void flush() {
         if (this.handle == 0 || this.buf.length == 0) { return; }
+        #on WINDOWS
         int w = 0;
         WriteFile(this.handle, this.buf, this.buf.length, &w, null);
         lstrcpyA(this.buf, "");
+        #off
     }
 
     public void close() {
         this.flush();
+        #on WINDOWS
         if (this.handle != 0) {
             CloseHandle(this.handle);
             this.handle = 0;
         }
+        #off
     }
 }
 
@@ -682,9 +705,12 @@ public int64 bcFnv1Range(string data, int start, int end) {
 
 // Byte-range slice through a temp copy of the aggregate: seek + ReadFile
 // into a preallocated buffer sized exactly for the range, so the buffer's
-// own NUL terminator lands right after the bytes read.
+// own NUL terminator lands right after the bytes read. The whole body is
+// raw kernel32 file I/O (no std equivalent offers seek-into-range with an
+// exact-length read), so the region spans the body.
 public string bcSliceViaFile(string hopPath, int start, int len) {
     if (len <= 0 || hopPath.length == 0) { return ""; }
+    #on WINDOWS
     int h = CreateFileA(hopPath, 0x80000000, 3, null, 3, 0x80, 0);
     if (h == -1 || h == 0) { return ""; }
     string r = "";
@@ -697,6 +723,8 @@ public string bcSliceViaFile(string hopPath, int start, int len) {
     }
     CloseHandle(h);
     return r;
+    #off
+    return "";
 }
 
 // Fallback slice for tiny ranges and hop failures: plain per-char copy,
@@ -714,32 +742,37 @@ public bool bcFileExists(string path) {
     return file.exists(path);
 }
 
-// Environment lookup through a preallocated writable string buffer (strings
-// lower to dense char buffers on every backend, unlike managed arrays).
+// APPDATA lookup rides the universal env module (env.get is natively
+// dispatched by both compilers' codegens). Semantics match the old 64-char
+// probe: an unset variable yields "", and APPDATA paths stay far below the
+// old cap.
 public string bcEnvValue(string name) {
-    string buf = "                                                                ";
-    int cap = 64;
-    GetEnvironmentVariableA(name, buf, cap);
-    string r = "";
-    for (int i = 0; i < cap; i++) {
-        char c = buf[i];
-        if (c == 0) { break; }
-        r = r + c;
-    }
-    return r;
+    return env.get(name);
 }
 
+// Epoch-millisecond wall stamp: time(0) is msvcrt's epoch-seconds clock.
+// std has no epoch-ms source (time.now() is the QPC boot counter;
+// datetime.unix() is whole seconds), so the raw call stays — region-wrapped
+// per UNIFIED_CORE_LIBRARY.md §2/§4 rule 6.
 public int bcNowMillis() {
+    #on WINDOWS
     return time(0) * 1000;
+    #off
+    return 0;
 }
 
+// File size via CreateFileA + GetFileSize (std fs has no size() yet —
+// reported gap), region-wrapped.
 public int bcFileSize(string path) {
+    #on WINDOWS
     int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
     if (h == -1 || h == 0) { return 0; }
     int sz = GetFileSize(h, null);
     CloseHandle(h);
     if (sz < 0) { return 0; }
     return sz;
+    #off
+    return 0;
 }
 
 // Modification-time proxy recorded in the .sbcr slot: the compiled runtime
@@ -817,20 +850,22 @@ public string resolveRel(string root, string rel) {
     return root + "\\" + winRel;
 }
 
-// Create every path component below the current directory; CreateDirectoryA
-// fails harmlessly when a level already exists.
+// Create every path component below the current directory, riding the
+// universal fs module. fs.createDir fails harmlessly when a level already
+// exists, matching the old direct CreateDirectoryA semantics. Inherited
+// drive-prefix components (e.g. "C:") skip creation exactly as before.
 public void ensureDirTree(string dir) {
     string cur = "";
     for (int i = 0; i < dir.length; i++) {
         char c = dir[i];
         if (c == '\\' || c == '/') {
-            if (cur.length >= 2) { CreateDirectoryA(cur, null); }
+            if (cur.length >= 2) { fs.createDir(cur); }
             cur = cur + '\\';
         } else {
             cur = cur + c;
         }
     }
-    if (cur.length >= 2) { CreateDirectoryA(cur, null); }
+    if (cur.length >= 2) { fs.createDir(cur); }
 }
 
 public string sliceRange(string s, int start, int end) {
@@ -1128,12 +1163,16 @@ private Token? tokenFromRange(string text, int start, int end) {
         int hexStart = colon + 1;
         if (blen > 0) {
             payload = bcSpaces(blen);
+            #on WINDOWS
             lstrcpyA(payload, "");
+            #off
             for (int b = 0; b < blen; b++) {
                 int hi = bcHexVal(text[hexStart + b * 2]);
                 int lo = bcHexVal(text[hexStart + b * 2 + 1]);
                 if (hi < 0 || lo < 0) { return null; }
+                #on WINDOWS
                 lstrcatA(payload, charToString(char(hi * 16 + lo)));
+                #off
             }
         }
     }

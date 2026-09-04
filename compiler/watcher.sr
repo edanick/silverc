@@ -1,9 +1,13 @@
 mod export watcher;
 
-import * from win32.kernel32;
 import * from fs;
 import * from bcache;
 import * from cli_flags;
+import * from path;
+
+#on WINDOWS
+import * from win32.kernel32;
+#off
 
 // OVERHAUL.md --watch — predictive precompilation watcher helpers.
 //
@@ -56,18 +60,19 @@ public string[] watchScanSources(string rootDir) {
 private void wtWalk(string rootDir, string relDir, string[] result) {
     string dir = rootDir;
     if (relDir.length > 0) {
-        if (rootDir == ".") { dir = relDir; } else { dir = rootDir + "\\" + relDir; }
+        // A "." root stays bare (".\x" would leak into cache keys); every
+        // other join rides the universal path module.
+        if (rootDir == ".") { dir = relDir; } else { dir = path.join(rootDir, relDir); }
     }
     string[] names = folder.getFiles(dir);
     for (int i = 0; i < names.length; i++) {
         string name = names[i];
         if (!wtHasSrSuffix(name)) { continue; }
-        if (relDir.length > 0) {
-            if (rootDir == ".") { result.add(relDir + "\\" + name); }
-            else { result.add(rootDir + "\\" + relDir + "\\" + name); }
+        if (rootDir == ".") {
+            if (relDir.length > 0) { result.add(relDir + "\\" + name); }
+            else { result.add(name); }
         } else {
-            if (rootDir == ".") { result.add(name); }
-            else { result.add(rootDir + "\\" + name); }
+            result.add(path.join(dir, name));
         }
     }
     string[] subdirs = folder.getFolders(dir);
@@ -85,16 +90,20 @@ private bool wtHasSrSuffix(string name) {
     return name[name.length - 3] == '.' && name[name.length - 2] == 's' && name[name.length - 1] == 'r';
 }
 
-// Byte size of a file via CreateFileA + GetFileSize (no fixed-array
-// WIN32_FIND_DATA needed — the self-hosted parser does not support
-// byte[] name[size] fixed-declaration syntax).
+// Byte size of a file via CreateFileA + GetFileSize (std fs has exists()
+// but no size() — reported gap), so the raw calls stay, region-wrapped;
+// no fixed-array WIN32_FIND_DATA is needed — the self-hosted parser does
+// not support byte[] name[size] fixed-declaration syntax.
 public int wtFileSize(string path) {
+    #on WINDOWS
     int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
     if (h == -1 || h == 0) { return 0; }
     int sz = GetFileSize(h, null);
     CloseHandle(h);
     if (sz < 0) { return 0; }
     return sz;
+    #off
+    return 0;
 }
 
 // Total byte size of the given files.
