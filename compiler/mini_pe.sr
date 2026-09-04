@@ -1,4 +1,30 @@
+// ============================================================================
+// WINDOWS-TARGET MODULE — emits PE executables for the compiler's OUTPUT.
+// ============================================================================
+// This region keying differs from the std modules: std's `#on WINDOWS` gates
+// the HOST OS the running program talks to, while every region here gates what
+// the COMPILER EMITS as its output target. On a Linux build of silverc these
+// regions are excluded wholesale and the `#on LINUX` slot below is where the
+// ELF/Mach-O emitter slots in — same MiniPe surface (addSectionData/
+// setVersionInfo/writeFile/build), a different byte-level container.
+//
+// The whole module is Windows-target machinery: DOS header ("MZ"), PE\0\0
+// signature, COFF + optional header, section table (.text/.rdata/.rsrc),
+// import directory + ILT/IAT, VERSIONINFO resource blob, subsystem field.
+// The pure byte-order helpers (writeLe32/writeLe64/padToAlign) are CPU-level
+// and shared by any emitter, but they sit INSIDE the regions because they are
+// only referenced by PE emission today — the Linux emitter re-uses them by
+// moving them out of the region or re-declaring them.
+//
+// NOTE on the `#on LINUX` slot: this is COMPILER MACHINERY, not std — the
+// std rule "no empty placeholder regions" (UNIFIED_CORE_LIBRARY.md §2) does
+// not apply here. The slot below is a deliberate, documented insertion point
+// for the future ELF emitter and contains ONLY comments.
+// ============================================================================
+
 mod export mini_pe;
+
+#on WINDOWS
 
 class PeImport {
     public prop string dll;
@@ -576,3 +602,24 @@ public int[] build(int[] codeIn, int[] stringData, string[] versionData) {
         return pe;
     }
 }
+#off
+
+// LINUX INSERTION POINT — see the module header. Comments inside this region
+// are the documentation; the region holds only comments (compiler machinery
+// slot — the std no-placeholder rule does not apply).
+#on LINUX
+// What the Linux backend must provide here (mirroring the MiniPe surface the
+// driver already calls — addSectionData / setVersionInfo / writeFile / build):
+//   * ELF header (0x7F 'E' 'L' 'F', ELFCLASS64, little-endian, ET_EXEC or
+//     ET_DYN per the loader strategy) and program headers (PT_LOAD segments
+//     for .text at the chosen base, PT_GNU_STACK).
+//   * Section table + .shstrtab for debug/tooling visibility (optional).
+//   * Symbol resolution replacing the PE import directory: GOT/PLT stubs or
+//     static linking for libc; the import names come from mini_cg's
+//     importDlls/importFuncs tables (patchImportRefs is the Windows patcher;
+//     the Linux backend patches against its own relocation model).
+//   * The subsystem flag (`type: app`) maps to no direct ELF equivalent —
+//     decide console/daemon handling at the driver level.
+//   * writeLe32/writeLe64/padToAlign above are reusable as-is for ELF byte
+//     packing (lift them out of the `#on WINDOWS` region or re-declare).
+#off

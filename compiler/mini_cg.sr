@@ -1,3 +1,58 @@
+// ============================================================================
+// WINDOWS-TARGET MODULE — Win64 native code generator (the .text emitter).
+// ============================================================================
+// Region keying here differs from the std modules: std's `#on WINDOWS` gates
+// the HOST OS a running program talks to, while compiler-machinery regions
+// gate what the COMPILER EMITS as its output target. On a Linux build of
+// silverc the `#on WINDOWS` regions below are excluded and the mirrored
+// `#on LINUX` comment slots mark where the Linux backend slots in.
+//
+// THE Win64 ABI IS WOVEN THROUGH THE CORE (deliberately NOT region-wrapped).
+// The Linux backend replaces the ABI layer WHOLESALE — it cannot be filled in
+// piecemeal at region boundaries:
+//   * Calling convention: every generated call uses the Win64 shape —
+//     arguments in RCX/RDX/R8/R9 (asm regs 1/2/8/9), 32 bytes of shadow space
+//     + 16-byte RSP alignment via asm.emitCallSetup/emitCallTeardown, stack
+//     params at [RBP+48] in the emitFunctionBody prologues, results in RAX.
+//   * Runtime imports: addImportPatch sites hardcode Windows DLL exports
+//     (kernel32.dll, msvcrt.dll, ucrtbase.dll, version.dll). ~200 patch sites
+//     weave through the gen* emitters — msvcrt/ucrtbase malloc/free/printf/
+//     strcmp/strlen/strtoll/strcpy for the string model, kernel32
+//     GetStdHandle/HeapAlloc/GetProcessHeap/VirtualAlloc for memory. The
+//     Linux backend repoints these at libc/syscalls and its own resolution.
+//   * Exception model: __exc_active/__exc_value globals (the registration
+//     block is region-marked) + emitThrowException/emitExcCheck/
+//     emitExceptionJump — cooperative label-dispatch unwinding, NOT SEH.
+//   * Program exit: ExitProcess thunks in every entry stub (region-marked).
+//   * PE coupling: patchGlobalRefs/patchStringRefs/patchRuntimeRefs hardcode
+//     the 0x140000000 default image base; entry/mainLabel offsets feed
+//     mini_pe (the PE emitter — also a WINDOWS-TARGET module).
+//
+// THE REGIONS MARK ONLY THE CLEANLY-SEPARABLE WINDOWS-EMISSION BLOCKS:
+//   1. the synthesized no-main entry (ExitProcess) in genProgram
+//   2. patchImportRefs — the absolute-address IAT patch pass
+//   3. the --runtime Windows heap: emitRtStateAddr / emitRuntimeFunctions /
+//      emitRuntimeEntryStub / patchRuntimeRefs (VirtualAlloc + HeapAlloc)
+//   4. emitUtf8ConsoleSetup — SetConsoleOutputCP(65001)
+//   5. emitGlobalInitStub's entry/exit tail (ExitProcess)
+//   6. genBinaryMetadataStatus / genBinaryMetadataField — the PE VERSIONINFO
+//      bridge over version.dll (GetFileVersionInfoSizeA / GetFileVersionInfoA
+//      / VerQueryValueA)
+// Every wrap is body-level: signatures stay universal so a Linux build still
+// compiles (calls become no-ops) until the backend lands. `#on LINUX` slots
+// at these boundaries hold ONLY comments — this is compiler machinery, so
+// comment-only Linux slots are allowed here (the std no-placeholder rule,
+// UNIFIED_CORE_LIBRARY.md §2, does not apply). computeIatAddresses stays
+// ungated: it is pure PE-layout arithmetic with no imports; the Linux
+// backend replaces it together with the whole patch pipeline.
+//
+// The win32 grant tables (win32ModuleDll / win32ExportTable / win32Allowed /
+// registerWin32Import) are the win32 LANGUAGE FEATURE — the same class as
+// parser.sr's win32 import machinery — and stay ungated: they are what lets
+// user code call DLL exports, and the Linux backend keeps the feature shape
+// (re-pointing it at its own FFI story) rather than deleting it.
+// ============================================================================
+
 class StrEntry {
     public prop string text;
     public prop int dataOffset;
@@ -1163,6 +1218,10 @@ class MiniCg {
     }
 
     public void patchImportRefs(int[] code, int[] iatAddrs, int rdataRva) {
+        // WINDOWS-TARGET: rewrites every import call site to the absolute
+        // PE IAT slot address (0x140000000 + rdataRva + iatOff). The Linux
+        // backend replaces this pass with its own relocation/GOT patching.
+        #on WINDOWS
         for (int i = 0; i < this.importPatchOffsets.length; i++) {
             int patchPos = this.importPatchOffsets[i];
             int funcIdx = this.importPatchFuncIndices[i];
@@ -1177,6 +1236,11 @@ class MiniCg {
             code[patchPos + 6] = (addr >> 48) & 0xFF;
             code[patchPos + 7] = (addr >> 56) & 0xFF;
         }
+        #off
+        #on LINUX
+        // Linux slot: patch import call sites against the ELF relocation
+        // model (GOT offsets / PLT thunks) instead of absolute PE IAT VAs.
+        #off
     }
 
     public void patchStringRefs(int[] code, int stringsStart, int rdataRva) {
@@ -1279,6 +1343,9 @@ int strIdx = this.stringPatchIndices[i];
                 }
             }
         }
+        // WINDOWS-TARGET: the exception-state globals of the cooperative
+        // throw/catch model (__exc_active flag + __exc_value object slot).
+        #on WINDOWS
         // Reserve two writable global slots for the exception state: an
         // active flag and the thrown value. Registered after user globals so
         // their indices are stable and the init stub zeroes them.
@@ -1292,6 +1359,16 @@ int strIdx = this.stringPatchIndices[i];
         this.globalOffsets.add(this.globalOffsets.length * 8);
         Node excMissing2 = new Node(); excMissing2.kind = 255;
         this.globalInits.add(excMissing2);
+        #off
+        #on LINUX
+        // Linux slot: register the exception-state slots (or the backend's
+        // equivalent) here. NOTE: the woven core's throw/catch emitters
+        // (emitThrowException / emitExcCheck / kind-68 throw / kind-59
+        // try-catch / the unhandled-in-main check) resolve these slots via
+        // findGlobal("__exc_active"/"__exc_value"), so the Linux backend must
+        // keep two same-named slots unless it rewrites the whole exception
+        // protocol. The model itself (label-dispatch, no SEH) is portable.
+        #off
         if (this.globalNames.length > 0) {
             this.globalAreaSize = this.globalNames.length * 8;
         }
@@ -1428,6 +1505,7 @@ int strIdx = this.stringPatchIndices[i];
             // Sources without a main function still produce a valid
             // executable: synthesize an entry that exits with status 0.
             this.mainLabelOffset = this.asm.buf.length;
+            #on WINDOWS
             this.asm.xorRR64(0, 0);
             this.asm.movRR64(1, 0);
             this.addImportPatch("kernel32.dll", "ExitProcess");
@@ -1437,6 +1515,12 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.emitCallSetup(0);
             this.asm.callR64(0);
             this.asm.emitCallTeardown();
+            #off
+            #on LINUX
+            // Linux slot: emit the exit-with-status-0 entry here (the
+            // backend's exit thunk/syscall; keep the mainLabelOffset
+            // assignment above so the driver's entry plumbing stays intact).
+            #off
         }
         // OVERHAUL.md --runtime: append the embedded allocator + GC entry
         // points after all program code, then an entry trampoline that brings
@@ -1525,6 +1609,10 @@ int strIdx = this.stringPatchIndices[i];
         }
     }
 
+    // WINDOWS-TARGET: the embedded --runtime heap is built on the Win32
+    // allocator (VirtualAlloc reserve + HeapAlloc fallback). The Linux
+    // backend replaces the whole cluster with mmap/malloc equivalents.
+    #on WINDOWS
     // Emit `movabs reg, <runtime state>` and remember the immediate's patch
     // position; the driver fills in the state block's absolute address after
     // the PE layout is known.
@@ -1658,7 +1746,22 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
     }
+    #off
+    #on LINUX
+    // Linux slots (mirroring the `#on WINDOWS` block that ended above, same
+    // surfaces): emitRtStateAddr, emitRuntimeFunctions, emitRuntimeEntryStub,
+    // patchRuntimeRefs — an mmap-based heap instead of VirtualAlloc +
+    // HeapAlloc, an ELF-layout state patcher instead of the PE one, and the
+    // trampoline exiting through the backend's exit thunk. Body-level wraps
+    // mean a Linux build of THIS compiler compiles these as no-op methods
+    // until the backend fills them — signatures stay universal on purpose.
+    #off
 
+    // WINDOWS-TARGET: reserves the runtime state block in the PE .rdata
+    // stream and patches absolute Win64 addresses (0x140000000 image base)
+    // into the movabs sites and the HeapAlloc-redirect slot. Linux replaces
+    // with its own data layout + image base.
+    #on WINDOWS
     // Reserve the writable runtime state block (heap base + bump offset + gc
     // cycles) and the internal pointer slot that redirects HeapAlloc calls to
     // __silver_rt_alloc. Called by the driver right after getStringData().
@@ -1705,6 +1808,12 @@ int strIdx = this.stringPatchIndices[i];
             code[pos + 7] = (slotAddr >> 56) & 0xFF;
         }
     }
+    #off
+    #on LINUX
+    // Linux slots: appendRuntimeData reserves the runtime state block +
+    // HeapAlloc-redirect slot in the ELF data stream; patchRuntimeRefs is the
+    // ELF-layout patcher (state-block address, alloc address, redirect slot).
+    #off
 
     public void emitGlobalInitStub() {
         // Emitted at the end of .text when the program declares globals.  The
@@ -1777,6 +1886,7 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.xorRR64(0, 0);
             this.asm.movRR64(1, 0);
         }
+        #on WINDOWS
         this.addImportPatch("kernel32.dll", "ExitProcess");
 
         int sEx = 0xDEADBEEFCAFEBABF;
@@ -1785,6 +1895,11 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.emitCallSetup(0);
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
+        #off
+        #on LINUX
+        // Linux slot: the backend's exit thunk here (RAX already holds
+        // main's status / 0 from the branches above).
+        #off
     }
 
     public void patchForwardCalls(int[] code) {
@@ -1906,7 +2021,12 @@ int strIdx = this.stringPatchIndices[i];
     }
 
     this.emitFunctionBody(func);
-}    public void emitUtf8ConsoleSetup() {
+}    // WINDOWS-TARGET: main()'s console setup — SetConsoleOutputCP(65001)
+    // so printf/WriteFile renders Silver's UTF-8 output correctly. Linux:
+    // a no-op or termios/locale init — keep the same-signature method (the
+    // currentIsMain call site below is ungated).
+    public void emitUtf8ConsoleSetup() {
+        #on WINDOWS
         // Silver strings and file contents are UTF-8 bytes. Configure the
         // Windows console so printf/WriteFile displays those bytes correctly.
         this.asm.movRI64(1, 65001);
@@ -1916,6 +2036,12 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRMBase(0, 0, 0);
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
+        #off
+        #on LINUX
+        // Linux slot: no-op or terminal/locale init (printf handles UTF-8
+        // natively); keep the same-signature method — the currentIsMain call
+        // site is ungated.
+        #off
     }
 
     public void emitFunctionBody(Node func) {
@@ -6960,6 +7086,10 @@ public void genNewCall(Node call) {
         elif (this.strEq(name, "callRel32")) { this.asm.callRel32(this.asmArg(args, 0)); }
     }
 
+    // WINDOWS-TARGET: the PE VERSIONINFO bridge. The self-hosted backend uses
+    // the same version.dll APIs as silverc-rs, but emits them through its
+    // normal import-patch mechanism.
+    #on WINDOWS
     // DOCS/251 -- native PE VERSIONINFO bridge. The self-hosted backend uses
     // the same version.dll APIs as silverc-rs, but emits them through its
     // normal import-patch mechanism.
@@ -7093,6 +7223,13 @@ public void genNewCall(Node call) {
         this.emitLlmaiEmptyString();
         this.asm.bindLabel(done);
     }
+    #off
+    #on LINUX
+    // Linux slot: the PE VERSIONINFO bridge (GetFileVersionInfoSizeA /
+    // GetFileVersionInfoA / VerQueryValueA over version.dll). Implement
+    // binary_metadata against the ELF story (.note sections, linker
+    // metadata, or the project manifest baked into a data section).
+    #off
 
     // True when a bare call to `name`
     // resolves as an imported win32 export: the export sits in a fully
