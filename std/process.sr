@@ -120,9 +120,11 @@ class Process {
     // Body shape: null foreground HWND leaves the whole Process zero/empty;
     // a failed OpenProcess or image-name query leaves path/filename empty
     // while handle/title/id stay set. The filename slash-scan is pure Silver
-    // and stays; every DLL call is inline in the region below.
+    // and stays UNGATED below the region (§4 rule 6); the raw ladder and the
+    // buffer decodes tangled with it live in the region.
     public static Process getFocusedProcess() {
         Process result = new Process();
+        string fullPath = "";
         #on WINDOWS
         int hwnd = GetForegroundWindow();
         if (hwnd != 0) {
@@ -139,7 +141,6 @@ class Process {
             int pid = 0;
             GetWindowThreadProcessId(hwnd, &pid);
             result.id = pid;
-            string fullPath = "";
             int hProcess = OpenProcess(0x1000, 0, pid);
             if (hProcess != 0) {
                 // Writable 1024-space path buffer; the length in/out is the
@@ -154,18 +155,18 @@ class Process {
                     for (int i = 0; i < len && pathBuf[i] != char(0); i++) { fullPath += char(pathBuf[i]); }
                 }
             }
-            result.path = fullPath;
-            int lastSlash = -1;
-            for (int i = 0; i < fullPath.length; i++) {
-                if (fullPath[i] == '\\' || fullPath[i] == '/') { lastSlash = i; }
-            }
-            if (lastSlash >= 0) {
-                result.filename = fullPath[lastSlash + 1..fullPath.length];
-            } else {
-                result.filename = fullPath;
-            }
         }
         #off
+        result.path = fullPath;
+        int lastSlash = -1;
+        for (int i = 0; i < fullPath.length; i++) {
+            if (fullPath[i] == '\\' || fullPath[i] == '/') { lastSlash = i; }
+        }
+        if (lastSlash >= 0) {
+            result.filename = fullPath[lastSlash + 1..fullPath.length];
+        } else {
+            result.filename = fullPath;
+        }
         return result;
     }
 }
