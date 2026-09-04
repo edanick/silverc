@@ -18,14 +18,25 @@ import * from watcher;
 import * from progress;
 import * from visibility;
 import * from preprocess;
-import * from win32.kernel32;
+// Timing and pid identity ride the universal std modules (time -> QPC behind
+// its own #on WINDOWS regions; sysinfo -> GetCurrentProcessId likewise). No
+// bare win32 import remains in the driver: the only raw OS surface left is
+// the JIT child-process runner, whose calls sit inside a #on WINDOWS region
+// (see jitExecute) because process.run cannot supply its contract (no exit
+// code, faults on self-host — see that function's comment).
+import * from time;
+import * from sysinfo;
 
 // Print the final success line on STDERR (alongside the progress lines) once
 // a compile has produced its output: `<output> (N modules, Xs)`. `moduleCount`
 // is the number of modules (entry + collected imports/sources) processed and
-// `startTick` when the compile pass started.
-void drvReportSuccess(string outputFile, int moduleCount, int startTick) {
-    int elapsedMs = GetTickCount() - startTick;
+// `startMs` when the compile pass started. The elapsed computation rides the
+// universal time module: time.now() is QPC (monotonic, float64 ms since
+// boot-referenced counter), so successive readings are strictly comparable —
+// an equivalent monotonic basis to the GetTickCount deltas this replaces
+// (better, in fact: GetTickCount can jump with wall-clock changes).
+void drvReportSuccess(string outputFile, int moduleCount, float64 startMs) {
+    int elapsedMs = int(time.now() - startMs);
     if (elapsedMs < 0) { elapsedMs = 0; }
     eprintln("compilation successful: " + outputFile + " (" + moduleCount.toString() + " modules, " + formatDuration(elapsedMs / 1000) + ")");
 }
@@ -434,9 +445,17 @@ int countModuleImports(string source, string inputFile, string ignored) {
 }
 
 // ---------------------------------------------------------------------------
-// OVERHAUL.md --jit: execute the emitted image as a direct child process (no
-// shell involved — CreateProcessA maps straight onto the OS), wait for it to
-// finish, and hand its exit code back to the caller.
+// OVERHAUL.md --jit: execute the emitted image as a direct child process
+// (no shell involved — CreateProcessA maps straight onto the OS), wait for
+// it to finish, and hand its exit code back to the caller.
+//
+// The spawn ladder stays a raw `#on WINDOWS` region (the one OS layer this
+// driver carries): std process.run() cannot stand in for it — it passes a
+// null lpProcessInformation (faults 0xC0000005 on the self-hosted compiler
+// on every path, per the std/process.sr header), never waits explicitly, and
+// hardcodes exitCode = 0 instead of reading the child's exit code, while the
+// driver must propagate it. The universal scaffold (temp dir, unique path
+// via sysinfo.pid(), image write, delete) stays ungated.
 // ---------------------------------------------------------------------------
 
 int jitExecute(CliFlags flags, int[] peData, string inputPath) {
@@ -447,8 +466,9 @@ int jitExecute(CliFlags flags, int[] peData, string inputPath) {
     ensureDirTree(jitDir);
     string stem = drvFileStem(inputPath);
     if (stem.length == 0) { stem = "jit"; }
-    string exePath = jitDir + "\\" + stem + "_" + bcNowMillis().toString() + "_" + GetCurrentProcessId().toString() + ".exe";
+    string exePath = jitDir + "\\" + stem + "_" + bcNowMillis().toString() + "_" + sysinfo.pid().toString() + ".exe";
     file.writeBytes(exePath, peData);
+    #on WINDOWS
     // Zeroed STARTUPINFO (104 bytes) and PROCESS_INFORMATION (24 bytes)
     // buffers; the arrays lower to data pointers across the Win32 boundary.
     int[] si = [];
@@ -467,6 +487,11 @@ int jitExecute(CliFlags flags, int[] peData, string inputPath) {
     CloseHandle(hProcess);
     file.delete(exePath);
     return gotCode;
+    #off
+    // Non-Windows machines have no spawn backend yet (regions are filled on
+    // those machines later); the same failure shape as a failed spawn.
+    flags.errLine("jit: failed to execute " + exePath);
+    return 1;
 }
 
 // Split a marked aggregate into per-file chunks: paths, body ranges as
@@ -654,7 +679,7 @@ void main() {
 // failure; in --jit mode the compiled program runs as a child and its exit
 // code propagates.
 int compileOnce(CliFlags flags, string outputFile) {
-    int startTick = GetTickCount();
+    float64 startTick = time.now();
     string inputFile = flags.input;
     bool inputIsProject = projectHasSuffix(inputFile, ".srp");
     int moduleCount = 1;
@@ -856,7 +881,7 @@ int compileOnce(CliFlags flags, string outputFile) {
             string hopBase = bcEnvValue("TEMP");
             if (hopBase.length == 0) { hopBase = bcEnvValue("TMP"); }
             if (hopBase.length == 0) { hopBase = "."; }
-            string hopPath = hopBase + "\\silverc-hop\\hop_" + GetCurrentProcessId().toString() + ".tmp";
+            string hopPath = hopBase + "\\silverc-hop\\hop_" + sysinfo.pid().toString() + ".tmp";
             ensureDirTree(bcDirname(hopPath));
             file.writeString(hopPath, source);
             for (int ci2 = 0; ci2 < chunks.paths.length; ci2++) {
@@ -1114,9 +1139,10 @@ void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, stri
         sigSizes.add(wtFileSize(files[i]));
     }
 
-    int idleStart = GetTickCount();
+    // Idle-debounce timers ride the universal time module (QPC, monotonic).
+    float64 idleStart = time.now();
     while (true) {
-        Sleep(500);
+        time.sleep(500);
 
         // Rescan: any change (mtime, size, new or removed file) resets the
         // idle timer to zero.
@@ -1157,13 +1183,14 @@ void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, stri
                 sigMtimes.add(bcModifiedMs(current[r]));
                 sigSizes.add(wtFileSize(current[r]));
             }
-            idleStart = GetTickCount();
+            idleStart = time.now();
             continue;
         }
 
         // Idle long enough? Fires only after exactly the configured idle
-        // duration with no saves in between.
-        if (GetTickCount() - idleStart < cfg.frequencySecs * 1000) { continue; }
+        // duration with no saves in between. (int() truncation keeps the
+        // whole-ms granularity the GetTickCount comparison had.)
+        if (int(time.now() - idleStart) < cfg.frequencySecs * 1000) { continue; }
 
         // Manual-compilation guard: if the output binary is newer than the
         // newest source mtime recorded at the last check, someone built it
@@ -1175,7 +1202,7 @@ void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, stri
             }
             if (outM > newestSrc) {
                 flags.errLine("watch: external build detected, skipping this tick");
-                idleStart = GetTickCount();
+                idleStart = time.now();
                 continue;
             }
         }
@@ -1197,6 +1224,6 @@ void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, stri
             sigMtimes.add(bcModifiedMs(post[q]));
             sigSizes.add(wtFileSize(post[q]));
         }
-        idleStart = GetTickCount();
+        idleStart = time.now();
     }
 }
