@@ -1,7 +1,7 @@
 mod export cli_flags;
 
-import * from win32.kernel32;
 import * from resource;
+import * from sysinfo;
 
 // OVERHAUL.md — compiler CLI flags & modes.
 //
@@ -194,44 +194,27 @@ class CliFlags {
     }
 
     // OVERHAUL.md CLI diagnostics go to the standard error stream
-    // (silverc-rs prints them via eprintln!). Written through raw Win32 with
-    // the string itself as the byte buffer — strings lower to dense
-    // NUL-terminated char buffers on every backend, unlike managed arrays.
+    // (silverc-rs prints them via eprintln!). The `eprintln` language
+    // builtin lowers to GetStdHandle(STD_ERROR_HANDLE) + WriteFile on both
+    // backends, so these wrappers keep the exact byte output and stderr
+    // routing of the raw calls they replace.
     public void errLine(string msg) {
-        this.errRaw(msg);
-        this.errRaw("\n");
+        eprintln(msg);
     }
 
     public void errRaw(string msg) {
         if (msg.length == 0) { return; }
-        int h = GetStdHandle(-12);
-        if (h == -1 || h == 0) { return; }
-        int wrote = 0;
-        WriteFile(h, msg, msg.length, &wrote, null);
+        eprint(msg);
     }
 }
 
-// Logical processor count via the NUMBER_OF_PROCESSORS environment entry
-// Windows maintains for every process; falls back to 4 when unavailable.
-// The lookup writes into a preallocated string buffer (strings lower to
-// dense char buffers on every backend) and scans until the terminator.
+// Logical processor count via the universal sysinfo module
+// (SYSTEM_INFO.dwNumberOfProcessors — the same figure Windows reports in
+// the NUMBER_OF_PROCESSORS environment entry). Falls back to 4 when the
+// count cannot be read, mirroring the old environment-lookup fallback.
 public int totalCpuThreads() {
-    string buf = "                    ";
-    int cap = 20;
-    GetEnvironmentVariableA("NUMBER_OF_PROCESSORS", buf, cap);
-    int v = 0;
-    bool any = false;
-    for (int i = 0; i < cap; i++) {
-        int c = buf[i];
-        if (c == 0) { break; }
-        if (c >= '0' && c <= '9') {
-            v = v * 10 + (c - '0');
-            any = true;
-        } else {
-            break;
-        }
-    }
-    if (!any || v < 1) { return 4; }
+    int v = sysinfo.cpuCores();
+    if (v < 1) { return 4; }
     return v;
 }
 

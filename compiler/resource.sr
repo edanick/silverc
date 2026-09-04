@@ -1,77 +1,44 @@
 mod export resource;
 
-import * from win32.kernel32;
-import * from win32.msvcrt;
+import * from sysinfo;
 
 // ---------------------------------------------------------------------------
 // Adaptive resource layer — auto-adjust to the host machine.
 //
 // The compiler scales to whatever system it runs on: big machines (many CPU
 // threads, lots of RAM) or small ones (less). Every size decision derives
-// from live system state queried through the Windows API below — there are
-// no hardcoded assumptions about machine size. Targets ~90% of system
-// resources with a 10% safety margin, never overcommitting.
+// from live system state queried through the universal `sysinfo` std module
+// (sysinfo -> win32.kernel32 behind its own `#on WINDOWS` regions) — there
+// are no raw DLL calls or preprocessor regions here, no hardcoded
+// assumptions about machine size. Targets ~90% of system resources with a
+// 10% safety margin, never overcommitting.
 //
-// Win32 struct buffers (SYSTEM_INFO, MEMORYSTATUSEX) are queried through
-// preallocated writable string buffers: strings lower to dense char buffers
-// on every backend, so an index reads one raw byte and a bare call passes
-// the buffer pointer straight across the boundary.
+// UNIFIED_CORE_LIBRARY.md §4 rule 6: this module is pure universal Silver —
+// the one OS layer lives inside sysinfo's public functions (cpuCores decodes
+// SYSTEM_INFO's dwNumberOfProcessors DWORD at offset 32; memoryTotal /
+// memoryFree decode MEMORYSTATUSEX's ullTotalPhys / ullAvailPhys QWORDs at
+// offsets 8 / 16, reported in whole MiB).
 // ---------------------------------------------------------------------------
 
 private int64 LOW_MEMORY_FLOOR = 1073741824; // 1 GiB
 
-// Writable string buffer of n bytes (spaces) for Win32 struct queries.
-private string rsBuf(int n) {
-    string r = "";
-    for (int i = 0; i < n; i++) { r = r + " "; }
-    return r;
-}
-
-// Little-endian DWORD at byte offset `off` in a string buffer.
-private int rsDword(string buf, int off) {
-    int v = 0;
-    for (int i = 0; i < 4; i++) {
-        int b = buf[off + i];
-        v = v + (b << (i * 8));
-    }
-    return v;
-}
-
-// Logical processor count from GetSystemInfo (dwNumberOfProcessors).
+// Logical processor count (SYSTEM_INFO.dwNumberOfProcessors).
 public int rsCpuThreadCount() {
-    string buf = rsBuf(48);
-    GetSystemInfo(buf);
-    int n = rsDword(buf, 32);
+    int n = sysinfo.cpuCores();
     if (n < 1) { n = 1; }
     return n;
 }
 
-// One physical-RAM field of MEMORYSTATUSEX at byte offset `startOff`
-// (ullTotalPhys at 8, ullAvailPhys at 16), read as a little-endian QWORD.
-// The dwLength member is primed to sizeof(MEMORYSTATUSEX) == 64 before the
-// call; a failing call yields 0.
-private int64 rsRamField(int startOff) {
-    string buf = rsBuf(64);
-    memset(buf, 0, 64);
-    lstrcpyA(buf, "@");
-    int ok = GlobalMemoryStatusEx(buf);
-    if (ok == 0) { return 0; }
-    int64 v = 0;
-    for (int i = 0; i < 8; i++) {
-        int64 b = buf[startOff + i];
-        v = v + (b << (i * 8));
-    }
-    return v;
-}
-
-// Bytes of physical RAM currently available (ullAvailPhys).
+// Bytes of physical RAM currently available (MEMORYSTATUSEX.ullAvailPhys).
+// sysinfo reports whole MiB; the byte value is reconstructed exactly for
+// every whole-MiB figure.
 public int64 rsAvailableRamBytes() {
-    return rsRamField(16);
+    return sysinfo.memoryFree() * 1024 * 1024;
 }
 
-// Total physical RAM bytes (ullTotalPhys).
+// Total physical RAM bytes (MEMORYSTATUSEX.ullTotalPhys), same MiB basis.
 public int64 rsTotalRamBytes() {
-    return rsRamField(8);
+    return sysinfo.memoryTotal() * 1024 * 1024;
 }
 
 // Default worker count: 90% of logical processors, never exceeding total
