@@ -41,12 +41,33 @@
 // the user's session when run, so they are verified compile-only; the
 // read-only surface (isDown, vk, keyNameToVk, nameToVk, the VK_* constants)
 // is probe-safe.
+//
+// LINUX BACKEND (Phase B, XWayland/X11 v1 per LINUX.md §7): key synthesis
+// via linux.xtst (XTestFakeKeyEvent) and state via linux.x11
+// (XStringToKeysym/XKeysymToKeycode/XQueryKeymap), mirroring the user32
+// bodies. The vk() table stays PURE (Windows numbers everywhere, per
+// contract): the Linux path does NOT drive X off vk codes. Instead the
+// string forms resolve the Silver key NAME to an X keysym name with the
+// pure keyNameToX table below (single chars pass through, with X aliases
+// for space/tab/enter/punctuation and the word keys), then
+// XStringToKeysym/XKeysymToKeycode yield the server keycode. The int
+// forms (press(int)/isDown(int)) carry X keycodes straight through on
+// Linux (documented escape hatch -- pass server codes, not vk() codes).
+// A null display (headless SSH) degrades to silent no-op / false, and
+// unknown names resolve to NoSymbol and are skipped. nameToVk keeps its
+// pure table + gated VkKeyScanA fallback (unknown -> 0 on Linux already).
 // ---------------------------------------------------------------------------
 
 mod export keyboard;
 
 #on WINDOWS
 import * from win32.user32;
+#off
+#on LINUX
+import * from linux.x11;
+#off
+#on LINUX
+import * from linux.xtst;
 #off
 
 // ---------------------------------------------------------------------------
@@ -198,6 +219,108 @@ int nameToVk(string name) {
     return 0;
 }
 
+// Silver key name -> X keysym name for XStringToKeysym (LINUX.md §7 v1).
+// Pure table, ungated. Single printable chars pass through ("a", "A",
+// "1"); X-side aliases cover the rest. Unknown names yield "" (the
+// callers treat that as NoSymbol and skip).
+string keyNameToX(string name) {
+    if (name.length == 0) { return ""; }
+    if (name.length() == 1) {
+        if (name == " ") { return "space"; }
+        if (name == ",") { return "comma"; }
+        if (name == ".") { return "period"; }
+        if (name == "/") { return "slash"; }
+        if (name == ";") { return "semicolon"; }
+        if (name == "'") { return "apostrophe"; }
+        if (name == "[") { return "bracketleft"; }
+        if (name == "]") { return "bracketright"; }
+        if (name == "\\") { return "backslash"; }
+        if (name == "-") { return "minus"; }
+        if (name == "=") { return "equal"; }
+        if (name == "`") { return "grave"; }
+        return name;
+    }
+    if (name == "TAB") { return "Tab"; }
+    if (name == "ESC" || name == "ESCAPE") { return "Escape"; }
+    if (name == "ENTER" || name == "RETURN") { return "Return"; }
+    if (name == "SPACE") { return "space"; }
+    if (name == "BACKSPACE") { return "BackSpace"; }
+    if (name == "DELETE" || name == "DEL") { return "Delete"; }
+    if (name == "INSERT") { return "Insert"; }
+    if (name == "HOME") { return "Home"; }
+    if (name == "END") { return "End"; }
+    if (name == "PAGEUP" || name == "PRIOR") { return "Prior"; }
+    if (name == "PAGEDOWN" || name == "NEXT") { return "Next"; }
+    if (name == "LEFT") { return "Left"; }
+    if (name == "UP") { return "Up"; }
+    if (name == "RIGHT") { return "Right"; }
+    if (name == "DOWN") { return "Down"; }
+    if (name == "SHIFT") { return "Shift_L"; }
+    if (name == "CTRL" || name == "CONTROL") { return "Control_L"; }
+    if (name == "ALT" || name == "MENU") { return "Alt_L"; }
+    if (name == "WIN_KEY" || name == "WIN") { return "Super_L"; }
+    if (name == "CAPS_LOCK" || name == "CAPS") { return "Caps_Lock"; }
+    if (name == "NUM_LOCK" || name == "NUM") { return "Num_Lock"; }
+    if (name == "SCROLL_LOCK" || name == "SCROLL") { return "Scroll_Lock"; }
+    if (name.length() == 2 && name[0] == 'F') { return name; }
+    if (name.length() == 3 && name[0] == 'F') { return name; }
+    if (name.length() == 2 && name[0] == '_') { return name.substr(1, 1); }
+    return "";
+}
+
+// Synthesize one keysym press (isDown != 0) or release through XTest.
+// LINUX-only helper; unknown names and missing displays are silent no-ops.
+void pressKeysym(string xname, int isDown) {
+    #on LINUX
+    if (xname.length() == 0) { return; }
+    int d = XOpenDisplay(null);
+    if (d == 0) { return; }
+    int ks = XStringToKeysym(xname);
+    if (ks == 0) { XCloseDisplay(d); return; }
+    int code = XKeysymToKeycode(d, ks);
+    if (code == 0) { XCloseDisplay(d); return; }
+    XTestFakeKeyEvent(d, code, isDown, 0);
+    XFlush(d);
+    XCloseDisplay(d);
+    #off
+}
+
+// True when the X keycode's bit is set in the server keymap.
+// LINUX-only helper.
+bool queryKeycodeBit(int code) {
+    #on LINUX
+    if (code < 8 || code > 255) { return false; }
+    int d = XOpenDisplay(null);
+    if (d == 0) { return false; }
+    int[] keys = new int[4];
+    XQueryKeymap(d, keys);
+    XCloseDisplay(d);
+    int byteOff = code / 8;
+    int byteVal = (keys[byteOff / 8] >> ((byteOff % 8) * 8)) & 0xFF;
+    int bit = code % 8;
+    return ((byteVal >> bit) & 1) != 0;
+    #off
+    return false;
+}
+
+// queryKeycodeBit for a Silver key name (NoSymbol -> false).
+// LINUX-only helper.
+bool queryKeycodeBitFor(string keyName) {
+    #on LINUX
+    string xname = keyNameToX(keyName);
+    if (xname.length() == 0) { return false; }
+    int d = XOpenDisplay(null);
+    if (d == 0) { return false; }
+    int ks = XStringToKeysym(xname);
+    if (ks == 0) { XCloseDisplay(d); return false; }
+    int code = XKeysymToKeycode(d, ks);
+    XCloseDisplay(d);
+    if (code == 0) { return false; }
+    return queryKeycodeBit(code);
+    #off
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Core press / release helpers (no private qualifier - silverc-rs parser
 // doesn't recognize `private`). On a future non-Windows backend these are
@@ -209,11 +332,21 @@ void press(string keyName) {
     #on WINDOWS
     keybd_event(vk, 0, 0, 0);
     #off
+    #on LINUX
+    pressKeysym(keyNameToX(keyName), 1);
+    #off
 }
 
 void press(int vk) {
     #on WINDOWS
     keybd_event(vk, 0, 0, 0);
+    #off
+    #on LINUX
+    int d = XOpenDisplay(null);
+    if (d == 0) { return; }
+    XTestFakeKeyEvent(d, vk, 1, 0);
+    XFlush(d);
+    XCloseDisplay(d);
     #off
 }
 
@@ -222,11 +355,21 @@ void release(string keyName) {
     #on WINDOWS
     keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
     #off
+    #on LINUX
+    pressKeysym(keyNameToX(keyName), 0);
+    #off
 }
 
 void release(int vk) {
     #on WINDOWS
     keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+    #off
+    #on LINUX
+    int d = XOpenDisplay(null);
+    if (d == 0) { return; }
+    XTestFakeKeyEvent(d, vk, 0, 0);
+    XFlush(d);
+    XCloseDisplay(d);
     #off
 }
 
@@ -248,6 +391,10 @@ void send(string text) {
         keybd_event(vk, 0, 0, 0);
         keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
         #off
+        #on LINUX
+        pressKeysym(keyNameToX(one), 1);
+        pressKeysym(keyNameToX(one), 0);
+        #off
     }
 }
 
@@ -259,12 +406,18 @@ bool isDown(string keyName) {
     #on WINDOWS
     return (GetKeyState(vk) & 0x8000) != 0;
     #off
+    #on LINUX
+    return queryKeycodeBitFor(keyNameToX(keyName));
+    #off
     return false;
 }
 
 bool isDown(int vk) {
     #on WINDOWS
     return (GetKeyState(vk) & 0x8000) != 0;
+    #off
+    #on LINUX
+    return queryKeycodeBit(vk);
     #off
     return false;
 }
