@@ -2635,6 +2635,78 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movMBaseR(1, 0, 0);
     }
 
+    // LINUX SysV backend (additive): load the captured _start RSP into RAX.
+    public void emitLinuxStackTopLoad() {
+        int stIdx = this.findGlobal("__linux_stack_top");
+        int sp = this.asm.buf.length;
+        this.asm.emitImm64(0, 0);
+        this.globalPatchOffsets.add(sp + 2);
+        this.globalPatchIndices.add(stIdx);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.movRMBase(0, 0, 0);
+    }
+
+    // LINUX SysV backend (additive): rebuild argv from the captured _start
+    // stack ([RSP0]=argc, [RSP0+8+i*8]=argv[i]) into the same heap layout
+    // the WINDOWS parser produces ([argc, arg0, ...], arr+8 returned).
+    // Mirrors silverc-rs emit_cargs_linux.
+    public void genLinuxCargsCall() {
+        this.emitLinuxStackTopLoad();
+        int rspOff = this.allocLocal("__cargs_rsp");
+        this.asm.movMBaseR(5, 0, rspOff);
+        int argcOff = this.allocLocal("__cargs_argc");
+        int arrOff = this.allocLocal("__cargs_arr");
+        int iOff = this.allocLocal("__cargs_i");
+        // argc = [RSP0]
+        this.asm.movRMBase(0, 5, rspOff);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.movMBaseR(5, 0, argcOff);
+        // size = (argc+1)*8 into R8; malloc + zero via the heap helper.
+        this.asm.movRMBase(0, 5, argcOff);
+        this.asm.addRI32(0, 1);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.movRR64(8, 0);
+        this.emitLinuxHeapAllocFromR8();
+        this.asm.movMBaseR(5, 0, arrOff);
+        // [arr] = argc
+        this.asm.movRMBase(1, 5, argcOff);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movMBaseR(0, 1, 0);
+        // i = 0; while i < argc: arr[8+i*8] = argv[i]
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        int loopL = this.newLabel();
+        int doneL = this.newLabel();
+        this.asm.bindLabel(loopL);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, argcOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(doneL);
+        // argv[i]: R10 = RSP0 + 8 + i*8; R10 = [R10]
+        this.asm.movRMBase(10, 5, rspOff);
+        this.asm.addRI32(10, 8);
+        this.asm.movRMBase(11, 5, iOff);
+        this.asm.shlR64Imm(11, 3);
+        this.asm.addRR64(10, 11);
+        this.asm.movRMBase(10, 10, 0);
+        // arr[8+i*8] = argv[i]
+        this.asm.movRMBase(11, 5, arrOff);
+        this.asm.addRI32(11, 8);
+        this.asm.movRMBase(1, 5, iOff);
+        this.asm.shlR64Imm(1, 3);
+        this.asm.addRR64(11, 1);
+        this.asm.movMBaseR(11, 10, 0);
+        // i++
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(loopL);
+        this.asm.bindLabel(doneL);
+        // Arrays point at their first element: skip the length word.
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.addRI32(0, 8);
+    }
+
     public void patchForwardCalls(int[] code) {
         for (int i = 0; i < this.forwardCalls.length; i++) {
             int patchPos = this.forwardCalls[i];
@@ -11996,6 +12068,11 @@ public void genNewCall(Node call) {
         // error handle (GetStdHandle(STD_ERROR_HANDLE) + WriteFile). Only
         // string arguments reach this path -- every compiler diagnostic is
         // built by string concatenation before printing.
+        // LINUX SysV backend (additive): write(2, msg, len) instead.
+        if (this.isLinuxTarget()) {
+            this.genLinuxEprintCall(call, newline);
+            return;
+        }
         if (call.childCount() < 1) { return; }
         Node arg = call.child(0);
         this.genExpr(arg);
@@ -12050,6 +12127,50 @@ public void genNewCall(Node call) {
             this.asm.movRMBase(0, 0, 0);
             this.asm.callR64(0);
             this.asm.emitCallTeardown();
+        }
+    }
+
+    // LINUX SysV backend (additive): write(2, msg, len) (+ "\n"), mirroring
+    // silverc-rs emit_stderr_write_linux. Only string arguments reach here.
+    public void genLinuxEprintCall(Node call, bool newline) {
+        if (call.childCount() < 1) { return; }
+        Node arg = call.child(0);
+        this.genExpr(arg);
+        int msgOff = this.allocLocal("__emsg");
+        this.asm.movMBaseR(5, 0, msgOff);
+        int lenOff = this.allocLocal("__elen");
+        this.asm.movRMBase(7, 5, msgOff);
+        this.addImportPatchDirect("libc.so.6", "strlen");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.emitAbiCallSetup(0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movMBaseR(5, 0, lenOff);
+        this.asm.movRI64(7, 2);
+        this.asm.movRMBase(6, 5, msgOff);
+        this.asm.movRMBase(2, 5, lenOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "write");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        if (newline) {
+            int nlIdx = this.addString("\n");
+            int sp = this.asm.buf.length;
+            this.asm.emitImm64(0, 0);
+            this.stringPatchOffsets.add(sp + 2);
+            this.stringPatchIndices.add(nlIdx);
+            this.asm.movRR64(6, 0);
+            this.asm.movRI64(7, 2);
+            this.asm.movRI64(2, 1);
+            this.emitAbiCallSetup(0);
+            this.addImportPatchDirect("libc.so.6", "write");
+            this.asm.emitImm64(0, 0);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.callR64(0);
+            this.emitAbiCallTeardown();
         }
     }
 
@@ -12881,6 +13002,13 @@ public void genNewCall(Node call) {
     }
 
     public void genCargsCall(Node call) {
+        // LINUX SysV backend (additive): rebuild argv from the _start stack
+        // captured in __linux_stack_top (same array layout, no exit in the
+        // shared path). The WINDOWS command-line parser below is unchanged.
+        if (this.isLinuxTarget()) {
+            this.genLinuxCargsCall();
+            return;
+        }
         int cmdOff = this.allocLocal("__cargs_cmd");
         int lenOff = this.allocLocal("__cargs_len");
         int argcOff = this.allocLocal("__cargs_argc");
@@ -13173,6 +13301,14 @@ public void genNewCall(Node call) {
     }
 
     public void genGetCommandLineCall(Node call) {
+        // LINUX SysV backend (additive): argv[0] (program path) from the
+        // captured _start stack. NOTE: GetCommandLineA returns the whole
+        // command line; joining all argv entries stays a stage-1 gap.
+        if (this.isLinuxTarget()) {
+            this.emitLinuxStackTopLoad();
+            this.asm.movRMBase(0, 0, 8);
+            return;
+        }
         this.addImportPatch("kernel32.dll", "GetCommandLineA");
         this.asm.emitImm64(0, 0);
         this.asm.movRMBase(0, 0, 0);
@@ -14168,6 +14304,11 @@ public void genNewCall(Node call) {
     // Modeled after genReadStringCall but uses the stdin handle instead of
     // CreateFileA, and a fixed-size (4096-byte) heap buffer.
     public void genInputCall(Node call) {
+        // LINUX SysV backend (additive): read(0, buf, 4096) instead.
+        if (this.isLinuxTarget()) {
+            this.genLinuxInputCall();
+            return;
+        }
         // GetStdHandle(-10) -> stdin handle
         this.asm.emitCallSetup(0);
         this.asm.movRI64(1, -10);
@@ -14226,6 +14367,47 @@ public void genNewCall(Node call) {
         this.asm.movRI64(1, 0);
         this.asm.movMBaseByteR(0, 1, 0);
 
+        // Return buffer pointer in RAX
+        this.asm.movRMBase(0, 5, bufOff);
+    }
+
+    // LINUX SysV backend (additive): read(0, buf, 4096) into a heap buffer,
+    // NUL-terminated at the bytes-read position. A negative read (error)
+    // yields the empty string.
+    public void genLinuxInputCall() {
+        int bufSize = 4096;
+        int sizeOff = this.allocLocal("__in_size");
+        this.asm.movRI64(0, bufSize);
+        this.asm.movMBaseR(5, 0, sizeOff);
+        this.asm.movRMBase(8, 5, sizeOff);
+        this.emitLinuxHeapAllocFromR8();
+        int bufOff = this.allocLocal("__in_buf");
+        this.asm.movMBaseR(5, 0, bufOff);
+        int breadOff = this.allocLocal("__in_bread");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, breadOff);
+        // read(0, buf, 4096)
+        this.asm.xorRR64(7, 7);
+        this.asm.movRMBase(6, 5, bufOff);
+        this.asm.movRMBase(2, 5, sizeOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "read");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        int readOk = this.newLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jgeLabel(readOk);
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(readOk);
+        this.asm.movMBaseR(5, 0, breadOff);
+        // Null-terminate the buffer at the bytes-read position
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.movRMBase(1, 5, breadOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movRI64(1, 0);
+        this.asm.movMBaseByteR(0, 1, 0);
         // Return buffer pointer in RAX
         this.asm.movRMBase(0, 5, bufOff);
     }
