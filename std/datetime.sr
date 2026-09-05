@@ -57,9 +57,19 @@ mod export datetime;
 // garbles string-typed ternaries concatenated with an int field (probe: the
 // ternary arm collapses to "" and the field value is lost), while the
 // if/else shape compiles identically on both backends.
+//
+// LINUX BACKEND (Phase B): clock_gettime(CLOCK_REALTIME = 0) for the epoch
+// seconds plus localtime_r/gmtime_r for the civil fields, mirroring the
+// GetLocalTime/GetSystemTime bodies. struct tm (glibc: 9 int fields +
+// gmtoff + zone = 56 bytes) rides an int[7]; the packed 32-bit fields
+// unpack with the same shift idiom as the SYSTEMTIME words. The tm_year
+// (years since 1900) and tm_mon (0-based) biases are applied.
 
 #on WINDOWS
 import * from win32.kernel32;
+#off
+#on LINUX
+import * from linux.libc;
 #off
 
 class duration {
@@ -98,6 +108,24 @@ class now {
             this.minute = (st[1] >> 16) & 0xFFFF;
             this.second = (st[1] >> 32) & 0xFFFF;
             this.millisecond = (st[1] >> 48) & 0xFFFF;
+            #off
+            #on LINUX
+            // clock_gettime(REALTIME) + localtime_r fill the packed struct
+            // tm with the caller's LOCAL civil time; the shifts unpack the
+            // same fields (tm_year/tm_mon carry their C biases).
+            int[] ts = new int[2];
+            clock_gettime(0, ts);
+            int64 sec = ts[0];
+            int64 nsec = ts[1];
+            int[] tm = new int[7];
+            localtime_r(&sec, tm);
+            this.year = 1900 + int((tm[2] >> 32) & 0xFFFFFFFF);
+            this.month = 1 + int((tm[2]) & 0xFFFFFFFF);
+            this.day = int((tm[1] >> 32) & 0xFFFFFFFF);
+            this.hour = int(tm[1] & 0xFFFFFFFF);
+            this.minute = int((tm[0] >> 32) & 0xFFFFFFFF);
+            this.second = int(tm[0] & 0xFFFFFFFF);
+            this.millisecond = int(nsec / 1000000);
             #off
         } else {
             this.year = y;
@@ -185,6 +213,23 @@ public now utcNow() {
     n.minute = (st[1] >> 16) & 0xFFFF;
     n.second = (st[1] >> 32) & 0xFFFF;
     n.millisecond = (st[1] >> 48) & 0xFFFF;
+    #off
+    #on LINUX
+    // clock_gettime(REALTIME) + gmtime_r overwrite the same fields with
+    // wall-clock UTC.
+    int[] ts = new int[2];
+    clock_gettime(0, ts);
+    int64 sec = ts[0];
+    int64 nsec = ts[1];
+    int[] tm = new int[7];
+    gmtime_r(&sec, tm);
+    n.year = 1900 + int((tm[2] >> 32) & 0xFFFFFFFF);
+    n.month = 1 + int((tm[2]) & 0xFFFFFFFF);
+    n.day = int((tm[1] >> 32) & 0xFFFFFFFF);
+    n.hour = int(tm[1] & 0xFFFFFFFF);
+    n.minute = int((tm[0] >> 32) & 0xFFFFFFFF);
+    n.second = int(tm[0] & 0xFFFFFFFF);
+    n.millisecond = int(nsec / 1000000);
     #off
     return n;
 }
