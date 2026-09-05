@@ -52,12 +52,30 @@
 // Cursor.setX/setY/getPosition, mouse.hold/click/tap (pure delegation to
 // gated entries), and setCursorX/setCursorY -- those bodies only update the
 // tracked Cursor locals (the Win32 move lives in Cursor.setPosition).
+//
+// LINUX BACKEND (Phase B, XWayland/X11 v1 per LINUX.md §7): XOpenDisplay /
+// XQueryPointer / XWarpPointer from linux.x11 plus button synthesis from
+// linux.xtst (XTestFakeButtonEvent), mirroring the user32 bodies call for
+// call. X button numbers are 1 = left, 2 = middle, 3 = right (the
+// mouseButtonToX helper). XQueryPointer takes nine arguments -- all nine
+// ride real out-var addresses (never null: a null in a SysV stack-arg slot
+// faults the callee on silverc-rs, probed). Every entry opens its own
+// display and closes it before returning (stateless v1); a null display
+// (no $DISPLAY / headless SSH) takes the documented fallback path: reads
+// answer 0/false and writes are silent no-ops, with the tracked Cursor
+// locals still updating so getPosition() stays consistent.
 // ---------------------------------------------------------------------------
 
 mod export mouse;
 
 #on WINDOWS
 import * from win32.user32;
+#off
+#on LINUX
+import * from linux.x11;
+#off
+#on LINUX
+import * from linux.xtst;
 #off
 
 const int MOUSEEVENTF_LEFTDOWN  = 0x0002;
@@ -112,12 +130,18 @@ class Cursor {
         #on WINDOWS
         return GetCursorX();
         #off
+        #on LINUX
+        return queryPointerAxis(0);
+        #off
         return 0;
     }
 
     public int getY() {
         #on WINDOWS
         return GetCursorY();
+        #off
+        #on LINUX
+        return queryPointerAxis(1);
         #off
         return 0;
     }
@@ -135,6 +159,14 @@ class Cursor {
         #on WINDOWS
         SetCursorPos(newX, newY);
         #off
+        #on LINUX
+        int d = XOpenDisplay(null);
+        if (d == 0) { return; }
+        int root = XDefaultRootWindow(d);
+        XWarpPointer(d, 0, root, 0, 0, 0, 0, newX, newY);
+        XFlush(d);
+        XCloseDisplay(d);
+        #off
     }
 }
 
@@ -148,6 +180,46 @@ int mouseUpFlag(int button) {
     if (button == MouseButtons_RIGHT) { return MOUSEEVENTF_RIGHTUP; }
     if (button == MouseButtons_MIDDLE) { return MOUSEEVENTF_MIDDLEUP; }
     return MOUSEEVENTF_LEFTUP;
+}
+
+// X button number for a MouseButtons code (1 left, 2 middle, 3 right).
+// Pure mapping, ungated.
+int mouseButtonToX(int button) {
+    if (button == MouseButtons_RIGHT) { return 3; }
+    if (button == MouseButtons_MIDDLE) { return 2; }
+    return 1;
+}
+
+// Live pointer read via XQueryPointer: result 0/1 selects the root X/Y.
+// Opens and closes its own display; 0 when no display is reachable.
+// LINUX-only helper (the WINDOWS side reads through GetCursorX/GetCursorY).
+int queryPointerAxis(int wantY) {
+    #on LINUX
+    int d = XOpenDisplay(null);
+    if (d == 0) { return 0; }
+    int root = XDefaultRootWindow(d);
+    int rroot = 0;
+    int rchild = 0;
+    int rx = 0;
+    int ry = 0;
+    int wx = 0;
+    int wy = 0;
+    int mask = 0;
+    int ok = XQueryPointer(d, root, &rroot, &rchild, &rx, &ry, &wx, &wy, &mask);
+    XCloseDisplay(d);
+    if (ok == 0) { return 0; }
+    if (wantY != 0) { return ry; }
+    return rx;
+    #off
+    return 0;
+}
+
+// Button mask bit for a MouseButtons code (Button1/2/3Mask). Pure, ungated.
+int mouseMaskBit(int buttonCode) {
+    if (buttonCode == MouseButtons_RIGHT) { return 1024; }
+    if (buttonCode == MouseButtons_MIDDLE) { return 512; }
+    if (buttonCode == MouseButtons_LEFT) { return 256; }
+    return 0;
 }
 
 class mouse {
@@ -165,6 +237,13 @@ class mouse {
         #on WINDOWS
         mouse_event(mouseDownFlag(button), 0, 0, 0, 0);
         #off
+        #on LINUX
+        int d = XOpenDisplay(null);
+        if (d == 0) { return; }
+        XTestFakeButtonEvent(d, mouseButtonToX(button), 1, 0);
+        XFlush(d);
+        XCloseDisplay(d);
+        #off
     }
 
     public void hold(int button) {
@@ -174,6 +253,13 @@ class mouse {
     public void release(int button) {
         #on WINDOWS
         mouse_event(mouseUpFlag(button), 0, 0, 0, 0);
+        #off
+        #on LINUX
+        int d = XOpenDisplay(null);
+        if (d == 0) { return; }
+        XTestFakeButtonEvent(d, mouseButtonToX(button), 0, 0);
+        XFlush(d);
+        XCloseDisplay(d);
         #off
     }
 
@@ -194,6 +280,9 @@ class mouse {
         #on WINDOWS
         mouse_event(MOUSEEVENTF_WHEEL, 0, 0, amount, 0);
         #off
+        #on LINUX
+        wheelX(amount);
+        #off
     }
 
     // scroll(int amount, ScrollDirection direction)
@@ -210,6 +299,9 @@ class mouse {
         #on WINDOWS
         mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0);
         #off
+        #on LINUX
+        wheelX(delta);
+        #off
     }
 
     // Read live cursor X / Y from Win32. The compilers recognise the
@@ -221,12 +313,18 @@ class mouse {
         #on WINDOWS
         return GetCursorX();
         #off
+        #on LINUX
+        return queryPointerAxis(0);
+        #off
         return 0;
     }
 
     public int cursorY() {
         #on WINDOWS
         return GetCursorY();
+        #off
+        #on LINUX
+        return queryPointerAxis(1);
         #off
         return 0;
     }
@@ -235,6 +333,9 @@ class mouse {
         #on WINDOWS
         return GetCursorX();
         #off
+        #on LINUX
+        return queryPointerAxis(0);
+        #off
         return 0;
     }
 
@@ -242,8 +343,32 @@ class mouse {
         #on WINDOWS
         return GetCursorY();
         #off
+        #on LINUX
+        return queryPointerAxis(1);
+        #off
         return 0;
     }
+}
+
+// Wheel synthesis via XTest buttons 4 (up) / 5 (down), one click per
+// WHEEL_DELTA-ish 120 units (a nonzero remainder still clicks once).
+// LINUX-only helper.
+void wheelX(int amount) {
+    #on LINUX
+    int btn = 5;
+    int n = amount;
+    if (n < 0) { btn = 4; n = -n; }
+    n = n / 120;
+    if (n == 0 && amount != 0) { n = 1; }
+    int d = XOpenDisplay(null);
+    if (d == 0) { return; }
+    for (int i = 0; i < n; i++) {
+        XTestFakeButtonEvent(d, btn, 1, 0);
+        XTestFakeButtonEvent(d, btn, 0, 0);
+    }
+    XFlush(d);
+    XCloseDisplay(d);
+    #off
 }
 
 mouse instance = new mouse();
@@ -260,12 +385,18 @@ int getCursorX() {
     #on WINDOWS
     return GetCursorX();
     #off
+    #on LINUX
+    return queryPointerAxis(0);
+    #off
     return 0;
 }
 
 int getCursorY() {
     #on WINDOWS
     return GetCursorY();
+    #off
+    #on LINUX
+    return queryPointerAxis(1);
     #off
     return 0;
 }
@@ -289,6 +420,24 @@ bool isMouseDown(int buttonCode) {
     if (vk == 0) { return false; }
     #on WINDOWS
     return (GetKeyState(vk) & 0x8000) != 0;
+    #off
+    #on LINUX
+    int bit = mouseMaskBit(buttonCode);
+    if (bit == 0) { return false; }
+    int d = XOpenDisplay(null);
+    if (d == 0) { return false; }
+    int root = XDefaultRootWindow(d);
+    int rroot = 0;
+    int rchild = 0;
+    int rx = 0;
+    int ry = 0;
+    int wx = 0;
+    int wy = 0;
+    int mask = 0;
+    int ok = XQueryPointer(d, root, &rroot, &rchild, &rx, &ry, &wx, &wy, &mask);
+    XCloseDisplay(d);
+    if (ok == 0) { return false; }
+    return (mask & bit) != 0;
     #off
     return false;
 }
