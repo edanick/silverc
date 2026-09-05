@@ -56,9 +56,19 @@ mod export threads;
 // stored handle only; the public join() guards on `this.handle != 0`
 // first, so joining an un-started Thread is a no-op and probes over this
 // module can never hang through it.
+//
+// LINUX BACKEND (Phase B): pthread_join for join(), nanosleep for sleep(),
+// from linux.libc. The dormant-spawn posture is OS-INDEPENDENT and stays:
+// pthread_create needs a start-routine function pointer, and bare function
+// names lower to null/garbage on both compilers (see DORMANT SPAWN above),
+// so start() keeps no region and no spawn call on Linux either; handle
+// stays 0 and join() is a no-op there exactly like on Windows.
 
 #on WINDOWS
 import * from win32.kernel32;
+#off
+#on LINUX
+import * from linux.libc;
 #off
 
 class Thread {
@@ -88,6 +98,10 @@ class Thread {
             #on WINDOWS
             WaitForSingleObject(this.handle, -1);
             CloseHandle(this.handle);
+            #off
+            #on LINUX
+            int ret = 0;
+            pthread_join(this.handle, &ret);
             #off
             this.handle = 0;
         }
@@ -141,6 +155,14 @@ public ThreadGroup multi(object[] fns) {
 public void sleep(int ms) {
     #on WINDOWS
     Sleep(ms);
+    #off
+    #on LINUX
+    if (ms < 0) { return; }
+    int[] ts = new int[2];
+    ts[0] = ms / 1000;
+    ts[1] = (ms % 1000) * 1000000;
+    int[] rem = new int[2];
+    nanosleep(ts, rem);
     #off
 }
 
