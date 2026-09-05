@@ -608,18 +608,396 @@ public int[] build(int[] codeIn, int[] stringData, string[] versionData) {
 // are the documentation; the region holds only comments (compiler machinery
 // slot — the std no-placeholder rule does not apply).
 #on LINUX
-// What the Linux backend must provide here (mirroring the MiniPe surface the
-// driver already calls — addSectionData / setVersionInfo / writeFile / build):
-//   * ELF header (0x7F 'E' 'L' 'F', ELFCLASS64, little-endian, ET_EXEC or
-//     ET_DYN per the loader strategy) and program headers (PT_LOAD segments
-//     for .text at the chosen base, PT_GNU_STACK).
-//   * Section table + .shstrtab for debug/tooling visibility (optional).
-//   * Symbol resolution replacing the PE import directory: GOT/PLT stubs or
-//     static linking for libc; the import names come from mini_cg's
-//     importDlls/importFuncs tables (patchImportRefs is the Windows patcher;
-//     the Linux backend patches against its own relocation model).
-//   * The subsystem flag (`type: app`) maps to no direct ELF equivalent —
-//     decide console/daemon handling at the driver level.
-//   * writeLe32/writeLe64/padToAlign above are reusable as-is for ELF byte
-//     packing (lift them out of the `#on WINDOWS` region or re-declare).
+// LINUX ELF ET_EXEC emitter -- mirrors silverc-rs src/elf.rs plan()/emit().
+// Layout (exact mirror of the Rust ET_EXEC writer):
+//   Ehdr 64B: 7F 45 4C 46, ELFCLASS64(2), LE(1), EV_CURRENT(1), SYSV(0),
+//     ET_EXEC(2), EM_X86_64(62), version(1), entry=0x400000+entryRva,
+//     phoff=64, phentsize=56, phnum=7.
+//   Phdrs 7x56B (TABLES_OFF=64+7*56=456):
+//     [0] PT_INTERP(3) R -- /lib64/ld-linux-x86-64.so.2
+//     [1] PT_LOAD(1) R -- file offset 0 at 0x400000 (headers+tables;
+//           the kernel hands the loader AT_PHDR inside this mapping,
+//           so offset 0 MUST be mapped).
+//     [2] PT_LOAD(1) RX -- code at 0x401000 (TEXT_RVA=0x1000).
+//     [3] PT_LOAD(1) RW -- data (strings + globals/state) after code,
+//           page-aligned; writable so global mutation never faults.
+//     [4] PT_LOAD(1) RW -- GOT (3 reserved header zeros + one slot/import).
+//     [5] PT_DYNAMIC(2) R -- DT_NEEDED libc.so.6, DT_HASH, DT_PLTGOT,
+//           DF_BIND_NOW, STRTAB/STRSZ/SYMTAB/SYMENT/RELA/RELASZ/RELENT/
+//           JMPREL/PLTRELSZ/PLTREL, NULL.
+//     [6] PT_GNU_STACK(0x6474e551) RW -- empty, marks stack non-executable.
+//   R tables at 456: .interp, .hash (SysV nbucket=1 chaining every dynamic
+//     symbol -- required, ld.so leaves GOT zero without it), .dynstr
+//     (0 | libs | names), .dynsym (null + UND FUNC/GLOBAL per import),
+//     .rela.plt (one R_X86_64_JUMP_SLOT=7 per import, PLT-less direct-GOT
+//     calls: mov rax,<got>; mov rax,[rax]; call rax), .dynamic.
+//   Helpers writeLe32/writeLe64/padToAlign are re-declared here: they sit
+//   inside the WINDOWS region above, so a LINUX build re-declares them.
+//   MiniPe surface (addSectionData/setVersionInfo/writeFile/build/addImport/
+//   computeRdataRva/computeLayout) matches WINDOWS so the driver compiles on
+//   both targets; subsystem/version are stored but have no ELF equivalent.
+class PeImport {
+    public prop string dll;
+    public prop string name;
+
+    construct (string dll, string name) {
+        this.dll = dll;
+        this.name = name;
+    }
+}
+class PeDllGroup {
+    public prop string dll;
+    public prop int count;
+
+    construct (string dll) {
+        this.dll = dll;
+        this.count = 0;
+    }
+}
+class MiniPe {
+    public int[] code;
+    public int entryRva;
+    public int globalAreaSize;
+    public PeImport[] imports;
+    public int[] relocOffsets;
+    public int[] extraData;
+    public string[] viKeys;
+    public string[] viValues;
+    public int subsystem;
+
+    construct () {
+        this.code = [];
+        this.entryRva = 0;
+        this.globalAreaSize = 0;
+        this.imports = [];
+        this.relocOffsets = [];
+        this.extraData = [];
+        this.viKeys = [];
+        this.viValues = [];
+        this.subsystem = 3;
+    }
+
+    public void addSectionData(int[] data) {
+        this.extraData = data;
+    }
+
+    public void setVersionInfo(string[] keys, string[] values) {
+        this.viKeys = keys;
+        this.viValues = values;
+    }
+
+    public void writeFile(string path) {
+        int[] elfBytes = this.build(this.code, this.extraData, []);
+        file.writeBytes(path, elfBytes);
+    }
+
+    public void addImport(string dll, string name) {
+        this.imports.add(new PeImport(dll, name));
+    }
+
+    private bool strEq(string a, string b) {
+        if (a.length != b.length) { return false; }
+        for (int i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    public int computeRdataRva() {
+        int SECT_ALIGN = 0x1000;
+        int textRva = SECT_ALIGN;
+        int textVirt = this.padToAlign(this.code.length, SECT_ALIGN);
+        return textRva + textVirt;
+    }
+
+    public int[] computeLayout(int stringDataLen) {
+        PeDllGroup[] groups = [];
+        int[] groupMap = [];
+        for (int i = 0; i < this.imports.length; i++) {
+            string impDll = this.imports[i].dll;
+            int gIdx = -1;
+            for (int j = 0; j < groups.length; j++) {
+                string gDll = groups[j].dll;
+                if (this.strEq(gDll, impDll)) {
+                    gIdx = j;
+                    break;
+                }
+            }
+            if (gIdx < 0) {
+                groups.add(new PeDllGroup(impDll));
+                gIdx = groups.length - 1;
+            }
+            PeDllGroup grp = groups[gIdx];
+            grp.count = grp.count + 1;
+            groupMap.add(gIdx);
+        }
+        int numGroups = groups.length;
+        int relaTotal = this.imports.length * 24;
+        int[] layout = [];
+        layout.add(0);
+        layout.add(numGroups);
+        layout.add(relaTotal);
+        return layout;
+    }
+
+    public int padToAlign(int offset, int align) {
+        int m = offset % align;
+        if (m != 0) {
+            return offset + (align - m);
+        }
+        return offset;
+    }
+
+    public void writeLe32(int[] buf, int offset, int val) {
+        buf[offset] = val & 0xFF;
+        buf[offset + 1] = (val >> 8) & 0xFF;
+        buf[offset + 2] = (val >> 16) & 0xFF;
+        buf[offset + 3] = (val >> 24) & 0xFF;
+    }
+
+    public void writeLe64(int[] buf, int offset, int64 val) {
+        buf[offset] = val & 0xFF;
+        buf[offset + 1] = (val >> 8) & 0xFF;
+        buf[offset + 2] = (val >> 16) & 0xFF;
+        buf[offset + 3] = (val >> 24) & 0xFF;
+        buf[offset + 4] = (val >> 32) & 0xFF;
+        buf[offset + 5] = (val >> 40) & 0xFF;
+        buf[offset + 6] = (val >> 48) & 0xFF;
+        buf[offset + 7] = (val >> 56) & 0xFF;
+    }
+
+    public int[] build(int[] codeIn, int[] stringData, string[] versionData) {
+        this.code = codeIn;
+        int n = this.imports.length;
+        int codeLen = codeIn.length;
+        int dataLen = stringData.length + this.globalAreaSize;
+        int PAGE = 0x1000;
+        int BASE = 0x400000;
+        int TEXT_RVA = 0x1000;
+        int TABLES_OFF = 456;
+        string interpStr = "/lib64/ld-linux-x86-64.so.2";
+        int interpLen = interpStr.length + 1;
+        string libcName = "libc.so.6";
+        string[] neededLibs = [];
+        for (int i = 0; i < n; i++) {
+            string libName = this.imports[i].dll;
+            if (libName.length == 0) { libName = libcName; }
+            bool seen = false;
+            for (int j = 0; j < neededLibs.length; j++) {
+                if (this.strEq(neededLibs[j], libName)) { seen = true; break; }
+            }
+            if (!seen) { neededLibs.add(libName); }
+        }
+        if (neededLibs.length == 0) { neededLibs.add(libcName); }
+        int[] dynstrBytes = [];
+        dynstrBytes.add(0);
+        int[] libOffs = [];
+        for (int i = 0; i < neededLibs.length; i++) {
+            libOffs.add(dynstrBytes.length);
+            string lb = neededLibs[i];
+            for (int k = 0; k < lb.length; k++) { dynstrBytes.add(lb[k]); }
+            dynstrBytes.add(0);
+        }
+        int libcOff = libOffs[0];
+        for (int i = 0; i < neededLibs.length; i++) {
+            if (this.strEq(neededLibs[i], libcName)) { libcOff = libOffs[i]; break; }
+        }
+        int[] nameOffs = [];
+        for (int i = 0; i < n; i++) {
+            nameOffs.add(dynstrBytes.length);
+            string fn = this.imports[i].name;
+            for (int k = 0; k < fn.length; k++) { dynstrBytes.add(fn[k]); }
+            dynstrBytes.add(0);
+        }
+        int dynstrLen = dynstrBytes.length;
+        int rxFilesz = this.padToAlign(codeLen, PAGE);
+        int rxOff = PAGE;
+        int rxVaddr = BASE + TEXT_RVA;
+        int dataFilesz = this.padToAlign(dataLen, PAGE);
+        int dataOff = rxOff + rxFilesz;
+        int dataVaddr = rxVaddr + rxFilesz;
+        int relaLen = n * 24;
+        int dynsymLen = 24 * (n + 1);
+        int dynamicLen = (14 + neededLibs.length) * 16;
+        int hashLen = 16 + n * 4;
+        int offInterp = TABLES_OFF;
+        int offHash = offInterp + interpLen;
+        int offDynstr = offHash + hashLen;
+        int offDynsym = offDynstr + dynstrLen;
+        int offRela = offDynsym + dynsymLen;
+        int offDynamic = offRela + relaLen;
+        int rFilesz = offDynamic + dynamicLen;
+        int rwOff = dataOff + dataFilesz;
+        int rwVaddr = dataVaddr + dataFilesz;
+        int64 entryAddr = BASE + this.entryRva;
+        int totalSize = rwOff + 24 + n * 8;
+        int[] out = [];
+        for (int i = 0; i < totalSize; i++) { out.add(0); }
+        out[0] = 127;
+        out[1] = 69;
+        out[2] = 76;
+        out[3] = 70;
+        out[4] = 2;
+        out[5] = 1;
+        out[6] = 1;
+        out[7] = 0;
+        out[16] = 2;
+        out[17] = 0;
+        out[18] = 62;
+        out[19] = 0;
+        this.writeLe32(out, 20, 1);
+        this.writeLe64(out, 24, entryAddr);
+        this.writeLe64(out, 32, 64);
+        this.writeLe64(out, 40, 0);
+        this.writeLe32(out, 48, 0);
+        out[52] = 64;
+        out[53] = 0;
+        out[54] = 56;
+        out[55] = 0;
+        out[56] = 7;
+        out[57] = 0;
+        int ph0 = 64;
+        this.writeLe32(out, ph0, 3);
+        this.writeLe32(out, ph0 + 4, 4);
+        this.writeLe64(out, ph0 + 8, offInterp);
+        this.writeLe64(out, ph0 + 16, BASE + offInterp);
+        this.writeLe64(out, ph0 + 24, BASE + offInterp);
+        this.writeLe64(out, ph0 + 32, interpLen);
+        this.writeLe64(out, ph0 + 40, interpLen);
+        this.writeLe64(out, ph0 + 48, 1);
+        int ph1 = 120;
+        this.writeLe32(out, ph1, 1);
+        this.writeLe32(out, ph1 + 4, 4);
+        this.writeLe64(out, ph1 + 8, 0);
+        this.writeLe64(out, ph1 + 16, BASE);
+        this.writeLe64(out, ph1 + 24, BASE);
+        this.writeLe64(out, ph1 + 32, rFilesz);
+        this.writeLe64(out, ph1 + 40, rFilesz);
+        this.writeLe64(out, ph1 + 48, PAGE);
+        int ph2 = 176;
+        this.writeLe32(out, ph2, 1);
+        this.writeLe32(out, ph2 + 4, 5);
+        this.writeLe64(out, ph2 + 8, rxOff);
+        this.writeLe64(out, ph2 + 16, rxVaddr);
+        this.writeLe64(out, ph2 + 24, rxVaddr);
+        this.writeLe64(out, ph2 + 32, rxFilesz);
+        this.writeLe64(out, ph2 + 40, rxFilesz);
+        this.writeLe64(out, ph2 + 48, PAGE);
+        int ph3 = 232;
+        this.writeLe32(out, ph3, 1);
+        this.writeLe32(out, ph3 + 4, 6);
+        this.writeLe64(out, ph3 + 8, dataOff);
+        this.writeLe64(out, ph3 + 16, dataVaddr);
+        this.writeLe64(out, ph3 + 24, dataVaddr);
+        this.writeLe64(out, ph3 + 32, dataFilesz);
+        this.writeLe64(out, ph3 + 40, dataFilesz);
+        this.writeLe64(out, ph3 + 48, PAGE);
+        int ph4 = 288;
+        this.writeLe32(out, ph4, 1);
+        this.writeLe32(out, ph4 + 4, 6);
+        this.writeLe64(out, ph4 + 8, rwOff);
+        this.writeLe64(out, ph4 + 16, rwVaddr);
+        this.writeLe64(out, ph4 + 24, rwVaddr);
+        this.writeLe64(out, ph4 + 32, 24 + n * 8);
+        this.writeLe64(out, ph4 + 40, 24 + n * 8);
+        this.writeLe64(out, ph4 + 48, PAGE);
+        int ph5 = 344;
+        this.writeLe32(out, ph5, 2);
+        this.writeLe32(out, ph5 + 4, 4);
+        this.writeLe64(out, ph5 + 8, offDynamic);
+        this.writeLe64(out, ph5 + 16, BASE + offDynamic);
+        this.writeLe64(out, ph5 + 24, BASE + offDynamic);
+        this.writeLe64(out, ph5 + 32, dynamicLen);
+        this.writeLe64(out, ph5 + 40, dynamicLen);
+        this.writeLe64(out, ph5 + 48, 8);
+        int ph6 = 400;
+        this.writeLe32(out, ph6, 0x6474e551);
+        this.writeLe32(out, ph6 + 4, 6);
+        this.writeLe64(out, ph6 + 8, 0);
+        this.writeLe64(out, ph6 + 16, 0);
+        this.writeLe64(out, ph6 + 24, 0);
+        this.writeLe64(out, ph6 + 32, 0);
+        this.writeLe64(out, ph6 + 40, 0);
+        this.writeLe64(out, ph6 + 48, 16);
+        for (int k = 0; k < interpStr.length; k++) { out[offInterp + k] = interpStr[k]; }
+        out[offInterp + interpStr.length] = 0;
+        this.writeLe32(out, offHash, 1);
+        this.writeLe32(out, offHash + 4, n + 1);
+        if (n > 0) { this.writeLe32(out, offHash + 8, 1); } else { this.writeLe32(out, offHash + 8, 0); }
+        this.writeLe32(out, offHash + 12, 0);
+        for (int hi = 1; hi <= n; hi++) {
+            int cv = 0;
+            if (hi < n) { cv = hi + 1; }
+            this.writeLe32(out, offHash + 12 + hi * 4, cv);
+        }
+        for (int k = 0; k < dynstrLen; k++) { out[offDynstr + k] = dynstrBytes[k]; }
+        for (int si = 0; si < n; si++) {
+            int symOff = offDynsym + 24 * (si + 1);
+            this.writeLe32(out, symOff, nameOffs[si]);
+            out[symOff + 4] = 18;
+        }
+        for (int si = 0; si < n; si++) {
+            int relaBase = offRela + si * 24;
+            int gotSlot = rwVaddr + 24 + si * 8;
+            this.writeLe64(out, relaBase, gotSlot);
+            this.writeLe32(out, relaBase + 8, 7);
+            this.writeLe32(out, relaBase + 12, si + 1);
+        }
+        int dynPos = offDynamic;
+        this.writeLe64(out, dynPos, 1);
+        this.writeLe64(out, dynPos + 8, libcOff);
+        dynPos = dynPos + 16;
+        for (int li = 0; li < neededLibs.length; li++) {
+            if (!this.strEq(neededLibs[li], libcName)) {
+                this.writeLe64(out, dynPos, 1);
+                this.writeLe64(out, dynPos + 8, libOffs[li]);
+                dynPos = dynPos + 16;
+            }
+        }
+        this.writeLe64(out, dynPos, 4);
+        this.writeLe64(out, dynPos + 8, BASE + offHash);
+        dynPos = dynPos + 16;
+        this.writeLe64(out, dynPos, 3);
+        this.writeLe64(out, dynPos + 8, rwVaddr);
+        dynPos = dynPos + 16;
+        this.writeLe64(out, dynPos, 30);
+        this.writeLe64(out, dynPos + 8, 8);
+        dynPos = dynPos + 16;
+        this.writeLe64(out, dynPos, 5);
+        this.writeLe64(out, dynPos + 8, BASE + offDynstr);
+        dynPos = dynPos + 16;
+        this.writeLe64(out, dynPos, 10);
+        this.writeLe64(out, dynPos + 8, dynstrLen);
+        dynPos = dynPos + 16;
+        this.writeLe64(out, dynPos, 6);
+        this.writeLe64(out, dynPos + 8, BASE + offDynsym);
+        dynPos = dynPos + 16;
+        this.writeLe64(out, dynPos, 11);
+        this.writeLe64(out, dynPos + 8, 24);
+        dynPos = dynPos + 16;
+        this.writeLe64(out, dynPos, 7);
+        this.writeLe64(out, dynPos + 8, BASE + offRela);
+        dynPos = dynPos + 16;
+        this.writeLe64(out, dynPos, 8);
+        this.writeLe64(out, dynPos + 8, relaLen);
+        dynPos = dynPos + 16;
+        this.writeLe64(out, dynPos, 9);
+        this.writeLe64(out, dynPos + 8, 24);
+        dynPos = dynPos + 16;
+        this.writeLe64(out, dynPos, 23);
+        this.writeLe64(out, dynPos + 8, BASE + offRela);
+        dynPos = dynPos + 16;
+        this.writeLe64(out, dynPos, 2);
+        this.writeLe64(out, dynPos + 8, relaLen);
+        dynPos = dynPos + 16;
+        this.writeLe64(out, dynPos, 20);
+        this.writeLe64(out, dynPos + 8, 7);
+        dynPos = dynPos + 16;
+        this.writeLe64(out, dynPos, 0);
+        this.writeLe64(out, dynPos + 8, 0);
+        for (int ci = 0; ci < codeIn.length; ci++) { out[rxOff + ci] = codeIn[ci]; }
+        for (int di = 0; di < stringData.length; di++) { out[dataOff + di] = stringData[di]; }
+        return out;
+    }
+}
 #off
