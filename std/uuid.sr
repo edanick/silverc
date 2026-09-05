@@ -1,6 +1,9 @@
 #on WINDOWS
 import { SystemFunction036 as RtlGenRandom } from win32.advapi32;
 #off
+#on LINUX
+import * from linux.libc;
+#off
 
 mod export uuid;
 
@@ -10,9 +13,10 @@ mod export uuid;
 // 0. REGION: the aliased CSPRNG grant sits inside an `#on WINDOWS` region
 //    (the last win32 import outside a region, folded per
 //    UNIFIED_CORE_LIBRARY.md §2/§4 rule 6 + §8.3 item 1). The CSPRNG call
-//    sites below also sit in regions; a non-Windows backend fills its own
-//    region bodies later (the pure-Silver formatting/parse helpers are
-//    ungated and already portable).
+//    sites below also sit in regions; the Linux side reads getrandom(2)
+//    through a plain `import * from linux.libc;` (no alias needed: no
+//    `getrandom` name in this module). The pure-Silver formatting/parse
+//    helpers are ungated and already portable.
 //
 // 1. GRANT: calls need an import grant -- both compilers reject an
 //    ungated call ("unknown method RtlGenRandom"). The conventional
@@ -53,6 +57,9 @@ class uuid {
         #on WINDOWS
         RtlGenRandom(packed, 16);
         #off
+        #on LINUX
+        getrandom(packed, 16, 0);
+        #off
         byte[] bytes = new byte[16];
         for (int i = 0; i < 16; i++) {
             bytes[i] = (packed[i / 8] >> ((i % 8) * 8)) & 0xFF;
@@ -65,6 +72,9 @@ public string generate() {
     int[] packed = new int[2];
     #on WINDOWS
     RtlGenRandom(packed, 16);
+    #off
+    #on LINUX
+    getrandom(packed, 16, 0);
     #off
     int[] b = new int[16];
     for (int i = 0; i < 16; i++) {
