@@ -37,9 +37,15 @@ import * from fs;
 // these helpers can delegate to it.
 //
 // RNG NOTE: salt/key material routes through the module's
-// cryptoRandomRange (msvcrt rand inside its Windows region). Swapping the
-// CRT rand for a stronger unified RNG (and making bcryptHash actually
-// hash) is future work.
+// cryptoRandomRange (msvcrt rand inside its Windows region, libc rand
+// inside the Linux region). Swapping the CRT rand for a stronger unified
+// RNG (and making bcryptHash actually hash) is future work.
+//
+// LINUX BACKEND (Phase B): cryptoRandomRange rides libc rand() with the
+// same span shape; randomBytes reads real entropy from getrandom(2) into
+// a packed int[2+]-style buffer and unpacks one byte per slot (the uuid.sr
+// layout -- byte[] must not cross the boundary packed). A failed getrandom
+// keeps the zero fill, matching the old fallback.
 //
 // COMPILER NOTE: silverc-rs cannot consume exported CLASS types from
 // source modules (rsaKeyPair as a user-local type fails with the standard
@@ -58,6 +64,9 @@ import * from fs;
 import { CryptAcquireContextA, CryptGenRandom, CryptReleaseContext } from win32.advapi32;
 import * from win32.msvcrt;
 #off
+#on LINUX
+import * from linux.libc;
+#off
 
 class rsaKeyPair {
     public string publicKey;
@@ -73,6 +82,10 @@ class rsaKeyPair {
 // Falls back to the range minimum on a future non-Windows backend.
 private int cryptoRandomRange(int min, int max) {
     #on WINDOWS
+    int span = max - min + 1;
+    return min + rand() % span;
+    #off
+    #on LINUX
     int span = max - min + 1;
     return min + rand() % span;
     #off
@@ -206,6 +219,19 @@ public byte[] randomBytes(int count) {
     if (prov != 0) {
         CryptGenRandom(prov, count, result);
         CryptReleaseContext(prov, 0);
+    }
+    return result;
+    #off
+    #on LINUX
+    if (count <= 0) { return []; }
+    int slots = (count + 7) / 8;
+    int[] packed = new int[slots];
+    int n = getrandom(packed, count, 0);
+    byte[] result = new byte[count];
+    if (n < 0) { return result; }
+    if (n > count) { n = count; }
+    for (int i = 0; i < n; i++) {
+        result[i] = (packed[i / 8] >> ((i % 8) * 8)) & 0xFF;
     }
     return result;
     #off
