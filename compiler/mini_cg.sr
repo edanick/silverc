@@ -11828,6 +11828,29 @@ public void genNewCall(Node call) {
         this.emitAbiCallTeardown();
     }
 
+    // LINUX SysV backend (additive): sprintf(buf, fmt, value) where RCX=buf,
+    // RDX=fmt, R8=value-bits are already staged (join/float paths below).
+    // Shuffles to RDI/RSI/RDX, stages XMM0 + AL for %g floats, and calls
+    // through an R10-staged GOT slot.
+    public void emitLinuxSprintfStaged(bool isFloat) {
+        this.asm.movRR64(7, 1);
+        this.asm.movRR64(6, 2);
+        this.asm.movRR64(2, 8);
+        if (isFloat) {
+            this.emitMovqXmmGpr(0, 2);
+        }
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "sprintf");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(10, 0, 0);
+        this.asm.xorRR64(0, 0);
+        if (isFloat) {
+            this.asm.incR64(0);
+        }
+        this.asm.callR64(10);
+        this.emitAbiCallTeardown();
+    }
+
     public void genPrintCall(Node call, bool newline) {
         if (call.childCount() < 1) { return; }
         Node arg = call.child(0);
@@ -12345,12 +12368,18 @@ public void genNewCall(Node call) {
             this.stringPatchIndices.add(fmtIdx);
             this.asm.movRR64(2, 0);
             this.asm.movRR64(8, 9);
-            this.addImportPatch("msvcrt.dll", "sprintf");
-            this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
-            this.asm.movRMBase(0, 0, 0);
-            this.asm.emitCallSetup(0);
-            this.asm.callR64(0);
-            this.asm.emitCallTeardown();
+            // LINUX SysV backend (additive): staged sprintf with XMM0/AL for
+            // %g floats. WINDOWS tail below unchanged.
+            if (this.isLinuxTarget()) {
+                this.emitLinuxSprintfStaged(fltElem);
+            } else {
+                this.addImportPatch("msvcrt.dll", "sprintf");
+                this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
+                this.asm.movRMBase(0, 0, 0);
+                this.asm.emitCallSetup(0);
+                this.asm.callR64(0);
+                this.asm.emitCallTeardown();
+            }
             this.asm.movRMBase(1, 5, scratchOff);
             this.addImportPatch("ucrtbase.dll", "strlen");
             this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
@@ -12488,12 +12517,18 @@ public void genNewCall(Node call) {
             this.stringPatchIndices.add(fmtIdx);
             this.asm.movRR64(2, 0);
             this.asm.movRR64(8, 9);
-            this.addImportPatch("msvcrt.dll", "sprintf");
-            this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
-            this.asm.movRMBase(0, 0, 0);
-            this.asm.emitCallSetup(0);
-            this.asm.callR64(0);
-            this.asm.emitCallTeardown();
+            // LINUX SysV backend (additive): staged sprintf with XMM0/AL for
+            // %g floats. WINDOWS tail below unchanged.
+            if (this.isLinuxTarget()) {
+                this.emitLinuxSprintfStaged(fltElem);
+            } else {
+                this.addImportPatch("msvcrt.dll", "sprintf");
+                this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
+                this.asm.movRMBase(0, 0, 0);
+                this.asm.emitCallSetup(0);
+                this.asm.callR64(0);
+                this.asm.emitCallTeardown();
+            }
             this.asm.movRMBase(1, 5, scratchOff);
             this.addImportPatch("ucrtbase.dll", "strlen");
             this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
@@ -12608,12 +12643,17 @@ public void genNewCall(Node call) {
         this.asm.movRMBase(8, 5, valOff);
         this.asm.movRR64(2, 1);
         this.asm.movRMBase(1, 5, bufOff);
-        this.addImportPatch("msvcrt.dll", "sprintf");
-        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.emitCallSetup(0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
+        // LINUX SysV backend (additive): %g always needs XMM0/AL=1.
+        if (this.isLinuxTarget()) {
+            this.emitLinuxSprintfStaged(true);
+        } else {
+            this.addImportPatch("msvcrt.dll", "sprintf");
+            this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+        }
         this.asm.movRMBase(0, 5, bufOff);
     }
 
