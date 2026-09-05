@@ -3726,18 +3726,12 @@ int strIdx = this.stringPatchIndices[i];
                 this.asm.shlR64Imm(0, 3);
                 this.asm.movRR64(8, 0);
                 this.asm.emitCallSetup(0);
-                this.addImportPatch("kernel32.dll", "GetProcessHeap");
-                this.asm.emitImm64(0, 0);
-                this.asm.movRMBase(0, 0, 0);
-                this.asm.callR64(0);
+                this.emitGetProcessHeapCall();
                 this.asm.emitCallTeardown();
                 this.asm.movRR64(1, 0);
                 this.asm.movRI64(2, 8);
                 this.asm.emitCallSetup(0);
-                this.addImportPatch("kernel32.dll", "HeapAlloc");
-                this.asm.emitImm64(0, 0);
-                this.asm.movRMBase(0, 0, 0);
-                this.asm.callR64(0);
+                this.emitHeapAllocCall();
                 this.asm.emitCallTeardown();
                 int arrOff = this.allocLocal("__na_arr");
                 this.asm.movMBaseR(5, 0, arrOff);
@@ -13303,19 +13297,13 @@ public void genNewCall(Node call) {
 
         // buf = HeapAlloc(GetProcessHeap(), 0, size)
         this.asm.emitCallSetup(0);
-        this.addImportPatch("kernel32.dll", "GetProcessHeap");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
+        this.emitGetProcessHeapCall();
         this.asm.emitCallTeardown();
         this.asm.emitCallSetup(0);
         this.asm.movRR64(1, 0);
         this.asm.xorRR64(2, 2);
         this.asm.movRMBase(8, 5, sizeOff);
-        this.addImportPatch("kernel32.dll", "HeapAlloc");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
+        this.emitHeapAllocCall();
         this.asm.emitCallTeardown();
         int bufOff = this.allocLocal("__env_buf");
         this.asm.movMBaseR(5, 0, bufOff);
@@ -14119,10 +14107,7 @@ public void genNewCall(Node call) {
         this.asm.movMBaseR(5, 0, sizeOff);
 
         this.asm.emitCallSetup(0);
-        this.addImportPatch("kernel32.dll", "GetProcessHeap");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
+        this.emitGetProcessHeapCall();
         this.asm.emitCallTeardown();
 
 
@@ -14131,10 +14116,7 @@ public void genNewCall(Node call) {
         this.asm.xorRR64(2, 2);
         this.asm.movRMBase(8, 5, sizeOff);
         this.asm.addRI32(8, 1);
-        this.addImportPatch("kernel32.dll", "HeapAlloc");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
+        this.emitHeapAllocCall();
         this.asm.emitCallTeardown();
 
         int bufOff = this.allocLocal("__rs_buf");
@@ -14205,20 +14187,14 @@ public void genNewCall(Node call) {
         this.asm.movMBaseR(5, 0, sizeOff);
 
         this.asm.emitCallSetup(0);
-        this.addImportPatch("kernel32.dll", "GetProcessHeap");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
+        this.emitGetProcessHeapCall();
         this.asm.emitCallTeardown();
 
         this.asm.emitCallSetup(0);
         this.asm.movRR64(1, 0);
         this.asm.xorRR64(2, 2);
         this.asm.movRMBase(8, 5, sizeOff);
-        this.addImportPatch("kernel32.dll", "HeapAlloc");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
+        this.emitHeapAllocCall();
         this.asm.emitCallTeardown();
 
         int bufOff = this.allocLocal("__in_buf");
@@ -14263,8 +14239,83 @@ public void genNewCall(Node call) {
         this.stringPatchIndices.add(strIdx);
     }
 
+    // LINUX SysV backend (additive): HeapAlloc(handle, flags, size) with
+    // size in R8 becomes malloc(R8) + memset zeroing (the HEAP_ZERO_MEMORY
+    // contract). Mirrors silverc-rs emit_heap_alloc_linux. RCX/RDX are
+    // ignored. Uses Direct imports (never the redirect slot, so a runtime
+    // fallback through here cannot recurse). In runtimeMode the malloc
+    // reference is recorded for the patchRuntimeRefs redirect.
+    public void emitLinuxHeapAllocFromR8() {
+        this.asm.pushR64(8);
+        this.asm.movRR64(7, 8);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "malloc");
+        if (this.runtimeMode) {
+            this.heapAllocPatchPos.add(this.asm.buf.length + 2);
+        }
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        int okLbl = this.newLabel();
+        int doneLbl = this.newLabel();
+        this.asm.orRR64(0, 0);
+        this.asm.jneLabel(okLbl);
+        this.asm.popR64(1);
+        this.asm.jmpLabel(doneLbl);
+        this.asm.bindLabel(okLbl);
+        this.asm.movRR64(7, 0);
+        this.asm.xorRR64(6, 6);
+        this.asm.popR64(2);
+        this.asm.pushR64(7);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "memset");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.popR64(0);
+        this.asm.bindLabel(doneLbl);
+    }
+
+    // Call-site wrappers for the inline GetProcessHeap/HeapAlloc pairs: on
+    // Linux take the malloc/free path, otherwise emit the historical Win64
+    // 4-liner byte-identically (setup/teardown stay at the call sites).
+    public void emitGetProcessHeapCall() {
+        // No process-heap handle on Linux (malloc/free take none); a dummy
+        // zero keeps the following mov RCX,RAX harmless. Mirrors silverc-rs
+        // emit_get_process_heap.
+        if (this.isLinuxTarget()) {
+            this.asm.xorRR64(0, 0);
+            return;
+        }
+        this.addImportPatch("kernel32.dll", "GetProcessHeap");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+    }
+
+    public void emitHeapAllocCall() {
+        // R8 = size on entry (both targets).
+        if (this.isLinuxTarget()) {
+            this.emitLinuxHeapAllocFromR8();
+            return;
+        }
+        this.addImportPatch("kernel32.dll", "HeapAlloc");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+    }
+
     public void emitLlmaiHeapAlloc(int sizeOff) {
         // RAX = HeapAlloc(GetProcessHeap(), 0, [sizeOff])
+        // LINUX SysV backend (additive): malloc + memset zeroing from the
+        // size local (same HEAP_ZERO_MEMORY contract as the Win64 pair).
+        if (this.isLinuxTarget()) {
+            this.asm.movRMBase(8, 5, sizeOff);
+            this.emitLinuxHeapAllocFromR8();
+            return;
+        }
         this.asm.emitCallSetup(0);
         this.addImportPatch("kernel32.dll", "GetProcessHeap");
         this.asm.emitImm64(0, 0);
