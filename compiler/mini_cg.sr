@@ -2802,15 +2802,30 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.emitU32(this.stackSize);
             subRspPatchPos = this.asm.buf.length - 4;
             if (isMethod == 1) {
-                int thisOff = this.findLocal("this");
-                this.asm.movMBaseR(5, 1, thisOff);
+                // LINUX SysV backend (additive): `this` arrives in RDI (7),
+                // declared params in RSI/RDX/RCX/R8/R9, params 6+ on the
+                // caller stack at [RBP+16] (no shadow: retaddr 8 + saved
+                // rbp 8). The WINDOWS registers/offsets below are unchanged.
+                int thisReg = 1;
                 int[] paramRegsMb = [2, 8, 9];
+                int mbRegMax = 3;
+                int mbStackBase = 48;
+                int mbStackFirst = 3;
+                if (this.isLinuxTarget()) {
+                    thisReg = 7;
+                    paramRegsMb = [6, 2, 1, 8, 9];
+                    mbRegMax = 5;
+                    mbStackBase = 16;
+                    mbStackFirst = 5;
+                }
+                int thisOff = this.findLocal("this");
+                this.asm.movMBaseR(5, thisReg, thisOff);
                 if (func.childCount() > 0) {
                     Node params = func.child(0);
                     for (int i = 0; i < params.childCount(); i++) {
                         int poff = this.findLocal(params.child(i).name);
                         if (poff != 0) {
-                            if (i < 3) {
+                            if (i < mbRegMax) {
                                 this.asm.movMBaseR(5, paramRegsMb[i], poff);
                             } else {
                                 // Method ABI: `this` is RCX, declared params
@@ -2819,20 +2834,32 @@ int strIdx = this.stringPatchIndices[i];
                                 // frame, the first stack argument is at
                                 // [RBP+48]: return address (8), saved frame
                                 // pointer (8), shadow space (32).
-                                this.asm.movRMBase(0, 5, 48 + (i - 3) * 8);
+                                this.asm.movRMBase(0, 5, mbStackBase + (i - mbStackFirst) * 8);
                                 this.asm.movMBaseR(5, 0, poff);
                             }
                         }
                     }
                 }
             } else {
+                // LINUX SysV backend (additive): params 1-6 arrive in
+                // RDI/RSI/RDX/RCX/R8/R9, params 7+ at [RBP+16]. The WINDOWS
+                // registers/offsets below are unchanged.
                 int[] paramRegsFb = [1, 2, 8, 9];
+                int fbRegMax = 4;
+                int fbStackBase = 48;
+                int fbStackFirst = 4;
+                if (this.isLinuxTarget()) {
+                    paramRegsFb = [7, 6, 2, 1, 8, 9];
+                    fbRegMax = 6;
+                    fbStackBase = 16;
+                    fbStackFirst = 6;
+                }
                 if (func.childCount() > 0) {
                     Node params = func.child(0);
                     for (int i = 0; i < params.childCount(); i++) {
                         int poff = this.findLocal(params.child(i).name);
                         if (poff != 0) {
-                            if (i < 4) {
+                            if (i < fbRegMax) {
                                 this.asm.movMBaseR(5, paramRegsFb[i], poff);
                             } else {
                                 // Free-function ABI: params 1-4 use RCX/RDX/
@@ -2840,7 +2867,7 @@ int strIdx = this.stringPatchIndices[i];
                                 // stack at [RBP+48], [RBP+56], ... (return
                                 // address 8 + saved frame pointer 8 + shadow
                                 // space 32).
-                                this.asm.movRMBase(0, 5, 48 + (i - 4) * 8);
+                                this.asm.movRMBase(0, 5, fbStackBase + (i - fbStackFirst) * 8);
                                 this.asm.movMBaseR(5, 0, poff);
                             }
                         }
@@ -2876,7 +2903,10 @@ int strIdx = this.stringPatchIndices[i];
             }
             if (isMethod == 1) {
                 int thisOff = this.findLocal("this");
-                this.asm.movMBaseR(5, 1, thisOff);
+                // LINUX SysV backend (additive): `this` arrives in RDI.
+                int thisReg2 = 1;
+                if (this.isLinuxTarget()) { thisReg2 = 7; }
+                this.asm.movMBaseR(5, thisReg2, thisOff);
             }
         }
         if (this.currentIsMain) {
@@ -7611,23 +7641,38 @@ public void genNewCall(Node call) {
         // argument to the shadow/stack slots first (nested call in a later
         // argument would clobber the volatile argument registers), then load
         // the registers.
-
+        // LINUX SysV backend (additive): RDI = `this`, RSI/RDX/RCX/R8/R9 =
+        // first five declared params, params 6+ at [RSP+0] (no shadow).
+        // Slot counts include `this` on both targets.
+        int ctorSlots = nargs + 1;
+        int ctorNreg = 4;
+        int ctorBase = 32;
+        if (this.isLinuxTarget()) {
+            ctorNreg = 6;
+            ctorBase = 0;
+        }
         int extraStack = 0;
-        if (nargs > 3) { extraStack = (nargs - 3) * 8; }
-        this.asm.emitCallSetup(extraStack);
+        if (ctorSlots > ctorNreg) { extraStack = (ctorSlots - ctorNreg) * 8; }
+        this.emitAbiCallSetup(extraStack);
         this.asm.movRMBase(0, 5, tmpOff);
         this.asm.movMBaseR(4, 0, 0);
         for (int i = 0; i < nargs; i++) {
             this.asm.movRMBase(0, 5, argTemps[i]);
-            if (i < 3) {
-                this.asm.movMBaseR(4, 0, 8 + i * 8);
+            if (i + 1 < ctorNreg) {
+                this.asm.movMBaseR(4, 0, (i + 1) * 8);
             } else {
-                this.asm.movMBaseR(4, 0, 32 + (i - 3) * 8);
+                this.asm.movMBaseR(4, 0, ctorBase + (i + 1 - ctorNreg) * 8);
             }
         }
-        this.asm.movRMBase(1, 5, tmpOff);
-        for (int i = 0; i < nargs && i < 3; i++) {
-            this.asm.movRMBase(argRegs[i + 1], 5, argTemps[i]);
+        int ctorThisReg = 1;
+        if (this.isLinuxTarget()) { ctorThisReg = 7; }
+        this.asm.movRMBase(ctorThisReg, 5, tmpOff);
+        for (int i = 0; i < nargs && i + 1 < ctorNreg; i++) {
+            if (this.isLinuxTarget()) {
+                this.asm.movRMBase(this.sysvRegAt(i + 1), 5, argTemps[i]);
+            } else {
+                this.asm.movRMBase(argRegs[i + 1], 5, argTemps[i]);
+            }
         }
         if (this.funcOffsets[ctorIdx] >= 0) {
             int targetOff = this.funcOffsets[ctorIdx];
@@ -7641,7 +7686,7 @@ public void genNewCall(Node call) {
             this.forwardCallNames.add("construct");
             this.forwardCallClasses.add(this.funcClasses[ctorIdx]);
         }
-        this.asm.emitCallTeardown();
+        this.emitAbiCallTeardown();
     }
     this.asm.movRMBase(0, 5, tmpOff);
 }
@@ -7680,18 +7725,33 @@ public void genNewCall(Node call) {
         }
 
         // Set up the call: R1 = this, R2..R9 = args 0-2, stack = rest.
+        // LINUX SysV backend (additive): RDI = this, RSI/RDX/RCX/R8/R9 =
+        // args 0-4, stack = rest at [RSP+0]. Slot counts include `this`.
         int[] argRegs = [1, 2, 8, 9];
+        int superSlots = nargs + 1;
+        int superNreg = 4;
+        int superBase = 32;
+        if (this.isLinuxTarget()) {
+            superNreg = 6;
+            superBase = 0;
+        }
         int extraStack = 0;
-        if (nargs > 3) { extraStack = (nargs - 3) * 8; }
-        this.asm.emitCallSetup(extraStack);
+        if (superSlots > superNreg) { extraStack = (superSlots - superNreg) * 8; }
+        this.emitAbiCallSetup(extraStack);
         // Load `this` directly from its local slot into R1.
-        this.asm.movRMBase(1, 5, this.findLocal("this"));   // R1 = this
+        int superThisReg = 1;
+        if (this.isLinuxTarget()) { superThisReg = 7; }
+        this.asm.movRMBase(superThisReg, 5, this.findLocal("this"));   // R1 = this
         for (int i = 0; i < nargs; i++) {
-            if (i < 3) {
-                this.asm.movRMBase(argRegs[i + 1], 5, argTemps[i]);
+            if (i + 1 < superNreg) {
+                if (this.isLinuxTarget()) {
+                    this.asm.movRMBase(this.sysvRegAt(i + 1), 5, argTemps[i]);
+                } else {
+                    this.asm.movRMBase(argRegs[i + 1], 5, argTemps[i]);
+                }
             } else {
                 this.asm.movRMBase(0, 5, argTemps[i]);
-                this.asm.movMBaseR(4, 0, 32 + (i - 3) * 8);
+                this.asm.movMBaseR(4, 0, superBase + (i + 1 - superNreg) * 8);
             }
         }
 
@@ -7708,7 +7768,7 @@ public void genNewCall(Node call) {
             this.forwardCallNames.add("construct");
             this.forwardCallClasses.add(parentClass);
         }
-        this.asm.emitCallTeardown();
+        this.emitAbiCallTeardown();
     }
 
     public int asmOperand(Node expr) {
@@ -8211,9 +8271,12 @@ public void genNewCall(Node call) {
             int slotBias = 0;
             if (staticMethodCall) { slotBias = 1; }
             int slotTotal = totalArgs + slotBias;
+            // LINUX SysV backend (additive): 6 register slots, no shadow.
+            int callNreg = this.abiRegCount();
+            int callBase = this.abiStackBase();
             int extraStack = 0;
-            if (slotTotal > 4) { extraStack = (slotTotal - 4) * 8; }
-            this.asm.emitCallSetup(extraStack);
+            if (slotTotal > callNreg) { extraStack = (slotTotal - callNreg) * 8; }
+            this.emitAbiCallSetup(extraStack);
             if (staticMethodCall) {
                 this.asm.xorRR64(0, 0);
                 this.asm.movMBaseR(4, 0, 0);
@@ -8236,14 +8299,18 @@ public void genNewCall(Node call) {
                     this.asm.xorRR64(0, 0);
                 }
                 int slot = i + slotBias;
-                if (slot < 4) {
+                if (slot < callNreg) {
                     this.asm.movMBaseR(4, 0, slot * 8);
                 } else {
-                    this.asm.movMBaseR(4, 0, 32 + (slot - 4) * 8);
+                    this.asm.movMBaseR(4, 0, callBase + (slot - callNreg) * 8);
                 }
             }
-            for (int i = 0; i < slotTotal && i < 4; i++) {
-                this.asm.movRMBase(argRegs[i], 4, i * 8);
+            for (int i = 0; i < slotTotal && i < callNreg; i++) {
+                if (this.isLinuxTarget()) {
+                    this.asm.movRMBase(this.sysvRegAt(i), 4, i * 8);
+                } else {
+                    this.asm.movRMBase(argRegs[i], 4, i * 8);
+                }
             }
 
             if (targetOff >= 0) {
@@ -8257,7 +8324,7 @@ public void genNewCall(Node call) {
                 this.forwardCallNames.add(name);
                 this.forwardCallClasses.add(lookupClass);
             }
-            this.asm.emitCallTeardown();
+            this.emitAbiCallTeardown();
             this.emitExcCheck();
             return;
         }
@@ -8558,17 +8625,28 @@ public void genNewCall(Node call) {
         }
 
         int explicitCount = argTemps.length;
+        // LINUX SysV backend (additive): the receiver rides RDI with five
+        // following register slots (RSI/RDX/RCX/R8/R9), stack at [RSP+0].
+        int dynSlots = explicitCount + 1;
+        int dynNreg = this.abiRegCount();
+        int dynBase = this.abiStackBase();
         int extraStack = 0;
-        if (explicitCount > 3) { extraStack = (explicitCount - 3) * 8; }
-        this.asm.emitCallSetup(extraStack);
-        this.asm.movRMBase(1, 5, recvOff);
+        if (dynSlots > dynNreg) { extraStack = (dynSlots - dynNreg) * 8; }
+        this.emitAbiCallSetup(extraStack);
+        int dynRecvReg = 1;
+        if (this.isLinuxTarget()) { dynRecvReg = 7; }
+        this.asm.movRMBase(dynRecvReg, 5, recvOff);
         int[] argRegs = [2, 8, 9];
         for (int i = 0; i < explicitCount; i = i + 1) {
-            if (i < 3) {
-                this.asm.movRMBase(argRegs[i], 5, argTemps[i]);
+            if (i + 1 < dynNreg) {
+                if (this.isLinuxTarget()) {
+                    this.asm.movRMBase(this.sysvRegAt(i + 1), 5, argTemps[i]);
+                } else {
+                    this.asm.movRMBase(argRegs[i], 5, argTemps[i]);
+                }
             } else {
                 this.asm.movRMBase(0, 5, argTemps[i]);
-                this.asm.movMBaseR(4, 0, 32 + (i - 3) * 8);
+                this.asm.movMBaseR(4, 0, dynBase + (i + 1 - dynNreg) * 8);
             }
         }
         int targetOff = this.funcOffsets[funcIdx];
@@ -8583,7 +8661,7 @@ public void genNewCall(Node call) {
             this.forwardCallNames.add(name);
             this.forwardCallClasses.add("MiniAsm");
         }
-        this.asm.emitCallTeardown();
+        this.emitAbiCallTeardown();
         this.dynamicAsmActive = savedDynamicAsmActive;
     }
 
@@ -10081,23 +10159,31 @@ public void genNewCall(Node call) {
         }
 
         int extraStack = 0;
-        if (totalArgs > 4) {
-            extraStack = (totalArgs - 4) * 8;
+        // LINUX SysV backend (additive): 6 register slots (RDI = `this`),
+        // no shadow. The WINDOWS counts below are unchanged.
+        int memberNreg = this.abiRegCount();
+        int memberBase = this.abiStackBase();
+        if (totalArgs > memberNreg) {
+            extraStack = (totalArgs - memberNreg) * 8;
         }
-        this.asm.emitCallSetup(extraStack);
+        this.emitAbiCallSetup(extraStack);
         // Methods use RCX for `this`, then RDX/R8/R9 for declared parameters.
         // Further parameters are placed after Win64 shadow space at [RSP+32].
         int[] argRegs = [1, 2, 8, 9];
         int regArgs = totalArgs;
-        if (regArgs > 4) { regArgs = 4; }
+        if (regArgs > memberNreg) { regArgs = memberNreg; }
         for (int i = 0; i < regArgs; i++) {
             int argOff = this.scratchBaseOffset - (8 * (scratchBase + i));
-            this.asm.movRMBase(argRegs[i], 5, argOff);
+            if (this.isLinuxTarget()) {
+                this.asm.movRMBase(this.sysvRegAt(i), 5, argOff);
+            } else {
+                this.asm.movRMBase(argRegs[i], 5, argOff);
+            }
         }
-        for (int i = 4; i < totalArgs; i++) {
+        for (int i = memberNreg; i < totalArgs; i++) {
             int argOff = this.scratchBaseOffset - (8 * (scratchBase + i));
             this.asm.movRMBase(0, 5, argOff);
-            this.asm.movMBaseR(4, 0, 32 + (i - 4) * 8);
+            this.asm.movMBaseR(4, 0, memberBase + (i - memberNreg) * 8);
         }
 
         if (funcIdx >= 0 && funcIdx < this.funcOffsets.length) {
@@ -10120,7 +10206,7 @@ public void genNewCall(Node call) {
             this.forwardCallNames.add(name);
             this.forwardCallClasses.add(lookupClass);
         }
-        this.asm.emitCallTeardown();
+        this.emitAbiCallTeardown();
         this.funcCallArgCount = scratchBase;
     }
 
