@@ -547,11 +547,15 @@ string projectRelativePath(string root, string path) {
 }
 
 string projectStripDirectives(string source) {
-    string result = "";
+    // Linear accumulation: one small part per line joined once at the end.
+    // Per-line `result = result + line` was quadratic in retained garbage
+    // (the runtime never frees the abandoned buffers) and blew past 10GB on
+    // the self-hosted build aggregate (~30K lines), OOM-killing the host.
+    string[] parts = [];
     int cursor = 0;
     while (cursor < source.length) {
         int end = cursor;
-        while (end < source.length && source[end] != '\n') { end = end + 1; }
+        while (end < source.length && source[end] != '\n') { end++; }
         string line = projectSlice(source, cursor, end);
         string trimmed = projectTrim(line);
         bool skip = false;
@@ -563,11 +567,11 @@ string projectStripDirectives(string source) {
         bool isWin32Import = trimmed.length >= 6 && projectSlice(trimmed, 0, 6) == "import" && projectFind(trimmed, "win32", 0) >= 0;
         bool isLinuxImport = trimmed.length >= 6 && projectSlice(trimmed, 0, 6) == "import" && projectFind(trimmed, "linux", 0) >= 0;
         if (trimmed.length >= 6 && projectSlice(trimmed, 0, 6) == "import" && !isWin32Import && !isLinuxImport) { skip = true; }
-        if (!skip) { result = result + line; }
-        if (end < source.length) { result = result + '\n'; }
+        if (!skip) { parts.add(line); }
+        if (end < source.length) { parts.add("\n"); }
         cursor = end + 1;
     }
-    return result;
+    return parts.join("");
 }
 
 // Cache-marker comment line (--cache-bytecode): the driver splits the
