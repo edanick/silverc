@@ -48,6 +48,19 @@ mod export sysinfo;
 // GlobalMemoryStatusEx / GetDiskFreeSpaceExA / GetSystemInfo calls are
 // deliberately DUPLICATED per function (no helpers) -- one unified public
 // function per operation with its OS code inline.
+//
+// LINUX BACKEND (Phase B): sysconf(_SC_NPROCESSORS_ONLN = 84),
+// uname/gethostname/getlogin_r/getpid/clock_gettime/statvfs from linux.libc
+// plus /proc text parsing (cpuinfo/meminfo/environ) with open/read/close.
+// struct utsname holds 65-byte fields (machine at +260); struct statvfs is
+// 112 bytes (f_frsize slot 1, f_blocks slot 2, f_bavail slot 4, all u64).
+// Two callouts: (1) the module's `env.get` delegation (homeDir/tempDir/
+// lang) CANNOT serve Linux -- silverc-rs answers env.get NATIVELY and its
+// native getter faults on Linux (probed SIGSEGV), so the LINUX bodies read
+// /proc/self/environ directly with a local parser; (2) lang() returns the
+// $LANG value (e.g. "en_US.UTF-8"), not a LANGID quirk -- documented
+// difference. os() answers "linux" under LINUX. Separator note: `/`, no
+// drive letters (diskTotal/Free stat "/"), case-sensitive.
 
 // Writable string buffer of n bytes (spaces) for NUL-terminated Win32 data.
 string blankBuf(int n) {
@@ -60,9 +73,18 @@ string blankBuf(int n) {
 import * from win32.advapi32;
 import * from win32.kernel32;
 #off
+#on LINUX
+import * from linux.libc;
+#off
 
 public string os() {
+    #on WINDOWS
     return "windows";
+    #off
+    #on LINUX
+    return "linux";
+    #off
+    return "";
 }
 
 public string osVersion() {
@@ -79,6 +101,16 @@ public string arch() {
     if (archCode == 12) { return "aarch64"; }
     return "unknown";
     #off
+    #on LINUX
+    int[] u = new int[49];
+    int rc = uname(u);
+    if (rc != 0) { return "unknown"; }
+    string machine = utsField(u, 260);
+    if (machine == "x86_64") { return "x86_64"; }
+    if (machine == "aarch64") { return "aarch64"; }
+    if (machine == "i386" || machine == "i686") { return "x86"; }
+    return "unknown";
+    #off
     return "unknown";
 }
 
@@ -91,6 +123,14 @@ public string hostname() {
     for (int i = 0; i < size && buf[i] != char(0); i++) { result += char(buf[i]); }
     return result;
     #off
+    #on LINUX
+    string buf = blankBuf(256);
+    int rc = gethostname(buf, 256);
+    if (rc != 0) { return ""; }
+    string result = "";
+    for (int i = 0; i < 256 && buf[i] != char(0); i++) { result += char(buf[i]); }
+    return result;
+    #off
     return "";
 }
 
@@ -99,6 +139,9 @@ public int cpuCores() {
     int[] si = new int[6];
     GetSystemInfo(si);
     return si[4] & 0xFFFFFFFF;
+    #off
+    #on LINUX
+    return sysconf(84);
     #off
     return 0;
 }
@@ -116,6 +159,9 @@ public string cpuModel() {
     for (int i = 0; i < size && buf[i] != char(0); i++) { model += char(buf[i]); }
     return model;
     #off
+    #on LINUX
+    return procCpuModel();
+    #off
     return "";
 }
 
@@ -129,6 +175,9 @@ public int64 memoryTotal() {
     if (ok == 0) { return 0; }
     return ms[1] / 1024 / 1024;
     #off
+    #on LINUX
+    return procMemValue("MemTotal") / 1024;
+    #off
     return 0;
 }
 
@@ -139,6 +188,9 @@ public int64 memoryFree() {
     int ok = GlobalMemoryStatusEx(ms);
     if (ok == 0) { return 0; }
     return ms[2] / 1024 / 1024;
+    #off
+    #on LINUX
+    return procMemValue("MemAvailable") / 1024;
     #off
     return 0;
 }
@@ -153,6 +205,12 @@ public double memoryUsagePercent() {
     if (ok == 0) { return 0; }
     return double((ms[0] >> 32) & 0xFFFFFFFF);
     #off
+    #on LINUX
+    int64 total = procMemValue("MemTotal");
+    if (total <= 0) { return 0; }
+    int64 avail = procMemValue("MemAvailable");
+    return double(total - avail) / double(total) * 100.0;
+    #off
     return 0;
 }
 
@@ -163,6 +221,13 @@ public int64 diskTotal() {
     GetDiskFreeSpaceExA("C:\\", null, &totalBytes, &freeBytes);
     return totalBytes / 1024 / 1024 / 1024;
     #off
+    #on LINUX
+    int[] sv = new int[14];
+    int rc = statvfs("/", sv);
+    if (rc != 0) { return 0; }
+    int64 total = sv[2] * sv[1];
+    return total / 1024 / 1024 / 1024;
+    #off
     return 0;
 }
 
@@ -172,6 +237,13 @@ public int64 diskFree() {
     int64 freeBytes = 0;
     GetDiskFreeSpaceExA("C:\\", null, &totalBytes, &freeBytes);
     return freeBytes / 1024 / 1024 / 1024;
+    #off
+    #on LINUX
+    int[] sv = new int[14];
+    int rc = statvfs("/", sv);
+    if (rc != 0) { return 0; }
+    int64 free = sv[4] * sv[1];
+    return free / 1024 / 1024 / 1024;
     #off
     return 0;
 }
@@ -192,6 +264,9 @@ public int pid() {
     #on WINDOWS
     return GetCurrentProcessId();
     #off
+    #on LINUX
+    return getpid();
+    #off
     return 0;
 }
 
@@ -200,6 +275,12 @@ public string processName() { return "silver-app"; }
 public int64 uptime() {
     #on WINDOWS
     return GetTickCount64() / 1000;
+    #off
+    #on LINUX
+    int[] ts = new int[2];
+    clock_gettime(1, ts);
+    int64 sec = ts[0];
+    return sec;
     #off
     return 0;
 }
@@ -213,15 +294,39 @@ public string username() {
     for (int i = 0; i < size && buf[i] != char(0); i++) { result += char(buf[i]); }
     return result;
     #off
+    #on LINUX
+    string buf = blankBuf(256);
+    int rc = getlogin_r(buf, 256);
+    if (rc == 0) {
+        string result = "";
+        for (int i = 0; i < 256 && buf[i] != char(0); i++) { result += char(buf[i]); }
+        if (result.length() > 0) { return result; }
+    }
+    return sysProcEnvValue("USER");
+    #off
     return "";
 }
 
 public string homeDir() {
+    #on WINDOWS
     return env.get("USERPROFILE");
+    #off
+    #on LINUX
+    return sysProcEnvValue("HOME");
+    #off
+    return "";
 }
 
 public string tempDir() {
+    #on WINDOWS
     return env.get("TEMP");
+    #off
+    #on LINUX
+    string t = sysProcEnvValue("TMPDIR");
+    if (t.length() == 0) { t = "/tmp"; }
+    return t;
+    #off
+    return "";
 }
 
 public string lang() {
@@ -235,9 +340,136 @@ public string lang() {
     result += char((langId & 0xFF));
     return result;
     #off
+    #on LINUX
+    return sysProcEnvValue("LANG");
+    #off
     return "";
 }
 
 public string env(string name) {
+    #on WINDOWS
     return env.get(name);
+    #off
+    #on LINUX
+    return sysProcEnvValue(name);
+    #off
+    return "";
+}
+
+// -- LINUX-only private helpers (struct decodes + /proc readers) ----------
+
+// One 65-byte NUL-terminated utsname field at byte offset off, decoded
+// straight out of the int[] slots (no address arithmetic).
+string utsField(int[] u, int off) {
+    #on LINUX
+    string r = "";
+    for (int i = 0; i < 65; i++) {
+        int b = (u[(off + i) / 8] >> (((off + i) % 8) * 8)) & 0xFF;
+        if (b == 0) { break; }
+        r += char(b);
+    }
+    return r;
+    #off
+    return "";
+}
+
+// Whole text file into a string, 4096 bytes per read. Text files carry no
+// NUL bytes, so every byte rides the concat; the n-bound keeps the zeroed
+// tail out.
+string readProcFile(string path) {
+    #on LINUX
+    int fd = open(path, 0, 0);
+    if (fd < 0) { return ""; }
+    string out = "";
+    while (true) {
+        int[] chunk = new int[512];
+        int n = read(fd, chunk, 4096);
+        if (n <= 0) { break; }
+        for (int i = 0; i < n; i++) {
+            int b = (chunk[i / 8] >> ((i % 8) * 8)) & 0xFF;
+            out += char(b);
+        }
+        if (n < 4096) { break; }
+    }
+    close(fd);
+    return out;
+    #off
+    return "";
+}
+
+// Value of key parsed out of /proc/self/environ (mirrors env.sr's reader:
+// entries never materialize NULs; "" when absent or unreadable).
+string sysProcEnvValue(string key) {
+    #on LINUX
+    if (key.length == 0) { return ""; }
+    string want = key + "=";
+    int fd = open("/proc/self/environ", 0, 0);
+    if (fd < 0) { return ""; }
+    string entry = "";
+    string value = "";
+    int hit = 0;
+    while (true) {
+        int[] chunk = new int[512];
+        int n = read(fd, chunk, 4096);
+        if (n <= 0) { break; }
+        for (int i = 0; i < n; i++) {
+            int b = (chunk[i / 8] >> ((i % 8) * 8)) & 0xFF;
+            if (b == 0) {
+                if (entry.length() >= want.length() && entry.substr(0, want.length()) == want) {
+                    value = entry.substr(want.length());
+                    hit = 1;
+                    break;
+                }
+                entry = "";
+            } else {
+                entry += char(b);
+            }
+        }
+        if (hit != 0 || n < 4096) { break; }
+    }
+    close(fd);
+    return value;
+    #off
+    return "";
+}
+
+// Number after "Key:" in /proc/meminfo (kilobytes), or 0 when absent.
+int64 procMemValue(string key) {
+    #on LINUX
+    string mem = readProcFile("/proc/meminfo");
+    string want = key + ":";
+    int at = mem.indexOf(want);
+    if (at < 0) { return 0; }
+    int p = at + want.length();
+    while (p < mem.length() && (mem[p] == ' ' || mem[p] == '\t')) { p++; }
+    int64 v = 0;
+    while (p < mem.length() && mem[p] >= '0' && mem[p] <= '9') {
+        v = v * 10 + int(mem[p]) - 48;
+        p++;
+    }
+    return v;
+    #off
+    return 0;
+}
+
+// "model name" value from /proc/cpuinfo, or "" when absent. NOTE: the
+// two-argument indexOf(needle, start) ignores its start on silverc-rs
+// (probed: returns the first match from 0), so the parse re-roots with
+// substr() and searches the tail with the single-argument form.
+string procCpuModel() {
+    #on LINUX
+    string cpu = readProcFile("/proc/cpuinfo");
+    string want = "model name";
+    int at = cpu.indexOf(want);
+    if (at < 0) { return ""; }
+    string tail = cpu.substr(at + want.length());
+    int rel = tail.indexOf(":");
+    if (rel < 0) { return ""; }
+    int start = rel + 1;
+    while (start < tail.length() && (tail[start] == ' ' || tail[start] == '\t')) { start++; }
+    int end = start;
+    while (end < tail.length() && tail[end] != '\n') { end++; }
+    return tail.substr(start, end - start);
+    #off
+    return "";
 }
