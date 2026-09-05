@@ -26,6 +26,9 @@ import * from preprocess;
 // code, faults on self-host — see that function's comment).
 import * from time;
 import * from sysinfo;
+#on LINUX
+import * from linux.libc;
+#off
 
 // Print the final success line on STDERR (alongside the progress lines) once
 // a compile has produced its output: `<output> (N modules, Xs)`. `moduleCount`
@@ -456,6 +459,9 @@ int countModuleImports(string source, string inputFile, string ignored) {
 // hardcodes exitCode = 0 instead of reading the child's exit code, while the
 // driver must propagate it. The universal scaffold (temp dir, unique path
 // via sysinfo.pid(), image write, delete) stays ungated.
+// LINUX branch (additive, below) mirrors this with a TEMP ELF +
+// fork/execve/waitpid ladder via linux.libc; the WINDOWS ladder stays
+// byte-identical.
 // ---------------------------------------------------------------------------
 
 int jitExecute(CliFlags flags, int[] peData, string inputPath) {
@@ -467,6 +473,29 @@ int jitExecute(CliFlags flags, int[] peData, string inputPath) {
     string stem = drvFileStem(inputPath);
     if (stem.length == 0) { stem = "jit"; }
     string exePath = jitDir + "\\" + stem + "_" + bcNowMillis().toString() + "_" + sysinfo.pid().toString() + ".exe";
+    #on LINUX
+    string tmpL = bcEnvValue("TMPDIR");
+    if (tmpL.length == 0) { tmpL = "/tmp"; }
+    string jitDirL = tmpL + "/silverc-jit";
+    ensureDirTree(jitDirL);
+    string stemL = drvFileStem(inputPath);
+    if (stemL.length == 0) { stemL = "jit"; }
+    string elfPath = jitDirL + "/" + stemL + "_" + bcNowMillis().toString() + "_" + sysinfo.pid().toString();
+    file.writeBytes(elfPath, peData);
+    int pid = fork();
+    if (pid == 0) {
+        execve(elfPath, null, null);
+        exit(127);
+    }
+    if (pid < 0) {
+        flags.errLine("jit: failed to execute " + elfPath);
+        return 1;
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    file.delete(elfPath);
+    return (st >> 8) & 0xFF;
+    #off
     file.writeBytes(exePath, peData);
     #on WINDOWS
     // Zeroed STARTUPINFO (104 bytes) and PROCESS_INFORMATION (24 bytes)
