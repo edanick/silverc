@@ -111,6 +111,19 @@ class MiniCg {
     public prop string[] win32AliasDlls;
     public prop bool win32Error;
     public prop string win32ErrorMessage;
+    // LINUX SysV backend target (additive, LINUX.md Phase C): "" = unset,
+    // which behaves as WINDOWS. The driver sets it once per compilation via
+    // ppTargetOsFor(flags.targetOs), so --os WINDOWS emission is unchanged.
+    public prop string targetOs;
+    // LINUX.md Phase C -- linux module grants, mirroring the win32 trio
+    // above. linuxLibs lists fully opened libs (libc.so.6, ...);
+    // linuxGrants lists single exports as "lib|name"; the alias trio answers
+    // to the LOCAL call name only (`import { X as Y } from linux.libc;`).
+    public prop string[] linuxLibs;
+    public prop string[] linuxGrants;
+    public prop string[] linuxAliasLocals;
+    public prop string[] linuxAliasExports;
+    public prop string[] linuxAliasLibs;
     public prop int[] loopStartStack;
     public prop int[] loopEndStack;
     public prop int[] loopContinueStack;
@@ -252,6 +265,12 @@ class MiniCg {
         this.win32AliasDlls = [];
         this.win32Error = false;
         this.win32ErrorMessage = "";
+        this.targetOs = "";
+        this.linuxLibs = [];
+        this.linuxGrants = [];
+        this.linuxAliasLocals = [];
+        this.linuxAliasExports = [];
+        this.linuxAliasLibs = [];
         this.loopStartStack = [];
         this.loopEndStack = [];
         this.loopContinueStack = [];
@@ -756,6 +775,21 @@ class MiniCg {
     }
 
     public int addImportPatch(string dll, string name) {
+        // LINUX SysV backend (additive): same-shape libc calls keep their
+        // Win64-regged emission here and are shuffled into SysV position
+        // below, so the ~200 existing call sites need no per-site edits.
+        // Dedicated-branch sites (HeapAlloc, cargs, eprint/input) and
+        // already-SysV sites (ext-path linux imports, print tails) bypass
+        // the shuffle via addImportPatchDirect.
+        if (this.isLinuxTarget()) {
+            string lib = this.linuxImportLib(dll);
+            string lname = this.linuxImportName(dll, name);
+            if (lib.length > 0 && lname.length > 0) {
+                dll = lib;
+                name = lname;
+            }
+            this.shuffleWin64ToSysv();
+        }
         int idx = this.findImport(dll, name);
         this.importPatchOffsets.add(this.asm.buf.length + 2);
         this.importPatchDllIndices.add(-1);
@@ -767,6 +801,333 @@ class MiniCg {
             this.heapAllocPatchPos.add(this.asm.buf.length + 2);
         }
         return idx;
+    }
+
+    // ------------------------------------------------------------------
+    // LINUX SysV backend, additive (LINUX.md Phase C, mirrors silverc-rs
+    // codegen.rs TargetOs::Linux branches). Every method here is either a
+    // pure target query (no emission) or a Linux branch beside an unchanged
+    // WINDOWS default, so --os WINDOWS emission stays byte-identical.
+    // SysV argument registers RDI/RSI/RDX/RCX/R8/R9 are asm regs 7/6/2/1/8/9.
+    // ------------------------------------------------------------------
+
+    // True when this compilation targets Linux (driver sets targetOs via
+    // ppTargetOsFor; "" behaves as WINDOWS).
+    public bool isLinuxTarget() {
+        return this.strEq(this.targetOs, "LINUX");
+    }
+
+    // Integer/pointer argument registers: 4 on Win64 (RCX/RDX/R8/R9),
+    // 6 on SysV (RDI/RSI/RDX/RCX/R8/R9).
+    public int abiRegCount() {
+        if (this.isLinuxTarget()) { return 6; }
+        return 4;
+    }
+
+    // Outgoing stack-argument base: 32 (Win64 shadow space) on WINDOWS,
+    // 0 on SysV (no shadow space).
+    public int abiStackBase() {
+        if (this.isLinuxTarget()) { return 0; }
+        return 32;
+    }
+
+    // First integer/pointer argument register: RCX (1) on WINDOWS,
+    // RDI (7) on SysV.
+    public int abiFirstArgReg() {
+        if (this.isLinuxTarget()) { return 7; }
+        return 1;
+    }
+
+    // The i-th SysV argument register (RDI/RSI/RDX/RCX/R8/R9).
+    public int sysvRegAt(int i) {
+        if (i == 0) { return 7; }
+        if (i == 1) { return 6; }
+        if (i == 2) { return 2; }
+        if (i == 3) { return 1; }
+        if (i == 4) { return 8; }
+        return 9;
+    }
+
+    // ABI call-setup dispatch (mirrors silverc-rs emit_aligned_call_setup /
+    // emit_sysv_call_setup): SysV anchors RSP in R13, 16-aligns, and reserves
+    // only the requested outgoing stack space (16-rounded, no 32-byte
+    // shadow). The WINDOWS path calls the historical shape unchanged.
+    // Teardown is shared (mov RSP,R13 + pop R13) on both targets.
+    public void emitAbiCallSetup(int extraBytes) {
+        if (this.isLinuxTarget()) {
+            this.asm.pushR64(13);
+            this.asm.movRR64(13, 4);
+            this.asm.andRImm(4, -16);
+            int alignedTotal = ((extraBytes + 15) / 16) * 16;
+            this.asm.subRI32(4, alignedTotal);
+            return;
+        }
+        this.asm.emitCallSetup(extraBytes);
+    }
+
+    public void emitAbiCallTeardown() {
+        this.asm.emitCallTeardown();
+    }
+
+    // Shuffle the Win64 argument registers into SysV position at an import
+    // call boundary: RCX->RDI, RDX->RSI, R8->RDX, R9->RCX. Order-safe (every
+    // destination is written after its source was consumed). RDI/RSI are
+    // caller-saved in both ABIs so no live value is lost; RAX is untouched
+    // so a staged movabs address or AL count survives.
+    public void shuffleWin64ToSysv() {
+        this.asm.movRR64(7, 1);
+        this.asm.movRR64(6, 2);
+        this.asm.movRR64(2, 8);
+        this.asm.movRR64(1, 9);
+    }
+
+    // LINUX.md §6: backing shared lib for a win32 DLL on the Linux target.
+    // "" keeps the original pair (dedicated branch, or an honest loader
+    // failure for Windows-only APIs with no Linux equivalent).
+    public string linuxImportLib(string dll) {
+        if (this.strEq(dll, "kernel32.dll")) { return "libc.so.6"; }
+        if (this.strEq(dll, "msvcrt.dll")) { return "libc.so.6"; }
+        if (this.strEq(dll, "ucrtbase.dll")) { return "libc.so.6"; }
+        if (this.strEq(dll, "ws2_32.dll")) { return "libc.so.6"; }
+        return "";
+    }
+
+    // LINUX.md §6: libc equivalent of one win32 export. "" keeps the
+    // original pair: HeapAlloc/GetProcessHeap/SetConsoleOutputCP (dedicated
+    // branches), GetStdHandle/GetCommandLineA (dedicated branches), and
+    // Windows-only APIs (process/registry/toast/wininet/X11 gaps, listed in
+    // the commit notes) that fail loudly at load when actually called.
+    public string linuxImportName(string dll, string name) {
+        if (this.strEq(dll, "kernel32.dll")) {
+            if (this.strEq(name, "ExitProcess")) { return "exit"; }
+            if (this.strEq(name, "VirtualAlloc")) { return "mmap"; }
+            if (this.strEq(name, "CloseHandle")) { return "close"; }
+            if (this.strEq(name, "CreateFileA")) { return "open"; }
+            if (this.strEq(name, "ReadFile")) { return "read"; }
+            if (this.strEq(name, "WriteFile")) { return "write"; }
+            if (this.strEq(name, "DeleteFileA")) { return "unlink"; }
+            if (this.strEq(name, "MoveFileA")) { return "rename"; }
+            if (this.strEq(name, "RemoveDirectoryA")) { return "rmdir"; }
+            if (this.strEq(name, "GetFileAttributesA")) { return "stat"; }
+            if (this.strEq(name, "FindFirstFileA")) { return "opendir"; }
+            if (this.strEq(name, "FindNextFileA")) { return "readdir"; }
+            if (this.strEq(name, "FindClose")) { return "closedir"; }
+            if (this.strEq(name, "GetEnvironmentVariableA")) { return "getenv"; }
+            if (this.strEq(name, "SetEnvironmentVariableA")) { return "setenv"; }
+            if (this.strEq(name, "GetComputerNameA")) { return "gethostname"; }
+            if (this.strEq(name, "GetCurrentProcessId")) { return "getpid"; }
+            if (this.strEq(name, "Sleep")) { return "nanosleep"; }
+            if (this.strEq(name, "GetTickCount") || this.strEq(name, "GetTickCount64")) { return "clock_gettime"; }
+            if (this.strEq(name, "QueryPerformanceCounter") || this.strEq(name, "QueryPerformanceFrequency")) { return "clock_gettime"; }
+            if (this.strEq(name, "GetLocalTime") || this.strEq(name, "GetSystemTime")) { return "clock_gettime"; }
+            if (this.strEq(name, "SetFilePointer") || this.strEq(name, "GetFileSize")) { return "lseek"; }
+            if (this.strEq(name, "lstrlenA")) { return "strlen"; }
+            return "";
+        }
+        // msvcrt/ucrtbase overlap on the same C library: glibc carries every
+        // name both DLLs export except the Windows-only underscore helpers.
+        if (this.strEq(dll, "msvcrt.dll") || this.strEq(dll, "ucrtbase.dll")) {
+            if (this.strEq(name, "_atoi64")) { return "atoll"; }
+            return name;
+        }
+        if (this.strEq(dll, "ws2_32.dll")) {
+            if (this.strEq(name, "closesocket")) { return "close"; }
+            if (this.strEq(name, "socket") || this.strEq(name, "bind") || this.strEq(name, "listen") || this.strEq(name, "accept") || this.strEq(name, "recv") || this.strEq(name, "send") || this.strEq(name, "shutdown") || this.strEq(name, "connect") || this.strEq(name, "setsockopt") || this.strEq(name, "getaddrinfo") || this.strEq(name, "freeaddrinfo")) { return name; }
+            return "";
+        }
+        return "";
+    }
+
+    // Import-patch core WITHOUT the register shuffle, for call sites that
+    // already marshal SysV registers (ext-path linux imports, print/printf
+    // tails, heap helpers). Mapping + dedup + recording match addImportPatch.
+    public int addImportPatchDirect(string dll, string name) {
+        if (this.isLinuxTarget()) {
+            string lib = this.linuxImportLib(dll);
+            string lname = this.linuxImportName(dll, name);
+            if (lib.length > 0 && lname.length > 0) {
+                dll = lib;
+                name = lname;
+            }
+        }
+        int idx = this.findImport(dll, name);
+        this.importPatchOffsets.add(this.asm.buf.length + 2);
+        this.importPatchDllIndices.add(-1);
+        this.importPatchFuncIndices.add(idx);
+        return idx;
+    }
+
+    // Map a linux module name (the part after "linux.") to its shared lib.
+    // Mirrors compiler/parser.sr linuxModuleNameLib.
+    public string linuxModuleLib(string module) {
+        if (this.strEq(module, "libc")) { return "libc.so.6"; }
+        if (this.strEq(module, "x11")) { return "libX11.so.6"; }
+        if (this.strEq(module, "xtst")) { return "libXtst.so.6"; }
+        return "";
+    }
+
+    // Export tables mirror compiler/parser.sr linuxLibExportTable word for
+    // word so codegen grants exactly what the parser resolves.
+    public string linuxExportTable(string lib) {
+        if (this.strEq(lib, "libc.so.6")) { return "exit mmap munmap malloc free read write open close lseek stat unlink rename mkdir rmdir opendir readdir closedir getenv setenv clock_gettime nanosleep localtime_r gmtime_r fork execve waitpid kill pipe dup2 _exit execvpe getpid pthread_create pthread_join sysconf uname gethostname getlogin_r statvfs getrandom rand srand getuid printf strlen strcmp strcpy memcpy memset socket connect bind listen accept send recv setsockopt getaddrinfo freeaddrinfo"; }
+        if (this.strEq(lib, "libX11.so.6")) { return "XOpenDisplay XCloseDisplay XQueryPointer XWarpPointer XFlush XCreateSimpleWindow XMapWindow XUnmapWindow XDestroyWindow XStoreName XDefaultRootWindow XScreenCount XDisplayWidth XDisplayHeight XStringToKeysym XKeysymToKeycode XQueryKeymap"; }
+        if (this.strEq(lib, "libXtst.so.6")) { return "XTestFakeButtonEvent XTestFakeKeyEvent XTestFakeMotionEvent XTestQueryExtension"; }
+        return "";
+    }
+
+    public bool linuxTableHas(string lib, string fn) {
+        string table = this.linuxExportTable(lib);
+        int i = 0;
+        while (i < table.length) {
+            while (i < table.length && table[i] == ' ') { i++; }
+            int start = i;
+            while (i < table.length && table[i] != ' ') { i++; }
+            if (i > start && this.strEq(fn, projectSlice(table, start, i))) { return true; }
+        }
+        return false;
+    }
+
+    public void linuxAddLib(string lib) {
+        if (lib.length == 0) { return; }
+        for (int i = 0; i < this.linuxLibs.length; i++) {
+            if (this.strEq(this.linuxLibs[i], lib)) { return; }
+        }
+        this.linuxLibs.add(lib);
+    }
+
+    public void linuxAddGrant(string lib, string fn) {
+        if (lib.length == 0 || fn.length == 0) { return; }
+        string grant = lib + "|" + fn;
+        for (int i = 0; i < this.linuxGrants.length; i++) {
+            if (this.strEq(this.linuxGrants[i], grant)) { return; }
+        }
+        this.linuxGrants.add(grant);
+    }
+
+    public void linuxAddGrantAlias(string lib, string exportName, string localName) {
+        if (lib.length == 0 || exportName.length == 0 || localName.length == 0) { return; }
+        if (this.strEq(exportName, localName)) { this.linuxAddGrant(lib, exportName); return; }
+        for (int i = 0; i < this.linuxAliasLocals.length; i++) {
+            if (this.strEq(this.linuxAliasLocals[i], localName) && this.strEq(this.linuxAliasExports[i], exportName) && this.strEq(this.linuxAliasLibs[i], lib)) { return; }
+        }
+        this.linuxAliasLocals.add(localName);
+        this.linuxAliasExports.add(exportName);
+        this.linuxAliasLibs.add(lib);
+    }
+
+    public void linuxAddGrantNamed(string lib, Node nameNode) {
+        if (nameNode.isAlias && nameNode.strVal.length > 0) {
+            this.linuxAddGrantAlias(lib, nameNode.name, nameNode.strVal);
+            return;
+        }
+        this.linuxAddGrant(lib, nameNode.name);
+    }
+
+    // True when `fn` may be called as a free function targeting `lib`.
+    public bool linuxAllowed(string lib, string fn) {
+        for (int i = 0; i < this.linuxLibs.length; i++) {
+            if (this.strEq(this.linuxLibs[i], lib)) {
+                if (this.linuxTableHas(lib, fn)) { return true; }
+            }
+        }
+        string grant = lib + "|" + fn;
+        for (int i = 0; i < this.linuxGrants.length; i++) {
+            if (this.strEq(this.linuxGrants[i], grant)) { return true; }
+        }
+        return false;
+    }
+
+    // Register one parsed import statement (node.kind == 105), mirroring
+    // registerWin32Import for `linux` / `linux.<module>` sources.
+    public void registerLinuxImport(Node node) {
+        string source = node.typeHint;
+        bool all = node.isStatic;
+        if (!this.strEq(source, "linux") && source.length > 6) {
+            string prefix = projectSlice(source, 0, 6);
+            if (!this.strEq(prefix, "linux.")) { return; }
+        } elif (!this.strEq(source, "linux")) {
+            return;
+        }
+        if (this.strEq(source, "linux")) {
+            if (all) {
+                this.linuxAddLib(this.linuxModuleLib("libc"));
+                this.linuxAddLib(this.linuxModuleLib("x11"));
+                this.linuxAddLib(this.linuxModuleLib("xtst"));
+                return;
+            }
+            this.linuxAddLib(this.linuxModuleLib(node.name));
+            for (int j = 0; j < node.childCount(); j++) {
+                this.linuxAddLib(this.linuxModuleLib(node.child(j).name));
+            }
+            return;
+        }
+        string module = projectSlice(source, 6, source.length);
+        string lib = this.linuxModuleLib(module);
+        if (lib.length == 0) { return; }
+        if (all) {
+            this.linuxAddLib(lib);
+            return;
+        }
+        this.linuxAddGrantNamed(lib, node);
+        for (int j = 0; j < node.childCount(); j++) {
+            this.linuxAddGrantNamed(lib, node.child(j));
+        }
+    }
+
+    // Inverse of linuxModuleLib: first module alias for a shared lib.
+    public string linuxModuleOf(string lib) {
+        if (this.strEq(lib, "libc.so.6")) { return "libc"; }
+        if (this.strEq(lib, "libX11.so.6")) { return "x11"; }
+        if (this.strEq(lib, "libXtst.so.6")) { return "xtst"; }
+        return lib;
+    }
+
+    // True when a bare call to `name` resolves as a granted linux export.
+    // Target-gated: on WINDOWS builds linux grants never resolve, so WINDOWS
+    // emission is unaffected by linux imports in the source.
+    public bool linuxCallResolves(string name) {
+        if (!this.isLinuxTarget()) { return false; }
+        for (int i = 0; i < this.linuxLibs.length; i++) {
+            if (this.linuxTableHas(this.linuxLibs[i], name)) { return true; }
+        }
+        for (int g = 0; g < this.linuxGrants.length; g++) {
+            string grant = this.linuxGrants[g];
+            if (grant.length > name.length + 1 && this.strEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') { return true; }
+        }
+        for (int a = 0; a < this.linuxAliasLocals.length; a++) {
+            if (this.strEq(this.linuxAliasLocals[a], name)) { return true; }
+        }
+        return false;
+    }
+
+    // Resolve a free-function name to its (lib, export) on the Linux target:
+    // full-lib tables and plain grants first, aliased grants (by local name)
+    // second — mirroring silverc-rs linux::resolve order. "" lib = no hit.
+    public string linuxResolveLib(string name) {
+        for (int i = 0; i < this.linuxLibs.length; i++) {
+            if (this.linuxTableHas(this.linuxLibs[i], name)) { return this.linuxLibs[i]; }
+        }
+        for (int g = 0; g < this.linuxGrants.length; g++) {
+            string grant = this.linuxGrants[g];
+            if (grant.length > name.length + 1 && this.strEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') {
+                return projectSlice(grant, 0, grant.length - name.length - 1);
+            }
+        }
+        return "";
+    }
+
+    public string linuxResolveExport(string name) {
+        for (int a = 0; a < this.linuxAliasLocals.length; a++) {
+            if (this.strEq(this.linuxAliasLocals[a], name)) { return this.linuxAliasExports[a]; }
+        }
+        return name;
+    }
+
+    public string linuxResolveAliasLib(string name) {
+        for (int a = 0; a < this.linuxAliasLocals.length; a++) {
+            if (this.strEq(this.linuxAliasLocals[a], name)) { return this.linuxAliasLibs[a]; }
+        }
+        return "";
     }
 
     // ------------------------------------------------------------------
