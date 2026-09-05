@@ -38,9 +38,19 @@ mod export time;
 //         printline("working...");
 //         ...
 //     }));
+//
+// LINUX BACKEND (Phase B): clock_gettime(CLOCK_MONOTONIC = 1) from
+// linux.libc for now() (milliseconds as float64, same unit as the QPC
+// ratio); nanosleep for the sleep pair (milliseconds split into whole
+// seconds + nanoseconds in a two-slot timespec int[2]). Negative sleeps
+// return at once (nanosleep rejects them; the clamp keeps the call safe).
+// stopwatch() is pure Silver over now() and needs no region.
 
 #on WINDOWS
 import * from win32.kernel32;
+#off
+#on LINUX
+import * from linux.libc;
 #off
 
 public void stopwatch(void () job) {
@@ -53,11 +63,26 @@ public void sleep(int ms) {
     #on WINDOWS
     Sleep(ms);
     #off
+    #on LINUX
+    if (ms < 0) { return; }
+    int[] ts = new int[2];
+    ts[0] = ms / 1000;
+    ts[1] = (ms % 1000) * 1000000;
+    int[] rem = new int[2];
+    nanosleep(ts, rem);
+    #off
 }
 
 public void sleep(uint ms) {
     #on WINDOWS
     Sleep(ms);
+    #off
+    #on LINUX
+    int[] ts = new int[2];
+    ts[0] = ms / 1000;
+    ts[1] = (ms % 1000) * 1000000;
+    int[] rem = new int[2];
+    nanosleep(ts, rem);
     #off
 }
 
@@ -68,5 +93,12 @@ public float64 now() {
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
     return float64(count) / float64(freq) * 1000.0;
+    #off
+    #on LINUX
+    int[] ts = new int[2];
+    clock_gettime(1, ts);
+    int64 sec = ts[0];
+    int64 nsec = ts[1];
+    return float64(sec) * 1000.0 + float64(nsec) / 1000000.0;
     #off
 }
