@@ -30,9 +30,17 @@ mod export io;
 // gen_input) only fires when no user-defined `input` is in scope: once
 // `import * from io;` resolves, io's own functions win the func_labels
 // dispatch. Both paths produce the same behavior.
+//
+// LINUX BACKEND (Phase B): fd 0 read() from linux.libc, one byte per call
+// like the WINDOWS ReadFile loop -- same append-until-'\n', same '\r'
+// strip, same empty-on-EOF. Headless/SSH needs nothing special: fd 0 works
+// on pipes, redirects, and terminals alike.
 
 #on WINDOWS
 import * from win32.kernel32;
+#off
+#on LINUX
+import * from linux.libc;
 #off
 
 public string readLine() {
@@ -45,6 +53,19 @@ public string readLine() {
     while (true) {
         bool ok = ReadFile(stdin, buf, 1, &read, null);
         if (!ok || read == 0) { break; }
+        char c = char(buf[0]);
+        if (c == '\n') { break; }
+        if (c == '\r') { continue; }
+        result += c;
+    }
+    return result;
+    #off
+    #on LINUX
+    string result = "";
+    byte[] buf = new byte[1];
+    while (true) {
+        int n = read(0, buf, 1);
+        if (n <= 0) { break; }
         char c = char(buf[0]);
         if (c == '\n') { break; }
         if (c == '\r') { continue; }
