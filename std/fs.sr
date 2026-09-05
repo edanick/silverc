@@ -23,9 +23,30 @@ mod export fs;
 // module's own function. The delegation is required: the native path
 // allocates a raw byte buffer for ReadFile, while a Silver array header
 // passed to Win32 could crash on ordinary instance reads.
+//
+// LINUX BACKEND (Phase B): open/read/write/close + stat/unlink/renameFile/
+// mkdir/opendir+readdir/closedir from linux.libc, mirroring the WINDOWS
+// bodies statement-for-statement. The rename grant is aliased
+// (`rename as renameFile`): a bare rename(string, string) would resolve to
+// this module's own rename/2 (same arity) and recurse forever -- the
+// net.sr NAME-COLLISION FINDING; uuid.sr carries the same documented alias
+// precedent. Paths use `/` (no drive letters) and are case-sensitive.
+// NUL bytes cannot ride string concat (dropped on both backends), so short
+// reads and binary tails behave the same here as under ReadFile.
+// Times/attrs beyond size are not queried: stat is used for size only
+// (st_size, i64 at offset 48 = slot 6 of an int[18]); directory/file kinds
+// decode st_mode (u32 at offset 24, low half of slot 3) with S_IFMT/FDIR.
+// struct dirent's d_name starts at offset 19 and is copied bounded (256)
+// out of libc's static storage into an int[] before the NUL scan.
 
 #on WINDOWS
 import * from win32.kernel32;
+#off
+#on LINUX
+import * from linux.libc;
+#off
+#on LINUX
+import { rename as renameFile } from linux.libc;
 #off
 
 class FileOps {
@@ -35,17 +56,30 @@ class FileOps {
         #on WINDOWS
         return GetFileAttributesA(path) != -1;
         #off
+        #on LINUX
+        int fd = open(path, 0, 0);
+        if (fd < 0) { return false; }
+        close(fd);
+        return true;
+        #off
+        return false;
     }
 
     public void delete(string path) {
         #on WINDOWS
         DeleteFileA(path);
         #off
+        #on LINUX
+        unlink(path);
+        #off
     }
 
     public void rename(string oldPath, string newPath) {
         #on WINDOWS
         MoveFileA(oldPath, newPath);
+        #off
+        #on LINUX
+        renameFile(oldPath, newPath);
         #off
     }
 
@@ -64,6 +98,20 @@ class FileOps {
         int wrote = 0;
         WriteFile(h, data, data.length, &wrote, null);
         CloseHandle(h);
+        #off
+        #on LINUX
+        int fd = open(path, 0x241, 0x1A4);
+        if (fd < 0) { return; }
+        if (data.length > 0) {
+            int slots = (data.length + 7) / 8;
+            int[] packed = new int[slots];
+            for (int i = 0; i < data.length; i++) {
+                int b = data[i] & 0xFF;
+                packed[i / 8] = packed[i / 8] | (b << ((i % 8) * 8));
+            }
+            write(fd, packed, data.length);
+        }
+        close(fd);
         #off
     }
 }
@@ -86,6 +134,10 @@ class FolderOps {
         FindClose(h);
         return names;
         #off
+        #on LINUX
+        string[] names = readDirNames(path);
+        return names;
+        #off
     }
 
     public string[] list() << this.list(".");
@@ -99,6 +151,14 @@ class FolderOps {
         }
         return result;
         #off
+        #on LINUX
+        string[] all = this.list();
+        string[] result = [];
+        foreach (string f in all) {
+            if (isDirPath(f) == 0) { result.add(f); }
+        }
+        return result;
+        #off
     }
 
     public string[] folders() {
@@ -107,6 +167,14 @@ class FolderOps {
         string[] result = [];
         foreach (string f in all) {
             if (GetFileAttributesA(f) == 0x10) { result.add(f); }
+        }
+        return result;
+        #off
+        #on LINUX
+        string[] all = this.list();
+        string[] result = [];
+        foreach (string f in all) {
+            if (isDirPath(f) != 0) { result.add(f); }
         }
         return result;
         #off
@@ -129,11 +197,17 @@ class FolderOps {
         #on WINDOWS
         CreateDirectoryA(path, null);
         #off
+        #on LINUX
+        mkdir(path, 493);
+        #off
     }
 
     public void create(string path, bool ignoreExistence) {
         #on WINDOWS
         CreateDirectoryA(path, null);
+        #off
+        #on LINUX
+        mkdir(path, 493);
         #off
     }
 }
@@ -154,6 +228,23 @@ public string readString(string path) {
     foreach (byte b in buf) { result += char(b); }
     return result;
     #off
+    #on LINUX
+    int fd = open(path, 0, 0);
+    if (fd < 0) { return ""; }
+    int64 size = statSize(path);
+    if (size <= 0) { close(fd); return ""; }
+    int slots = int((size + 7) / 8);
+    int[] buf = new int[slots];
+    int n = read(fd, buf, int(size));
+    close(fd);
+    if (n < 0) { return ""; }
+    string result = "";
+    for (int i = 0; i < n; i++) {
+        int b = (buf[i / 8] >> ((i % 8) * 8)) & 0xFF;
+        result += char(b);
+    }
+    return result;
+    #off
 }
 
 public byte[] read(string path) {
@@ -167,6 +258,22 @@ public byte[] read(string path) {
     CloseHandle(h);
     return buf;
     #off
+    #on LINUX
+    int fd = open(path, 0, 0);
+    if (fd < 0) { return []; }
+    int64 size = statSize(path);
+    if (size <= 0) { close(fd); return []; }
+    int slots = int((size + 7) / 8);
+    int[] buf = new int[slots];
+    int n = read(fd, buf, int(size));
+    close(fd);
+    if (n < 0) { return []; }
+    byte[] out = new byte[n];
+    for (int i = 0; i < n; i++) {
+        out[i] = (buf[i / 8] >> ((i % 8) * 8)) & 0xFF;
+    }
+    return out;
+    #off
 }
 
 public void writeString(string path, string content) {
@@ -178,6 +285,21 @@ public void writeString(string path, string content) {
     WriteFile(h, buf, buf.length, &wrote, null);
     CloseHandle(h);
     #off
+    #on LINUX
+    int fd = open(path, 0x241, 0x1A4);
+    if (fd < 0) { return; }
+    int len = content.length;
+    if (len > 0) {
+        int slots = (len + 7) / 8;
+        int[] packed = new int[slots];
+        for (int i = 0; i < len; i++) {
+            int b = int(content[i]);
+            packed[i / 8] = packed[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
+        }
+        write(fd, packed, len);
+    }
+    close(fd);
+    #off
 }
 
 public void write(string path, byte[] data) {
@@ -188,11 +310,31 @@ public void write(string path, byte[] data) {
     WriteFile(h, data, data.length, &wrote, null);
     CloseHandle(h);
     #off
+    #on LINUX
+    int fd = open(path, 0x241, 0x1A4);
+    if (fd < 0) { return; }
+    if (data.length > 0) {
+        int slots = (data.length + 7) / 8;
+        int[] packed = new int[slots];
+        for (int i = 0; i < data.length; i++) {
+            int b = data[i] & 0xFF;
+            packed[i / 8] = packed[i / 8] | (b << ((i % 8) * 8));
+        }
+        write(fd, packed, data.length);
+    }
+    close(fd);
+    #off
 }
 
 public bool exists(string path) {
     #on WINDOWS
     return GetFileAttributesA(path) != -1;
+    #off
+    #on LINUX
+    int fd = open(path, 0, 0);
+    if (fd < 0) { return false; }
+    close(fd);
+    return true;
     #off
 }
 
@@ -200,11 +342,17 @@ public void delete(string path) {
     #on WINDOWS
     DeleteFileA(path);
     #off
+    #on LINUX
+    unlink(path);
+    #off
 }
 
 public void rename(string oldPath, string newPath) {
     #on WINDOWS
     MoveFileA(oldPath, newPath);
+    #off
+    #on LINUX
+    renameFile(oldPath, newPath);
     #off
 }
 
@@ -223,12 +371,74 @@ public string[] listDir(string path) {
     FindClose(h);
     return names;
     #off
+    #on LINUX
+    string[] names = readDirNames(path);
+    return names;
+    #off
 }
 
 public void createDir(string path) {
     #on WINDOWS
     CreateDirectoryA(path, null);
     #off
+    #on LINUX
+    mkdir(path, 493);
+    #off
+}
+
+// st_size (i64 at stat offset 48 = slot 6 of an int[18]), or -1 when stat
+// fails. LINUX-only helper; the WINDOWS bodies size via GetFileSize.
+int64 statSize(string path) {
+    #on LINUX
+    int[] st = new int[18];
+    int rc = stat(path, st);
+    if (rc != 0) { return -1; }
+    return st[6];
+    #off
+    return -1;
+}
+
+// 1 when path stats as a directory, else 0 (stat failure counts as
+// not-a-dir, mirroring GetFileAttributesA != 0x10). LINUX-only helper.
+int isDirPath(string path) {
+    #on LINUX
+    int[] st = new int[18];
+    int rc = stat(path, st);
+    if (rc != 0) { return 0; }
+    int mode = st[3] & 0xFFFF;
+    if ((mode & 0xF000) == 0x4000) { return 1; }
+    return 0;
+    #off
+    return 0;
+}
+
+// Directory entries via opendir/readdir/closedir, skipping "." and "..".
+// Each dirent's d_name (offset 19) is copied bounded (256) out of libc's
+// static storage before the NUL scan, so no unbounded read escapes.
+// LINUX-only helper; the WINDOWS bodies enumerate with FindFirstFileA.
+string[] readDirNames(string path) {
+    #on LINUX
+    string[] names = [];
+    int dir = opendir(path);
+    if (dir == 0) { return names; }
+    while (true) {
+        int node = readdir(dir);
+        if (node == 0) { break; }
+        int[] raw = new int[32];
+        memcpy(raw, node + 19, 256);
+        string name = "";
+        for (int i = 0; i < 256; i++) {
+            int b = (raw[i / 8] >> ((i % 8) * 8)) & 0xFF;
+            if (b == 0) { break; }
+            name += char(b);
+        }
+        if (name != "." && name != "..") { names.add(name); }
+    }
+    closedir(dir);
+    return names;
+    #off
+    string[] empty = [];
+    return empty;
 }
 
 construct () {
