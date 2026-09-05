@@ -11772,6 +11772,62 @@ public void genNewCall(Node call) {
         return false;
     }
 
+    // LINUX SysV backend (additive): shared float-aware variadic tail for
+    // printf (one fixed arg: RDI=fmt) and sprintf (two: RDI=dest, RSI=fmt).
+    // GP values fill the remaining registers, floats ride XMM0-7, the rest
+    // spills at [RSP+0]; AL carries the live XMM count through an R10-staged
+    // call (mirrors silverc-rs emit_printf_call / interp emission).
+    public void emitLinuxVariadicTail(string lib, string fn, int[] fixedOffs, int[] valOffs, Node[] vals) {
+        int firstFixed = fixedOffs.length;
+        int gpNeed = 0;
+        int xmNeed = 0;
+        for (int i = 0; i < vals.length; i++) {
+            if (this.isFloatLike(vals[i])) { xmNeed = xmNeed + 1; } else { gpNeed = gpNeed + 1; }
+        }
+        int gpMax = 6 - firstFixed;
+        int gpOver = gpNeed - gpMax;
+        if (gpOver < 0) { gpOver = 0; }
+        int xmOver = xmNeed - 8;
+        if (xmOver < 0) { xmOver = 0; }
+        this.emitAbiCallSetup((gpOver + xmOver) * 8);
+        for (int f = 0; f < firstFixed; f++) {
+            this.asm.movRMBase(this.sysvRegAt(f), 5, fixedOffs[f]);
+        }
+        int gp = 0;
+        int xm = 0;
+        int st = 0;
+        int al = 0;
+        for (int i = 0; i < vals.length; i++) {
+            if (this.isFloatLike(vals[i])) {
+                if (xm < 8) {
+                    this.asm.movRMBase(0, 5, valOffs[i]);
+                    this.emitMovqXmmGpr(xm, 0);
+                    xm = xm + 1;
+                    al = al + 1;
+                } else {
+                    this.asm.movRMBase(0, 5, valOffs[i]);
+                    this.asm.movMBaseR(4, 0, st * 8);
+                    st = st + 1;
+                }
+            } else {
+                if (gp < gpMax) {
+                    this.asm.movRMBase(this.sysvRegAt(firstFixed + gp), 5, valOffs[i]);
+                    gp = gp + 1;
+                } else {
+                    this.asm.movRMBase(0, 5, valOffs[i]);
+                    this.asm.movMBaseR(4, 0, st * 8);
+                    st = st + 1;
+                }
+            }
+        }
+        this.addImportPatchDirect(lib, fn);
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(10, 0, 0);
+        this.asm.movRI64(0, al);
+        this.asm.callR64(10);
+        this.emitAbiCallTeardown();
+    }
+
     public void genPrintCall(Node call, bool newline) {
         if (call.childCount() < 1) { return; }
         Node arg = call.child(0);
@@ -11826,22 +11882,30 @@ public void genNewCall(Node call) {
             }
             int extraStack = 0;
             if (exprs.length > 3) { extraStack = (exprs.length - 3) * 8; }
-            this.asm.emitCallSetup(extraStack);
-            this.asm.movRMBase(1, 5, fmtOff);
-            int[] argRegs = [2, 8, 9];
-            for (int ai = 0; ai < exprs.length && ai < 3; ai++) {
-                this.asm.movRMBase(argRegs[ai], 5, argOffs[ai]);
+            // LINUX SysV backend (additive): float-aware variadic tail
+            // (RDI=fmt, GP/XMM split, AL count). WINDOWS below unchanged.
+            if (this.isLinuxTarget()) {
+                int[] fixedOffs = [];
+                fixedOffs.add(fmtOff);
+                this.emitLinuxVariadicTail("libc.so.6", "printf", fixedOffs, argOffs, exprs);
+            } else {
+                this.asm.emitCallSetup(extraStack);
+                this.asm.movRMBase(1, 5, fmtOff);
+                int[] argRegs = [2, 8, 9];
+                for (int ai = 0; ai < exprs.length && ai < 3; ai++) {
+                    this.asm.movRMBase(argRegs[ai], 5, argOffs[ai]);
+                }
+                for (int ai = 3; ai < exprs.length; ai++) {
+                    this.asm.movRMBase(0, 5, argOffs[ai]);
+                    this.asm.movMBaseR(4, 0, 32 + (ai - 3) * 8);
+                }
+                this.addImportPatch("msvcrt.dll", "printf");
+                int s1 = 0xDEADBEEFCAFEBAD0;
+                this.asm.emitImm64(0, s1);
+                this.asm.movRMBase(0, 0, 0);
+                this.asm.callR64(0);
+                this.asm.emitCallTeardown();
             }
-            for (int ai = 3; ai < exprs.length; ai++) {
-                this.asm.movRMBase(0, 5, argOffs[ai]);
-                this.asm.movMBaseR(4, 0, 32 + (ai - 3) * 8);
-            }
-            this.addImportPatch("msvcrt.dll", "printf");
-            int s1 = 0xDEADBEEFCAFEBAD0;
-            this.asm.emitImm64(0, s1);
-            this.asm.movRMBase(0, 0, 0);
-            this.asm.callR64(0);
-            this.asm.emitCallTeardown();
         } else {
             this.genExpr(arg);
             bool charLike = this.isCharExpr(arg);
@@ -11864,9 +11928,33 @@ public void genNewCall(Node call) {
             this.asm.popR64(2);
         }
         if (arg.kind != 69) {
-        this.addImportPatch("msvcrt.dll", "printf");
+        // The shared patch below serves both WINDOWS tails; the Linux tail
+        // records its own Direct patch (a second record here would point at
+        // stale bytes).
+        if (!this.isLinuxTarget()) {
+            this.addImportPatch("msvcrt.dll", "printf");
+        }
         int s1 = 0xDEADBEEFCAFEBAD0;
-        if (fltArg) {
+        // LINUX SysV backend (additive): RDI=fmt, RSI=value, XMM0=value +
+        // AL=1 for floats, AL=0 otherwise, through an R10-staged call.
+        // Both WINDOWS shapes below are byte-identical to before.
+        if (this.isLinuxTarget()) {
+            this.asm.movRR64(7, 1);
+            this.asm.movRR64(6, 2);
+            if (fltArg) {
+                this.emitMovqXmmGpr(0, 6);
+            }
+            this.emitAbiCallSetup(0);
+            this.addImportPatchDirect("libc.so.6", "printf");
+            this.asm.emitImm64(0, 0);
+            this.asm.movRMBase(10, 0, 0);
+            this.asm.xorRR64(0, 0);
+            if (fltArg) {
+                this.asm.incR64(0);
+            }
+            this.asm.callR64(10);
+            this.emitAbiCallTeardown();
+        } elif (fltArg) {
             // Varargs FP call: stage the printf pointer through R10 so the
             // AL vector-count immediate cannot clobber it, then set AL=1 --
             // mirrors silverc-rs emit_printf_call(1) byte for byte.
@@ -12013,23 +12101,32 @@ public void genNewCall(Node call) {
         }
         int extraStack = 0;
         if (exprs.length > 2) { extraStack = (exprs.length - 2) * 8; }
-        this.asm.emitCallSetup(extraStack);
-        this.asm.movRMBase(1, 5, bufOff);
-        this.asm.movRMBase(2, 5, fmtOff);
-        int[] argRegs = [8, 9];
-        for (int ai = 0; ai < exprs.length && ai < 2; ai++) {
-            this.asm.movRMBase(argRegs[ai], 5, argOffs[ai]);
+        // LINUX SysV backend (additive): float-aware variadic tail
+        // (RDI=buf, RSI=fmt, GP/XMM split, AL count). WINDOWS below unchanged.
+        if (this.isLinuxTarget()) {
+            int[] fixedOffs = [];
+            fixedOffs.add(bufOff);
+            fixedOffs.add(fmtOff);
+            this.emitLinuxVariadicTail("libc.so.6", "sprintf", fixedOffs, argOffs, exprs);
+        } else {
+            this.asm.emitCallSetup(extraStack);
+            this.asm.movRMBase(1, 5, bufOff);
+            this.asm.movRMBase(2, 5, fmtOff);
+            int[] argRegs = [8, 9];
+            for (int ai = 0; ai < exprs.length && ai < 2; ai++) {
+                this.asm.movRMBase(argRegs[ai], 5, argOffs[ai]);
+            }
+            for (int ai = 2; ai < exprs.length; ai++) {
+                this.asm.movRMBase(0, 5, argOffs[ai]);
+                this.asm.movMBaseR(4, 0, 32 + (ai - 2) * 8);
+            }
+            this.addImportPatch("msvcrt.dll", "sprintf");
+            this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
         }
-        for (int ai = 2; ai < exprs.length; ai++) {
-            this.asm.movRMBase(0, 5, argOffs[ai]);
-            this.asm.movMBaseR(4, 0, 32 + (ai - 2) * 8);
-        }
-        this.addImportPatch("msvcrt.dll", "sprintf");
-        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.emitCallSetup(0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
         this.asm.movRMBase(0, 5, bufOff);
     }
 
