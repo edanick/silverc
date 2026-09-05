@@ -66,6 +66,20 @@ mod export process;
 //   The string crosses the boundary straight from its dense char buffer
 //   (the documented string-buffer idiom; same bytes as a byte[] conversion).
 //
+// LINUX BACKEND (Phase B): fork/execvpe/waitpid + pipe/dup2/read/close from
+// linux.libc inside run()'s body, mirroring the WINDOWS pipe/spawn/drain
+// shape. The child argv is a Silver string[] with an explicit null
+// terminator (argv.add(null)); envp rides null (empty child environment).
+// pipe()'s two 32-bit fds unpack from slot 0 (fds[0] low = read end, high
+// = write end -- pipe(2) writes ints, not Silver slots). The exit status
+// unpacks as (st >> 8) & 0xFF. Unlike the faulting CreateProcessA ladder,
+// a missing executable exits the child with 127 and run() returns that
+// code with empty stdout instead of faulting. getFocusedProcess() keeps
+// the documented all-zero fallback on Linux (no display-server query in
+// the libc backend); the pipe class keeps its dead posture (write() is an
+// empty no-op and read() returns "" there -- no region needed, matching
+// the Windows no-backend stubs per LINUX.md headless rules).
+//
 // DISPATCH NOTE (per compiler, probed): on
 // silverc-rs every `Process.getFocusedProcess()` / `process.getFocusedProcess()`
 // call is intercepted BEFORE this source body and emitted natively
@@ -86,6 +100,9 @@ mod export process;
 #on WINDOWS
 import * from win32.user32;
 import * from win32.kernel32;
+#off
+#on LINUX
+import * from linux.libc;
 #off
 
 class result {
@@ -237,6 +254,50 @@ public result run(string cmd, string[] args) {
         CloseHandle(hReadOut);
         res.stdout = output;
         res.exitCode = 0;
+    }
+    #off
+    #on LINUX
+    // pipe() + fork() + execvpe() + drain + waitpid(): the same
+    // spawn-a-child-and-capture-stdout shape as the WINDOWS ladder. The
+    // child's argv carries cmd first (no fullCmd join needed); a failed
+    // exec exits 127 instead of faulting the parent.
+    int[] fds = new int[2];
+    pipe(fds);
+    int fr = fds[0] & 0xFFFFFFFF;
+    int fw = (fds[0] >> 32) & 0xFFFFFFFF;
+    int pid = fork();
+    if (pid < 0) {
+        close(fr);
+        close(fw);
+        res.exitCode = -1;
+        res.stderr = "Failed to create process";
+    } else if (pid == 0) {
+        close(fr);
+        dup2(fw, 1);
+        close(fw);
+        string[] argv = [];
+        argv.add(cmd);
+        for (int i = 0; i < args.length; i++) { argv.add(args[i]); }
+        argv.add(null);
+        execvpe(cmd, argv, null);
+        _exit(127);
+    } else {
+        close(fw);
+        int[] chunk = new int[1024];
+        string output = "";
+        while (true) {
+            int n = read(fr, chunk, 8192);
+            if (n <= 0) { break; }
+            for (int i = 0; i < n; i++) {
+                int b = (chunk[i / 8] >> ((i % 8) * 8)) & 0xFF;
+                output += char(b);
+            }
+        }
+        close(fr);
+        int st = 0;
+        waitpid(pid, &st, 0);
+        res.stdout = output;
+        res.exitCode = (st >> 8) & 0xFF;
     }
     #off
     return res;
