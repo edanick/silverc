@@ -2234,7 +2234,7 @@ int strIdx = this.stringPatchIndices[i];
             this.forwardCallFuncIdxs.add(-1);
             this.forwardCallNames.add("__init_globals");
             this.forwardCallClasses.add("");
-            this.asm.emitCallTeardown();
+            this.emitAbiCallTeardown();
         }
         if (this.hasMain) {
             this.asm.emitCallSetup(0);
@@ -2572,23 +2572,23 @@ int strIdx = this.stringPatchIndices[i];
         }
 
         // __init_globals();
-        this.asm.emitCallSetup(0);
+        this.emitAbiCallSetup(0);
         this.asm.callRel32(0);
         this.forwardCalls.add(this.asm.buf.length - 4);
             this.forwardCallFuncIdxs.add(-1);
         this.forwardCallNames.add("__init_globals");
         this.forwardCallClasses.add("");
-        this.asm.emitCallTeardown();
+        this.emitAbiCallTeardown();
 
         if (this.hasMain) {
             // main();
-            this.asm.emitCallSetup(0);
+            this.emitAbiCallSetup(0);
             this.asm.callRel32(0);
             this.forwardCalls.add(this.asm.buf.length - 4);
             this.forwardCallFuncIdxs.add(-1);
             this.forwardCallNames.add("main");
             this.forwardCallClasses.add("");
-            this.asm.emitCallTeardown();
+            this.emitAbiCallTeardown();
 
             // ExitProcess(main's return value in RAX).
             this.asm.movRR64(1, 0);
@@ -4243,7 +4243,12 @@ int strIdx = this.stringPatchIndices[i];
         }
         for (int r = 0; r < this.anonRelocLabelIds.length; r++) {
             int target = this.asm.getLabelOffset(this.anonRelocLabelIds[r]);
+            // LINUX SysV backend (additive): code runs at 0x401000, not
+            // 0x140000000 + 0x1000.
             int64 va = 0x140000000 + 0x1000 + target;
+            if (this.isLinuxTarget()) {
+                va = this.elfCodeVaddr() + target;
+            }
             int pos = this.anonRelocPatchOffsets[r];
             this.asm.buf[pos] = va & 0xFF;
             this.asm.buf[pos + 1] = (va >> 8) & 0xFF;
@@ -8499,27 +8504,36 @@ public void genNewCall(Node call) {
             }
         }
         int extArgCount = call.childCount() - argStart;
+        // LINUX SysV backend (additive): 6 register slots, no shadow. The
+        // WINDOWS counts below are unchanged; the bridge teardowns below
+        // pair with either setup (teardown is shared).
+        int extNreg = this.abiRegCount();
+        int extBase = this.abiStackBase();
         int extStack = 0;
-        if (extArgCount > 4) { extStack = (extArgCount - 4) * 8; }
-        this.asm.emitCallSetup(extStack);
+        if (extArgCount > extNreg) { extStack = (extArgCount - extNreg) * 8; }
+        this.emitAbiCallSetup(extStack);
         int[] argRegs2 = [1, 2, 8, 9];
         int nargs2 = extArgCount;
-        if (nargs2 > 4) { nargs2 = 4; }
+        if (nargs2 > extNreg) { nargs2 = extNreg; }
         // Spill every argument to the shadow space / stack slots before
         // loading the argument registers (nested calls clobber volatile regs).
         for (int i = 0; i < extArgCount; i++) {
             this.genExpr(call.child(i + argStart));
-            if (i < 4) {
+            if (i < extNreg) {
                 this.asm.movMBaseR(4, 0, i * 8);
             } else {
                 // Win64: args 5+ go at [rsp+32], [rsp+40], ... (same layout as
                 // internal function calls above). Storing instead of pushing keeps
                 // the argument order correct (pushing reversed the order).
-                this.asm.movMBaseR(4, 0, 32 + (i - 4) * 8);
+                this.asm.movMBaseR(4, 0, extBase + (i - extNreg) * 8);
             }
         }
         for (int i = 0; i < nargs2; i++) {
-            this.asm.movRMBase(argRegs2[i], 4, i * 8);
+            if (this.isLinuxTarget()) {
+                this.asm.movRMBase(this.sysvRegAt(i), 4, i * 8);
+            } else {
+                this.asm.movRMBase(argRegs2[i], 4, i * 8);
+            }
         }
         // DOCS/247 — nativeToastShow is a synthetic bridge that the silverc-rs
         // codegen translates into real Win32 DLL calls.  In the self-hosted
@@ -8687,23 +8701,39 @@ public void genNewCall(Node call) {
         if (isWin32) {
             if (!plainWin32Allowed) {
                 if (aliasDll.length > 0) {
-                    this.addImportPatch(aliasDll, aliasExport);
+                    // LINUX: pre-spilled args are already SysV (see above),
+                    // so record Direct (no shuffle). WINDOWS unchanged.
+                    if (this.isLinuxTarget()) {
+                        this.addImportPatchDirect(aliasDll, aliasExport);
+                    } else {
+                        this.addImportPatch(aliasDll, aliasExport);
+                    }
                     this.asm.emitImm64(0, 0);
                     this.asm.movRMBase(0, 0, 0);
                     this.asm.callR64(0);
-                    this.asm.emitCallTeardown();
+                    this.emitAbiCallTeardown();
                     return;
                 }
                 // DOCS/213 -- the owning win32 module was not imported.
                 printline("Error: Win32 function '" + name + "' used without importing its module (add: import * from win32." + this.win32ModuleOf(win32Dll) + ";)");
                 exit(1);
             }
-            this.addImportPatch(win32Dll, importName);
+            // LINUX: Direct (regs already SysV); the mapping still
+            // translates same-shape libc names. WINDOWS unchanged.
+            if (this.isLinuxTarget()) {
+                this.addImportPatchDirect(win32Dll, importName);
+            } else {
+                this.addImportPatch(win32Dll, importName);
+            }
             this.asm.emitImm64(0, 0);
             this.asm.movRMBase(0, 0, 0);
             this.asm.callR64(0);
         } elif (aliasDll.length > 0) {
-            this.addImportPatch(aliasDll, aliasExport);
+            if (this.isLinuxTarget()) {
+                this.addImportPatchDirect(aliasDll, aliasExport);
+            } else {
+                this.addImportPatch(aliasDll, aliasExport);
+            }
             this.asm.emitImm64(0, 0);
             this.asm.movRMBase(0, 0, 0);
             this.asm.callR64(0);
@@ -8715,7 +8745,7 @@ public void genNewCall(Node call) {
             this.forwardCallNames.add(name);
             this.forwardCallClasses.add("");
         }
-        this.asm.emitCallTeardown();
+        this.emitAbiCallTeardown();
     }
 
     public bool isThisAsmMember(Node call) {
