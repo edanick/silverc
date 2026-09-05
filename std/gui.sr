@@ -51,6 +51,17 @@
 // probe-safe; SetWindowTextA/LoadImageA/SendMessageA only fire on a live
 // handle. No screen-metrics function is exposed publicly --
 // GetSystemMetrics is constructor-internal (centering) only.
+//
+// LINUX BACKEND (Phase B, XWayland/X11 v1 per LINUX.md §7): windows are
+// X11 simple windows (XCreateSimpleWindow/XMapWindow/XUnmapWindow/
+// XDestroyWindow/XStoreName from linux.x11). The display connection opens
+// in the constructor and lives in the private `display` field beside the
+// window XID in `handle` (both 0 = headless record, exactly like the
+// handle-0 fallback the header already describes: show/hide keep `visible`
+// and setTitle/setIcon record their strings). Centering reuses
+// XDisplayWidth/XDisplayHeight on screen 0; colors ride literal pixels
+// (border 0, background white). A null display (headless SSH) leaves both
+// fields 0 and every method guards on them.
 // ---------------------------------------------------------------------------
 
 mod export gui;
@@ -58,6 +69,9 @@ mod export gui;
 #on WINDOWS
 import * from win32.user32;
 import * from win32.kernel32;
+#off
+#on LINUX
+import * from linux.x11;
 #off
 
 class Window {
@@ -68,6 +82,7 @@ class Window {
     private int handle;
     private bool visible;
     private string icon;
+    private int display;
 
     construct(string name, string title, int width, int height) {
         this.name = name;
@@ -77,6 +92,7 @@ class Window {
         this.handle = 0;
         this.visible = false;
         this.icon = "";
+        this.display = 0;
 
         #on WINDOWS
         int hinst = GetModuleHandleA(0);
@@ -85,6 +101,25 @@ class Window {
         if (x < 0) { x = 0; }
         if (y < 0) { y = 0; }
         this.handle = CreateWindowExA(0, "STATIC", title, 0x00CF0000, x, y, width, height, 0, 0, hinst, 0);
+        #off
+        #on LINUX
+        int d = XOpenDisplay(null);
+        if (d != 0) {
+            int root = XDefaultRootWindow(d);
+            int x = (XDisplayWidth(d, 0) - width) / 2;
+            int y = (XDisplayHeight(d, 0) - height) / 2;
+            if (x < 0) { x = 0; }
+            if (y < 0) { y = 0; }
+            int w = XCreateSimpleWindow(d, root, x, y, width, height, 1, 0, 16777215);
+            if (w != 0) {
+                XStoreName(d, w, title);
+                XFlush(d);
+                this.display = d;
+                this.handle = w;
+            } else {
+                XCloseDisplay(d);
+            }
+        }
         #off
         // Non-Windows fallback: no window-system backend yet, `handle`
         // stays 0 ("no window") and every method below guards on it.
@@ -103,6 +138,12 @@ class Window {
             #on WINDOWS
             SetWindowTextA(this.handle, t);
             #off
+            #on LINUX
+            if (this.display != 0) {
+                XStoreName(this.display, this.handle, t);
+                XFlush(this.display);
+            }
+            #off
         }
     }
 
@@ -118,6 +159,8 @@ class Window {
                 SendMessageA(this.handle, 0x80, 0, hicon); // ICON_SMALL
             }
             #off
+            // LINUX: no .ico path in the X11 v1 backend; the icon string
+            // stays recorded above (headless-record posture).
         }
     }
 
@@ -129,6 +172,12 @@ class Window {
             ShowWindow(this.handle, 5); // SW_SHOW
             UpdateWindow(this.handle);
             #off
+            #on LINUX
+            if (this.display != 0) {
+                XMapWindow(this.display, this.handle);
+                XFlush(this.display);
+            }
+            #off
         }
         this.visible = true;
     }
@@ -138,6 +187,12 @@ class Window {
             #on WINDOWS
             ShowWindow(this.handle, 0); // SW_HIDE
             #off
+            #on LINUX
+            if (this.display != 0) {
+                XUnmapWindow(this.display, this.handle);
+                XFlush(this.display);
+            }
+            #off
         }
         this.visible = false;
     }
@@ -146,6 +201,13 @@ class Window {
         if (this.handle != 0) {
             #on WINDOWS
             DestroyWindow(this.handle);
+            #off
+            #on LINUX
+            if (this.display != 0) {
+                XDestroyWindow(this.display, this.handle);
+                XCloseDisplay(this.display);
+                this.display = 0;
+            }
             #off
         }
         this.handle = 0;
