@@ -8,6 +8,9 @@ import * from path;
 #on WINDOWS
 import * from win32.kernel32;
 #off
+#on LINUX
+import * from linux.libc;
+#off
 
 // OVERHAUL.md --watch — predictive precompilation watcher helpers.
 //
@@ -93,7 +96,8 @@ private bool wtHasSrSuffix(string name) {
 // Byte size of a file via CreateFileA + GetFileSize (std fs has exists()
 // but no size() — reported gap), so the raw calls stay, region-wrapped;
 // no fixed-array WIN32_FIND_DATA is needed — the self-hosted parser does
-// not support byte[] name[size] fixed-declaration syntax.
+// not support byte[] name[size] fixed-declaration syntax. LINUX branch uses
+// stat via linux.libc (st_size at offset 48), same 0-on-failure shape.
 public int wtFileSize(string path) {
     #on WINDOWS
     int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
@@ -102,6 +106,15 @@ public int wtFileSize(string path) {
     CloseHandle(h);
     if (sz < 0) { return 0; }
     return sz;
+    #off
+    #on LINUX
+    int[] stw = [];
+    for (int i = 0; i < 144; i++) { stw.add(0); }
+    int rcw = stat(path, stw);
+    if (rcw != 0) { return 0; }
+    int szw = stw[48] + stw[49] * 256 + stw[50] * 65536 + stw[51] * 16777216;
+    if (szw < 0) { return 0; }
+    return szw;
     #off
     return 0;
 }
