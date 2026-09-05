@@ -15177,6 +15177,16 @@ public void genNewCall(Node call) {
             this.asm.bindLabel(doneLbl);
         }
 
+        // LINUX SysV backend (additive): open(path, O_WRONLY|O_CREAT|O_TRUNC)
+        // + write + close via libc. The shuffled Windows CreateFileA shape
+        // below reaches open with GENERIC_WRITE flags and no O_CREAT, so new
+        // files fail with ENOENT and the bytes are lost silent (EBADF). The
+        // WINDOWS block below is byte-identical to before.
+        if (this.isLinuxTarget()) {
+            this.genLinuxWriteBytesFile(pathOff, bufOff, sizeOff);
+            return;
+        }
+
         this.asm.emitCallSetup(24);
         this.asm.movRI64(0, 2);
         this.asm.movMBaseR(4, 0, 32);
@@ -15221,6 +15231,45 @@ public void genNewCall(Node call) {
         this.asm.movRMBase(0, 0, 0);
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
+    }
+
+    // LINUX SysV backend (additive): open/write/close tail for writeBytes
+    // (writeFile/writeString route through genWriteBytesCall too). bufOff
+    // holds the compacted bytes (int[]) or the literal chars (string),
+    // sizeOff their count. Mirrors silverc-rs gen_write_bytes_linux and the
+    // genLinuxEprintCall write shape (SysV regs + addImportPatchDirect).
+    public void genLinuxWriteBytesFile(int pathOff, int bufOff, int sizeOff) {
+        int hfileOff = this.allocLocal("__wb_hfile");
+        int writtenOff = this.allocLocal("__wb_written");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, writtenOff);
+        this.asm.movRMBase(7, 5, pathOff);
+        this.asm.movRI64(6, 0x241);
+        this.asm.movRI64(2, 0x1A4);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "open");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movMBaseR(5, 0, hfileOff);
+        this.asm.movRMBase(7, 5, hfileOff);
+        this.asm.movRMBase(6, 5, bufOff);
+        this.asm.movRMBase(2, 5, sizeOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "write");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movMBaseR(5, 0, writtenOff);
+        this.asm.movRMBase(7, 5, hfileOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "close");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
     }
 }
 
