@@ -2,6 +2,9 @@
 import * from win32.ws2_32;
 import { memcpy } from win32.msvcrt;
 #off
+#on LINUX
+import * from linux.libc;
+#off
 
 mod export net;
 
@@ -46,6 +49,26 @@ mod export net;
 // 2147483647`) guards the inet_addr result: self-host zero-extends, rs
 // sign-extends.
 //
+// LINUX BACKEND (Phase B): POSIX sockets from linux.libc, mirroring the
+// `#on WINDOWS` bodies statement-for-statement. The OS shape is
+// near-identical: socket/connect/bind/listen/accept/send/recv map 1:1,
+// SOCKET_ERROR is -1 on both (no zero-extend divergence on Linux -- the
+// normalization lines are kept verbatim anyway), and sockaddr_in packs
+// exactly like the header's int[2] layout. Deliberate divergences:
+// - No WSAStartup anywhere (no-op on Linux; the calls simply vanish).
+// - closesocket -> close (one close(2) for sockets and files alike).
+// - inet_addr -> parseDotted (pure-Silver dotted-quad parse below; same
+//   network-order u32 contract, -1 on malformed input).
+// - setRecvTimeoutRaw speaks Linux sockopt: SOL_SOCKET = 1 (not 0xFFFF),
+//   SO_RCVTIMEO = 21 (not 0x1006), and the value is a struct timeval
+//   {sec, usec} (16 bytes = int[2]) instead of a millisecond DWORD.
+// - getaddrinfo/freeaddrinfo keep their shape, with one layout fix:
+//   Windows ADDRINFOA keeps the 32-bit field order (ai_canonname at 24,
+//   ai_addr at 32 = node slot 4), while Linux struct addrinfo packs the
+//   pointers in declaration order (ai_addr at 24 = node slot 3,
+//   ai_canonname at 32, ai_next at 40 = node slot 5 on both). The Linux
+//   walk therefore reads saPtr from nodeBuf[3] (not [4]); the IPv4 word
+//   inside the sockaddr is at sa slot 0 high half on both.
 // BEHAVIOR NOTES: tls_client's connect() opens a plain TCP socket and
 // stores it as the context (EncryptMessage/DecryptMessage are
 // unimplemented in every compiler; setCA/setCert store their paths).
@@ -61,10 +84,16 @@ class socket {
         #on WINDOWS
         sendRaw(this.fd, data);
         #off
+        #on LINUX
+        sendRaw(this.fd, data);
+        #off
     }
 
     public string receive(int maxLen) {
         #on WINDOWS
+        return recvRaw(this.fd, maxLen);
+        #off
+        #on LINUX
         return recvRaw(this.fd, maxLen);
         #off
         return "";
@@ -72,6 +101,9 @@ class socket {
 
     public void close() {
         #on WINDOWS
+        closeRaw(this.fd);
+        #off
+        #on LINUX
         closeRaw(this.fd);
         #off
     }
@@ -92,11 +124,19 @@ class listener {
         if (client < 0) { return null; }
         return new socket(client);
         #off
+        #on LINUX
+        int client = acceptRaw(this.fd);
+        if (client < 0) { return null; }
+        return new socket(client);
+        #off
         return null;
     }
 
     public void close() {
         #on WINDOWS
+        closeRaw(this.fd);
+        #off
+        #on LINUX
         closeRaw(this.fd);
         #off
     }
@@ -129,11 +169,20 @@ class tls_client {
         this.context = sock;
         return true;
         #off
+        #on LINUX
+        int sock = connectRaw(this.host, this.port);
+        if (sock < 0) { return false; }
+        this.context = sock;
+        return true;
+        #off
         return false;
     }
 
     public void send(string data) {
         #on WINDOWS
+        sendRaw(this.context, data);
+        #off
+        #on LINUX
         sendRaw(this.context, data);
         #off
     }
@@ -142,11 +191,17 @@ class tls_client {
         #on WINDOWS
         return recvRaw(this.context, 8192);
         #off
+        #on LINUX
+        return recvRaw(this.context, 8192);
+        #off
         return "";
     }
 
     public void close() {
         #on WINDOWS
+        closeRaw(this.context);
+        #off
+        #on LINUX
         closeRaw(this.context);
         #off
     }
@@ -160,6 +215,11 @@ public socket connect(string host, int port) {
     if (sock < 0) { return null; }
     return new socket(sock);
     #off
+    #on LINUX
+    int sock = connectRaw(host, port);
+    if (sock < 0) { return null; }
+    return new socket(sock);
+    #off
     return null;
 }
 
@@ -167,6 +227,11 @@ public socket connect(string host, int port) {
 // listener object (null on failure).
 public listener listen(int port) {
     #on WINDOWS
+    int sock = listenRaw(port);
+    if (sock < 0) { return null; }
+    return new listener(sock);
+    #off
+    #on LINUX
     int sock = listenRaw(port);
     if (sock < 0) { return null; }
     return new listener(sock);
@@ -184,6 +249,9 @@ public listener listen(int port) {
 // descriptor, or -1 on failure.
 public int connectRaw(string host, int port) {
     #on WINDOWS
+    return openTcp(host, port);
+    #off
+    #on LINUX
     return openTcp(host, port);
     #off
     return -1;
@@ -209,6 +277,21 @@ public int bindRaw(int port) {
     }
     return sock;
     #off
+    #on LINUX
+    int sock = socket(2, 1, 0);
+    if (sock < 0) { return -1; }
+    int pHi = (port >> 8) & 0xFF;
+    int pLo = port & 0xFF;
+    int[] sa = new int[2];
+    sa[0] = 2 | (pHi << 16) | (pLo << 24);
+    sa[1] = 0;
+    int b = bind(sock, sa, 16);
+    if (b < 0 || b > 2147483647) {
+        close(sock);
+        return -1;
+    }
+    return sock;
+    #off
     return -1;
 }
 
@@ -216,6 +299,9 @@ public int bindRaw(int port) {
 // Returns the raw listening descriptor, or -1 on failure.
 public int listenRaw(int port) {
     #on WINDOWS
+    return bindListen(port);
+    #off
+    #on LINUX
     return bindListen(port);
     #off
     return -1;
@@ -229,6 +315,11 @@ public int acceptRaw(int fd) {
     if (client > 2147483647) { client = client - 4294967296; }
     return client;
     #off
+    #on LINUX
+    int client = accept(fd, null, null);
+    if (client > 2147483647) { client = client - 4294967296; }
+    return client;
+    #off
     return -1;
 }
 
@@ -236,6 +327,17 @@ public int acceptRaw(int fd) {
 // qword buffer; byte[] must not cross a DLL boundary). No-op on len <= 0.
 public void sendRaw(int fd, string data) {
     #on WINDOWS
+    int len = data.length;
+    if (len <= 0) { return; }
+    int slots = (len + 7) / 8;
+    int[] packedBuf = new int[slots];
+    for (int i = 0; i < len; i++) {
+        int b = int(data[i]);
+        packedBuf[i / 8] = packedBuf[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
+    }
+    send(fd, packedBuf, len, 0);
+    #off
+    #on LINUX
     int len = data.length;
     if (len <= 0) { return; }
     int slots = (len + 7) / 8;
@@ -266,6 +368,17 @@ public void sendBytesRaw(int fd, byte[] data) {
     }
     send(fd, packedBuf, len, 0);
     #off
+    #on LINUX
+    int len = data.length;
+    if (len <= 0) { return; }
+    int slots = (len + 7) / 8;
+    int[] packedBuf = new int[slots];
+    for (int i = 0; i < len; i++) {
+        int b = data[i] & 0xFF;
+        packedBuf[i / 8] = packedBuf[i / 8] | (b << ((i % 8) * 8));
+    }
+    send(fd, packedBuf, len, 0);
+    #off
 }
 
 // Length-capped variant of sendRaw: sends the first `len` bytes of `data`
@@ -275,6 +388,17 @@ public void sendBytesRaw(int fd, byte[] data) {
 // CRLF).
 public void sendRawLen(int fd, string data, int len) {
     #on WINDOWS
+    if (len <= 0) { return; }
+    if (len > data.length) { len = data.length; }
+    int slots = (len + 7) / 8;
+    int[] packedBuf = new int[slots];
+    for (int i = 0; i < len; i++) {
+        int b = int(data[i]);
+        packedBuf[i / 8] = packedBuf[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
+    }
+    send(fd, packedBuf, len, 0);
+    #off
+    #on LINUX
     if (len <= 0) { return; }
     if (len > data.length) { len = data.length; }
     int slots = (len + 7) / 8;
@@ -305,6 +429,21 @@ public string recvRaw(int fd, int maxLen) {
     }
     return result;
     #off
+    #on LINUX
+    if (maxLen <= 0) { return ""; }
+    int slots = (maxLen + 7) / 8;
+    int[] buf = new int[slots];
+    int n = recv(fd, buf, maxLen, 0);
+    if (n > 2147483647) { n = n - 4294967296; }
+    if (n <= 0) { return ""; }
+    string result = "";
+    for (int i = 0; i < n; i++) {
+        int b = (buf[i / 8] >> ((i % 8) * 8)) & 0xFF;
+        char c = char(b);
+        result += c.toString();
+    }
+    return result;
+    #off
     return "";
 }
 
@@ -312,6 +451,9 @@ public string recvRaw(int fd, int maxLen) {
 public void closeRaw(int fd) {
     #on WINDOWS
     closesocket(fd);
+    #off
+    #on LINUX
+    close(fd);
     #off
 }
 
@@ -327,6 +469,12 @@ public void setRecvTimeoutRaw(int fd, int ms) {
     int[] opt = new int[1];
     opt[0] = ms;
     setsockopt(fd, 0xFFFF, 0x1006, opt, 4);
+    #off
+    #on LINUX
+    int[] opt = new int[2];
+    opt[0] = ms / 1000;
+    opt[1] = (ms % 1000) * 1000;
+    setsockopt(fd, 1, 21, opt, 16);
     #off
 }
 
@@ -360,6 +508,23 @@ int openTcp(string host, int port) {
     }
     return sock;
     #off
+    #on LINUX
+    int sock = socket(2, 1, 0);
+    if (sock < 0) { return -1; }
+    int ip = parseDotted(host);
+    if (ip < 0) { close(sock); return -1; }
+    int pHi = (port >> 8) & 0xFF;
+    int pLo = port & 0xFF;
+    int[] sa = new int[2];
+    sa[0] = 2 | (pHi << 16) | (pLo << 24) | ((ip & 0xFFFFFFFF) << 32);
+    sa[1] = 0;
+    int c = connect(sock, sa, 16);
+    if (c < 0 || c > 2147483647) {
+        close(sock);
+        return -1;
+    }
+    return sock;
+    #off
     return -1;
 }
 
@@ -384,6 +549,26 @@ int bindListen(int port) {
     int l = listen(sock, 10);
     if (l < 0 || l > 2147483647) {
         closesocket(sock);
+        return -1;
+    }
+    return sock;
+    #off
+    #on LINUX
+    int sock = socket(2, 1, 0);
+    if (sock < 0) { return -1; }
+    int pHi = (port >> 8) & 0xFF;
+    int pLo = port & 0xFF;
+    int[] sa = new int[2];
+    sa[0] = 2 | (pHi << 16) | (pLo << 24);
+    sa[1] = 0;
+    int b = bind(sock, sa, 16);
+    if (b < 0 || b > 2147483647) {
+        close(sock);
+        return -1;
+    }
+    int l = listen(sock, 10);
+    if (l < 0 || l > 2147483647) {
+        close(sock);
         return -1;
     }
     return sock;
@@ -441,6 +626,63 @@ public string[] lookup(string host, int family = 2) {
     freeaddrinfo(res[0]);
     return addresses;
     #off
+    #on LINUX
+    int[] hints = new int[6];
+    hints[0] = family << 32;
+    hints[1] = 1;
+    int[] res = new int[1];
+    int ret = getaddrinfo(host, null, hints, res);
+    if (ret != 0) { string[] empty = []; return empty; }
+    string[] addresses = [];
+    int node = res[0];
+    while (node != 0) {
+        int[] nodeBuf = new int[6];
+        memcpy(nodeBuf, node, 48);
+        int saPtr = nodeBuf[3];
+        int next = nodeBuf[5];
+        if (saPtr != 0) {
+            int[] sa = new int[2];
+            memcpy(sa, saPtr, 16);
+            int ip = (sa[0] >> 32) & 0xFFFFFFFF;
+            string ipStr = ((ip >> 0) & 0xFF) + "." + ((ip >> 8) & 0xFF) + "." + ((ip >> 16) & 0xFF) + "." + ((ip >> 24) & 0xFF);
+            addresses.push(ipStr);
+        }
+        node = next;
+    }
+    freeaddrinfo(res[0]);
+    return addresses;
+    #off
     string[] empty = [];
     return empty;
+}
+
+// Pure-Silver dotted-quad parse ("a.b.c.d" -> network-order u32, the
+// inet_addr contract: the first octet lands in the LOWEST byte, so the
+// << 32 pack drops the wire order straight into the sockaddr; -1 on
+// malformed input). Ungated: no OS code.
+int parseDotted(string host) {
+    int ip = 0;
+    int mult = 1;
+    int start = 0;
+    for (int part = 0; part < 4; part++) {
+        string tail = host.substr(start, host.length() - start);
+        int rel = tail.indexOf(".");
+        int end = host.length();
+        if (rel >= 0) { end = start + rel; }
+        if (part == 3 && rel >= 0) { return -1; }
+        if (part < 3 && rel < 0) { return -1; }
+        string piece = host.substr(start, end - start);
+        if (piece.length() == 0) { return -1; }
+        int v = 0;
+        for (int i = 0; i < piece.length(); i++) {
+            char c = piece[i];
+            if (c < '0' || c > '9') { return -1; }
+            v = v * 10 + (int(c) - 48);
+        }
+        if (v > 255) { return -1; }
+        ip = ip + v * mult;
+        mult = mult * 256;
+        start = end + 1;
+    }
+    return ip;
 }
