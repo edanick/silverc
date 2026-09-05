@@ -1757,6 +1757,9 @@ int strIdx = this.stringPatchIndices[i];
                 // no-op source-module marker). Registered, not treated as an
                 // enum.
                 this.registerWin32Import(pi);
+                // LINUX SysV backend (additive): linux imports resolve beside
+                // win32 ones (registrars self-filter by source namespace).
+                this.registerLinuxImport(pi);
                 // Source-module imports are
                 // remembered so dotted-new `new mod.Class(...)` resolves
                 // through the module's flattened namespace. Native win32
@@ -1832,13 +1835,26 @@ int strIdx = this.stringPatchIndices[i];
         this.globalInits.add(excMissing2);
         #off
         #on LINUX
-        // Linux slot: register the exception-state slots (or the backend's
-        // equivalent) here. NOTE: the woven core's throw/catch emitters
-        // (emitThrowException / emitExcCheck / kind-68 throw / kind-59
-        // try-catch / the unhandled-in-main check) resolve these slots via
-        // findGlobal("__exc_active"/"__exc_value"), so the Linux backend must
-        // keep two same-named slots unless it rewrites the whole exception
-        // protocol. The model itself (label-dispatch, no SEH) is portable.
+        // Linux backend: the same two exception-state slots (the cooperative
+        // label-dispatch model is OS-independent; the woven throw/catch
+        // emitters resolve these names via findGlobal). Plus
+        // __linux_stack_top: the entry stub captures the _start RSP here so
+        // genCargsCall rebuilds argc/argv from it. Same shapes as WINDOWS.
+        this.globalNames.add("__exc_active");
+        this.globalTypes.add("int");
+        this.globalOffsets.add(this.globalOffsets.length * 8);
+        Node excMissing1 = new Node(); excMissing1.kind = 255;
+        this.globalInits.add(excMissing1);
+        this.globalNames.add("__exc_value");
+        this.globalTypes.add("int");
+        this.globalOffsets.add(this.globalOffsets.length * 8);
+        Node excMissing2 = new Node(); excMissing2.kind = 255;
+        this.globalInits.add(excMissing2);
+        this.globalNames.add("__linux_stack_top");
+        this.globalTypes.add("int");
+        this.globalOffsets.add(this.globalOffsets.length * 8);
+        Node stkMissing = new Node(); stkMissing.kind = 255;
+        this.globalInits.add(stkMissing);
         #off
         if (this.globalNames.length > 0) {
             this.globalAreaSize = this.globalNames.length * 8;
@@ -1988,9 +2004,17 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.emitCallTeardown();
             #off
             #on LINUX
-            // Linux slot: emit the exit-with-status-0 entry here (the
-            // backend's exit thunk/syscall; keep the mainLabelOffset
-            // assignment above so the driver's entry plumbing stays intact).
+            // Linux backend: exit(0) through libc. RDI is the first SysV
+            // argument register; Direct (no shuffle: RDI preset here).
+            // mainLabelOffset stays assigned above so driver entry plumbing
+            // is intact.
+            this.asm.xorRR64(7, 7);
+            this.addImportPatchDirect("libc.so.6", "exit");
+            this.asm.emitImm64(0, 0);
+            this.asm.movRMBase(0, 0, 0);
+            this.emitAbiCallSetup(0);
+            this.asm.callR64(0);
+            this.emitAbiCallTeardown();
             #off
         }
         // OVERHAUL.md --runtime: append the embedded allocator + GC entry
@@ -2219,13 +2243,159 @@ int strIdx = this.stringPatchIndices[i];
     }
     #off
     #on LINUX
-    // Linux slots (mirroring the `#on WINDOWS` block that ended above, same
-    // surfaces): emitRtStateAddr, emitRuntimeFunctions, emitRuntimeEntryStub,
-    // patchRuntimeRefs — an mmap-based heap instead of VirtualAlloc +
-    // HeapAlloc, an ELF-layout state patcher instead of the PE one, and the
-    // trampoline exiting through the backend's exit thunk. Body-level wraps
-    // mean a Linux build of THIS compiler compiles these as no-op methods
-    // until the backend fills them — signatures stay universal on purpose.
+    // Linux backend (mirroring the `#on WINDOWS` block that ended above,
+    // same surfaces): emitRtStateAddr, emitRuntimeFunctions,
+    // emitRuntimeEntryStub — an mmap-based heap instead of VirtualAlloc +
+    // HeapAlloc, and the trampoline exiting through libc exit.
+    // Emit `movabs reg, <runtime state>` and remember the immediate's patch
+    // position; the driver fills in the state block's ELF address after the
+    // layout is known (patchRuntimeRefs LINUX slot below).
+    public void emitRtStateAddr(int reg) {
+        this.rtStatePatchOffsets.add(this.asm.buf.length + 2);
+        this.asm.emitImm64(reg, 0);
+    }
+
+    public void emitRuntimeFunctions() {
+        // ---- __silver_rt_init ------------------------------------------
+        // mmap(NULL, RT_HEAP_RESERVE, PROT_READ|PROT_WRITE,
+        //      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); on success records
+        // base/offset in the writable state block (MAP_FAILED/-1 leaves the
+        // state zeroed so allocation falls back to malloc for the run).
+        // Mirrors silverc-rs runtime.rs emit_runtime_functions mmap branch.
+        this.rtRegisterFunc("__silver_rt_init");
+        this.rtInitOffset = this.asm.buf.length;
+        int okLbl = this.newLabel();
+        this.emitAbiCallSetup(0);
+        this.asm.xorRR64(7, 7);
+        this.asm.movRI64(6, 16777216);
+        this.asm.movRI64(2, 3);
+        this.asm.movRI64(1, 34);
+        this.asm.movRI64(8, -1);
+        this.asm.xorRR64(9, 9);
+        this.addImportPatchDirect("libc.so.6", "mmap");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.cmpRI32(0, -1);
+        this.asm.jeLabel(okLbl);
+        this.emitRtStateAddr(10);
+        this.asm.movMBaseR(10, 0, 0);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(10, 0, 8);
+        this.asm.bindLabel(okLbl);
+        this.asm.ret();
+
+        // ---- __silver_rt_alloc(size in R8) -----------------------------
+        // Same entry shape as the Windows path (size in R8) so no call site
+        // changes. Bump-allocates from the mmap region; falls back to libc
+        // malloc + memset zeroing when uninitialized or exhausted (Direct
+        // imports, never the redirect slot, so the fallback cannot recurse
+        // into __silver_rt_alloc itself).
+        this.rtRegisterFunc("__silver_rt_alloc");
+        this.rtAllocOffset = this.asm.buf.length;
+        int fbLbl = this.newLabel();
+        int doneLbl = this.newLabel();
+        this.emitRtStateAddr(10);
+        this.asm.movRMBase(0, 10, 0);
+        this.asm.orRR64(0, 0);
+        this.asm.jeLabel(fbLbl);
+        this.asm.movRR64(9, 8);
+        this.asm.addRI32(9, 15);
+        this.asm.andRImm(9, -16);
+        this.asm.movRMBase(11, 10, 8);
+        this.asm.movRR64(2, 11);
+        this.asm.addRR64(2, 9);
+        this.asm.cmpRI32(2, 16777216);
+        this.asm.jgLabel(fbLbl);
+        this.asm.movMBaseR(10, 2, 8);
+        this.asm.addRR64(0, 11);
+        this.asm.jmpLabel(doneLbl);
+        this.asm.bindLabel(fbLbl);
+        this.asm.pushR64(8);
+        this.asm.movRR64(7, 8);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "malloc");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        int fokLbl = this.newLabel();
+        int fdoneLbl = this.newLabel();
+        this.asm.orRR64(0, 0);
+        this.asm.jneLabel(fokLbl);
+        this.asm.popR64(1);
+        this.asm.jmpLabel(fdoneLbl);
+        this.asm.bindLabel(fokLbl);
+        this.asm.movRR64(7, 0);
+        this.asm.xorRR64(6, 6);
+        this.asm.popR64(2);
+        this.asm.pushR64(7);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "memset");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.popR64(0);
+        this.asm.bindLabel(fdoneLbl);
+        this.asm.bindLabel(doneLbl);
+        this.asm.ret();
+
+        // ---- __silver_rt_gc_collect ------------------------------------
+        // Scaffolding stub: advances the cycle counter (same as WINDOWS;
+        // exact mark-sweep needs tagged values in native codegen).
+        this.rtRegisterFunc("__silver_rt_gc_collect");
+        this.rtGcOffset = this.asm.buf.length;
+        this.emitRtStateAddr(10);
+        this.asm.movRMBase(0, 10, 16);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(10, 0, 16);
+        this.asm.ret();
+    }
+
+    public void emitRuntimeEntryStub() {
+        // The trampoline that becomes the ELF entry point in --runtime mode:
+        // capture the _start stack, bring up the mmap heap, run global
+        // initializers, call main, and exit with its status through libc.
+        // The driver prefers runtimeEntryOffset whenever it is set.
+        this.runtimeEntryOffset = this.asm.buf.length;
+        this.emitLinuxStackCapture();
+        this.emitAbiCallSetup(0);
+        this.asm.callRel32(0);
+        this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallFuncIdxs.add(-1);
+        this.forwardCallNames.add("__silver_rt_init");
+        this.forwardCallClasses.add("");
+        this.emitAbiCallTeardown();
+        if (this.globalNames.length > 0) {
+            this.emitAbiCallSetup(0);
+            this.asm.callRel32(0);
+            this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallFuncIdxs.add(-1);
+            this.forwardCallNames.add("__init_globals");
+            this.forwardCallClasses.add("");
+            this.emitAbiCallTeardown();
+        }
+        if (this.hasMain) {
+            this.emitAbiCallSetup(0);
+            this.asm.callRel32(0);
+            this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallFuncIdxs.add(-1);
+            this.forwardCallNames.add("main");
+            this.forwardCallClasses.add("");
+            this.emitAbiCallTeardown();
+            this.asm.movRR64(7, 0);
+        } else {
+            this.asm.xorRR64(7, 7);
+        }
+        this.addImportPatchDirect("libc.so.6", "exit");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.emitAbiCallSetup(0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+    }
     #off
 
     // WINDOWS-TARGET: reserves the runtime state block in the PE .rdata
@@ -2281,9 +2451,55 @@ int strIdx = this.stringPatchIndices[i];
     }
     #off
     #on LINUX
-    // Linux slots: appendRuntimeData reserves the runtime state block +
-    // HeapAlloc-redirect slot in the ELF data stream; patchRuntimeRefs is the
-    // ELF-layout patcher (state-block address, alloc address, redirect slot).
+    // Linux backend: same reservation (heap base + bump offset + gc cycles,
+    // then the malloc-redirect slot holding __silver_rt_alloc's address).
+    // The driver calls this right after getStringData(); mini_pe LINUX
+    // build() copies the extended stringData into the ELF data segment.
+    public void appendRuntimeData() {
+        if (!this.runtimeMode) { return; }
+        this.rtStateDataOff = this.stringData.length;
+        for (int i = 0; i < 24; i++) { this.stringData.add(0); }
+        this.rtPtrSlotDataOff = this.stringData.length;
+        for (int i = 0; i < 8; i++) { this.stringData.add(0); }
+    }
+
+    // Patch the embedded-runtime references once the layout is known: the
+    // state-block address into every movabs site, __silver_rt_alloc's
+    // address into the pointer slot, and the slot address over every
+    // recorded malloc reference (emitLinuxHeapAllocFromR8). Runs after
+    // patchImportRefs so the redirect wins. ELF layout (0x400000 base).
+    public void patchRuntimeRefs(int[] code, int stringsStart, int rdataRva) {
+        if (!this.runtimeMode) { return; }
+        int dataBase = this.elfDataVaddr();
+        int64 stateAddr = dataBase + stringsStart + this.rtStateDataOff;
+        for (int i = 0; i < this.rtStatePatchOffsets.length; i++) {
+            int pos = this.rtStatePatchOffsets[i];
+            code[pos] = stateAddr & 0xFF;
+            code[pos + 1] = (stateAddr >> 8) & 0xFF;
+            code[pos + 2] = (stateAddr >> 16) & 0xFF;
+            code[pos + 3] = (stateAddr >> 24) & 0xFF;
+            code[pos + 4] = (stateAddr >> 32) & 0xFF;
+            code[pos + 5] = (stateAddr >> 40) & 0xFF;
+            code[pos + 6] = (stateAddr >> 48) & 0xFF;
+            code[pos + 7] = (stateAddr >> 56) & 0xFF;
+        }
+        int64 allocAddr = this.elfCodeVaddr() + this.rtAllocOffset;
+        for (int b = 0; b < 8; b++) {
+            this.stringData[this.rtPtrSlotDataOff + b] = (allocAddr >> (b * 8)) & 0xFF;
+        }
+        int64 slotAddr = dataBase + stringsStart + this.rtPtrSlotDataOff;
+        for (int p = 0; p < this.heapAllocPatchPos.length; p++) {
+            int pos = this.heapAllocPatchPos[p];
+            code[pos] = slotAddr & 0xFF;
+            code[pos + 1] = (slotAddr >> 8) & 0xFF;
+            code[pos + 2] = (slotAddr >> 16) & 0xFF;
+            code[pos + 3] = (slotAddr >> 24) & 0xFF;
+            code[pos + 4] = (slotAddr >> 32) & 0xFF;
+            code[pos + 5] = (slotAddr >> 40) & 0xFF;
+            code[pos + 6] = (slotAddr >> 48) & 0xFF;
+            code[pos + 7] = (slotAddr >> 56) & 0xFF;
+        }
+    }
     #off
 
     public void emitGlobalInitStub() {
@@ -2331,6 +2547,14 @@ int strIdx = this.stringPatchIndices[i];
 
         this.entryOffset = this.asm.buf.length;
 
+        // LINUX SysV backend (additive): capture the _start stack pointer
+        // into __linux_stack_top before any push (entry runs with the kernel
+        // RSP: [RSP]=argc, [RSP+8]=argv[0], ...). genCargsCall rebuilds
+        // argc/argv from it. Skipped on WINDOWS (targetOs is "").
+        if (this.isLinuxTarget()) {
+            this.emitLinuxStackCapture();
+        }
+
         // __init_globals();
         this.asm.emitCallSetup(0);
         this.asm.callRel32(0);
@@ -2368,9 +2592,31 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.emitCallTeardown();
         #off
         #on LINUX
-        // Linux slot: the backend's exit thunk here (RAX already holds
-        // main's status / 0 from the branches above).
+        // Linux backend: exit(main's status) through libc. The branches
+        // above staged the status in RCX (the shared Win64-shaped path);
+        // move it to RDI and call the mapped exit import (Direct: no
+        // shuffle, args already SysV).
+        this.asm.movRR64(7, 1);
+        this.addImportPatchDirect("libc.so.6", "exit");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.emitAbiCallSetup(0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
         #off
+    }
+
+    // LINUX SysV backend (additive): save the entry RSP into the
+    // __linux_stack_top global slot (see genProgram). Runs first in the
+    // Linux entry stub while RSP is still the kernel _start stack.
+    public void emitLinuxStackCapture() {
+        int stIdx = this.findGlobal("__linux_stack_top");
+        this.asm.movRR64(0, 4);
+        int sp = this.asm.buf.length;
+        this.asm.emitImm64(1, 0);
+        this.globalPatchOffsets.add(sp + 2);
+        this.globalPatchIndices.add(stIdx);
+        this.asm.movMBaseR(1, 0, 0);
     }
 
     public void patchForwardCalls(int[] code) {
@@ -2695,14 +2941,27 @@ int strIdx = this.stringPatchIndices[i];
         }
         this.asm.movRR64(4, 5);
         if (this.currentIsMain) {
-            this.asm.movRR64(1, 0);
-            this.addImportPatch("kernel32.dll", "ExitProcess");
-            int sExit = 0xDEADBEEFCAFEBABE;
-            this.asm.emitImm64(0, sExit);
-            this.asm.movRMBase(0, 0, 0);
-            this.asm.emitCallSetup(0);
-            this.asm.callR64(0);
-            this.asm.emitCallTeardown();
+            // LINUX SysV backend (additive): exit(RAX) through libc instead
+            // of kernel32 ExitProcess. The WINDOWS sequence below is
+            // byte-identical to before.
+            if (this.isLinuxTarget()) {
+                this.asm.movRR64(7, 0);
+                this.addImportPatchDirect("libc.so.6", "exit");
+                this.asm.emitImm64(0, 0);
+                this.asm.movRMBase(0, 0, 0);
+                this.emitAbiCallSetup(0);
+                this.asm.callR64(0);
+                this.emitAbiCallTeardown();
+            } else {
+                this.asm.movRR64(1, 0);
+                this.addImportPatch("kernel32.dll", "ExitProcess");
+                int sExit = 0xDEADBEEFCAFEBABE;
+                this.asm.emitImm64(0, sExit);
+                this.asm.movRMBase(0, 0, 0);
+                this.asm.emitCallSetup(0);
+                this.asm.callR64(0);
+                this.asm.emitCallTeardown();
+            }
         } else {
             this.asm.popR64(5);
             this.asm.ret();
@@ -7696,10 +7955,18 @@ public void genNewCall(Node call) {
     }
     #off
     #on LINUX
-    // Linux slot: the PE VERSIONINFO bridge (GetFileVersionInfoSizeA /
-    // GetFileVersionInfoA / VerQueryValueA over version.dll). Implement
-    // binary_metadata against the ELF story (.note sections, linker
-    // metadata, or the project manifest baked into a data section).
+    // Linux backend: no VERSIONINFO bridge (PE-only resource). Status
+    // reports 0 (absent) and field yields the empty string, so metadata
+    // queries degrade exactly like a version-less PE on WINDOWS. A future
+    // ELF story (.note sections or the baked manifest) keeps these
+    // signatures.
+    public void genBinaryMetadataStatus(Node call) {
+        this.asm.xorRR64(0, 0);
+    }
+
+    public void genBinaryMetadataField(Node call) {
+        this.emitLlmaiEmptyString();
+    }
     #off
 
     // True when a bare call to `name`
@@ -8112,7 +8379,13 @@ public void genNewCall(Node call) {
         // the compile-time constant OSTypes.WINDOWS (0) on this Windows-only
         // backend.
         if (this.strEq(name, "osType")) {
-            this.asm.xorRR64(0, 0);
+            // LINUX SysV backend (additive): OSTypes.LINUX (1) on the Linux
+            // target; OSTypes.WINDOWS (0) otherwise (unchanged).
+            if (this.isLinuxTarget()) {
+                this.asm.movRI64(0, 1);
+            } else {
+                this.asm.xorRR64(0, 0);
+            }
             this.asm.emitCallTeardown();
             return;
         }
