@@ -40,6 +40,16 @@ class Parser {
     private bool win32AllModules;
     private string[] win32OpenModules;
     private string[] win32GrantNames;
+    // linux grants recorded from import statements (LINUX.md Phase B): a
+    // full open (`import * from linux;`), opened module names
+    // (`linux.libc`, `linux.x11`, `linux.xtst`), and individually granted
+    // export names. Mirrors the win32 trio above; used by the same
+    // unknown-method walk so free libc/X11 calls are never flagged. Like
+    // win32, `linux.libc` is the public systems surface while the other
+    // linux.* modules stay std-internal (enforced by visibility.sr).
+    private bool linuxAllModules;
+    private string[] linuxOpenModules;
+    private string[] linuxGrantNames;
     // `mod export NAME;` declarations and inline `mod NAME { ... }` blocks:
     // names plus their `internal` flag (DOCS/258). The flattened program
     // drops these containers, so the visibility pass reads them from here.
@@ -78,6 +88,9 @@ class Parser {
         this.win32AllModules = false;
         this.win32OpenModules = [];
         this.win32GrantNames = [];
+        this.linuxAllModules = false;
+        this.linuxOpenModules = [];
+        this.linuxGrantNames = [];
         this.modExportNames = [];
         this.modExportInternal = [];
         this.classSectionInternal = false;
@@ -635,6 +648,7 @@ class Parser {
             if (this.strEq(this.modExportNames[m], name)) { return true; }
         }
         if (this.win32Resolvable(name)) { return true; }
+        if (this.linuxResolvable(name)) { return true; }
         if (name.length > 0) {
             bool allCaps = true;
             for (int c = 0; c < name.length; c++) {
@@ -660,6 +674,7 @@ class Parser {
         if (this.isDeclaredTypeName(name)) { return true; }
         if (this.isBuiltinCallableName(name)) { return true; }
         if (this.win32Resolvable(name)) { return true; }
+        if (this.linuxResolvable(name)) { return true; }
         // ALL-CAPS identifiers stay native-call placeholders.
         if (name.length > 0) {
             bool allCaps = true;
@@ -681,6 +696,48 @@ class Parser {
         for (int m = 0; m < this.win32OpenModules.length; m++) {
             string dll = this.win32ModuleNameDll(this.win32OpenModules[m]);
             if (dll.length > 0 && this.win32TableHas(dll, name)) { return true; }
+        }
+        return false;
+    }
+
+    // Mirror of win32Resolvable for the linux grant trio above: a full
+    // `linux` open, an opened `linux.<module>`, or a granted export name
+    // (aliases answer to their local name only) resolves a free libc/X11
+    // call. Used beside win32Resolvable in the same two call sites.
+    private bool linuxResolvable(string name) {
+        if (this.linuxAllModules) { return true; }
+        for (int g = 0; g < this.linuxGrantNames.length; g++) {
+            if (this.strEq(this.linuxGrantNames[g], name)) { return true; }
+        }
+        for (int m = 0; m < this.linuxOpenModules.length; m++) {
+            string lib = this.linuxModuleNameLib(this.linuxOpenModules[m]);
+            if (lib.length > 0 && this.linuxTableHas(lib, name)) { return true; }
+        }
+        return false;
+    }
+
+    private string linuxModuleNameLib(string module) {
+        if (this.strEq(module, "libc")) { return "libc.so.6"; }
+        if (this.strEq(module, "x11")) { return "libX11.so.6"; }
+        if (this.strEq(module, "xtst")) { return "libXtst.so.6"; }
+        return "";
+    }
+
+    private string linuxLibExportTable(string lib) {
+        if (this.strEq(lib, "libc.so.6")) { return "exit mmap munmap malloc free read write open close lseek stat unlink rename mkdir rmdir opendir readdir closedir getenv setenv clock_gettime nanosleep localtime_r gmtime_r fork execve waitpid kill pipe dup2 _exit execvpe getpid pthread_create pthread_join sysconf uname gethostname getlogin_r statvfs getrandom rand srand getuid printf strlen strcmp strcpy memcpy memset socket connect bind listen accept send recv setsockopt getaddrinfo freeaddrinfo"; }
+        if (this.strEq(lib, "libX11.so.6")) { return "XOpenDisplay XCloseDisplay XQueryPointer XWarpPointer XFlush XCreateSimpleWindow XMapWindow XUnmapWindow XDestroyWindow XStoreName XDefaultRootWindow XScreenCount XDisplayWidth XDisplayHeight XStringToKeysym XKeysymToKeycode XQueryKeymap"; }
+        if (this.strEq(lib, "libXtst.so.6")) { return "XTestFakeButtonEvent XTestFakeKeyEvent XTestFakeMotionEvent XTestQueryExtension"; }
+        return "";
+    }
+
+    private bool linuxTableHas(string lib, string fn) {
+        string table = this.linuxLibExportTable(lib);
+        int i = 0;
+        while (i < table.length) {
+            while (i < table.length && table[i] == ' ') { i++; }
+            int start = i;
+            while (i < table.length && table[i] != ' ') { i++; }
+            if (i > start && this.strEq(fn, this.sliceStr(table, start, i))) { return true; }
         }
         return false;
     }
@@ -1296,16 +1353,20 @@ class Parser {
             }
             node.typeHint = src;
         }
-        // `X as Y` import aliasing. An alias binds a DLL export under a
+        // `X as Y` import aliasing. An alias binds a DLL/lib export under a
         // different local call name, which only carries meaning on win32
-        // imports; on a Silver-module import it would silently rebind the
-        // module's own symbols, so reject it.
-        if (this.importHasAlias(node) && !this.importSourceIsWin32(node.typeHint)) {
-            this.recordError("aliased import names (X as Y) are only allowed on win32 imports, at line " + node.line.toString() + ", column " + node.col.toString());
+        // and linux imports (fs.sr's `rename as renameFile` dodges the
+        // module's own rename/2); on a Silver-module import it would
+        // silently rebind the module's own symbols, so reject it.
+        if (this.importHasAlias(node) && !this.importSourceIsWin32(node.typeHint) && !this.importSourceIsLinux(node.typeHint)) {
+            this.recordError("aliased import names (X as Y) are only allowed on win32/linux imports, at line " + node.line.toString() + ", column " + node.col.toString());
         }
         // Remember win32 grants for the post-parse unknown-method walk
         // (DOCS/213): free Win32 calls resolve only through these imports.
         this.recordWin32ImportGrant(node);
+        // Remember linux grants beside them (LINUX.md Phase B): free libc
+        // calls resolve only through linux imports.
+        this.recordLinuxImportGrant(node);
         this.expectSemi();
         return node;
     }
@@ -1335,6 +1396,12 @@ class Parser {
     private bool importSourceIsWin32(string src) {
         if (this.strEq(src, "win32")) { return true; }
         if (src.length > 6 && this.strEq(this.sliceStr(src, 0, 6), "win32.")) { return true; }
+        return false;
+    }
+
+    private bool importSourceIsLinux(string src) {
+        if (this.strEq(src, "linux")) { return true; }
+        if (src.length > 6 && this.strEq(this.sliceStr(src, 0, 6), "linux.")) { return true; }
         return false;
     }
 
@@ -1368,6 +1435,34 @@ class Parser {
             this.win32GrantNames.add(this.importLocalName(node));
             for (int j2 = 0; j2 < node.childCount(); j2++) {
                 this.win32GrantNames.add(this.importLocalName(node.child(j2)));
+            }
+        }
+    }
+
+    // Mirror of recordWin32ImportGrant for `linux` / `linux.<module>`
+    // imports (LINUX.md Phase B): `import * from linux;` opens every known
+    // lib, `import <mod> from linux;` / `import * from linux.<mod>;` open
+    // one, and braced names grant single exports (aliases answer to their
+    // local name only, same as win32).
+    private void recordLinuxImportGrant(Node node) {
+        string src = node.typeHint;
+        if (this.strEq(src, "linux")) {
+            if (node.isStatic) { this.linuxAllModules = true; return; }
+            this.linuxOpenModules.add(node.name);
+            for (int j = 0; j < node.childCount(); j++) {
+                this.linuxOpenModules.add(node.child(j).name);
+            }
+            return;
+        }
+        if (src.length > 6 && this.strEq(this.sliceStr(src, 0, 6), "linux.")) {
+            string module = this.sliceStr(src, 6, src.length);
+            if (node.isStatic) {
+                this.linuxOpenModules.add(module);
+                return;
+            }
+            this.linuxGrantNames.add(this.importLocalName(node));
+            for (int j2 = 0; j2 < node.childCount(); j2++) {
+                this.linuxGrantNames.add(this.importLocalName(node.child(j2)));
             }
         }
     }
