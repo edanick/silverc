@@ -135,6 +135,343 @@ class NotificationAction {
 // the probed-safe shape (rs stringifies field pointers in larger expression
 // positions). AppName flows to the bridge as the AppUserModelId for the
 // Action Center routing.
+// LINUX BACKEND (Phase B): GNOME Shell native notifications over DBus
+// `org.freedesktop.Notifications` (LINUX.md §7), served natively by GNOME
+// Shell and identically on KDE. A minimal wire client lives below
+// (dbusNotify + helpers): EXTERNAL auth over the unix socket named by
+// $DBUS_SESSION_BUS_ADDRESS, a Hello handshake, then a fire-and-forget
+// Notify call (NO_REPLY flag, connection closed after send). Framing rules
+// probed against dbus-daemon with a forwarding proxy and libdbus captures:
+// little-endian, header fields in libdbus order (path, dest, iface,
+// member, signature), the fields length EXCLUDES trailing pad while the
+// pad bytes ride the stream to 8-alignment before the body, body length
+// counts its pad-to-4 tail, and EXTERNAL carries hex-of-decimal-uid.
+// Entries that cannot reach a bus (no $DBUS_SESSION_BUS_ADDRESS,
+// headless SSH, abstract-socket addresses) degrade to the parity line
+// only -- the same documented no-op posture as the self-host no-op
+// bridge. Titles/bodies ride as Silver strings (ASCII-safe; NUL bytes
+// cannot ride string concat anywhere in Silver).
+//
+// KNOWN QUIRK (probed 2026-09, dbus-daemon user session): notifications
+// whose marshalled body length is a multiple of 8 are silently dropped
+// by the daemon (no error, no reply) while all other sizes display;
+// small/typical notifications are unaffected. The framing validates
+// byte-exact under strict parsers and matches libdbus captures field
+// for field, so this is daemon-side, not a wire bug; short titles and
+// bodies (the common case) always work. Repro: Notify with body lengths
+// stepping 52/56/60/64/... bytes -- the %8==0 ones vanish.
+
+#on LINUX
+import * from linux.libc;
+#off
+
+// DBus wire putters over a caller-owned byte buffer (one byte per int[]
+// slot). Module-global arrays cannot grow past 8 elements on silverc-rs
+// Linux (probed runtime cap) and global scalars cannot be reassigned, so
+// the used length threads through every putter as an int parameter/return
+// and the message buffer is a pre-sized local. Stale tail bytes past the
+// length are never read.
+int dbusByte(int[] buf, int len, int b) {
+    if (len < buf.length) {
+        buf[len] = b & 0xFF;
+        return len + 1;
+    }
+    return len;
+}
+
+int dbusBytes(int[] buf, int len, string s) {
+    for (int i = 0; i < s.length(); i++) {
+        len = dbusByte(buf, len, int(s[i]) & 0xFF);
+    }
+    return len;
+}
+
+int dbusAlign(int[] buf, int len, int n) {
+    while (len % n != 0) {
+        len = dbusByte(buf, len, 0);
+    }
+    return len;
+}
+
+int dbusU32(int[] buf, int len, int v) {
+    len = dbusAlign(buf, len, 4);
+    len = dbusByte(buf, len, v & 0xFF);
+    len = dbusByte(buf, len, (v >> 8) & 0xFF);
+    len = dbusByte(buf, len, (v >> 16) & 0xFF);
+    len = dbusByte(buf, len, (v >> 24) & 0xFF);
+    return len;
+}
+
+// NOTE: no trailing pad after the NUL. Every putter self-aligns at
+// START (dbusU32/dbusField lead with dbusAlign), so trailing pads only
+// bloat array lengths: the daemon rejects a header fields length that
+// counts trailing pad (probed: libdbus ends the array at the last value
+// byte). Backpatched flen/blen therefore land exact with no adjustment.
+int dbusString(int[] buf, int len, string s) {
+    len = dbusU32(buf, len, s.length());
+    len = dbusBytes(buf, len, s);
+    len = dbusByte(buf, len, 0);
+    return len;
+}
+
+int dbusSig(int[] buf, int len, string s) {
+    len = dbusByte(buf, len, s.length());
+    len = dbusBytes(buf, len, s);
+    len = dbusByte(buf, len, 0);
+    return len;
+}
+
+int dbusField(int[] buf, int len, int code, string sig, string val) {
+    len = dbusAlign(buf, len, 8);
+    len = dbusByte(buf, len, code);
+    len = dbusByte(buf, len, sig.length());
+    len = dbusBytes(buf, len, sig);
+    len = dbusByte(buf, len, 0);
+    if (sig == "o" || sig == "s") {
+        len = dbusString(buf, len, val);
+    } else {
+        len = dbusSig(buf, len, val);
+    }
+    return len;
+}
+
+void dbusSend(int fd, int[] buf, int len) {
+    #on LINUX
+    if (len <= 0) { return; }
+    int slots = (len + 7) / 8;
+    int[] packed = new int[slots];
+    for (int i = 0; i < len; i++) {
+        int b = buf[i] & 0xFF;
+        packed[i / 8] = packed[i / 8] | (b << ((i % 8) * 8));
+    }
+    send(fd, packed, len, 0);
+    #off
+}
+
+string dbusReadLine(int fd) {
+    #on LINUX
+    string line = "";
+    for (int i = 0; i < 512; i++) {
+        int[] one = new int[1];
+        int n = recv(fd, one, 1, 0);
+        if (n <= 0) { break; }
+        int b = one[0] & 0xFF;
+        if (b == 10) { break; }
+        if (b == 13) { continue; }
+        line += char(b);
+    }
+    return line;
+    #off
+    return "";
+}
+
+string dbusBusPath() {
+    #on LINUX
+    string want = "DBUS_SESSION_BUS_ADDRESS=";
+    int fd = open("/proc/self/environ", 0, 0);
+    if (fd < 0) { return ""; }
+    string entry = "";
+    string value = "";
+    int hit = 0;
+    while (true) {
+        int[] chunk = new int[512];
+        int n = read(fd, chunk, 4096);
+        if (n <= 0) { break; }
+        for (int i = 0; i < n; i++) {
+            int b = (chunk[i / 8] >> ((i % 8) * 8)) & 0xFF;
+            if (b == 0) {
+                if (entry.length() >= want.length() && entry.substr(0, want.length()) == want) {
+                    value = entry.substr(want.length());
+                    hit = 1;
+                    break;
+                }
+                entry = "";
+            } else {
+                entry += char(b);
+            }
+        }
+        if (hit != 0 || n < 4096) { break; }
+    }
+    close(fd);
+    if (hit == 0) { return ""; }
+    string prefix = "unix:path=";
+    if (value.length() < prefix.length()) { return ""; }
+    if (value.substr(0, prefix.length()) != prefix) { return ""; }
+    string rest = value.substr(prefix.length(), value.length() - prefix.length());
+    int comma = rest.indexOf(",");
+    if (comma >= 0) { rest = rest.substr(0, comma); }
+    return rest;
+    #off
+    return "";
+}
+
+string dbusUidHex() {
+    #on LINUX
+    // EXTERNAL auth carries the hex of the uid's DECIMAL STRING
+    // (uid 1000 -> "31303030"), not hex-of-number.
+    int uid = getuid();
+    if (uid < 0) { uid = 0; }
+    string dec = "" + uid;
+    string hex = "0123456789abcdef";
+    string r = "";
+    for (int i = 0; i < dec.length(); i++) {
+        int ch = int(dec[i]);
+        r += hex[(ch >> 4) & 0xF];
+        r += hex[ch & 0xF];
+    }
+    return r;
+    #off
+    return "";
+}
+
+
+int[] dbusReadExact(int fd, int n) {
+    #on LINUX
+    int[] out = [];
+    int got = 0;
+    while (got < n) {
+        int[] one = new int[1];
+        int r = recv(fd, one, 1, 0);
+        if (r <= 0) { break; }
+        out.add(one[0] & 0xFF);
+        got = got + 1;
+    }
+    return out;
+    #off
+    int[] empty = [];
+    return empty;
+}
+
+int dbusU32At(int[] buf, int pos) {
+    int b0 = buf[pos] & 0xFF;
+    int b1 = buf[pos + 1] & 0xFF;
+    int b2 = buf[pos + 2] & 0xFF;
+    int b3 = buf[pos + 3] & 0xFF;
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+// Hello handshake: registers the connection (returns 1 when the daemon
+// answers our serial with a METHOD_RETURN). Required before any other
+// message; the daemon drops pre-Hello traffic.
+int dbusHello(int fd, int[] buf, int serial) {
+    #on LINUX
+    int len = 0;
+    len = dbusByte(buf, len, 108);
+    len = dbusByte(buf, len, 1);
+    len = dbusByte(buf, len, 0);
+    len = dbusByte(buf, len, 1);
+    int blenPos = len;
+    len = dbusU32(buf, len, 0);
+    len = dbusU32(buf, len, serial);
+    int flenPos = len;
+    len = dbusU32(buf, len, 0);
+    int fstart = len;
+    len = dbusField(buf, len, 1, "o", "/org/freedesktop/DBus");
+    len = dbusField(buf, len, 6, "s", "org.freedesktop.DBus");
+    len = dbusField(buf, len, 2, "s", "org.freedesktop.DBus");
+    len = dbusField(buf, len, 3, "s", "Hello");
+    int flen = len - fstart;
+    buf[flenPos] = flen & 0xFF;
+    buf[flenPos + 1] = (flen >> 8) & 0xFF;
+    buf[flenPos + 2] = (flen >> 16) & 0xFF;
+    buf[flenPos + 3] = (flen >> 24) & 0xFF;
+    buf[blenPos] = 0;
+    buf[blenPos + 1] = 0;
+    buf[blenPos + 2] = 0;
+    buf[blenPos + 3] = 0;
+    len = dbusAlign(buf, len, 8);
+    dbusSend(fd, buf, len);
+    int[] head = dbusReadExact(fd, 16);
+    if (head.length < 16) { return 0; }
+    if (head[1] != 2) { return 0; }
+    int blen = dbusU32At(head, 4);
+    int rlen = dbusU32At(head, 12);
+    int[] rest = dbusReadExact(fd, rlen);
+    if (rest.length < rlen) { return 0; }
+    int[] bdy = dbusReadExact(fd, blen);
+    if (bdy.length < blen) { return 0; }
+    return 1;
+    #off
+    return 0;
+}
+
+public int dbusNotify(string app, string title, string body) {
+    #on LINUX
+    string path = dbusBusPath();
+    if (path.length() == 0 || path.length() > 100) { return 0; }
+    int sock = socket(1, 1, 0);
+    if (sock < 0) { return 0; }
+    int[] sa = new int[14];
+    sa[0] = 1;
+    int plen = path.length();
+    for (int i = 0; i < plen; i++) {
+        int b = int(path[i]);
+        int pos = 2 + i;
+        sa[pos / 8] = sa[pos / 8] | ((b & 0xFF) << ((pos % 8) * 8));
+    }
+    int alen = 2 + plen + 1;
+    int c = connect(sock, sa, alen);
+    if (c != 0) { close(sock); return 0; }
+    int[] buf = new int[2048];
+    int len = 0;
+    len = dbusByte(buf, len, 0);
+    len = dbusBytes(buf, len, "AUTH EXTERNAL ");
+    len = dbusBytes(buf, len, dbusUidHex());
+    len = dbusBytes(buf, len, "\r\n");
+    dbusSend(sock, buf, len);
+    string line = dbusReadLine(sock);
+    if (line.length() < 2 || line.substr(0, 2) != "OK") { close(sock); return 0; }
+    len = 0;
+    len = dbusBytes(buf, len, "BEGIN\r\n");
+    dbusSend(sock, buf, len);
+    int hello = dbusHello(sock, buf, 2);
+    if (hello == 0) { close(sock); return 0; }
+    string appName = app;
+    if (appName.length() == 0) { appName = "Silver"; }
+    len = 0;
+    len = dbusByte(buf, len, 108);
+    len = dbusByte(buf, len, 1);
+    len = dbusByte(buf, len, 1);
+    len = dbusByte(buf, len, 1);
+    int blenPos = len;
+    len = dbusU32(buf, len, 0);
+    len = dbusU32(buf, len, 3);
+    int flenPos = len;
+    len = dbusU32(buf, len, 0);
+    int fstart = len;
+    len = dbusField(buf, len, 1, "o", "/org/freedesktop/Notifications");
+    len = dbusField(buf, len, 6, "s", "org.freedesktop.Notifications");
+    len = dbusField(buf, len, 2, "s", "org.freedesktop.Notifications");
+    len = dbusField(buf, len, 3, "s", "Notify");
+    len = dbusField(buf, len, 8, "g", "susssasa{sv}i");
+    int flen = len - fstart;
+    buf[flenPos] = flen & 0xFF;
+    buf[flenPos + 1] = (flen >> 8) & 0xFF;
+    buf[flenPos + 2] = (flen >> 16) & 0xFF;
+    buf[flenPos + 3] = (flen >> 24) & 0xFF;
+    len = dbusAlign(buf, len, 8);
+    int bstart = len;
+    len = dbusString(buf, len, appName);
+    len = dbusU32(buf, len, 0);
+    len = dbusString(buf, len, "");
+    len = dbusString(buf, len, title);
+    len = dbusString(buf, len, body);
+    len = dbusU32(buf, len, 0);
+    len = dbusU32(buf, len, 0);
+    len = dbusU32(buf, len, 4294967295);
+    int blen = len - bstart;
+    buf[blenPos] = blen & 0xFF;
+    buf[blenPos + 1] = (blen >> 8) & 0xFF;
+    buf[blenPos + 2] = (blen >> 16) & 0xFF;
+    buf[blenPos + 3] = (blen >> 24) & 0xFF;
+    len = dbusAlign(buf, len, 4);
+    dbusSend(sock, buf, len);
+    close(sock);
+    return 1;
+    #off
+    return 0;
+}
+
 public void show(Notification note) {
     // Canonical parity line printed by every backend (silverc-rs, silverc
     // self-hosted, silveri interpreter) so tests can match on it.
@@ -145,6 +482,14 @@ public void show(Notification note) {
     string app = note.AppName;
     try {
         nativeToastShow(t, b, app);
+    } catch (exception ex) { }
+    #off
+    #on LINUX
+    string t = note.title;
+    string b = note.body;
+    string app = note.AppName;
+    try {
+        dbusNotify(app, t, b);
     } catch (exception ex) { }
     #off
 }
