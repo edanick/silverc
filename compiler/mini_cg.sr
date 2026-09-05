@@ -1480,6 +1480,28 @@ class MiniCg {
     }
 
     public void patchGlobalRefs(int[] code, int globalsStart, int rdataRva) {
+        // LINUX SysV backend (additive): globals live in the ELF RW data
+        // segment right after stringData (mini_pe LINUX build() zero-pads
+        // dataLen = stringData + globalAreaSize), so the address is
+        // elfDataVaddr() + globalsStart + globalOffsets[gi]. The WINDOWS
+        // loop below is byte-identical to before.
+        if (this.isLinuxTarget()) {
+            int dataBase = this.elfDataVaddr();
+            for (int i = 0; i < this.globalPatchOffsets.length; i++) {
+                int patchPos = this.globalPatchOffsets[i];
+                int gi = this.globalPatchIndices[i];
+                int64 addr = dataBase + globalsStart + this.globalOffsets[gi];
+                code[patchPos] = addr & 0xFF;
+                code[patchPos + 1] = (addr >> 8) & 0xFF;
+                code[patchPos + 2] = (addr >> 16) & 0xFF;
+                code[patchPos + 3] = (addr >> 24) & 0xFF;
+                code[patchPos + 4] = (addr >> 32) & 0xFF;
+                code[patchPos + 5] = (addr >> 40) & 0xFF;
+                code[patchPos + 6] = (addr >> 48) & 0xFF;
+                code[patchPos + 7] = (addr >> 56) & 0xFF;
+            }
+            return;
+        }
         for (int i = 0; i < this.globalPatchOffsets.length; i++) {
             int patchPos = this.globalPatchOffsets[i];
             int gi = this.globalPatchIndices[i];
@@ -1524,6 +1546,12 @@ class MiniCg {
     }
 
     public int[] computeIatAddresses(int[] layout) {
+        // LINUX SysV backend (additive): on the Linux target the returned
+        // vector holds absolute ELF GOT slot addresses (flat import order)
+        // instead of PE IAT RVAs. The PE arithmetic below is untouched.
+        if (this.isLinuxTarget()) {
+            return this.computeGotAddresses();
+        }
         int stringsStart = layout[0];
         int numGroups = layout[1];
         int iltTotal = layout[2];
@@ -1578,6 +1606,48 @@ class MiniCg {
         return iatAddrs;
     }
 
+    // LINUX SysV backend (additive): ELF code-segment base. Mirrors
+    // compiler/mini_pe.sr LINUX build() (BASE + TEXT_RVA): emitted code
+    // runs at rxVaddr, so code offset N addresses 0x401000 + N. Pure
+    // layout math, shared by every Linux patch pass.
+    public int elfCodeVaddr() {
+        return 0x400000 + 0x1000;
+    }
+
+    // LINUX SysV backend (additive): ELF RW data-segment base (strings +
+    // globals + runtime state). Mirrors mini_pe LINUX build(): the RX code
+    // segment is page-padded, data follows it page-aligned. Call only after
+    // the final code length is known (same point computeIatAddresses runs).
+    public int elfDataVaddr() {
+        int codeLen = this.asm.buf.length;
+        int PAGE = 0x1000;
+        int rxFilesz = codeLen;
+        int m = rxFilesz % PAGE;
+        if (m != 0) { rxFilesz = rxFilesz + (PAGE - m); }
+        return 0x400000 + 0x1000 + rxFilesz;
+    }
+
+    // LINUX SysV backend (additive): absolute GOT slot addresses in flat
+    // import order (rwVaddr + 24 + i*8: 3 reserved header zeros, then one
+    // slot per import). Mirrors mini_pe LINUX build() and the silverc-rs
+    // elf::plan().got_addrs vector. NOTE (R-overflow guard): imports are
+    // deduped by findImport, so the slot count stays bounded by the distinct
+    // libc symbols (~dozens); the R tables then always fit their page and
+    // the fixed rxOff = PAGE layout shared with mini_pe stays valid.
+    public int[] computeGotAddresses() {
+        int[] gotAddrs = [];
+        int dataLen = this.stringData.length + this.globalAreaSize;
+        int PAGE = 0x1000;
+        int dataFilesz = dataLen;
+        int m = dataFilesz % PAGE;
+        if (m != 0) { dataFilesz = dataFilesz + (PAGE - m); }
+        int rwVaddr = this.elfDataVaddr() + dataFilesz;
+        for (int i = 0; i < this.importDlls.length; i++) {
+            gotAddrs.add(rwVaddr + 24 + i * 8);
+        }
+        return gotAddrs;
+    }
+
     public void patchImportRefs(int[] code, int[] iatAddrs, int rdataRva) {
         // WINDOWS-TARGET: rewrites every import call site to the absolute
         // PE IAT slot address (0x140000000 + rdataRva + iatOff). The Linux
@@ -1599,12 +1669,52 @@ class MiniCg {
         }
         #off
         #on LINUX
-        // Linux slot: patch import call sites against the ELF relocation
-        // model (GOT offsets / PLT thunks) instead of absolute PE IAT VAs.
+        // Linux backend: patch import call sites against the ELF GOT model
+        // (PLT-less direct-GOT calls: movabs rax,<got>; mov rax,[rax];
+        // call rax). computeIatAddresses carries absolute GOT addresses in
+        // iatAddrs on this target (mirror of the silverc-rs sentinel->GOT
+        // loop with the 0x400000 base), so the loop stores them directly
+        // instead of adding the 0x140000000 PE image base.
+        for (int i = 0; i < this.importPatchOffsets.length; i++) {
+            int patchPos = this.importPatchOffsets[i];
+            int funcIdx = this.importPatchFuncIndices[i];
+            int64 addr = iatAddrs[funcIdx];
+            code[patchPos] = addr & 0xFF;
+            code[patchPos + 1] = (addr >> 8) & 0xFF;
+            code[patchPos + 2] = (addr >> 16) & 0xFF;
+            code[patchPos + 3] = (addr >> 24) & 0xFF;
+            code[patchPos + 4] = (addr >> 32) & 0xFF;
+            code[patchPos + 5] = (addr >> 40) & 0xFF;
+            code[patchPos + 6] = (addr >> 48) & 0xFF;
+            code[patchPos + 7] = (addr >> 56) & 0xFF;
+        }
         #off
     }
 
     public void patchStringRefs(int[] code, int stringsStart, int rdataRva) {
+        // LINUX SysV backend (additive): strings live in the ELF RW data
+        // segment at elfDataVaddr() + stringsStart + dataOff (mini_pe LINUX
+        // build() copies stringData to dataOff). The WINDOWS loop below is
+        // byte-identical to before.
+        if (this.isLinuxTarget()) {
+            int dataBase = this.elfDataVaddr();
+            for (int i = 0; i < this.stringPatchOffsets.length; i++) {
+                int patchPos = this.stringPatchOffsets[i];
+                int strIdx = this.stringPatchIndices[i];
+                StrEntry se = this.strings[strIdx];
+                int dataOff = se.dataOffset;
+                int64 addr = dataBase + stringsStart + dataOff;
+                code[patchPos] = addr & 0xFF;
+                code[patchPos + 1] = (addr >> 8) & 0xFF;
+                code[patchPos + 2] = (addr >> 16) & 0xFF;
+                code[patchPos + 3] = (addr >> 24) & 0xFF;
+                code[patchPos + 4] = (addr >> 32) & 0xFF;
+                code[patchPos + 5] = (addr >> 40) & 0xFF;
+                code[patchPos + 6] = (addr >> 48) & 0xFF;
+                code[patchPos + 7] = (addr >> 56) & 0xFF;
+            }
+            return;
+        }
         for (int i = 0; i < this.stringPatchOffsets.length; i++) {
             int patchPos = this.stringPatchOffsets[i];
 int strIdx = this.stringPatchIndices[i];
