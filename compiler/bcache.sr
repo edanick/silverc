@@ -9,10 +9,15 @@ import * from fs;
 import * from win32.kernel32;
 import * from win32.msvcrt;
 #off
+#on LINUX
+import * from linux.libc;
+#off
 
 // OVERHAUL.md --cache-bytecode — persistent bytecode cache.
 //
-// Cache layout under %APPDATA%\silver cache\<project>\:
+// Cache layout under %APPDATA%\silver cache\<project>\ on WINDOWS
+// (unchanged) or /var/cache/silver/<project>/ on LINUX (additive, same
+// .sbcr/.srbc formats, `/` separators):
 //
 //   project.sbcr            record file (one entry per .sr file, recursive)
 //   src/main.srbc           cached token stream mirroring the source tree
@@ -79,6 +84,13 @@ class CacheSession {
         this.createdStamp = 0;
         this.oldIndexText = "";
         this.dirtyCount = 0;
+        #on LINUX
+        this.dir = "/var/cache/silver/" + bcSanitize(projName);
+        ensureDirTree(this.dir);
+        this.loadRecords();
+        this.ok = true;
+        return;
+        #off
         string appdata = bcEnvValue("APPDATA");
         if (appdata.length == 0) { return; }
         this.dir = appdata + "\\silver cache\\" + bcSanitize(projName);
@@ -202,11 +214,19 @@ class CacheSession {
         if (this.eqStr(indexText, this.oldIndexText)) { return; }
 
         ensureDirTree(this.dir);
-        file.writeString(this.dir + "\\project.sbcri", indexText);
+        string sbcriOut = this.dir + "\\project.sbcri";
+        #on LINUX
+        sbcriOut = this.dir + "/project.sbcri";
+        #off
+        file.writeString(sbcriOut, indexText);
 
         // Reference-format binary record (little-endian, see module docs),
         // streamed in bounded chunks like the .srbc artifacts.
-        BcBinWriter bw = new BcBinWriter(this.dir + "\\project.sbcr");
+        string sbcrOut = this.dir + "\\project.sbcr";
+        #on LINUX
+        sbcrOut = this.dir + "/project.sbcr";
+        #off
+        BcBinWriter bw = new BcBinWriter(sbcrOut);
         if (bw.ok()) {
             bw.b8(83);
             bw.b8(66);
@@ -248,7 +268,11 @@ class CacheSession {
     // ------------------------------------------------------------------
 
     private void loadRecords() {
-        string text = tryReadText(this.dir + "\\project.sbcri");
+        string sbcriPath = this.dir + "\\project.sbcri";
+        #on LINUX
+        sbcriPath = this.dir + "/project.sbcri";
+        #off
+        string text = tryReadText(sbcriPath);
         if (text.length == 0) { return; }
         this.oldIndexText = text;
         int pos = 0;
@@ -319,6 +343,16 @@ class CacheSession {
     // ------------------------------------------------------------------
 
     private string srbcPathFor(string keyOrAbs) {
+        #on LINUX
+        string relL = this.relKey(keyOrAbs);
+        if (relL.length == 0) { return ""; }
+        string dottedL = relL;
+        if (dottedL.length >= 3 && dottedL[dottedL.length - 1] == 'r'
+            && dottedL[dottedL.length - 2] == 's' && dottedL[dottedL.length - 3] == '.') {
+            dottedL = sliceRange(dottedL, 0, dottedL.length - 3);
+        }
+        return this.dir + "/" + dottedL + ".srbc";
+        #off
         string rel = this.relKey(keyOrAbs);
         if (rel.length == 0) { return ""; }
         string dotted = rel;
@@ -753,16 +787,26 @@ public string bcEnvValue(string name) {
 // Epoch-millisecond wall stamp: time(0) is msvcrt's epoch-seconds clock.
 // std has no epoch-ms source (time.now() is the QPC boot counter;
 // datetime.unix() is whole seconds), so the raw call stays — region-wrapped
-// per UNIFIED_CORE_LIBRARY.md §2/§4 rule 6.
+// per UNIFIED_CORE_LIBRARY.md §2/§4 rule 6. LINUX branch uses clock_gettime
+// (CLOCK_REALTIME) via linux.libc, same ms shape.
 public int bcNowMillis() {
     #on WINDOWS
     return time(0) * 1000;
+    #off
+    #on LINUX
+    int[] ts = [];
+    for (int i = 0; i < 16; i++) { ts.add(0); }
+    clock_gettime(0, ts);
+    int secLow = ts[0] + ts[1] * 256 + ts[2] * 65536 + ts[3] * 16777216;
+    int nsecLow = ts[8] + ts[9] * 256 + ts[10] * 65536 + ts[11] * 16777216;
+    return secLow * 1000 + nsecLow / 1000000;
     #off
     return 0;
 }
 
 // File size via CreateFileA + GetFileSize (std fs has no size() yet —
-// reported gap), region-wrapped.
+// reported gap), region-wrapped. LINUX branch uses stat via linux.libc
+// (st_size at offset 48), same 0-on-failure shape.
 public int bcFileSize(string path) {
     #on WINDOWS
     int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
@@ -772,14 +816,33 @@ public int bcFileSize(string path) {
     if (sz < 0) { return 0; }
     return sz;
     #off
+    #on LINUX
+    int[] st = [];
+    for (int i = 0; i < 144; i++) { st.add(0); }
+    int rc = stat(path, st);
+    if (rc != 0) { return 0; }
+    int szL = st[48] + st[49] * 256 + st[50] * 65536 + st[51] * 16777216;
+    if (szL < 0) { return 0; }
+    return szL;
+    #off
     return 0;
 }
 
 // Modification-time proxy recorded in the .sbcr slot: the compiled runtime
 // has no cross-stage-safe way to read FILETIMEs, so the change token is the
 // file size. Content identity is always decided by the FNV-1 hash alongside
-// it, so cache hits remain correct.
+// it, so cache hits remain correct. LINUX branch reads the real mtime via
+// stat (st_mtim at offset 88) in the same ms shape.
 public int bcModifiedMs(string path) {
+    #on LINUX
+    int[] stm = [];
+    for (int i = 0; i < 144; i++) { stm.add(0); }
+    int rcm = stat(path, stm);
+    if (rcm != 0) { return 0; }
+    int secM = stm[88] + stm[89] * 256 + stm[90] * 65536 + stm[91] * 16777216;
+    int nsecM = stm[96] + stm[97] * 256 + stm[98] * 65536 + stm[99] * 16777216;
+    return secM * 1000 + nsecM / 1000000;
+    #off
     return bcFileSize(path);
 }
 
@@ -845,6 +908,10 @@ public string bcDirname(string path) {
 }
 
 public string resolveRel(string root, string rel) {
+    #on LINUX
+    if (root.length == 0 || root == ".") { return rel; }
+    return root + "/" + rel;
+    #off
     string winRel = bcReplaceAll(rel, "/", "\\");
     if (root.length == 0 || root == ".") { return winRel; }
     return root + "\\" + winRel;
@@ -855,6 +922,20 @@ public string resolveRel(string root, string rel) {
 // exists, matching the old direct CreateDirectoryA semantics. Inherited
 // drive-prefix components (e.g. "C:") skip creation exactly as before.
 public void ensureDirTree(string dir) {
+    #on LINUX
+    string curL = "";
+    for (int i = 0; i < dir.length; i++) {
+        char c = dir[i];
+        if (c == '\\' || c == '/') {
+            if (curL.length >= 2) { fs.createDir(curL); }
+            curL = curL + '/';
+        } else {
+            curL = curL + c;
+        }
+    }
+    if (curL.length >= 2) { fs.createDir(curL); }
+    return;
+    #off
     string cur = "";
     for (int i = 0; i < dir.length; i++) {
         char c = dir[i];
