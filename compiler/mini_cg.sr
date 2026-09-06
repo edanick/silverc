@@ -13456,6 +13456,12 @@ public void genNewCall(Node call) {
     }
 
     public void genGetEnvCall(Node call) {
+        // LINUX SysV backend (additive): getenv(name) via libc. The WINDOWS
+        // block below is byte-identical to before.
+        if (this.isLinuxTarget()) {
+            this.genLinuxGetEnvCall(call);
+            return;
+        }
         // The variable-name argument sits at child(1) for member calls
         // (`env.get(name)` where child(0) is the receiver) and at child(0) for
         // a global `getenv(name)` call.
@@ -13511,6 +13517,36 @@ public void genNewCall(Node call) {
         this.asm.emitCallTeardown();
 
         this.asm.movRMBase(0, 5, bufOff);
+        this.asm.jmpLabel(done);
+        this.asm.bindLabel(notFound);
+        this.emitLlmaiStringLiteral("");
+        this.asm.bindLabel(done);
+    }
+
+    // LINUX SysV backend (additive): getenv(name) via libc, mirroring
+    // silverc/std/env.sr's LINUX posture (overlay + /proc fallback live at
+    // Silver level; the native bridge only needs the direct pointer). A NULL
+    // return (unset) yields "", otherwise the libc pointer is returned
+    // directly (NUL-terminated, owned by libc, never freed). SysV regs +
+    // addImportPatchDirect + emitAbiCallSetup/teardown.
+    public void genLinuxGetEnvCall(Node call) {
+        int keyIdx = 0;
+        if (call.isMember) { keyIdx = 1; }
+        if (call.childCount() <= keyIdx) { this.emitLlmaiStringLiteral(""); return; }
+        this.genExpr(call.child(keyIdx));
+        int keyOff = this.allocLocal("__env_linux_key");
+        this.asm.movMBaseR(5, 0, keyOff);
+        this.asm.movRMBase(7, 5, keyOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "getenv");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        int notFound = this.newLabel();
+        int done = this.newLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(notFound);
         this.asm.jmpLabel(done);
         this.asm.bindLabel(notFound);
         this.emitLlmaiStringLiteral("");
