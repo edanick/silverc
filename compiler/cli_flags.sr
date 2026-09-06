@@ -28,8 +28,10 @@ class CliFlags {
     public prop int threadCount;
     // True when the user requested every system thread (--threads N == total).
     public prop bool warnAllThreads;
-    // Preprocessor target OS override (--os WINDOWS/LINUX/MAC, case-sensitive;
-    // "" = host-default via ppTargetOs, mirror silverc-rs TargetOs::DEFAULT).
+    // Preprocessor target OS override (--os windows/linux/mac, lowercase is
+    // the documented form; WINDOWS/LINUX/MAC and mixed-case also accepted and
+    // normalize to the canonical UPPERCASE name; "" = host-default via
+    // ppTargetOs, mirror silverc-rs TargetOs::DEFAULT).
     // Additive: not part of activeFlagNames, so forbidden_flags behavior is
     // unchanged; WINDOWS builds with no --os behave byte-identically.
     public prop string targetOs;
@@ -328,6 +330,21 @@ private bool cliEq(string a, string b) {
     return true;
 }
 
+// Case-insensitive ASCII equality for `--os` flag values only (additive).
+// Lowercase windows/linux/mac is the documented form; UPPERCASE and
+// mixed-case normalize to the canonical UPPERCASE name.
+private bool cliEqFold(string a, string b) {
+    if (a.length != b.length) { return false; }
+    for (int i = 0; i < a.length; i++) {
+        int ca = a[i];
+        int cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') { ca = ca + 32; }
+        if (cb >= 'A' && cb <= 'Z') { cb = cb + 32; }
+        if (ca != cb) { return false; }
+    }
+    return true;
+}
+
 // Parse raw args (excluding argv[0]) into validated CliFlags. Never null:
 // failures land in flags.error for the caller to print and abort on.
 public CliFlags parseCliArgs(string[] args) {
@@ -357,10 +374,14 @@ public CliFlags parseCliArgs(string[] args) {
             continue;
         }
         if (want == 4) {
-            if (cliEq(arg, "WINDOWS") || cliEq(arg, "LINUX") || cliEq(arg, "MAC")) {
-                o.targetOs = arg;
+            if (cliEqFold(arg, "WINDOWS")) {
+                o.targetOs = "WINDOWS";
+            } elif (cliEqFold(arg, "LINUX")) {
+                o.targetOs = "LINUX";
+            } elif (cliEqFold(arg, "MAC")) {
+                o.targetOs = "MAC";
             } else {
-                o.error = "Error: --os expects one of WINDOWS, LINUX, MAC (case-sensitive), got '" + arg + "'";
+                o.error = "Error: --os expects one of windows, linux, mac (WINDOWS, LINUX, MAC also accepted), got '" + arg + "'";
                 return o;
             }
             want = 0;
