@@ -1,5 +1,17 @@
 mod export memory;
 
+import * from sysinfo;
+
+#on WINDOWS
+import * from win32.kernel32;
+#off
+#on LINUX
+import * from linux.libc;
+#off
+#on LINUX
+import { rename as renameFile } from linux.libc;
+#off
+
 public const int SM_OK = 0;
 public const int SM_ERR_NULL = 1;
 public const int SM_ERR_MAGIC = 2;
@@ -240,4 +252,525 @@ public string smResultString(int result) {
     if (result == SM_ERR_NAME_HASH) { return "name hash mismatch"; }
     if (result == SM_ERR_CHECKSUM) { return "checksum mismatch"; }
     return "unknown Silver Memory error";
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid paging stage 1 (additive): accounting + budgets + pressure gates +
+// spill naming for large strings/byte buffers. The 96-byte header codec above
+// is untouched; this manager calls it (plus sysinfo for pressure and the
+// temp dir) instead of duplicating that logic.
+// Two-gate policy (see DOCS/GC hybrid paging design.md): a buffer stays
+// resident unless BOTH the Silver bump is near OOM (>= 90% of the process
+// budget) AND system pressure via /proc/meminfo MemAvailable is >= 90%
+// (sysinfo.memoryUsagePercent). Ordinary workloads below either gate never
+// create /tmp/*.sm files. Arrays/dicts/pin barriers are follow-up.
+// ---------------------------------------------------------------------------
+
+// Mirror of the --runtime heap reserve emitted by both compilers
+// (silverc-rs RT_HEAP_RESERVE, silverc mini_cg 16777216 literals).
+public const int SM_RT_HEAP_RESERVE = 16777216;
+// 90% of the reserve: 16777216 * 9 / 10 = 15099494 (near-OOM warning,
+// keeping a 10% margin for stacks/metadata/untracked natives).
+public const int SM_RT_NEAR_OOM = 15099494;
+public const int SM_RT_PRESSURE_PCT = 90;
+// Only buffers at least one chunk stay eligible (large strings/byte
+// buffers first; arrays/dicts follow once descriptors exist).
+public const int SM_PAGE_MIN = 65536;
+// Native state-block mirror (see silverc mini_cg LINUX appendRuntimeData):
+// +0 base, +8 bump, +16 gc cycles, +24 managed, +32 pressure probes,
+// +40 spills, +48 faults, +56 session. The Silver manager tracks its own
+// counters below; the offsets keep both layers in sync.
+public const int SM_STATE_SIZE = 64;
+public const int SM_STATE_MANAGED_OFF = 24;
+public const int SM_STATE_PRESSURE_OFF = 32;
+public const int SM_STATE_SPILL_OFF = 40;
+public const int SM_STATE_FAULT_OFF = 48;
+public const int SM_STATE_SESSION_OFF = 56;
+
+// Slot indices into smSt/smFl below.
+public const int SM_ST_MANAGED = 0;
+public const int SM_ST_RESIDENT = 1;
+public const int SM_ST_PAGEFILE = 2;
+public const int SM_ST_SPILLS = 3;
+public const int SM_ST_FAULTS = 4;
+public const int SM_ST_NEXT_PAGE = 5;
+public const int SM_ST_NEXT_OWNER = 6;
+public const int SM_ST_PROC_BUDGET = 7;
+public const int SM_ST_PAGE_BUDGET = 8;
+public const int SM_ST_NAME_HASH = 9;
+public const int SM_FL_LAST_ERR = 0;
+public const int SM_FL_SALTED = 1;
+
+// Mutable manager state: MemoryGuard rejects rebinding a module global
+// (`x = ...`), so counters live in slot arrays mutated by indexed store —
+// the overlay idiom from std/env.sr — and registries only grow (.add)
+// with "" tombstones standing in for removal.
+private int64[] smSt = [0, 0, 0, 0, 0, 1, 1, 16777216, 67108864, 0];
+private int[] smFl = [0, 0];
+private string[] smOwnedFinals = [];
+private string[] smOwnedTmps = [];
+
+// Public byte-slice CRC32C (the chunk/index path needs the byte form;
+// crc32cBytes itself stays private beside smCrc32c).
+public int smCrc32cBytes(byte[] data) {
+    return crc32cBytes(data);
+}
+
+// 16 lowercase hex digits, most significant nibble first.
+string smHex16(int64 v) {
+    string digits = "0123456789abcdef";
+    string r = "";
+    for (int i = 0; i < 16; i++) {
+        int shift = (15 - i) * 4;
+        int nib = int((v >> shift) & 15);
+        r = r + digits[nib];
+    }
+    return r;
+}
+
+bool smIsHex16(string s) {
+    if (s.length != 16) { return false; }
+    for (int i = 0; i < 16; i++) {
+        char c = s[i];
+        bool ok = false;
+        if (c >= '0' && c <= '9') { ok = true; }
+        if (c >= 'a' && c <= 'f') { ok = true; }
+        if (c >= 'A' && c <= 'F') { ok = true; }
+        if (!ok) { return false; }
+    }
+    return true;
+}
+
+int64 smParseHex16(string s) {
+    int64 v = 0;
+    for (int i = 0; i < s.length; i++) {
+        char c = s[i];
+        int d = 0;
+        if (c >= '0' && c <= '9') { d = int(c) - 48; }
+        if (c >= 'a' && c <= 'f') { d = int(c) - 87; }
+        if (c >= 'A' && c <= 'F') { d = int(c) - 55; }
+        v = v * 16 + (int64)d;
+    }
+    return v;
+}
+
+// Opaque per-runtime session token. The pid is only a salt input to the
+// hashed virtual path below, never a readable filename part or subdir.
+// Recomputed per call: caching it would need a global rebind.
+string smSession() {
+    return "sess-" + sysinfo.pid().toString();
+}
+
+// $TMPDIR or /tmp through sysinfo (which already encodes that fallback);
+// never duplicated here.
+string smTempDir() {
+    string t = sysinfo.tempDir();
+    if (t.length != 0) { return t; }
+    if (sysinfo.os() == "linux") { return "/tmp"; }
+    return ".";
+}
+
+string smJoinPath(string dir, string name) {
+    if (dir.length == 0) { return name; }
+    char last = dir[dir.length - 1];
+    if (last == '/' || last == '\\') { return dir + name; }
+    if (sysinfo.os() == "linux") { return dir + "/" + name; }
+    return dir + "\\" + name;
+}
+
+// Gate 1: system-wide pressure at/above 90% (MemAvailable-backed).
+public bool smSystemPressureHigh() {
+    return sysinfo.memoryUsagePercent() >= 90.0;
+}
+
+// Gate 2: Silver bump at/above 90% of the configured process budget.
+public bool smBumpNearOom(int64 bumpOffset, int64 rounded) {
+    int64 budget = smSt[SM_ST_PROC_BUDGET] * 9 / 10;
+    return bumpOffset + rounded >= budget;
+}
+
+// Both gates: the only state that may page.
+public bool smShouldSpill(int64 bumpOffset, int64 rounded) {
+    if (!smBumpNearOom(bumpOffset, rounded)) { return false; }
+    return smSystemPressureHigh();
+}
+
+public void smSetBudgets(int64 processBudget, int64 pageBudget) {
+    if (processBudget > 0) { smSt[SM_ST_PROC_BUDGET] = processBudget; }
+    if (pageBudget > 0) { smSt[SM_ST_PAGE_BUDGET] = pageBudget; }
+}
+
+public void smAccountAlloc(int64 bytes) {
+    smSt[SM_ST_MANAGED] = smSt[SM_ST_MANAGED] + bytes;
+    smSt[SM_ST_RESIDENT] = smSt[SM_ST_RESIDENT] + bytes;
+}
+
+public void smAccountFree(int64 bytes) {
+    smSt[SM_ST_MANAGED] = smSt[SM_ST_MANAGED] - bytes;
+    if (smSt[SM_ST_MANAGED] < 0) { smSt[SM_ST_MANAGED] = 0; }
+    smSt[SM_ST_RESIDENT] = smSt[SM_ST_RESIDENT] - bytes;
+    if (smSt[SM_ST_RESIDENT] < 0) { smSt[SM_ST_RESIDENT] = 0; }
+}
+
+public int smLastError() {
+    return smFl[SM_FL_LAST_ERR];
+}
+
+public int64 smSpills() {
+    return smSt[SM_ST_SPILLS];
+}
+
+public int64 smFaults() {
+    return smSt[SM_ST_FAULTS];
+}
+
+public int64 smManaged() {
+    return smSt[SM_ST_MANAGED];
+}
+
+// Flat spill name: <tempdir>/<fnv1-64-hex>.sm — no PID, no subdirs. The
+// hashed virtual path carries the opaque session salt (with getpid as its
+// only pid use), page/kind/owner/generation. On collision the salt grows
+// (SALTED_NAME) and the winner hash is kept in smSt[SM_ST_NAME_HASH].
+public string smSpillPath(int64 pageId, int64 ownerId, int64 generation, int kind) {
+    smFl[SM_FL_SALTED] = 0;
+    string virt = "silver-memory/" + smSession() + "/" + pageId.toString() + "/" + kind.toString() + "/" + ownerId.toString() + "/g/" + generation.toString();
+    int64 h = smFnv1_64(virt);
+    smSt[SM_ST_NAME_HASH] = h;
+    string path = smJoinPath(smTempDir(), smHex16(h) + ".sm");
+    if (!smFileExists(path)) { return path; }
+    for (int i = 1; i < 8; i++) {
+        string salted = virt + "/r" + i.toString();
+        int64 h2 = smFnv1_64(salted);
+        string p2 = smJoinPath(smTempDir(), smHex16(h2) + ".sm");
+        if (!smFileExists(p2)) {
+            smFl[SM_FL_SALTED] = 1;
+            smSt[SM_ST_NAME_HASH] = h2;
+            return p2;
+        }
+    }
+    return "";
+}
+
+// Raw binary file primitives for .sm spill I/O (mirroring std/fs.sr
+// statement-for-statement). The file.* builtins cannot serve here:
+// readString NUL-truncates, and there is no byte[] read builtin; the
+// fs.* Silver wrappers would push a linux.libc grant onto every downstream
+// program, while module-local imports keep this manager self-sufficient.
+bool smFileExists(string path) {
+    #on WINDOWS
+    return GetFileAttributesA(path) != -1;
+    #off
+    #on LINUX
+    int fd = open(path, 0, 0);
+    if (fd < 0) { return false; }
+    close(fd);
+    return true;
+    #off
+    return false;
+}
+
+void smFileDelete(string path) {
+    #on WINDOWS
+    DeleteFileA(path);
+    #off
+    #on LINUX
+    unlink(path);
+    #off
+}
+
+void smFileRename(string oldPath, string newPath) {
+    #on WINDOWS
+    MoveFileA(oldPath, newPath);
+    #off
+    #on LINUX
+    renameFile(oldPath, newPath);
+    #off
+}
+
+bool smFileWrite(string path, byte[] data) {
+    #on WINDOWS
+    int h = CreateFileA(path, 0x40000000, 0, null, 2, 0x80, 0);
+    if (h == -1) { return false; }
+    int wrote = 0;
+    WriteFile(h, data, data.length, &wrote, null);
+    CloseHandle(h);
+    return true;
+    #off
+    #on LINUX
+    int fd = open(path, 0x241, 0x1A4);
+    if (fd < 0) { return false; }
+    if (data.length > 0) {
+        int slots = (data.length + 7) / 8;
+        int[] packed = new int[slots];
+        for (int i = 0; i < data.length; i++) {
+            int b = data[i] & 0xFF;
+            packed[i / 8] = packed[i / 8] | (b << ((i % 8) * 8));
+        }
+        write(fd, packed, data.length);
+    }
+    close(fd);
+    return true;
+    #off
+    return false;
+}
+
+int64 smStatSize(string path) {
+    #on LINUX
+    int[] st = new int[18];
+    int rc = stat(path, st);
+    if (rc != 0) { return -1; }
+    return st[6];
+    #off
+    return -1;
+}
+
+byte[] smFileRead(string path) {
+    #on WINDOWS
+    int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
+    if (h == -1) { return []; }
+    int size = GetFileSize(h, null);
+    byte[] buf = new byte[size];
+    int got = 0;
+    ReadFile(h, buf, size, &got, null);
+    CloseHandle(h);
+    return buf;
+    #off
+    #on LINUX
+    int fd = open(path, 0, 0);
+    if (fd < 0) { return []; }
+    int64 size = smStatSize(path);
+    if (size <= 0) { close(fd); return []; }
+    int slots = int((size + 7) / 8);
+    int[] buf = new int[slots];
+    int n = read(fd, buf, int(size));
+    close(fd);
+    if (n < 0) { return []; }
+    byte[] out = new byte[n];
+    for (int i = 0; i < n; i++) {
+        out[i] = (buf[i / 8] >> ((i % 8) * 8)) & 0xFF;
+    }
+    return out;
+    #off
+    byte[] empty = [];
+    return empty;
+}
+
+// One 32-byte chunk-index record per chunk (see DOCS/GC hybrid paging
+// design.md): logical/file offsets, logical/stored lengths, CRC32C of the
+// stored bytes, LAST flag on the final record. Stored == logical
+// (codec none); payloads sit contiguous after header + index.
+byte[] smBuildIndex(SmHeader h, byte[] payload) {
+    int n = h.chunk_count;
+    byte[] idx = new byte[n * SM_INDEX_RECORD_SIZE];
+    for (int i = 0; i < n; i++) {
+        int64 lo = (int64)i * (int64)h.chunk_size;
+        int64 rem = h.logical_size - lo;
+        int wantLen = h.chunk_size;
+        if (rem < (int64)wantLen) { wantLen = int(rem); }
+        int64 fo = (int64)h.index_offset + h.index_size + lo;
+        byte[] chunk = new byte[wantLen];
+        for (int j = 0; j < wantLen; j++) { chunk[j] = payload[int(lo) + j]; }
+        int crc = crc32cBytes(chunk);
+        int flags = 0;
+        if (i == n - 1) { flags = 1; }
+        int base = i * SM_INDEX_RECORD_SIZE;
+        smPutU64(idx, base, lo);
+        smPutU64(idx, base + 8, fo);
+        smPutU32(idx, base + 16, wantLen);
+        smPutU32(idx, base + 20, wantLen);
+        smPutU32(idx, base + 24, crc);
+        smPutU32(idx, base + 28, flags);
+    }
+    return idx;
+}
+
+// Header + index + payload image. [] when the header is invalid.
+byte[] smBuildPageFile(SmHeader h, byte[] payload) {
+    byte[] header = smHeaderEncode(h);
+    if (header.length == 0) { return []; }
+    byte[] idx = smBuildIndex(h, payload);
+    if (idx.length != int(h.index_size)) { return []; }
+    int total = SM_HEADER_SIZE + idx.length + payload.length;
+    byte[] file = new byte[total];
+    for (int i = 0; i < SM_HEADER_SIZE; i++) { file[i] = header[i]; }
+    for (int i = 0; i < idx.length; i++) { file[SM_HEADER_SIZE + i] = idx[i]; }
+    for (int i = 0; i < payload.length; i++) { file[SM_HEADER_SIZE + idx.length + i] = payload[i]; }
+    return file;
+}
+
+void smUntrackTmp(string path) {
+    for (int i = 0; i < smOwnedTmps.length; i++) {
+        if (smOwnedTmps[i] == path) { smOwnedTmps[i] = ""; }
+    }
+}
+
+// Crash-safe page write without gates (isolation tests call this; gated
+// spillers must check smShouldSpill first): header -> index -> payload
+// image, write <hash>.sm.tmp, atomic rename to <hash>.sm, read back and
+// validate header/bounds/name/checksum before registering. "" on any
+// failure with smFl[SM_FL_LAST_ERR]or set; the .tmp is removed on failure paths.
+public string smWritePage(byte[] payload, int kind) {
+    smFl[SM_FL_LAST_ERR] = SM_OK;
+    smFl[SM_FL_SALTED] = 0;
+    if (kind != SM_KIND_STRING && kind != SM_KIND_BYTES) { smFl[SM_FL_LAST_ERR] = SM_ERR_KIND; return ""; }
+    if (payload.length == 0) { smFl[SM_FL_LAST_ERR] = SM_ERR_SIZE; return ""; }
+    int64 pageId = smSt[SM_ST_NEXT_PAGE];
+    smSt[SM_ST_NEXT_PAGE] = smSt[SM_ST_NEXT_PAGE] + 1;
+    int64 ownerId = smSt[SM_ST_NEXT_OWNER];
+    smSt[SM_ST_NEXT_OWNER] = smSt[SM_ST_NEXT_OWNER] + 1;
+    int64 generation = 1;
+    string path = smSpillPath(pageId, ownerId, generation, kind);
+    if (path.length == 0) { smFl[SM_FL_LAST_ERR] = SM_ERR_INDEX; return ""; }
+    SmHeader h = new SmHeader();
+    h.format_version = SM_FORMAT_VERSION;
+    h.header_size = SM_HEADER_SIZE;
+    h.flags = SM_FLAG_REQUIRED + SM_FLAG_DELETE_ON_EXIT;
+    if (smFl[SM_FL_SALTED] != 0) { h.flags = h.flags + SM_FLAG_SALTED_NAME; }
+    h.kind = kind;
+    h.codec = SM_CODEC_NONE;
+    h.page_id = pageId;
+    h.owner_id = ownerId;
+    h.generation = generation;
+    h.logical_size = (int64)payload.length;
+    h.payload_size = (int64)payload.length;
+    h.chunk_size = SM_DEFAULT_CHUNK_SIZE;
+    int count = (payload.length + SM_DEFAULT_CHUNK_SIZE - 1) / SM_DEFAULT_CHUNK_SIZE;
+    h.chunk_count = count;
+    h.index_offset = SM_INDEX_OFFSET_REQUIRED;
+    h.index_size = (int64)(count * SM_INDEX_RECORD_SIZE);
+    h.payload_checksum = smCrc32cBytes(payload);
+    h.name_hash = smSt[SM_ST_NAME_HASH];
+    byte[] fileBytes = smBuildPageFile(h, payload);
+    if (fileBytes.length == 0) { smFl[SM_FL_LAST_ERR] = SM_ERR_INDEX; return ""; }
+    if (smSt[SM_ST_PAGEFILE] + (int64)fileBytes.length > smSt[SM_ST_PAGE_BUDGET]) { smFl[SM_FL_LAST_ERR] = SM_ERR_SIZE; return ""; }
+    string tmp = path + ".tmp";
+    smOwnedTmps.add(tmp);
+    smFileWrite(tmp, fileBytes);
+    if (!smFileExists(tmp)) { smUntrackTmp(tmp); smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return ""; }
+    smFileRename(tmp, path);
+    smUntrackTmp(tmp);
+    if (!smFileExists(path)) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return ""; }
+    byte[] back = smFileRead(path);
+    if (back.length != fileBytes.length) { smFileDelete(path); smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return ""; }
+    byte[] hbuf = new byte[SM_HEADER_SIZE];
+    for (int i = 0; i < SM_HEADER_SIZE; i++) { hbuf[i] = back[i]; }
+    SmHeader d = new SmHeader();
+    if (smHeaderDecode(hbuf, d) != SM_OK) { smFileDelete(path); smFl[SM_FL_LAST_ERR] = SM_ERR_CHECKSUM; return ""; }
+    if (smHeaderValidate(d, (int64)back.length, 1, h.name_hash, 1) != SM_OK) { smFileDelete(path); smFl[SM_FL_LAST_ERR] = SM_ERR_CHECKSUM; return ""; }
+    smOwnedFinals.add(path);
+    smSt[SM_ST_PAGEFILE] = smSt[SM_ST_PAGEFILE] + (int64)fileBytes.length;
+    if (smSt[SM_ST_RESIDENT] >= (int64)payload.length) { smSt[SM_ST_RESIDENT] = smSt[SM_ST_RESIDENT] - (int64)payload.length; }
+    smSt[SM_ST_SPILLS] = smSt[SM_ST_SPILLS] + 1;
+    return path;
+}
+
+// Gated spill for large strings/byte buffers: below either gate the buffer
+// stays resident ("") and no file is created. Arrays/dicts are follow-up
+// (SM_ERR_KIND is never returned for them here; they are not routed yet).
+public string smPageOutBytes(byte[] payload, int kind) {
+    smFl[SM_FL_LAST_ERR] = SM_OK;
+    if (kind != SM_KIND_STRING && kind != SM_KIND_BYTES) { smFl[SM_FL_LAST_ERR] = SM_ERR_KIND; return ""; }
+    if (payload.length < SM_PAGE_MIN) { return ""; }
+    if (smSt[SM_ST_MANAGED] < smSt[SM_ST_PROC_BUDGET] * 9 / 10) { return ""; }
+    if (!smSystemPressureHigh()) { return ""; }
+    return smWritePage(payload, kind);
+}
+
+public string smPageOutString(string data) {
+    byte[] bytes = data.toBytes();
+    return smPageOutBytes(bytes, SM_KIND_STRING);
+}
+
+// Filename stem (after the last separator, without a trailing .sm).
+string smFileStem(string path) {
+    int start = 0;
+    for (int i = 0; i < path.length; i++) {
+        if (path[i] == '/' || path[i] == '\\') { start = i + 1; }
+    }
+    string tail = "";
+    for (int i = start; i < path.length; i++) { tail = tail + path[i]; }
+    if (tail.length > 3 && tail[tail.length - 3] == '.' && tail[tail.length - 2] == 's' && tail[tail.length - 1] == 'm') {
+        string stem = "";
+        for (int i = 0; i < tail.length - 3; i++) { stem = stem + tail[i]; }
+        return stem;
+    }
+    return tail;
+}
+
+// Every index record must agree with the header and its chunk checksum;
+// [] on any mismatch (partial bytes are never exposed).
+bool smVerifyIndex(SmHeader h, byte[] file, byte[] payload) {
+    int n = h.chunk_count;
+    int idxSize = int(h.index_size);
+    byte[] idx = new byte[idxSize];
+    for (int i = 0; i < idxSize; i++) { idx[i] = file[SM_HEADER_SIZE + i]; }
+    for (int i = 0; i < n; i++) {
+        int base = i * SM_INDEX_RECORD_SIZE;
+        int64 lo = smGetU64(idx, base);
+        int64 fo = smGetU64(idx, base + 8);
+        int llen = smGetU32(idx, base + 16);
+        int slen = smGetU32(idx, base + 20);
+        int crc = smGetU32(idx, base + 24);
+        int flags = smGetU32(idx, base + 28);
+        int64 wantLo = (int64)i * (int64)h.chunk_size;
+        if (lo != wantLo) { return false; }
+        if (fo != (int64)h.index_offset + h.index_size + wantLo) { return false; }
+        int64 rem = h.logical_size - wantLo;
+        int wantLen = h.chunk_size;
+        if (rem < (int64)wantLen) { wantLen = int(rem); }
+        if (llen != wantLen || slen != wantLen) { return false; }
+        int wantFlags = 0;
+        if (i == n - 1) { wantFlags = 1; }
+        if (flags != wantFlags) { return false; }
+        byte[] chunk = new byte[wantLen];
+        for (int j = 0; j < wantLen; j++) { chunk[j] = payload[int(wantLo) + j]; }
+        if (crc32cBytes(chunk) != crc) { return false; }
+    }
+    return true;
+}
+
+// Fault a page back in: read, check magic/reserved/header checksum,
+// require exact bounds and filename-hash agreement, require the payload
+// CRC and every index record, then return the payload ([] on failure).
+public byte[] smPageInBytes(string path) {
+    smFl[SM_FL_LAST_ERR] = SM_OK;
+    byte[] file = smFileRead(path);
+    if (file.length < SM_HEADER_SIZE) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return []; }
+    string stem = smFileStem(path);
+    if (!smIsHex16(stem)) { smFl[SM_FL_LAST_ERR] = SM_ERR_NAME_HASH; return []; }
+    int64 want = smParseHex16(stem);
+    byte[] hbuf = new byte[SM_HEADER_SIZE];
+    for (int i = 0; i < SM_HEADER_SIZE; i++) { hbuf[i] = file[i]; }
+    SmHeader d = new SmHeader();
+    int dec = smHeaderDecode(hbuf, d);
+    if (dec != SM_OK) { smFl[SM_FL_LAST_ERR] = dec; return []; }
+    int chk = smHeaderValidate(d, (int64)file.length, 1, want, 1);
+    if (chk != SM_OK) { smFl[SM_FL_LAST_ERR] = chk; return []; }
+    int idxSize = int(d.index_size);
+    int payLen = int(d.payload_size);
+    if (file.length != SM_HEADER_SIZE + idxSize + payLen) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return []; }
+    byte[] payload = new byte[payLen];
+    for (int i = 0; i < payLen; i++) { payload[i] = file[SM_HEADER_SIZE + idxSize + i]; }
+    if (smCrc32cBytes(payload) != d.payload_checksum) { smFl[SM_FL_LAST_ERR] = SM_ERR_CHECKSUM; return []; }
+    if (!smVerifyIndex(d, file, payload)) { smFl[SM_FL_LAST_ERR] = SM_ERR_INDEX; return []; }
+    smSt[SM_ST_FAULTS] = smSt[SM_ST_FAULTS] + 1;
+    smSt[SM_ST_RESIDENT] = smSt[SM_ST_RESIDENT] + (int64)payLen;
+    return payload;
+}
+
+// Ordered shutdown cleanup: owned .tmp files first, then owned final .sm
+// files (including clean and paged-out ones), then the registry is
+// cleared. Best-effort; returns the owned-path count. Never touches
+// unowned *.sm files.
+public int smPageCleanup() {
+    int n = 0;
+    for (int i = 0; i < smOwnedTmps.length; i++) {
+        if (smOwnedTmps[i] != "") { smFileDelete(smOwnedTmps[i]); smOwnedTmps[i] = ""; n++; }
+    }
+    for (int i = 0; i < smOwnedFinals.length; i++) {
+        if (smOwnedFinals[i] != "") { smFileDelete(smOwnedFinals[i]); smOwnedFinals[i] = ""; n++; }
+    }
+    smSt[SM_ST_PAGEFILE] = 0;
+    return n;
 }
