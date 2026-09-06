@@ -13927,6 +13927,12 @@ public void genNewCall(Node call) {
         this.genExpr(call.child(pathIdx));
         int pathOff = this.allocLocal("__fsz_path");
         this.asm.movMBaseR(5, 0, pathOff);
+        // LINUX SysV backend (additive): stat st_size via libc.
+        // The WINDOWS block below is byte-identical to before.
+        if (this.isLinuxTarget()) {
+            this.genLinuxFileSize(pathOff);
+            return;
+        }
         this.asm.emitCallSetup(24);
         this.asm.movRI64(0, 3);
         this.asm.movMBaseR(4, 0, 32);
@@ -13969,6 +13975,36 @@ public void genNewCall(Node call) {
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
         this.asm.movRMBase(0, 5, sizeOff);
+        this.asm.jmpLabel(fszDone);
+        this.asm.bindLabel(fszBad);
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(fszDone);
+    }
+
+    // LINUX SysV backend (additive): file.getSize via libc stat (st_size,
+    // i64 at stat offset 48 = slot 6 of an int[18], per silverc/std/fs.sr
+    // statSize). A failed stat reports 0, matching the WINDOWS missing-file
+    // path below. SysV regs + addImportPatchDirect + emitAbiCallSetup/
+    // teardown, beside the unchanged WINDOWS block.
+    public void genLinuxFileSize(int pathOff) {
+        this.asm.movRI64(8, 144);
+        this.emitLinuxHeapAllocFromR8();
+        int stOff = this.allocLocal("__fsz_linux_st");
+        this.asm.movMBaseR(5, 0, stOff);
+        this.asm.movRMBase(7, 5, pathOff);
+        this.asm.movRMBase(6, 5, stOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "stat");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        int fszBad = this.newLabel();
+        int fszDone = this.newLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jneLabel(fszBad);
+        this.asm.movRMBase(0, 5, stOff);
+        this.asm.movRMBase(0, 0, 48);
         this.asm.jmpLabel(fszDone);
         this.asm.bindLabel(fszBad);
         this.asm.xorRR64(0, 0);
