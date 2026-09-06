@@ -13689,6 +13689,12 @@ public void genNewCall(Node call) {
     }
 
     public void genFileRenameCall(Node call) {
+        // LINUX SysV backend (additive): rename(old,new) via libc. The
+        // WINDOWS block below is byte-identical to before.
+        if (this.isLinuxTarget()) {
+            this.genLinuxFileRenameCall(call);
+            return;
+        }
         if (call.childCount() < 3) { this.asm.xorRR64(0, 0); return; }
         this.genExpr(call.child(1));
         int srcOff = this.allocLocal("__fr_src");
@@ -13704,6 +13710,27 @@ public void genNewCall(Node call) {
         this.asm.movRMBase(0, 0, 0);
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
+    }
+
+    // LINUX SysV backend (additive): rename(old,new) via libc, mirroring
+    // silverc/std/fs.sr's #on LINUX rename body (renameFile alias) and the
+    // genLinuxWriteBytesFile shape (SysV regs + addImportPatchDirect).
+    public void genLinuxFileRenameCall(Node call) {
+        if (call.childCount() < 3) { this.asm.xorRR64(0, 0); return; }
+        this.genExpr(call.child(1));
+        int srcOff = this.allocLocal("__flren_src");
+        this.asm.movMBaseR(5, 0, srcOff);
+        this.genExpr(call.child(2));
+        int dstOff = this.allocLocal("__flren_dst");
+        this.asm.movMBaseR(5, 0, dstOff);
+        this.asm.movRMBase(7, 5, srcOff);
+        this.asm.movRMBase(6, 5, dstOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "rename");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
     }
 
 
