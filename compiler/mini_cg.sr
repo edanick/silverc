@@ -13735,6 +13735,12 @@ public void genNewCall(Node call) {
 
 
     public void genFileCopyCall(Node call) {
+        // LINUX SysV backend (additive): open/read/write loop via libc. The
+        // WINDOWS block below is byte-identical to before.
+        if (this.isLinuxTarget()) {
+            this.genLinuxFileCopyCall(call);
+            return;
+        }
         if (call.childCount() < 3) { this.asm.xorRR64(0, 0); return; }
         this.genExpr(call.child(1));
         int srcOff = this.allocLocal("__fc_src");
@@ -13751,6 +13757,135 @@ public void genNewCall(Node call) {
         this.asm.movRMBase(0, 0, 0);
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
+    }
+
+    // LINUX SysV backend (additive): open src O_RDONLY + open dst
+    // O_WRONLY|O_CREAT|O_TRUNC 0644 (0x241/0x1A4) + read/write loop + close
+    // both, mirroring silverc/std/fs.sr's #on LINUX write bodies and the
+    // genLinuxWriteBytesFile open flags. CopyFileA has no libc equivalent
+    // (linuxImportName leaves it unmapped), so this dedicated branch replaces
+    // the failing remap. Returns 1 on success, 0 on failure (BOOL posture).
+    public void genLinuxFileCopyCall(Node call) {
+        if (call.childCount() < 3) { this.asm.xorRR64(0, 0); return; }
+        this.genExpr(call.child(1));
+        int srcOff = this.allocLocal("__fcp_src");
+        this.asm.movMBaseR(5, 0, srcOff);
+        this.genExpr(call.child(2));
+        int dstOff = this.allocLocal("__fcp_dst");
+        this.asm.movMBaseR(5, 0, dstOff);
+        this.asm.movRMBase(7, 5, srcOff);
+        this.asm.xorRR64(6, 6);
+        this.asm.xorRR64(2, 2);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "open");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        int srcFdOff = this.allocLocal("__fcp_srcfd");
+        this.asm.movMBaseR(5, 0, srcFdOff);
+        int copyFail0 = this.newLabel();
+        int copyFailSrc = this.newLabel();
+        int copyFailLoop = this.newLabel();
+        int copyLoop = this.newLabel();
+        int copyDone = this.newLabel();
+        int copyEnd = this.newLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jlLabel(copyFail0);
+        this.asm.movRMBase(7, 5, dstOff);
+        this.asm.movRI64(6, 0x241);
+        this.asm.movRI64(2, 0x1A4);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "open");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        int dstFdOff = this.allocLocal("__fcp_dstfd");
+        this.asm.movMBaseR(5, 0, dstFdOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jlLabel(copyFailSrc);
+        this.asm.movRI64(8, 8192);
+        this.emitLinuxHeapAllocFromR8();
+        int bufOff = this.allocLocal("__fcp_buf");
+        this.asm.movMBaseR(5, 0, bufOff);
+        int nOff = this.allocLocal("__fcp_n");
+        this.asm.bindLabel(copyLoop);
+        this.asm.movRMBase(7, 5, srcFdOff);
+        this.asm.movRMBase(6, 5, bufOff);
+        this.asm.movRI64(2, 8192);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "read");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movMBaseR(5, 0, nOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jlLabel(copyFailLoop);
+        this.asm.jeLabel(copyDone);
+        this.asm.movRMBase(7, 5, dstFdOff);
+        this.asm.movRMBase(6, 5, bufOff);
+        this.asm.movRMBase(2, 5, nOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "write");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.jmpLabel(copyLoop);
+        this.asm.bindLabel(copyDone);
+        this.asm.movRMBase(7, 5, srcFdOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "close");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movRMBase(7, 5, dstFdOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "close");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movRMBase(7, 5, bufOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "free");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movRI64(0, 1);
+        this.asm.jmpLabel(copyEnd);
+        this.asm.bindLabel(copyFailSrc);
+        this.asm.movRMBase(7, 5, srcFdOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "close");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.bindLabel(copyFail0);
+        this.asm.xorRR64(0, 0);
+        this.asm.jmpLabel(copyEnd);
+        this.asm.bindLabel(copyFailLoop);
+        this.asm.movRMBase(7, 5, srcFdOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "close");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movRMBase(7, 5, dstFdOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "close");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(copyEnd);
     }
 
     public void genFileSizeCall(Node call) {
