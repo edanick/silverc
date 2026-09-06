@@ -13609,6 +13609,12 @@ public void genNewCall(Node call) {
     }
 
     public void genFileDeleteCall(Node call) {
+        // LINUX SysV backend (additive): unlink(path) via libc. The WINDOWS
+        // block below is byte-identical to before.
+        if (this.isLinuxTarget()) {
+            this.genLinuxFileDeleteCall(call);
+            return;
+        }
         int pathIdx = 1;
         if (call.childCount() <= pathIdx) { this.asm.xorRR64(0, 0); return; }
         this.genExpr(call.child(pathIdx));
@@ -13619,6 +13625,24 @@ public void genNewCall(Node call) {
         this.asm.movRMBase(0, 0, 0);
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
+    }
+
+    // LINUX SysV backend (additive): unlink(path) via libc, mirroring
+    // silverc/std/fs.sr's #on LINUX delete body and the genLinuxWriteBytesFile
+    // shape (SysV regs + addImportPatchDirect + emitAbiCallSetup/teardown).
+    public void genLinuxFileDeleteCall(Node call) {
+        int pathIdx = 1;
+        if (call.childCount() <= pathIdx) { this.asm.xorRR64(0, 0); return; }
+        this.genExpr(call.child(pathIdx));
+        int pathOff = this.allocLocal("__fldel_path");
+        this.asm.movMBaseR(5, 0, pathOff);
+        this.asm.movRMBase(7, 5, pathOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "unlink");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
     }
 
     public void genFolderDeleteCall(Node call) {
