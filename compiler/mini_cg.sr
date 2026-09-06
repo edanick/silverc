@@ -16031,3 +16031,44 @@ class PeDllGroup {
         this.count = 0;
     }
 }
+        // LINUX SysV backend (additive): stat st_mode S_ISDIR via libc.
+        // The WINDOWS block below is byte-identical to before.
+        if (this.isLinuxTarget()) {
+            this.genLinuxIsDir();
+            return;
+        }
+    // LINUX SysV backend (additive): isDir via libc stat (st_mode, u32 at
+    // stat offset 24, masked with S_IFMT/FDIR per silverc/std/fs.sr
+    // isDirPath). A failed stat reports 0, matching the WINDOWS
+    // invalid-attributes path below.
+    public void genLinuxIsDir() {
+        int pathOff = this.allocLocal("__id_linux_path");
+        this.asm.movMBaseR(5, 0, pathOff);
+        this.asm.movRI64(8, 144);
+        this.emitLinuxHeapAllocFromR8();
+        int stOff = this.allocLocal("__id_linux_st");
+        this.asm.movMBaseR(5, 0, stOff);
+        this.asm.movRMBase(7, 5, pathOff);
+        this.asm.movRMBase(6, 5, stOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "stat");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        int idNo = this.newLabel();
+        int idDone = this.newLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jneLabel(idNo);
+        this.asm.movRMBase(0, 5, stOff);
+        this.asm.movRMBase(0, 0, 24);
+        this.asm.andRImm(0, 0xF000);
+        this.asm.cmpRI32(0, 0x4000);
+        this.asm.jneLabel(idNo);
+        this.asm.movRI64(0, 1);
+        this.asm.jmpLabel(idDone);
+        this.asm.bindLabel(idNo);
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(idDone);
+    }
+
