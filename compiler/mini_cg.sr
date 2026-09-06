@@ -2332,9 +2332,30 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.cmpRI32(2, 16777216);
         this.asm.jgLabel(fbLbl);
         this.asm.movMBaseR(10, 2, 8);
+        // -- spill accounting (additive): state+24 managed_bytes += rounded.
+        // RCX (reg 1) is dead on this path (the Win64 heap-handle slot the
+        // Linux backend ignores); RAX/RDX/R8/R9/R11 stay live for the
+        // pointer commit below.
+        this.asm.movRMBase(1, 10, 24);
+        this.asm.addRR64(1, 9);
+        this.asm.movMBaseR(10, 1, 24);
         this.asm.addRR64(0, 11);
         this.asm.jmpLabel(doneLbl);
         this.asm.bindLabel(fbLbl);
+        // -- pre-commit pressure relief (additive, GC hybrid paging stage
+        // 1): over-reserve and reinit-fallback arrivals call
+        // __silver_rt_page_out first (Gate 2 bump>=90% check plus pressure
+        // accounting; it preserves R8 size and R10 state), then run the
+        // malloc fallback below unchanged (spill-or-fallback: native spill
+        // of arbitrary bump pointers stays deferred until descriptors
+        // exist, so every byte below behaves as before).
+        this.emitAbiCallSetup(0);
+        this.asm.callRel32(0);
+        this.forwardCalls.add(this.asm.buf.length - 4);
+        this.forwardCallFuncIdxs.add(-1);
+        this.forwardCallNames.add("__silver_rt_page_out");
+        this.forwardCallClasses.add("");
+        this.emitAbiCallTeardown();
         this.asm.pushR64(8);
         this.asm.movRR64(7, 8);
         this.emitAbiCallSetup(0);
