@@ -57,15 +57,26 @@ void printHelp() {
     printline("Copyright: © 2025 Edan M.");
     printline("");
     printline("Usage:");
+#on WINDOWS
     printline("  silverc [options] [<input.sr> [<output.exe>]]");
     printline("  silverc -i <input.sr> -o <output.exe>");
+#off
+#on LINUX
+    printline("  silverc [options] [<input.sr> [<output>]]");
+    printline("  silverc -i <input.sr> -o <output>");
+#off
     printline("  silverc <project.srp> [flags]");
     printline("");
     printline("Options:");
     printline("  -h, --help, -?    Show this help message");
     printline("  -v, --version     Show compiler and language version");
     printline("  -i <file>         Input Silver source file (default: compiler_driver.sr)");
+#on WINDOWS
+    printline("  -o <file>         Output executable file (default: silverc.exe)");
+#off
+#on LINUX
     printline("  -o <file>         Output executable file (default: silverc)");
+#off
     printline("");
     printline("Execution modes (mutually exclusive):");
     printline("  --aot             Ahead-of-time compilation (default pipeline)");
@@ -82,11 +93,18 @@ void printHelp() {
 #off
     printline("  --watch           Predictive precompilation watcher");
     printline("  --threads <N>     Explicit worker count (default: 90% of system threads)");
+    printline("  --os windows|linux|mac  Target OS (default: host; WINDOWS, LINUX, MAC also accepted)");
     printline("");
     printline("Examples:");
     printline("  silverc --help");
+#on WINDOWS
     printline("  silverc input.sr output.exe");
     printline("  silverc -i input.sr -o output.exe");
+#off
+#on LINUX
+    printline("  silverc input.sr output");
+    printline("  silverc -i input.sr -o output");
+#off
     printline("");
     printline("Run with --help to show this message.");
 }
@@ -703,7 +721,16 @@ void main() {
             if (!cliArgEq(projectOutput, "")) { outputFile = projectOutput; }
         }
     }
+    // No -o and no manifest `output:`: Windows keeps the historical
+    // `silverc.exe` fallback (mirror silverc-rs main.rs:1083); Linux targets
+    // emit the bare `silverc` stem. Explicit -o / manifest output is honored
+    // verbatim either way (silverc.srp `output: silverc.exe` untouched).
+    #on WINDOWS
+    if (outputFile.length == 0) { outputFile = "silverc.exe"; }
+    #off
+    #on LINUX
     if (outputFile.length == 0) { outputFile = "silverc"; }
+    #off
 
     // OVERHAUL.md --threads resolution: over-request aborts with the exact
     // spec message and no fallback; requesting every thread warns about
@@ -811,6 +838,23 @@ int compileOnce(CliFlags flags, string outputFile) {
             if (llmaiSource.length == 0) {
                 llmaiSource = tryReadFile("..\\..\\std\\llmai.sr");
             }
+            #on LINUX
+            if (llmaiSource.length == 0) {
+                llmaiSource = tryReadFile("std/llmai.sr");
+            }
+            if (llmaiSource.length == 0) {
+                llmaiSource = tryReadFile("silverc/std/llmai.sr");
+            }
+            if (llmaiSource.length == 0) {
+                llmaiSource = tryReadFile("../std/llmai.sr");
+            }
+            if (llmaiSource.length == 0) {
+                llmaiSource = tryReadFile("../silverc/std/llmai.sr");
+            }
+            if (llmaiSource.length == 0) {
+                llmaiSource = tryReadFile("../../std/llmai.sr");
+            }
+            #off
             source = drvPreprocessOrDie(llmaiSource) + "\n" + source;
         }
 
@@ -833,6 +877,23 @@ int compileOnce(CliFlags flags, string outputFile) {
             if (excSource.length == 0) {
                 excSource = tryReadFile("..\\..\\std\\exception.sr");
             }
+            #on LINUX
+            if (excSource.length == 0) {
+                excSource = tryReadFile("std/exception.sr");
+            }
+            if (excSource.length == 0) {
+                excSource = tryReadFile("silverc/std/exception.sr");
+            }
+            if (excSource.length == 0) {
+                excSource = tryReadFile("../std/exception.sr");
+            }
+            if (excSource.length == 0) {
+                excSource = tryReadFile("../silverc/std/exception.sr");
+            }
+            if (excSource.length == 0) {
+                excSource = tryReadFile("../../std/exception.sr");
+            }
+            #off
             source = drvPreprocessOrDie(excSource) + "\n" + source;
         }
 
@@ -846,6 +907,13 @@ int compileOnce(CliFlags flags, string outputFile) {
             if (bomSource.length == 0) { bomSource = tryReadFile("..\\std\\bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile("..\\silverc\\std\\bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile("..\\..\\std\\bom.sr"); }
+            #on LINUX
+            if (bomSource.length == 0) { bomSource = tryReadFile("std/bom.sr"); }
+            if (bomSource.length == 0) { bomSource = tryReadFile("silverc/std/bom.sr"); }
+            if (bomSource.length == 0) { bomSource = tryReadFile("../std/bom.sr"); }
+            if (bomSource.length == 0) { bomSource = tryReadFile("../silverc/std/bom.sr"); }
+            if (bomSource.length == 0) { bomSource = tryReadFile("../../std/bom.sr"); }
+            #off
             source = drvPreprocessOrDie(bomSource) + "\n" + source;
         }
         int processImport = projectFind(source, "from " + "process", 0);
@@ -855,6 +923,13 @@ int compileOnce(CliFlags flags, string outputFile) {
             if (processSource.length == 0) { processSource = tryReadFile("..\\std\\process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile("..\\silverc\\std\\process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile("..\\..\\std\\process.sr"); }
+            #on LINUX
+            if (processSource.length == 0) { processSource = tryReadFile("std/process.sr"); }
+            if (processSource.length == 0) { processSource = tryReadFile("silverc/std/process.sr"); }
+            if (processSource.length == 0) { processSource = tryReadFile("../std/process.sr"); }
+            if (processSource.length == 0) { processSource = tryReadFile("../silverc/std/process.sr"); }
+            if (processSource.length == 0) { processSource = tryReadFile("../../std/process.sr"); }
+            #off
             source = drvPreprocessOrDie(processSource) + "\n" + source;
         }
         // Notifications (Windows toast / tray-balloon) is a source-level
@@ -867,6 +942,13 @@ int compileOnce(CliFlags flags, string outputFile) {
             if (notifSource.length == 0) { notifSource = tryReadFile("..\\std\\notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile("..\\silverc\\std\\notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile("..\\..\\std\\notifications.sr"); }
+            #on LINUX
+            if (notifSource.length == 0) { notifSource = tryReadFile("std/notifications.sr"); }
+            if (notifSource.length == 0) { notifSource = tryReadFile("silverc/std/notifications.sr"); }
+            if (notifSource.length == 0) { notifSource = tryReadFile("../std/notifications.sr"); }
+            if (notifSource.length == 0) { notifSource = tryReadFile("../silverc/std/notifications.sr"); }
+            if (notifSource.length == 0) { notifSource = tryReadFile("../../std/notifications.sr"); }
+            #off
             source = drvPreprocessOrDie(notifSource) + "\n" + source;
         }
 
@@ -934,6 +1016,11 @@ int compileOnce(CliFlags flags, string outputFile) {
             if (hopBase.length == 0) { hopBase = bcEnvValue("TMP"); }
             if (hopBase.length == 0) { hopBase = "."; }
             string hopPath = hopBase + "\\silverc-hop\\hop_" + sysinfo.pid().toString() + ".tmp";
+            #on LINUX
+            hopBase = bcEnvValue("TMPDIR");
+            if (hopBase.length == 0) { hopBase = "/tmp"; }
+            hopPath = hopBase + "/silverc-hop/hop_" + sysinfo.pid().toString() + ".tmp";
+            #off
             ensureDirTree(bcDirname(hopPath));
             file.writeString(hopPath, source);
             for (int ci2 = 0; ci2 < chunks.paths.length; ci2++) {
