@@ -16138,3 +16138,88 @@ class PeDllGroup {
         this.asm.bindLabel(drDone);
     }
 
+        // LINUX SysV backend (additive): stat-sized open/read/close via
+        // libc (genLinuxReadStringFile). The WINDOWS block below is
+        // byte-identical to before.
+        if (this.isLinuxTarget()) {
+            this.genLinuxReadStringFile(pathOff);
+            return;
+        }
+    // LINUX SysV backend (additive): readString via libc stat + open +
+    // read + close (stat st_size at offset 48 sizes a heap buffer that is
+    // NUL-terminated at the bytes read, mirroring the WINDOWS GetFileSize
+    // + ReadFile shape below and silverc/std/fs.sr's LINUX readString
+    // semantics). Missing files throw "file not found" like the WINDOWS
+    // path; an empty file yields "". SysV regs + addImportPatchDirect +
+    // emitAbiCallSetup/teardown, beside the unchanged WINDOWS block.
+    public void genLinuxReadStringFile(int pathOff) {
+        this.asm.movRI64(8, 144);
+        this.emitLinuxHeapAllocFromR8();
+        int stOff = this.allocLocal("__rs_linux_st");
+        this.asm.movMBaseR(5, 0, stOff);
+        this.asm.movRMBase(7, 5, pathOff);
+        this.asm.movRMBase(6, 5, stOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "stat");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        int rsErr = this.newLabel();
+        int rsDone = this.newLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jneLabel(rsErr);
+        this.asm.movRMBase(0, 5, stOff);
+        this.asm.movRMBase(0, 0, 48);
+        int sizeOff = this.allocLocal("__rs_linux_size");
+        this.asm.movMBaseR(5, 0, sizeOff);
+        this.asm.movRMBase(8, 5, sizeOff);
+        this.asm.addRI32(8, 1);
+        this.emitLinuxHeapAllocFromR8();
+        int bufOff = this.allocLocal("__rs_linux_buf");
+        this.asm.movMBaseR(5, 0, bufOff);
+        this.asm.movRMBase(7, 5, pathOff);
+        this.asm.xorRR64(6, 6);
+        this.asm.xorRR64(2, 2);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "open");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        int hfileOff = this.allocLocal("__rs_linux_hfile");
+        this.asm.movMBaseR(5, 0, hfileOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jlLabel(rsErr);
+        this.asm.movRMBase(7, 5, hfileOff);
+        this.asm.movRMBase(6, 5, bufOff);
+        this.asm.movRMBase(2, 5, sizeOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "read");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jlLabel(rsErr);
+        int breadOff = this.allocLocal("__rs_linux_bread");
+        this.asm.movMBaseR(5, 0, breadOff);
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.movRMBase(1, 5, breadOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movRI64(1, 0);
+        this.asm.movMBaseByteR(0, 1, 0);
+        this.asm.movRMBase(7, 5, hfileOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "close");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.jmpLabel(rsDone);
+        this.asm.bindLabel(rsErr);
+        this.emitThrowException("file not found");
+        this.asm.bindLabel(rsDone);
+    }
+
