@@ -13614,6 +13614,39 @@ public void genNewCall(Node call) {
         this.asm.bindLabel(feDone);
     }
 
+    // LINUX SysV backend (additive): file.exists via libc open (fd >= 0
+    // probes the path), then close and report 1; a failed open reports 0.
+    // Mirrors silverc-rs stdlib/fs.rs gen_file_exists_linux and the
+    // genLinuxWriteBytesFile open/close shape (SysV regs RDI/RSI/RDX =
+    // asm regs 7/6/2 + addImportPatchDirect + emitAbiCallSetup/teardown).
+    public void genLinuxFileExists(int pathOff) {
+        this.asm.movRMBase(7, 5, pathOff);
+        this.asm.xorRR64(6, 6);
+        this.asm.xorRR64(2, 2);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "open");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        int feNo = this.newLabel();
+        int feDone = this.newLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jlLabel(feNo);
+        this.asm.movRR64(7, 0);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "close");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movRI64(0, 1);
+        this.asm.jmpLabel(feDone);
+        this.asm.bindLabel(feNo);
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(feDone);
+    }
+
     public void genFileDeleteCall(Node call) {
         // LINUX SysV backend (additive): unlink(path) via libc. The WINDOWS
         // block below is byte-identical to before.
@@ -14251,6 +14284,12 @@ public void genNewCall(Node call) {
     }
 
     public void genFolderEntriesCall(Node call, int filter) {
+        // LINUX SysV backend (additive): opendir/readdir/closedir via libc.
+        // The WINDOWS block below is byte-identical to before.
+        if (this.isLinuxTarget()) {
+            this.genLinuxFolderEntriesCall(call, filter);
+            return;
+        }
         int pathIdx = 1;
         if (call.childCount() <= pathIdx) {
             this.emitEmptyStringArray();
@@ -14486,6 +14525,214 @@ public void genNewCall(Node call) {
         this.asm.jmpLabel(feDone);
         this.asm.bindLabel(noFiles);
         this.emitEmptyStringArray();
+        this.asm.bindLabel(feDone);
+    }
+
+    // LINUX SysV backend (additive): empty string array via libc malloc
+    // (mirrors emitEmptyStringArray layout [8,0] +16 but through the SysV
+    // heap helper, not the Win64 shuffle path).
+    public void genLinuxEmptyStringArray() {
+        this.asm.movRI64(8, 80);
+        this.emitLinuxHeapAllocFromR8();
+        this.asm.movRI64(1, 8);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRI64(1, 0);
+        this.asm.movMBaseR(0, 1, 8);
+        this.asm.addRI32(0, 16);
+    }
+
+    // LINUX SysV backend (additive): branch to skip when the dirent at
+    // nodeOff should be excluded: "." / ".." pseudo-entries (d_name at
+    // offset 19, per silverc/std/fs.sr readDirNames) or entries failing
+    // filter via d_type at offset 18 (4=dir, 8=file). Mirrors emitEntryTest
+    // shape but for libc dirent instead of WIN32_FIND_DATA.
+    public void emitLinuxDirentTest(int nodeOff, int filter, int skip) {
+        this.asm.movRMBase(0, 5, nodeOff);
+        int checkFilter = this.newLabel();
+        this.asm.movzxByteMBase(1, 0, 19);
+        this.asm.cmpRI32(1, 46);
+        this.asm.jneLabel(checkFilter);
+        this.asm.movzxByteMBase(1, 0, 20);
+        this.asm.cmpRI32(1, 0);
+        this.asm.jeLabel(skip);
+        this.asm.cmpRI32(1, 46);
+        this.asm.jneLabel(checkFilter);
+        this.asm.movzxByteMBase(1, 0, 21);
+        this.asm.cmpRI32(1, 0);
+        this.asm.jeLabel(skip);
+        this.asm.bindLabel(checkFilter);
+        if (filter == 1) {
+            this.asm.movRMBase(0, 5, nodeOff);
+            this.asm.movzxByteMBase(1, 0, 18);
+            this.asm.cmpRI32(1, 4);
+            this.asm.jeLabel(skip);
+        } elif (filter == 2) {
+            this.asm.movRMBase(0, 5, nodeOff);
+            this.asm.movzxByteMBase(1, 0, 18);
+            this.asm.cmpRI32(1, 4);
+            this.asm.jneLabel(skip);
+        }
+    }
+
+    // LINUX SysV backend (additive): folder entries via libc
+    // opendir/readdir/closedir, skipping "." and ".." and applying filter
+    // (0=all, 1=files, 2=folders) via d_type, mirroring silverc/std/fs.sr's
+    // #on LINUX readDirNames body and the two-pass WINDOWS shape above
+    // (count then fill, array header [cnt,cnt] +16). SysV regs +
+    // addImportPatchDirect + emitAbiCallSetup/teardown.
+    public void genLinuxFolderEntriesCall(Node call, int filter) {
+        int pathIdx = 1;
+        if (call.childCount() <= pathIdx) {
+            this.genLinuxEmptyStringArray();
+            return;
+        }
+        this.genExpr(call.child(pathIdx));
+        int dirOff = this.allocLocal("__fde_dir");
+        this.asm.movMBaseR(5, 0, dirOff);
+        this.asm.movRMBase(7, 5, dirOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "opendir");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        int hOff = this.allocLocal("__fde_h");
+        this.asm.movMBaseR(5, 0, hOff);
+        int noFiles = this.newLabel();
+        int cntOff = this.allocLocal("__fde_cnt");
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, cntOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(noFiles);
+        int nodeOff = this.allocLocal("__fde_node");
+        int p1Loop = this.newLabel();
+        int p1Skip = this.newLabel();
+        int p1Done = this.newLabel();
+        this.asm.bindLabel(p1Loop);
+        this.asm.movRMBase(7, 5, hOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "readdir");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movMBaseR(5, 0, nodeOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(p1Done);
+        this.emitLinuxDirentTest(nodeOff, filter, p1Skip);
+        this.asm.movRMBase(0, 5, cntOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, cntOff);
+        this.asm.bindLabel(p1Skip);
+        this.asm.jmpLabel(p1Loop);
+        this.asm.bindLabel(p1Done);
+        this.asm.movRMBase(7, 5, hOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "closedir");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movRMBase(0, 5, cntOff);
+        this.asm.addRI32(0, 2);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.movRR64(8, 0);
+        this.emitLinuxHeapAllocFromR8();
+        int arrOff = this.allocLocal("__fde_arr");
+        this.asm.movMBaseR(5, 0, arrOff);
+        this.asm.movRMBase(1, 5, cntOff);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(1, 5, cntOff);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movMBaseR(0, 1, 8);
+        this.asm.movRMBase(7, 5, dirOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "opendir");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movMBaseR(5, 0, hOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(noFiles);
+        int widxOff = this.allocLocal("__fde_widx");
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, widxOff);
+        int p2Loop = this.newLabel();
+        int p2Skip = this.newLabel();
+        int p2Done = this.newLabel();
+        this.asm.bindLabel(p2Loop);
+        this.asm.movRMBase(7, 5, hOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "readdir");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movMBaseR(5, 0, nodeOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(p2Done);
+        this.emitLinuxDirentTest(nodeOff, filter, p2Skip);
+        this.asm.movRMBase(0, 5, nodeOff);
+        this.asm.addRI32(0, 19);
+        this.asm.movRR64(7, 0);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "strlen");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        int nlenOff = this.allocLocal("__fde_nlen");
+        this.asm.movMBaseR(5, 0, nlenOff);
+        this.asm.movRMBase(0, 5, nlenOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movRR64(8, 0);
+        this.emitLinuxHeapAllocFromR8();
+        int bufOff = this.allocLocal("__fde_buf");
+        this.asm.movMBaseR(5, 0, bufOff);
+        this.asm.movRMBase(7, 5, bufOff);
+        this.asm.movRMBase(0, 5, nodeOff);
+        this.asm.addRI32(0, 19);
+        this.asm.movRR64(6, 0);
+        this.asm.movRMBase(2, 5, nlenOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "memcpy");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.movRMBase(1, 5, nlenOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movRI64(1, 0);
+        this.asm.movMBaseByteR(0, 1, 0);
+        this.asm.movRMBase(0, 5, widxOff);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.addRI32(0, 16);
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.movMBaseR(1, 0, 0);
+        this.asm.movRMBase(0, 5, widxOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, widxOff);
+        this.asm.bindLabel(p2Skip);
+        this.asm.jmpLabel(p2Loop);
+        this.asm.bindLabel(p2Done);
+        this.asm.movRMBase(7, 5, hOff);
+        this.emitAbiCallSetup(0);
+        this.addImportPatchDirect("libc.so.6", "closedir");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.emitAbiCallTeardown();
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.addRI32(0, 16);
+        int feDone = this.newLabel();
+        this.asm.jmpLabel(feDone);
+        this.asm.bindLabel(noFiles);
+        this.genLinuxEmptyStringArray();
         this.asm.bindLabel(feDone);
     }
 
