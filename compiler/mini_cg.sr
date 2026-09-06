@@ -2375,6 +2375,59 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.addRI32(0, 1);
         this.asm.movMBaseR(10, 0, 16);
         this.asm.ret();
+
+        // ---- __silver_rt_page_out(size in R8) --------------------------
+        // Spill-or-fallback wiring point (additive, GC hybrid paging stage
+        // 1): Gate 2 recheck (bump >= 15099494 = 90% of the 16 MiB reserve)
+        // plus pressure-probe accounting in state+32. ABI: R8 = requested
+        // bytes, preserved; returns RAX = 0 (no native spill performed, so
+        // the caller runs its malloc fallback). Preserves R10/R11/RDX/RCX
+        // via push/pop; no calls inside, so no ABI setup is needed. Gate 1
+        // (system pressure via /proc/meminfo MemAvailable) lives in the
+        // Silver page manager (runtime/memory.sr smShouldSpill through
+        // sysinfo.memoryUsagePercent); no /tmp/*.sm file is created here
+        // (native spill of arbitrary bump pointers stays deferred until
+        // descriptors exist), so workloads below either gate never touch
+        // disk. Arrays/dicts/pin barriers are follow-up.
+        this.rtRegisterFunc("__silver_rt_page_out");
+        this.asm.pushR64(10);
+        this.asm.pushR64(11);
+        this.asm.pushR64(2);
+        this.asm.pushR64(1);
+        this.emitRtStateAddr(10);
+        int poOutLbl = this.newLabel();
+        this.asm.movRMBase(11, 10, 8);
+        this.asm.movRI64(2, 15099494);
+        this.asm.cmpRR64(11, 2);
+        this.asm.jlLabel(poOutLbl);
+        this.asm.movRMBase(1, 10, 32);
+        this.asm.addRI32(1, 1);
+        this.asm.movMBaseR(10, 1, 32);
+        this.asm.bindLabel(poOutLbl);
+        this.asm.xorRR64(0, 0);
+        this.asm.popR64(1);
+        this.asm.popR64(2);
+        this.asm.popR64(11);
+        this.asm.popR64(10);
+        this.asm.ret();
+
+        // ---- __silver_rt_page_in ---------------------------------------
+        // Fault-in wiring point (additive, stage 1): records one fault
+        // inquiry in state+48 and returns RAX = 0 (resident — no disk fault
+        // performed; the Silver manager in runtime/memory.sr validates
+        // header/checksum/index on real faults). Preserves R8/R10/R11/RDX/
+        // RCX via push/pop; no calls inside.
+        this.rtRegisterFunc("__silver_rt_page_in");
+        this.asm.pushR64(10);
+        this.asm.pushR64(1);
+        this.emitRtStateAddr(10);
+        this.asm.movRMBase(1, 10, 48);
+        this.asm.addRI32(1, 1);
+        this.asm.movMBaseR(10, 1, 48);
+        this.asm.xorRR64(0, 0);
+        this.asm.popR64(1);
+        this.asm.popR64(10);
+        this.asm.ret();
     }
 
     public void emitRuntimeEntryStub() {
