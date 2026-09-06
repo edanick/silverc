@@ -1053,6 +1053,14 @@ int compileOnce(CliFlags flags, string outputFile) {
 
     Parser parser = new Parser(tokens);
     parser.setLineLengths(lineLens);
+    // DOCS/261 custom native modules: the manifest map lets declared custom
+    // grants resolve (standalone compiles keep the empty default). Bare
+    // customs resolve the manifest side matching `--os`.
+    if (inputIsProject) {
+        NativeModules drvNm = projectParseNativeModules(manifest);
+        parser.customNative = drvNm;
+    }
+    parser.customTargetOs = ppTargetOsFor(flags.targetOs);
 
     Node[] ast = parser.parseProgram();
 
@@ -1111,6 +1119,12 @@ int compileOnce(CliFlags flags, string outputFile) {
     // otherwise the host default). WINDOWS builds with no --os resolve to
     // WINDOWS exactly as before, so emission is byte-identical.
     cg.targetOs = ppTargetOsFor(flags.targetOs);
+    // DOCS/261: same manifest map lets declared custom grants resolve in
+    // codegen (lazy emission reuses the fixed machinery verbatim).
+    if (inputIsProject) {
+        NativeModules drvCgNm = projectParseNativeModules(manifest);
+        cg.customNative = drvCgNm;
+    }
 
     // Phase B/C reporting: the parse/typecheck frontend is done, native
     // emission begins, and the executable + cache flush must both complete

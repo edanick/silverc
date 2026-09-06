@@ -50,6 +50,14 @@ class Parser {
     private bool linuxAllModules;
     private string[] linuxOpenModules;
     private string[] linuxGrantNames;
+    // DOCS/261 -- per-project custom native modules (`.srp` `nativeModules`).
+    // Declared custom names resolve per target OS (bare `import { f } from m;`
+    // uses the `windows` file on WINDOWS/MAC, the `linux` file on LINUX; star
+    // needs an export list). Fixed `win32.*`/`linux.*` tables above are
+    // untouched; custom grants skip the std-internal rule (manifest opt-in).
+    // Empty when the manifest declares none (absent key = no change).
+    public NativeModules customNative;
+    public string customTargetOs;
     // `mod export NAME;` declarations and inline `mod NAME { ... }` blocks:
     // names plus their `internal` flag (DOCS/258). The flattened program
     // drops these containers, so the visibility pass reads them from here.
@@ -91,6 +99,8 @@ class Parser {
         this.linuxAllModules = false;
         this.linuxOpenModules = [];
         this.linuxGrantNames = [];
+        this.customNative = new NativeModules();
+        this.customTargetOs = "";
         this.modExportNames = [];
         this.modExportInternal = [];
         this.classSectionInternal = false;
@@ -1367,6 +1377,8 @@ class Parser {
         // Remember linux grants beside them (LINUX.md Phase B): free libc
         // calls resolve only through linux imports.
         this.recordLinuxImportGrant(node);
+        // DOCS/261 bare custom grants resolve per target OS beside them.
+        this.recordCustomBareGrant(node);
         this.expectSemi();
         return node;
     }
@@ -1414,56 +1426,191 @@ class Parser {
 
     // Mirror of MiniCg.registerWin32Import, kept in the parser so the
     // diagnostics pass can tell granted Win32 exports from unknown methods.
+    // DOCS/261: fixed names resolve first (untouched); declared custom names
+    // grant single exports only (star rejected); undeclared names report the
+    // manifest stanza. `import * from win32;` still grants fixed only.
     private void recordWin32ImportGrant(Node node) {
         string src = node.typeHint;
         if (this.strEq(src, "win32")) {
             if (node.isStatic) { this.win32AllModules = true; return; }
-            this.win32OpenModules.add(node.name);
+            this.checkWin32ModuleName(node.name, node);
             for (int j = 0; j < node.childCount(); j++) {
-                this.win32OpenModules.add(node.child(j).name);
+                this.checkWin32ModuleName(node.child(j).name, node);
             }
             return;
         }
         if (src.length > 6 && this.strEq(this.sliceStr(src, 0, 6), "win32.")) {
             string module = this.sliceStr(src, 6, src.length);
-            if (node.isStatic) {
-                this.win32OpenModules.add(module);
+            string dll = this.win32ModuleNameDll(module);
+            if (dll.length > 0) {
+                if (node.isStatic) {
+                    this.win32OpenModules.add(module);
+                    return;
+                }
+                this.win32GrantNames.add(this.importLocalName(node));
+                for (int j2 = 0; j2 < node.childCount(); j2++) {
+                    this.win32GrantNames.add(this.importLocalName(node.child(j2)));
+                }
                 return;
             }
-            // Aliased grants answer only to the LOCAL name (the alias), so
-            // the diagnostics walk must accept the alias, never the export.
-            this.win32GrantNames.add(this.importLocalName(node));
-            for (int j2 = 0; j2 < node.childCount(); j2++) {
-                this.win32GrantNames.add(this.importLocalName(node.child(j2)));
+            if (this.customDeclared(module)) {
+                string winf = this.customNative.winFile(module);
+                if (winf.length == 0) {
+                    this.recordError(nativeUndeclaredMsg(src) + ", at line " + node.line.toString() + ", column " + node.col.toString());
+                    return;
+                }
+                if (node.isStatic) {
+                    this.recordError(nativeStarMsg(src) + ", at line " + node.line.toString() + ", column " + node.col.toString());
+                    return;
+                }
+                this.win32GrantNames.add(this.importLocalName(node));
+                for (int j3 = 0; j3 < node.childCount(); j3++) {
+                    this.win32GrantNames.add(this.importLocalName(node.child(j3)));
+                }
+                return;
             }
+            this.recordError(nativeUndeclaredMsg(src) + ", at line " + node.line.toString() + ", column " + node.col.toString());
         }
+    }
+
+    private void checkWin32ModuleName(string modName, Node node) {
+        if (modName.length == 0) { return; }
+        string dll = this.win32ModuleNameDll(modName);
+        if (dll.length > 0) {
+            this.win32OpenModules.add(modName);
+            return;
+        }
+        if (this.customDeclared(modName)) {
+            this.recordError(nativeStarMsg("win32." + modName) + ", at line " + node.line.toString() + ", column " + node.col.toString());
+            return;
+        }
+        this.recordError(nativeUndeclaredMsg("win32." + modName) + ", at line " + node.line.toString() + ", column " + node.col.toString());
+    }
+
+    private bool customDeclared(string name) {
+        if (name.length == 0) { return false; }
+        return this.customNative.declared(name);
+    }
+
+    private string customEffectiveTarget() {
+        if (this.customTargetOs.length > 0) { return this.customTargetOs; }
+        return "WINDOWS";
     }
 
     // Mirror of recordWin32ImportGrant for `linux` / `linux.<module>`
     // imports (LINUX.md Phase B): `import * from linux;` opens every known
     // lib, `import <mod> from linux;` / `import * from linux.<mod>;` open
     // one, and braced names grant single exports (aliases answer to their
-    // local name only, same as win32).
+    // local name only, same as win32). DOCS/261 custom rules mirror win32.
     private void recordLinuxImportGrant(Node node) {
         string src = node.typeHint;
         if (this.strEq(src, "linux")) {
             if (node.isStatic) { this.linuxAllModules = true; return; }
-            this.linuxOpenModules.add(node.name);
+            this.checkLinuxModuleName(node.name, node);
             for (int j = 0; j < node.childCount(); j++) {
-                this.linuxOpenModules.add(node.child(j).name);
+                this.checkLinuxModuleName(node.child(j).name, node);
             }
             return;
         }
         if (src.length > 6 && this.strEq(this.sliceStr(src, 0, 6), "linux.")) {
             string module = this.sliceStr(src, 6, src.length);
-            if (node.isStatic) {
-                this.linuxOpenModules.add(module);
+            string lib = this.linuxModuleNameLib(module);
+            if (lib.length > 0) {
+                if (node.isStatic) {
+                    this.linuxOpenModules.add(module);
+                    return;
+                }
+                this.linuxGrantNames.add(this.importLocalName(node));
+                for (int j2 = 0; j2 < node.childCount(); j2++) {
+                    this.linuxGrantNames.add(this.importLocalName(node.child(j2)));
+                }
                 return;
             }
-            this.linuxGrantNames.add(this.importLocalName(node));
-            for (int j2 = 0; j2 < node.childCount(); j2++) {
-                this.linuxGrantNames.add(this.importLocalName(node.child(j2)));
+            if (this.customDeclared(module)) {
+                string linf = this.customNative.linFile(module);
+                if (linf.length == 0) {
+                    this.recordError(nativeUndeclaredMsg(src) + ", at line " + node.line.toString() + ", column " + node.col.toString());
+                    return;
+                }
+                if (node.isStatic) {
+                    this.recordError(nativeStarMsg(src) + ", at line " + node.line.toString() + ", column " + node.col.toString());
+                    return;
+                }
+                this.linuxGrantNames.add(this.importLocalName(node));
+                for (int j3 = 0; j3 < node.childCount(); j3++) {
+                    this.linuxGrantNames.add(this.importLocalName(node.child(j3)));
+                }
+                return;
             }
+            this.recordError(nativeUndeclaredMsg(src) + ", at line " + node.line.toString() + ", column " + node.col.toString());
+        }
+    }
+
+    private void checkLinuxModuleName(string modName, Node node) {
+        if (modName.length == 0) { return; }
+        string lib = this.linuxModuleNameLib(modName);
+        if (lib.length > 0) {
+            this.linuxOpenModules.add(modName);
+            return;
+        }
+        if (this.customDeclared(modName)) {
+            this.recordError(nativeStarMsg("linux." + modName) + ", at line " + node.line.toString() + ", column " + node.col.toString());
+            return;
+        }
+        this.recordError(nativeUndeclaredMsg("linux." + modName) + ", at line " + node.line.toString() + ", column " + node.col.toString());
+    }
+
+    // DOCS/261 bare custom grants (`import { f } from m;`,
+    // `import * from m;`): declared names resolve per target OS with no `#on`
+    // regions. Undeclared bare names are Silver (no grant, no error);
+    // declared-but-wrong-side and star-without-list report here so the
+    // unknown-method walk never misfires. Single grants need no export list.
+    private void recordCustomBareGrant(Node node) {
+        string src = node.typeHint;
+        if (src.length == 0) { return; }
+        if (this.strEq(src, "win32") || this.strEq(src, "linux")) { return; }
+        if (src.length > 6 && this.strEq(this.sliceStr(src, 0, 6), "win32.")) { return; }
+        if (src.length > 6 && this.strEq(this.sliceStr(src, 0, 6), "linux.")) { return; }
+        // Precedence: project-local sources, `.qs` bundle modules, and std
+        // modules beat custom native names; a colliding fixed name resolves
+        // to the fixed module (handled above). Std names never grant here.
+        if (projectIsStdModule(src) || projectBuiltin(src)) { return; }
+        if (!this.customDeclared(src)) { return; }
+        string target = this.customEffectiveTarget();
+        string file = this.customNative.fileFor(src, target);
+        if (file.length == 0) {
+            this.recordError(nativeSideError(this.customNative, src, target) + ", at line " + node.line.toString() + ", column " + node.col.toString());
+            return;
+        }
+        bool isLinux = cliArgEq(target, "LINUX");
+        if (node.isStatic) {
+            if (!this.customNative.starAllowed(src, target)) {
+                this.recordError(nativeStarMsg(src) + ", at line " + node.line.toString() + ", column " + node.col.toString());
+                return;
+            }
+            string exps = this.customNative.exportsFor(src, target);
+            int s = 0;
+            while (s < exps.length) {
+                while (s < exps.length && (exps[s] == ' ' || exps[s] == '\t')) { s++; }
+                int e = s;
+                while (e < exps.length && exps[e] != ' ' && exps[e] != '\t') { e++; }
+                if (e > s) {
+                    string nm = "";
+                    for (int k = s; k < e; k++) { nm = nm + exps[k]; }
+                    if (isLinux) { this.linuxGrantNames.add(nm); }
+                    else { this.win32GrantNames.add(nm); }
+                }
+                s = e;
+            }
+            return;
+        }
+        string local0 = this.importLocalName(node);
+        if (isLinux) { this.linuxGrantNames.add(local0); }
+        else { this.win32GrantNames.add(local0); }
+        for (int j = 0; j < node.childCount(); j++) {
+            string ln = this.importLocalName(node.child(j));
+            if (isLinux) { this.linuxGrantNames.add(ln); }
+            else { this.win32GrantNames.add(ln); }
         }
     }
 

@@ -125,6 +125,13 @@ class MiniCg {
     public prop string[] linuxAliasLocals;
     public prop string[] linuxAliasExports;
     public prop string[] linuxAliasLibs;
+    // DOCS/261 -- per-project custom native modules (`.srp` `nativeModules`).
+    // Empty when the manifest declares none (absent key = no change). Bare
+    // names resolve per targetOs with no `#on` regions; fixed tables above
+    // and their std-internal visibility are untouched; custom grants skip
+    // the std-internal rule (manifest opt-in). Declared-but-unused emits no
+    // import entries; only called functions do (lazy).
+    public prop NativeModules customNative;
     public prop int[] loopStartStack;
     public prop int[] loopEndStack;
     public prop int[] loopContinueStack;
@@ -272,6 +279,7 @@ class MiniCg {
         this.linuxAliasLocals = [];
         this.linuxAliasExports = [];
         this.linuxAliasLibs = [];
+        this.customNative = new NativeModules();
         this.loopStartStack = [];
         this.loopEndStack = [];
         this.loopContinueStack = [];
@@ -1045,7 +1053,9 @@ class MiniCg {
     }
 
     // Register one parsed import statement (node.kind == 105), mirroring
-    // registerWin32Import for `linux` / `linux.<module>` sources.
+    // registerWin32Import for `linux` / `linux.<module>` sources. DOCS/261
+    // custom rules mirror win32 (`import * from linux;` still grants fixed
+    // only).
     public void registerLinuxImport(Node node) {
         string source = node.typeHint;
         bool all = node.isStatic;
@@ -1062,23 +1072,61 @@ class MiniCg {
                 this.linuxAddLib(this.linuxModuleLib("xtst"));
                 return;
             }
-            this.linuxAddLib(this.linuxModuleLib(node.name));
+            this.checkLinuxModuleGrant(node.name, node);
             for (int j = 0; j < node.childCount(); j++) {
-                this.linuxAddLib(this.linuxModuleLib(node.child(j).name));
+                this.checkLinuxModuleGrant(node.child(j).name, node);
             }
             return;
         }
         string module = projectSlice(source, 6, source.length);
         string lib = this.linuxModuleLib(module);
-        if (lib.length == 0) { return; }
-        if (all) {
+        if (lib.length > 0) {
+            if (all) {
+                this.linuxAddLib(lib);
+                return;
+            }
+            this.linuxAddGrantNamed(lib, node);
+            for (int j = 0; j < node.childCount(); j++) {
+                this.linuxAddGrantNamed(lib, node.child(j));
+            }
+            return;
+        }
+        if (this.customNative.declared(module)) {
+            string lin = this.customNative.linFile(module);
+            if (lin.length == 0) {
+                printline("Error: " + nativeUndeclaredMsg(source));
+                exit(1);
+                return;
+            }
+            if (all) {
+                printline("Error: " + nativeStarMsg(source));
+                exit(1);
+                return;
+            }
+            this.linuxAddGrantNamed(lin, node);
+            for (int j2 = 0; j2 < node.childCount(); j2++) {
+                this.linuxAddGrantNamed(lin, node.child(j2));
+            }
+            return;
+        }
+        printline("Error: " + nativeUndeclaredMsg(source));
+        exit(1);
+    }
+
+    private void checkLinuxModuleGrant(string modName, Node node) {
+        if (modName.length == 0) { return; }
+        string lib = this.linuxModuleLib(modName);
+        if (lib.length > 0) {
             this.linuxAddLib(lib);
             return;
         }
-        this.linuxAddGrantNamed(lib, node);
-        for (int j = 0; j < node.childCount(); j++) {
-            this.linuxAddGrantNamed(lib, node.child(j));
+        if (this.customNative.declared(modName)) {
+            printline("Error: " + nativeStarMsg("linux." + modName));
+            exit(1);
+            return;
         }
+        printline("Error: " + nativeUndeclaredMsg("linux." + modName));
+        exit(1);
     }
 
     // Inverse of linuxModuleLib: first module alias for a shared lib.
@@ -1262,13 +1310,15 @@ class MiniCg {
     }
 
     // Register one parsed import statement (node.kind == 105 with
-    // typeHint/isStatic set by the parser).
+    // typeHint/isStatic set by the parser). DOCS/261: fixed names first
+    // (untouched); declared custom names grant single exports only (star
+    // rejected); undeclared names report the manifest stanza. Custom grants
+    // skip the std-internal rule (manifest opt-in). `import * from win32;`
+    // still grants fixed modules only.
     public void registerWin32Import(Node node) {
         string source = node.typeHint;
         bool all = node.isStatic;
         if (!this.strEq(source, "win32") && source.length > 6) {
-            // win32.<module>: the prefix check below only accepts sources on
-            // the "win32." namespace.
             string prefix = projectSlice(source, 0, 6);
             if (!this.strEq(prefix, "win32.")) { return; }
         } elif (!this.strEq(source, "win32")) {
@@ -1287,22 +1337,125 @@ class MiniCg {
                 this.win32AddDll(this.win32ModuleDll("version"));
                 return;
             }
-            this.win32AddDll(this.win32ModuleDll(node.name));
+            this.checkWin32ModuleGrant(node.name, node);
             for (int j = 0; j < node.childCount(); j++) {
-                this.win32AddDll(this.win32ModuleDll(node.child(j).name));
+                this.checkWin32ModuleGrant(node.child(j).name, node);
             }
             return;
         }
         string module = projectSlice(source, 6, source.length);
         string dll = this.win32ModuleDll(module);
-        if (dll.length == 0) { return; }
-        if (all) {
+        if (dll.length > 0) {
+            if (all) {
+                this.win32AddDll(dll);
+                return;
+            }
+            this.win32AddGrantNamed(dll, node);
+            for (int j = 0; j < node.childCount(); j++) {
+                this.win32AddGrantNamed(dll, node.child(j));
+            }
+            return;
+        }
+        if (this.customNative.declared(module)) {
+            string winf = this.customNative.winFile(module);
+            if (winf.length == 0) {
+                printline("Error: " + nativeUndeclaredMsg(source));
+                exit(1);
+                return;
+            }
+            if (all) {
+                printline("Error: " + nativeStarMsg(source));
+                exit(1);
+                return;
+            }
+            this.win32AddGrantNamed(winf, node);
+            for (int j2 = 0; j2 < node.childCount(); j2++) {
+                this.win32AddGrantNamed(winf, node.child(j2));
+            }
+            return;
+        }
+        printline("Error: " + nativeUndeclaredMsg(source));
+        exit(1);
+    }
+
+    private void checkWin32ModuleGrant(string modName, Node node) {
+        if (modName.length == 0) { return; }
+        string dll = this.win32ModuleDll(modName);
+        if (dll.length > 0) {
             this.win32AddDll(dll);
             return;
         }
-        this.win32AddGrantNamed(dll, node);
-        for (int j = 0; j < node.childCount(); j++) {
-            this.win32AddGrantNamed(dll, node.child(j));
+        if (this.customNative.declared(modName)) {
+            printline("Error: " + nativeStarMsg("win32." + modName));
+            exit(1);
+            return;
+        }
+        printline("Error: " + nativeUndeclaredMsg("win32." + modName));
+        exit(1);
+    }
+
+    private bool customDeclaredCg(string name) {
+        if (name.length == 0) { return false; }
+        return this.customNative.declared(name);
+    }
+
+    private string customEffectiveTarget() {
+        if (this.targetOs.length > 0) { return this.targetOs; }
+        return "WINDOWS";
+    }
+
+    // DOCS/261 bare custom grants (`import { f } from m;`,
+    // `import * from m;`): declared names resolve per targetOs with no `#on`
+    // regions. Undeclared bare names are Silver (no grant, no error);
+    // declared-but-wrong-side and star-without-list fail here. Single grants
+    // need no export list. Lazy: only called functions later emit imports.
+    public void registerCustomBareImport(Node node) {
+        string source = node.typeHint;
+        if (source.length == 0) { return; }
+        if (this.strEq(source, "win32") || this.strEq(source, "linux")) { return; }
+        if (source.length > 6 && this.strEq(projectSlice(source, 0, 6), "win32.")) { return; }
+        if (source.length > 6 && this.strEq(projectSlice(source, 0, 6), "linux.")) { return; }
+        if (projectIsStdModule(source) || projectBuiltin(source)) { return; }
+        if (!this.customNative.declared(source)) { return; }
+        string target = this.customEffectiveTarget();
+        string file = this.customNative.fileFor(source, target);
+        if (file.length == 0) {
+            printline("Error: " + nativeSideError(this.customNative, source, target));
+            exit(1);
+            return;
+        }
+        bool isLinux = this.strEq(target, "LINUX");
+        if (node.isStatic) {
+            if (!this.customNative.starAllowed(source, target)) {
+                printline("Error: " + nativeStarMsg(source));
+                exit(1);
+                return;
+            }
+            string exps = this.customNative.exportsFor(source, target);
+            int s = 0;
+            while (s < exps.length) {
+                while (s < exps.length && (exps[s] == ' ' || exps[s] == '\t')) { s++; }
+                int e = s;
+                while (e < exps.length && exps[e] != ' ' && exps[e] != '\t') { e++; }
+                if (e > s) {
+                    string nm = projectSlice(exps, s, e);
+                    if (isLinux) { this.linuxAddGrant(file, nm); }
+                    else { this.win32AddGrant(file, nm); }
+                }
+                s = e;
+            }
+            return;
+        }
+        if (isLinux) {
+            this.linuxAddGrantNamed(file, node);
+            for (int j = 0; j < node.childCount(); j++) {
+                this.linuxAddGrantNamed(file, node.child(j));
+            }
+        } else {
+            this.win32AddGrantNamed(file, node);
+            for (int k = 0; k < node.childCount(); k++) {
+                this.win32AddGrantNamed(file, node.child(k));
+            }
         }
     }
 
@@ -1783,18 +1936,29 @@ int strIdx = this.stringPatchIndices[i];
                 // LINUX SysV backend (additive): linux imports resolve beside
                 // win32 ones (registrars self-filter by source namespace).
                 this.registerLinuxImport(pi);
+                // DOCS/261 bare custom grants resolve per targetOs beside them.
+                this.registerCustomBareImport(pi);
                 // Source-module imports are
                 // remembered so dotted-new `new mod.Class(...)` resolves
                 // through the module's flattened namespace. Native win32
                 // sources carry no Silver classes, and neither do the
                 // built-in stdlib modules (STDLIB_MODULES), so neither kind
                 // becomes a user module — mirroring the Rust compiler.
+                // DOCS/261: declared bare customs are native too, never user
+                // modules (their dormant grant is harmless; calls resolve
+                // user-first, lazily).
                 string src = pi.typeHint;
                 bool srcIsWin32 = this.strEq(src, "win32");
                 if (!srcIsWin32 && src.length > 6) {
                     if (this.strEq(projectSlice(src, 0, 6), "win32.")) { srcIsWin32 = true; }
                 }
-                if (!srcIsWin32 && src.length > 0 && !this.isStdlibModuleName(src)) {
+                bool srcIsLinux = this.strEq(src, "linux");
+                if (!srcIsLinux && src.length > 6) {
+                    if (this.strEq(projectSlice(src, 0, 6), "linux.")) { srcIsLinux = true; }
+                }
+                bool srcIsCustom = false;
+                if (!srcIsWin32 && !srcIsLinux && src.length > 0 && this.customNative.declared(src)) { srcIsCustom = true; }
+                if (!srcIsWin32 && !srcIsLinux && !srcIsCustom && src.length > 0 && !this.isStdlibModuleName(src)) {
                     this.userModuleNames.add(src);
                 }
             } elif (pi.kind == 105) {
@@ -8235,6 +8399,35 @@ public void genNewCall(Node call) {
         return false;
     }
 
+    // DOCS/261 custom resolve for the generic dispatcher below: the owning
+    // file of a plain (non-aliased) custom grant answering to `name`, or ""
+    // when none. Fixed full-DLL tables are NOT consulted here (the hardcoded
+    // chain above owns them); custom dll/lib strings are generic and never
+    // appear there. Aliased grants answer only via the alias loops.
+    public string win32CustomResolveDll(string name) {
+        for (int g = 0; g < this.win32Grants.length; g++) {
+            string grant = this.win32Grants[g];
+            if (grant.length > name.length + 1 && this.strEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') {
+                return projectSlice(grant, 0, grant.length - name.length - 1);
+            }
+        }
+        return "";
+    }
+
+    // Ungated linux twin of the above (custom grants emit on both targets,
+    // mirroring silverc-rs where win32::resolve and linux::resolve both run
+    // regardless of `--os`). Fixed linux tables stay gated behind
+    // linuxCallResolves/isLinuxTarget; only custom libs resolve here.
+    public string linuxCustomResolveLibUngated(string name) {
+        for (int g = 0; g < this.linuxGrants.length; g++) {
+            string grant = this.linuxGrants[g];
+            if (grant.length > name.length + 1 && this.strEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') {
+                return projectSlice(grant, 0, grant.length - name.length - 1);
+            }
+        }
+        return "";
+    }
+
     // Overload dispatch by argument count:
     // the LAST declared overload of `name` (class `cls`, "" for globals)
     // whose parameter list accepts `nargs` arguments. The variadic tail is
@@ -8779,6 +8972,24 @@ public void genNewCall(Node call) {
             isWin32 = true;
             win32Dll = "user32.dll";
         }
+        // DOCS/261 custom fallback (additive, fixed chain above untouched):
+        // plain custom grants answer by local name on both targets (mirroring
+        // silverc-rs where win32::resolve and linux::resolve both run
+        // regardless of `--os`). Fixed behavior is byte-identical when no
+        // custom is declared (both resolvers return "").
+        if (!isWin32) {
+            string custWin = this.win32CustomResolveDll(name);
+            if (custWin.length > 0) {
+                isWin32 = true;
+                win32Dll = custWin;
+            } else {
+                string custLin = this.linuxCustomResolveLibUngated(name);
+                if (custLin.length > 0) {
+                    isWin32 = true;
+                    win32Dll = custLin;
+                }
+            }
+        }
         // kernel32 exports CreateProcessA/CreateProcessW, never bare
         // CreateProcess (that spelling exists only as a C macro).  Map it to
         // the ANSI import so source like std/process.sr links and runs.
@@ -8789,8 +9000,18 @@ public void genNewCall(Node call) {
         // single-export grants answer first, aliased grants second, matched
         // by the LOCAL call name only. The PE import keeps the real export,
         // so aliasing one export never grants the rest of the DLL.
+        // DOCS/261: custom linux aliases answer here too so prefixed linux
+        // customs emit on WINDOWS targets (PE with .so NEEDED, Win64 ABI).
         bool plainWin32Allowed = false;
-        if (isWin32) { plainWin32Allowed = this.win32Allowed(win32Dll, importName); }
+        if (isWin32) {
+            plainWin32Allowed = this.win32Allowed(win32Dll, importName);
+            // DOCS/261: win32Dll may actually be a linux lib for custom linux
+            // plain grants on WINDOWS targets (PE with .so NEEDED). Fixed
+            // behavior unchanged (linuxAllowed is false for fixed win dlls).
+            if (!plainWin32Allowed) {
+                if (this.linuxAllowed(win32Dll, importName)) { plainWin32Allowed = true; }
+            }
+        }
         string aliasDll = "";
         string aliasExport = "";
         if (!plainWin32Allowed) {
@@ -8798,6 +9019,14 @@ public void genNewCall(Node call) {
                 if (this.strEq(this.win32AliasLocals[g], name)) {
                     aliasDll = this.win32AliasDlls[g];
                     aliasExport = this.win32AliasExports[g];
+                }
+            }
+            if (aliasDll.length == 0) {
+                for (int a2 = 0; a2 < this.linuxAliasLocals.length; a2++) {
+                    if (this.strEq(this.linuxAliasLocals[a2], name)) {
+                        aliasDll = this.linuxAliasLibs[a2];
+                        aliasExport = this.linuxAliasExports[a2];
+                    }
                 }
             }
         }
