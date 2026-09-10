@@ -10,6 +10,13 @@ mod export preprocess;
 //
 // Semantics:
 //   #on WINDOWS   open a region fed only on WINDOWS builds
+//   #on LINUX or MAC
+//                 open (or chain) a single branch fed on LINUX *or* MAC
+//                 builds: one branch listing several OS names separated by
+//                 the lowercase word `or` (OS names stay UPPERCASE-only,
+//                 order is irrelevant — `#on MAC or LINUX` means the same).
+//                 The branch matches when the target equals ANY listed OS
+//                 and keeps the usual first-match-wins / `#else`-last rules.
 //   #on LINUX     inside an open region: close the previous branch and open
 //                 the next branch of the SAME region (first match wins)
 //   #else         fed only when no preceding `#on` of the region matched;
@@ -169,34 +176,70 @@ public string ppPreprocess(string source, string targetOs, string[] errs) {
                     nameEnd++;
                 }
                 string osName = ppSlice(source, nameStart, nameEnd);
-                int after = ppSkipBlanks(source, nameEnd, contentEnd);
                 if (osName.length == 0) {
                     errs.add("preprocessor: '#on' requires an OS name (WINDOWS, LINUX, MAC), at line " + lineNo.toString());
-                    return source;
-                }
-                if (after < contentEnd) {
-                    errs.add("preprocessor: unexpected text after '#on', at line " + lineNo.toString());
                     return source;
                 }
                 if (!ppIsOsName(osName)) {
                     errs.add("preprocessor: unknown OS name '" + osName + "' after '#on' (valid OS names are WINDOWS, LINUX, MAC), at line " + lineNo.toString());
                     return source;
                 }
+                // OR-list: `#on LINUX or MAC` — one branch fed when the
+                // target equals ANY listed OS (names UPPERCASE-only,
+                // separator lowercase `or`, order irrelevant). The branch
+                // keeps the usual first-match-wins / `#else`-last rules.
+                bool matchesTarget = ppEq(osName, targetOs);
+                int listEnd = nameEnd;
+                int cursor = nameEnd;
+                while (cursor < contentEnd) {
+                    int sepSkip = ppSkipBlanks(source, cursor, contentEnd);
+                    if (sepSkip >= contentEnd) { break; }
+                    int sepEnd = sepSkip;
+                    while (sepEnd < contentEnd) {
+                        char sc = source[sepEnd];
+                        if (sc == ' ' || sc == '\t') { break; }
+                        sepEnd++;
+                    }
+                    string sep = ppSlice(source, sepSkip, sepEnd);
+                    if (!ppEq(sep, "or")) {
+                        errs.add("preprocessor: unexpected text after '#on', at line " + lineNo.toString());
+                        return source;
+                    }
+                    int nextSkip = ppSkipBlanks(source, sepEnd, contentEnd);
+                    int nextEnd = nextSkip;
+                    while (nextEnd < contentEnd) {
+                        char nc = source[nextEnd];
+                        if (nc == ' ' || nc == '\t') { break; }
+                        nextEnd++;
+                    }
+                    string nextOs = ppSlice(source, nextSkip, nextEnd);
+                    if (nextOs.length == 0) {
+                        errs.add("preprocessor: '#on' requires an OS name (WINDOWS, LINUX, MAC) after 'or', at line " + lineNo.toString());
+                        return source;
+                    }
+                    if (!ppIsOsName(nextOs)) {
+                        errs.add("preprocessor: unknown OS name '" + nextOs + "' after '#on' (valid OS names are WINDOWS, LINUX, MAC), at line " + lineNo.toString());
+                        return source;
+                    }
+                    if (ppEq(nextOs, targetOs)) { matchesTarget = true; }
+                    listEnd = nextEnd;
+                    cursor = nextEnd;
+                }
                 if (mode == 1) {
                     if (sawElse) {
                         errs.add("preprocessor: '#on' after '#else' in the same region ('#else' must be last), at line " + lineNo.toString());
                         return source;
                     }
-                    active = ppEq(osName, targetOs) && !matchedAny;
-                    matchedAny = matchedAny || ppEq(osName, targetOs);
+                    active = matchesTarget && !matchedAny;
+                    matchedAny = matchedAny || matchesTarget;
                 } else {
                     mode = 1;
-                    active = ppEq(osName, targetOs);
+                    active = matchesTarget;
                     matchedAny = active;
                     sawElse = false;
                     regionOpenLine = lineNo;
                     regionOpenOsStart = nameStart;
-                    regionOpenOsEnd = nameEnd;
+                    regionOpenOsEnd = listEnd;
                 }
             } elif (ppEq(word, "else")) {
                 isDirective = true;
