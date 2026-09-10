@@ -63,12 +63,19 @@ mod export threads;
 // names lower to null/garbage on both compilers (see DORMANT SPAWN above),
 // so start() keeps no region and no spawn call on Linux either; handle
 // stays 0 and join() is a no-op there exactly like on Windows.
+//
+// MAC BACKEND (Phase B, code-only -- MAC.md section 10, UNVALIDATED until
+// probed on Mac hardware): pthread_join for join(), nanosleep for sleep()
+// via mac.libsystem -- identical spellings, shared through `#else`. The
+// dormant-spawn posture stays OS-independent (libSystem pthreads need the
+// same unexpressible start-routine pointer).
 
 #on WINDOWS
 import * from win32.kernel32;
-#off
 #on LINUX
 import * from linux.libc;
+#on MAC
+import * from mac.libsystem;
 #off
 
 class Thread {
@@ -98,8 +105,7 @@ class Thread {
             #on WINDOWS
             WaitForSingleObject(this.handle, -1);
             CloseHandle(this.handle);
-            #off
-            #on LINUX
+            #else
             int ret = 0;
             pthread_join(this.handle, &ret);
             #off
@@ -155,8 +161,7 @@ public ThreadGroup multi(object[] fns) {
 public void sleep(int ms) {
     #on WINDOWS
     Sleep(ms);
-    #off
-    #on LINUX
+    #else
     if (ms < 0) { return; }
     int[] ts = new int[2];
     ts[0] = ms / 1000;

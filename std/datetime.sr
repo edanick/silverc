@@ -64,12 +64,21 @@ mod export datetime;
 // gmtoff + zone = 56 bytes) rides an int[7]; the packed 32-bit fields
 // unpack with the same shift idiom as the SYSTEMTIME words. The tm_year
 // (years since 1900) and tm_mon (0-based) biases are applied.
+//
+// MAC BACKEND (Phase B, code-only -- MAC.md section 10, UNVALIDATED until
+// probed on Mac hardware): clock_gettime(CLOCK_REALTIME = 0, the same value
+// on Darwin) + localtime_r/gmtime_r via mac.libsystem, shared through
+// `#else` (the bodies are textually identical). Darwin struct tm carries
+// the same first 9 int fields at the same offsets (tm_sec..tm_isdst at
+// bytes 0-35, then 8-byte gmtoff + 8-byte zone = 52 bytes, inside the same
+// int[7]); only the fields these bodies read are relied on.
 
 #on WINDOWS
 import * from win32.kernel32;
-#off
 #on LINUX
 import * from linux.libc;
+#on MAC
+import * from mac.libsystem;
 #off
 
 class duration {
@@ -108,8 +117,7 @@ class now {
             this.minute = (st[1] >> 16) & 0xFFFF;
             this.second = (st[1] >> 32) & 0xFFFF;
             this.millisecond = (st[1] >> 48) & 0xFFFF;
-            #off
-            #on LINUX
+            #else
             // clock_gettime(REALTIME) + localtime_r fill the packed struct
             // tm with the caller's LOCAL civil time; the shifts unpack the
             // same fields (tm_year/tm_mon carry their C biases).
@@ -213,8 +221,7 @@ public now utcNow() {
     n.minute = (st[1] >> 16) & 0xFFFF;
     n.second = (st[1] >> 32) & 0xFFFF;
     n.millisecond = (st[1] >> 48) & 0xFFFF;
-    #off
-    #on LINUX
+    #else
     // clock_gettime(REALTIME) + gmtime_r overwrite the same fields with
     // wall-clock UTC.
     int[] ts = new int[2];

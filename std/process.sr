@@ -80,6 +80,20 @@ mod export process;
 // empty no-op and read() returns "" there -- no region needed, matching
 // the Windows no-backend stubs per LINUX.md headless rules).
 //
+// MAC BACKEND (Phase B, code-only -- MAC.md section 10, UNVALIDATED until
+// probed on Mac hardware): posix_spawn + waitpid + pipe/read/close from
+// mac.libsystem -- NEVER bare fork (fork without exec is deprecated/unsafe
+// on macOS: the ObjC runtime is not fork-safe; posix_spawn/posix_spawnp is
+// the supported ladder, kill for terminate, pipe for redirection). The
+// child's stdout is captured through a posix_spawn file-actions object
+// (init + adddup2(pipe-write, 1) + destroy around the spawn); argv carries
+// cmd first with an explicit null terminator, envp rides null. A failed
+// spawn returns the same zero result the WINDOWS created == 0 branch
+// produces (exitCode -1, "Failed to create process"). getFocusedProcess()
+// keeps the documented all-zero fallback on macOS (no WindowServer query
+// in the libSystem backend); the pipe class keeps its dead posture there
+// too (no region needed, matching the Windows/Linux stubs).
+//
 // DISPATCH NOTE (per compiler, probed): on
 // silverc-rs every `Process.getFocusedProcess()` / `process.getFocusedProcess()`
 // call is intercepted BEFORE this source body and emitted natively
@@ -100,9 +114,10 @@ mod export process;
 #on WINDOWS
 import * from win32.user32;
 import * from win32.kernel32;
-#off
 #on LINUX
 import * from linux.libc;
+#on MAC
+import * from mac.libsystem;
 #off
 
 class result {
@@ -255,7 +270,6 @@ public result run(string cmd, string[] args) {
         res.stdout = output;
         res.exitCode = 0;
     }
-    #off
     #on LINUX
     // pipe() + fork() + execvpe() + drain + waitpid(): the same
     // spawn-a-child-and-capture-stdout shape as the WINDOWS ladder. The
@@ -283,6 +297,48 @@ public result run(string cmd, string[] args) {
         _exit(127);
     } else {
         close(fw);
+        int[] chunk = new int[1024];
+        string output = "";
+        while (true) {
+            int n = read(fr, chunk, 8192);
+            if (n <= 0) { break; }
+            for (int i = 0; i < n; i++) {
+                int b = (chunk[i / 8] >> ((i % 8) * 8)) & 0xFF;
+                output += char(b);
+            }
+        }
+        close(fr);
+        int st = 0;
+        waitpid(pid, &st, 0);
+        res.stdout = output;
+        res.exitCode = (st >> 8) & 0xFF;
+    }
+    #on MAC
+    // posix_spawn() + drain + waitpid(): the same spawn-a-child-and-
+    // capture-stdout shape as the ladders above (fork is deprecated on
+    // macOS, so there is no fork/exec branch here). The child's stdout is
+    // wired to the pipe through a file-actions object; a failed spawn
+    // returns the created == 0 zero result instead of faulting.
+    int[] fds = new int[2];
+    pipe(fds);
+    int fr = fds[0] & 0xFFFFFFFF;
+    int fw = (fds[0] >> 32) & 0xFFFFFFFF;
+    int actions = 0;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, fw, 1);
+    string[] argv = [];
+    argv.add(cmd);
+    for (int i = 0; i < args.length; i++) { argv.add(args[i]); }
+    argv.add(null);
+    int pid = 0;
+    int rc = posix_spawn(&pid, cmd, actions, null, argv, null);
+    posix_spawn_file_actions_destroy(&actions);
+    close(fw);
+    if (rc != 0) {
+        close(fr);
+        res.exitCode = -1;
+        res.stderr = "Failed to create process";
+    } else {
         int[] chunk = new int[1024];
         string output = "";
         while (true) {

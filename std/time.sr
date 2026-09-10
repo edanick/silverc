@@ -45,12 +45,19 @@ mod export time;
 // seconds + nanoseconds in a two-slot timespec int[2]). Negative sleeps
 // return at once (nanosleep rejects them; the clamp keeps the call safe).
 // stopwatch() is pure Silver over now() and needs no region.
+//
+// MAC BACKEND (Phase B, code-only -- MAC.md section 10, UNVALIDATED until
+// probed on Mac hardware): clock_gettime(CLOCK_MONOTONIC = 6 on Darwin,
+// NOT 1 -- <time.h>, re-derived, never copied) + nanosleep via
+// mac.libsystem. The timespec int[2] shape is the same (Darwin timespec is
+// tv_sec/time_t + tv_nsec/long = 16 bytes, like Linux x86-64).
 
 #on WINDOWS
 import * from win32.kernel32;
-#off
 #on LINUX
 import * from linux.libc;
+#on MAC
+import * from mac.libsystem;
 #off
 
 public void stopwatch(void () job) {
@@ -62,8 +69,7 @@ public void stopwatch(void () job) {
 public void sleep(int ms) {
     #on WINDOWS
     Sleep(ms);
-    #off
-    #on LINUX
+    #else
     if (ms < 0) { return; }
     int[] ts = new int[2];
     ts[0] = ms / 1000;
@@ -76,8 +82,7 @@ public void sleep(int ms) {
 public void sleep(uint ms) {
     #on WINDOWS
     Sleep(ms);
-    #off
-    #on LINUX
+    #else
     int[] ts = new int[2];
     ts[0] = ms / 1000;
     ts[1] = (ms % 1000) * 1000000;
@@ -93,10 +98,15 @@ public float64 now() {
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
     return float64(count) / float64(freq) * 1000.0;
-    #off
     #on LINUX
     int[] ts = new int[2];
     clock_gettime(1, ts);
+    int64 sec = ts[0];
+    int64 nsec = ts[1];
+    return float64(sec) * 1000.0 + float64(nsec) / 1000000.0;
+    #on MAC
+    int[] ts = new int[2];
+    clock_gettime(6, ts);
     int64 sec = ts[0];
     int64 nsec = ts[1];
     return float64(sec) * 1000.0 + float64(nsec) / 1000000.0;
