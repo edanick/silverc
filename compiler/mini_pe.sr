@@ -1,25 +1,26 @@
 // ============================================================================
-// WINDOWS-TARGET MODULE — emits PE executables for the compiler's OUTPUT.
+// TARGET MODULE — emits PE/ELF/Mach-O executables for the compiler's OUTPUT.
 // ============================================================================
 // This region keying differs from the std modules: std's `#on WINDOWS` gates
 // the HOST OS the running program talks to, while every region here gates what
-// the COMPILER EMITS as its output target. On a Linux build of silverc these
-// regions are excluded wholesale and the `#on LINUX` slot below is where the
-// ELF/Mach-O emitter slots in — same MiniPe surface (addSectionData/
-// setVersionInfo/writeFile/build), a different byte-level container.
+// the COMPILER EMITS as its output target. One chained region holds all three
+// emitters (WINDOWS PE, LINUX ELF, MAC Mach-O) closed by a single `#off` —
+// same MiniPe surface (addSectionData/setVersionInfo/writeFile/build), a
+// different byte-level container per branch.
 //
-// The whole module is Windows-target machinery: DOS header ("MZ"), PE\0\0
-// signature, COFF + optional header, section table (.text/.rdata/.rsrc),
-// import directory + ILT/IAT, VERSIONINFO resource blob, subsystem field.
+// The WINDOWS branch is DOS header ("MZ"), PE\0\0 signature, COFF + optional
+// header, section table (.text/.rdata/.rsrc), import directory + ILT/IAT,
+// VERSIONINFO resource blob, subsystem field. The LINUX branch is the ELF
+// ET_EXEC emitter (see its header). The MAC branch is the Mach-O MH_EXECUTE
+// ARM64 emitter (16KB segments, dyld commands, ad-hoc signature — see its
+// header; code-only, UNVALIDATED until Mac hardware).
 // The pure byte-order helpers (writeLe32/writeLe64/padToAlign) are CPU-level
-// and shared by any emitter, but they sit INSIDE the regions because they are
-// only referenced by PE emission today — the Linux emitter re-uses them by
-// moving them out of the region or re-declaring them.
+// and shared by any emitter, but they sit INSIDE each branch because each
+// branch re-declares them (the type checker overwrites same-name classes,
+// so each branch defines its own MiniPe).
 //
-// NOTE on the `#on LINUX` slot: this is COMPILER MACHINERY, not std — the
-// std rule "no empty placeholder regions" (UNIFIED_CORE_LIBRARY.md §2) does
-// not apply here. The slot below is a deliberate, documented insertion point
-// for the future ELF emitter and contains ONLY comments.
+// NOTE: this is COMPILER MACHINERY, not std — the std no-placeholder rule
+// does not apply. Each branch is a deliberate, documented emitter.
 // ============================================================================
 
 mod export mini_pe;
@@ -602,11 +603,6 @@ public int[] build(int[] codeIn, int[] stringData, string[] versionData) {
         return pe;
     }
 }
-#off
-
-// LINUX INSERTION POINT — see the module header. Comments inside this region
-// are the documentation; the region holds only comments (compiler machinery
-// slot — the std no-placeholder rule does not apply).
 #on LINUX
 // LINUX ELF ET_EXEC emitter -- mirrors silverc-rs src/elf.rs plan()/emit().
 // Layout (exact mirror of the Rust ET_EXEC writer):
@@ -997,6 +993,492 @@ class MiniPe {
         this.writeLe64(out, dynPos + 8, 0);
         for (int ci = 0; ci < codeIn.length; ci++) { out[rxOff + ci] = codeIn[ci]; }
         for (int di = 0; di < stringData.length; di++) { out[dataOff + di] = stringData[di]; }
+        return out;
+    }
+}
+#on MAC
+// MAC Mach-O MH_EXECUTE ARM64 emitter -- mirrors silverc-rs src/macho.rs
+// plan()/emit() layout decisions (code-only, UNVALIDATED until Mac hardware,
+// MAC.md section 10): __TEXT (RX code + __stubs) / __DATA (writable __got +
+// data) / __LINKEDIT (bind + symtab + ad-hoc signature) at 16KB pages,
+// LC_SEGMENT_64 x3, LC_LOAD_DYLINKER (/usr/lib/dyld), LC_MAIN, LC_LOAD_DYLIB
+// (/usr/lib/libSystem.B.dylib; Aqua extras are future work -- desktop stays
+// degraded-headless like the reference), LC_BUILD_VERSION (platform MACOS,
+// minos 11.0), LC_SYMTAB/LC_DYSYMTAB, LC_DYLD_INFO_ONLY bind opcodes against
+// __DATA, LC_CODE_SIGNATURE ad-hoc SuperBlob+CodeDirectory (SHA-256 over
+// __TEXT pages; v1 emits correct magic/length/ident with zeroed page hashes
+// -- real hashing via the pure-Silver hash module is hardware-gated, and the
+// kernel acceptance test is Mac-gated). CPU subtype is plain ARM64_ALL (no
+// ARM64E); plain ret (no PAC/BTI). Shares Phase-A A64 decisions: dyld stubs
+// and the entry stub use the a64Enc* tables from mini_asm.sr (same formulas
+// the harness pins), never redesigned here. Full per-construct AAPCS64 body
+// lowering is hardware-gated like the reference: v1 emits the fixed 20-byte
+// exit stub (adrp x16 / ldr x16 / movz x0#0 / blr x16 / ret) and ignores
+// codeIn bodies -- deterministic, structurally valid, unrun until a Mac.
+class PeImport {
+    public prop string dll;
+    public prop string name;
+
+    construct (string dll, string name) {
+        this.dll = dll;
+        this.name = name;
+    }
+}
+class PeDllGroup {
+    public prop string dll;
+    public prop int count;
+
+    construct (string dll) {
+        this.dll = dll;
+        this.count = 0;
+    }
+}
+class MiniPe {
+    public int[] code;
+    public int entryRva;
+    public int globalAreaSize;
+    public PeImport[] imports;
+    public int[] relocOffsets;
+    public int[] extraData;
+    public string[] viKeys;
+    public string[] viValues;
+    public int subsystem;
+
+    construct () {
+        this.code = [];
+        this.entryRva = 0;
+        this.globalAreaSize = 0;
+        this.imports = [];
+        this.relocOffsets = [];
+        this.extraData = [];
+        this.viKeys = [];
+        this.viValues = [];
+        this.subsystem = 3;
+    }
+
+    public void addSectionData(int[] data) {
+        this.extraData = data;
+    }
+
+    public void setVersionInfo(string[] keys, string[] values) {
+        this.viKeys = keys;
+        this.viValues = values;
+    }
+
+    public void writeFile(string path) {
+        int[] machoBytes = this.build(this.code, this.extraData, []);
+        file.writeBytes(path, machoBytes);
+    }
+
+    public void addImport(string dll, string name) {
+        this.imports.add(new PeImport(dll, name));
+    }
+
+    private bool strEq(string a, string b) {
+        if (a.length != b.length) { return false; }
+        for (int i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    public int computeRdataRva() {
+        int SECT_ALIGN = 0x4000;
+        int textRva = SECT_ALIGN;
+        int textVirt = this.padToAlign(20, SECT_ALIGN);
+        return textRva + textVirt;
+    }
+
+    public int[] computeLayout(int stringDataLen) {
+        PeDllGroup[] groups = [];
+        int[] groupMap = [];
+        for (int i = 0; i < this.imports.length; i++) {
+            string impDll = this.imports[i].dll;
+            int gIdx = -1;
+            for (int j = 0; j < groups.length; j++) {
+                string gDll = groups[j].dll;
+                if (this.strEq(gDll, impDll)) {
+                    gIdx = j;
+                    break;
+                }
+            }
+            if (gIdx < 0) {
+                groups.add(new PeDllGroup(impDll));
+                gIdx = groups.length - 1;
+            }
+            PeDllGroup grp = groups[gIdx];
+            grp.count = grp.count + 1;
+            groupMap.add(gIdx);
+        }
+        int numGroups = groups.length;
+        int[] layout = [];
+        layout.add(0);
+        layout.add(numGroups);
+        layout.add(this.imports.length * 12);
+        return layout;
+    }
+
+    public int padToAlign(int offset, int align) {
+        int m = offset % align;
+        if (m != 0) {
+            return offset + (align - m);
+        }
+        return offset;
+    }
+
+    public void writeLe32(int[] buf, int offset, int val) {
+        buf[offset] = val & 0xFF;
+        buf[offset + 1] = (val >> 8) & 0xFF;
+        buf[offset + 2] = (val >> 16) & 0xFF;
+        buf[offset + 3] = (val >> 24) & 0xFF;
+    }
+
+    public void writeLe64(int[] buf, int offset, int64 val) {
+        buf[offset] = int(val & 0xFF);
+        buf[offset + 1] = int((val >> 8) & 0xFF);
+        buf[offset + 2] = int((val >> 16) & 0xFF);
+        buf[offset + 3] = int((val >> 24) & 0xFF);
+        buf[offset + 4] = int((val >> 32) & 0xFF);
+        buf[offset + 5] = int((val >> 40) & 0xFF);
+        buf[offset + 6] = int((val >> 48) & 0xFF);
+        buf[offset + 7] = int((val >> 56) & 0xFF);
+    }
+
+    private void lcAddU32(int[] lc, int v) {
+        lc.add(v & 0xFF);
+        lc.add((v >> 8) & 0xFF);
+        lc.add((v >> 16) & 0xFF);
+        lc.add((v >> 24) & 0xFF);
+    }
+
+    private void lcAddU64(int[] lc, int64 v) {
+        lc.add(int(v & 0xFF));
+        lc.add(int((v >> 8) & 0xFF));
+        lc.add(int((v >> 16) & 0xFF));
+        lc.add(int((v >> 24) & 0xFF));
+        lc.add(int((v >> 32) & 0xFF));
+        lc.add(int((v >> 40) & 0xFF));
+        lc.add(int((v >> 48) & 0xFF));
+        lc.add(int((v >> 56) & 0xFF));
+    }
+
+    private void lcAddName(int[] lc, string s, int total) {
+        int n = s.length;
+        if (n > total) { n = total; }
+        for (int i = 0; i < n; i++) { lc.add(s[i]); }
+        for (int j = n; j < total; j++) { lc.add(0); }
+    }
+
+    private void sigAddU32BE(int[] sig, int v) {
+        sig.add((v >> 24) & 0xFF);
+        sig.add((v >> 16) & 0xFF);
+        sig.add((v >> 8) & 0xFF);
+        sig.add(v & 0xFF);
+    }
+
+    public int[] build(int[] codeIn, int[] stringData, string[] versionData) {
+        this.code = codeIn;
+        int n = this.imports.length;
+        int PAGE = 0x4000;
+        int64 TEXT_VMADDR = 4294967296;
+        int codeLen = 20;
+        int dataLen = stringData.length + this.globalAreaSize;
+        int stubsLen = n * 12;
+        int gotLen = n * 8;
+        string dyldPath = "/usr/lib/dyld";
+        string libPath = "/usr/lib/libSystem.B.dylib";
+        int dyldSize = this.padToAlign(12 + dyldPath.length + 1, 8);
+        int dylibSize = this.padToAlign(24 + libPath.length + 1, 8);
+        int segTextSize = 72 + 2 * 80;
+        int segDataSize = 72 + 2 * 80;
+        int segLinkSize = 72;
+        int sizeofcmds = segTextSize + segDataSize + segLinkSize + dyldSize + 24 + dylibSize + 32 + 24 + 80 + 48 + 16;
+        int headerLen = 32 + sizeofcmds;
+        int textCodeOff = headerLen;
+        int stubsOff = textCodeOff + codeLen;
+        int textEnd = stubsOff + stubsLen;
+        int textFilesz = this.padToAlign(textEnd, PAGE);
+        int dataOff = textFilesz;
+        int dataFilesz = this.padToAlign(gotLen + dataLen, PAGE);
+        if (dataFilesz < PAGE) { dataFilesz = PAGE; }
+        int linkeditOff = dataOff + dataFilesz;
+        int[] strtabBytes = [];
+        strtabBytes.add(0);
+        int[] strOffs = [];
+        for (int si = 0; si < n; si++) {
+            strOffs.add(strtabBytes.length);
+            strtabBytes.add(95);
+            string nm = this.imports[si].name;
+            for (int k = 0; k < nm.length; k++) { strtabBytes.add(nm[k]); }
+            strtabBytes.add(0);
+        }
+        int symLen = n * 16;
+        int[] bindBytes = [];
+        for (int bi = 0; bi < n; bi++) {
+            bindBytes.add(17);
+            bindBytes.add(64);
+            bindBytes.add(95);
+            string bn = this.imports[bi].name;
+            for (int q = 0; q < bn.length; q++) { bindBytes.add(bn[q]); }
+            bindBytes.add(0);
+            bindBytes.add(81);
+            bindBytes.add(114);
+            int off = bi * 8;
+            while (off >= 128) {
+                bindBytes.add((off & 127) | 128);
+                off = off / 128;
+            }
+            bindBytes.add(off);
+            bindBytes.add(144);
+        }
+        bindBytes.add(0);
+        int offBind = linkeditOff;
+        int offSym = offBind + bindBytes.length;
+        int offStr = offSym + symLen;
+        int sigStart = this.padToAlign(offStr + strtabBytes.length, 16);
+        int npages = textFilesz / PAGE;
+        int sigLen = 20 + 64 + 7 + npages * 32;
+        int64 dataVaddr = TEXT_VMADDR + dataOff;
+        int64 linkVaddr = TEXT_VMADDR + linkeditOff;
+        int64 textVaddr = TEXT_VMADDR;
+        int entryFileoff = textCodeOff;
+        int[] lc = [];
+        this.lcAddU32(lc, 25);
+        this.lcAddU32(lc, segTextSize);
+        this.lcAddName(lc, "__TEXT", 16);
+        this.lcAddU64(lc, textVaddr);
+        this.lcAddU64(lc, textFilesz);
+        this.lcAddU64(lc, 0);
+        this.lcAddU64(lc, textFilesz);
+        this.lcAddU32(lc, 5);
+        this.lcAddU32(lc, 5);
+        this.lcAddU32(lc, 2);
+        this.lcAddU32(lc, 0);
+        this.lcAddName(lc, "__text", 16);
+        this.lcAddName(lc, "__TEXT", 16);
+        this.lcAddU64(lc, textVaddr + textCodeOff);
+        this.lcAddU64(lc, codeLen);
+        this.lcAddU32(lc, textCodeOff);
+        this.lcAddU32(lc, 2);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 2147485696);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddName(lc, "__stubs", 16);
+        this.lcAddName(lc, "__TEXT", 16);
+        this.lcAddU64(lc, textVaddr + stubsOff);
+        this.lcAddU64(lc, stubsLen);
+        this.lcAddU32(lc, stubsOff);
+        this.lcAddU32(lc, 2);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 25);
+        this.lcAddU32(lc, segDataSize);
+        this.lcAddName(lc, "__DATA", 16);
+        this.lcAddU64(lc, dataVaddr);
+        this.lcAddU64(lc, dataFilesz);
+        this.lcAddU64(lc, dataOff);
+        this.lcAddU64(lc, dataFilesz);
+        this.lcAddU32(lc, 3);
+        this.lcAddU32(lc, 3);
+        this.lcAddU32(lc, 2);
+        this.lcAddU32(lc, 0);
+        this.lcAddName(lc, "__got", 16);
+        this.lcAddName(lc, "__DATA", 16);
+        this.lcAddU64(lc, dataVaddr);
+        this.lcAddU64(lc, gotLen);
+        this.lcAddU32(lc, dataOff);
+        this.lcAddU32(lc, 3);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddName(lc, "__data", 16);
+        this.lcAddName(lc, "__DATA", 16);
+        this.lcAddU64(lc, dataVaddr + gotLen);
+        this.lcAddU64(lc, dataLen);
+        this.lcAddU32(lc, dataOff + gotLen);
+        this.lcAddU32(lc, 2);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 25);
+        this.lcAddU32(lc, segLinkSize);
+        this.lcAddName(lc, "__LINKEDIT", 16);
+        this.lcAddU64(lc, linkVaddr);
+        this.lcAddU64(lc, this.padToAlign((sigStart + sigLen) - linkeditOff, PAGE));
+        this.lcAddU64(lc, linkeditOff);
+        this.lcAddU64(lc, this.padToAlign((sigStart + sigLen) - linkeditOff, PAGE));
+        this.lcAddU32(lc, 1);
+        this.lcAddU32(lc, 1);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 14);
+        this.lcAddU32(lc, dyldSize);
+        this.lcAddU32(lc, 12);
+        for (int dp = 0; dp < dyldPath.length; dp++) { lc.add(dyldPath[dp]); }
+        lc.add(0);
+        while (lc.length % 8 != 0) { lc.add(0); }
+        this.lcAddU32(lc, 2147483688);
+        this.lcAddU32(lc, 24);
+        this.lcAddU64(lc, entryFileoff);
+        this.lcAddU64(lc, 0);
+        this.lcAddU32(lc, 12);
+        this.lcAddU32(lc, dylibSize);
+        this.lcAddU32(lc, 24);
+        this.lcAddU32(lc, 2);
+        this.lcAddU32(lc, 65536);
+        this.lcAddU32(lc, 65536);
+        for (int lp = 0; lp < libPath.length; lp++) { lc.add(libPath[lp]); }
+        lc.add(0);
+        while (lc.length % 8 != 0) { lc.add(0); }
+        this.lcAddU32(lc, 50);
+        this.lcAddU32(lc, 32);
+        this.lcAddU32(lc, 1);
+        this.lcAddU32(lc, 720896);
+        this.lcAddU32(lc, 720896);
+        this.lcAddU32(lc, 1);
+        this.lcAddU32(lc, 3);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 2);
+        this.lcAddU32(lc, 24);
+        this.lcAddU32(lc, offSym);
+        this.lcAddU32(lc, n);
+        this.lcAddU32(lc, offStr);
+        this.lcAddU32(lc, strtabBytes.length);
+        this.lcAddU32(lc, 11);
+        this.lcAddU32(lc, 80);
+        for (int z = 0; z < 18; z++) { this.lcAddU32(lc, 0); }
+        this.lcAddU32(lc, 34);
+        this.lcAddU32(lc, 48);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, offBind);
+        this.lcAddU32(lc, bindBytes.length);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 0);
+        this.lcAddU32(lc, 29);
+        this.lcAddU32(lc, 16);
+        this.lcAddU32(lc, sigStart);
+        this.lcAddU32(lc, sigLen);
+        int totalSize = sigStart + sigLen;
+        int[] out = [];
+        for (int f = 0; f < totalSize; f++) { out.add(0); }
+        this.writeLe32(out, 0, 4277009103);
+        this.writeLe32(out, 4, 16777228);
+        this.writeLe32(out, 8, 0);
+        this.writeLe32(out, 12, 2);
+        this.writeLe32(out, 16, 11);
+        this.writeLe32(out, 20, sizeofcmds);
+        this.writeLe32(out, 24, 2097285);
+        this.writeLe32(out, 28, 0);
+        for (int li = 0; li < lc.length; li++) { out[32 + li] = lc[li]; }
+        int64 stubVaddrBase = TEXT_VMADDR + stubsOff;
+        int64 gotVaddrBase = dataVaddr;
+        int stubPos = textCodeOff;
+        int64 stubPage = stubVaddrBase / PAGE * PAGE;
+        int64 gotPage = gotVaddrBase / PAGE * PAGE;
+        int pageOff = int((gotPage - stubPage) / PAGE);
+        int lo0 = int(gotVaddrBase - gotPage);
+        out[stubPos] = a64EncAdrp(16, pageOff) & 0xFF;
+        out[stubPos + 1] = (a64EncAdrp(16, pageOff) >> 8) & 0xFF;
+        out[stubPos + 2] = (a64EncAdrp(16, pageOff) >> 16) & 0xFF;
+        out[stubPos + 3] = (a64EncAdrp(16, pageOff) >> 24) & 0xFF;
+        out[stubPos + 4] = a64EncLdrImm(16, 16, lo0) & 0xFF;
+        out[stubPos + 5] = (a64EncLdrImm(16, 16, lo0) >> 8) & 0xFF;
+        out[stubPos + 6] = (a64EncLdrImm(16, 16, lo0) >> 16) & 0xFF;
+        out[stubPos + 7] = (a64EncLdrImm(16, 16, lo0) >> 24) & 0xFF;
+        out[stubPos + 8] = a64EncMovz(0, 0, 0) & 0xFF;
+        out[stubPos + 9] = (a64EncMovz(0, 0, 0) >> 8) & 0xFF;
+        out[stubPos + 10] = (a64EncMovz(0, 0, 0) >> 16) & 0xFF;
+        out[stubPos + 11] = (a64EncMovz(0, 0, 0) >> 24) & 0xFF;
+        out[stubPos + 12] = a64EncBlr(16) & 0xFF;
+        out[stubPos + 13] = (a64EncBlr(16) >> 8) & 0xFF;
+        out[stubPos + 14] = (a64EncBlr(16) >> 16) & 0xFF;
+        out[stubPos + 15] = (a64EncBlr(16) >> 24) & 0xFF;
+        out[stubPos + 16] = a64EncRet(30) & 0xFF;
+        out[stubPos + 17] = (a64EncRet(30) >> 8) & 0xFF;
+        out[stubPos + 18] = (a64EncRet(30) >> 16) & 0xFF;
+        out[stubPos + 19] = (a64EncRet(30) >> 24) & 0xFF;
+        for (int gi = 0; gi < n; gi++) {
+            int64 sv = stubVaddrBase + 20 + gi * 12;
+            int64 gv = gotVaddrBase + gi * 8;
+            int64 sp = sv / PAGE * PAGE;
+            int64 gp = gv / PAGE * PAGE;
+            int po = int((gp - sp) / PAGE);
+            int lo = int(gv - gp);
+            int w0 = a64EncAdrp(16, po);
+            int w1 = a64EncLdrImm(16, 16, lo);
+            int w2 = a64EncBlr(16);
+            int base = stubsOff + 20 + gi * 12;
+            out[base] = w0 & 0xFF;
+            out[base + 1] = (w0 >> 8) & 0xFF;
+            out[base + 2] = (w0 >> 16) & 0xFF;
+            out[base + 3] = (w0 >> 24) & 0xFF;
+            out[base + 4] = w1 & 0xFF;
+            out[base + 5] = (w1 >> 8) & 0xFF;
+            out[base + 6] = (w1 >> 16) & 0xFF;
+            out[base + 7] = (w1 >> 24) & 0xFF;
+            out[base + 8] = w2 & 0xFF;
+            out[base + 9] = (w2 >> 8) & 0xFF;
+            out[base + 10] = (w2 >> 16) & 0xFF;
+            out[base + 11] = (w2 >> 24) & 0xFF;
+        }
+        for (int di2 = 0; di2 < stringData.length; di2++) { out[dataOff + gotLen + di2] = stringData[di2]; }
+        for (int bi2 = 0; bi2 < bindBytes.length; bi2++) { out[offBind + bi2] = bindBytes[bi2]; }
+        for (int sy = 0; sy < n; sy++) {
+            int sbase = offSym + sy * 16;
+            this.writeLe32(out, sbase, strOffs[sy]);
+            out[sbase + 4] = 1;
+            out[sbase + 5] = 0;
+            this.writeLe32(out, sbase + 6, 0);
+            this.writeLe64(out, sbase + 8, 0);
+        }
+        for (int st = 0; st < strtabBytes.length; st++) { out[offStr + st] = strtabBytes[st]; }
+        int[] sig = [];
+        this.sigAddU32BE(sig, 4278849984);
+        this.sigAddU32BE(sig, 16 + 64 + 7 + npages * 32);
+        this.sigAddU32BE(sig, 1);
+        this.sigAddU32BE(sig, 0);
+        this.sigAddU32BE(sig, 16);
+        this.sigAddU32BE(sig, 4278849794);
+        this.sigAddU32BE(sig, 64 + 7 + npages * 32);
+        this.sigAddU32BE(sig, 131584);
+        this.sigAddU32BE(sig, 2);
+        this.sigAddU32BE(sig, 71);
+        this.sigAddU32BE(sig, 64);
+        this.sigAddU32BE(sig, 0);
+        this.sigAddU32BE(sig, npages);
+        this.sigAddU32BE(sig, textFilesz);
+        sig.add(32);
+        sig.add(2);
+        sig.add(0);
+        sig.add(14);
+        this.sigAddU32BE(sig, 0);
+        this.sigAddU32BE(sig, 0);
+        this.sigAddU32BE(sig, 0);
+        this.sigAddU32BE(sig, 0);
+        this.sigAddU32BE(sig, 0);
+        string ident = "silver";
+        for (int id = 0; id < ident.length; id++) { sig.add(ident[id]); }
+        sig.add(0);
+        for (int hp = 0; hp < npages * 32; hp++) { sig.add(0); }
+        for (int sg = 0; sg < sig.length; sg++) { out[sigStart + sg] = sig[sg]; }
         return out;
     }
 }
