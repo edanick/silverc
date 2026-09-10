@@ -10,9 +10,12 @@ mod export preprocess;
 //
 // Semantics:
 //   #on WINDOWS   open a region fed only on WINDOWS builds
-//   #else         fed only when no preceding `#on` of the region matched
+//   #on LINUX     inside an open region: close the previous branch and open
+//                 the next branch of the SAME region (first match wins)
+//   #else         fed only when no preceding `#on` of the region matched;
+//                 always the LAST branch of the region
 //   #off          close the region; shared code resumes
-//   Nesting is forbidden: an `#on` inside an open region is an error.
+//   A `#on` after `#else` in the same region is an error.
 //
 // Directives are recognized on their OWN lines (first non-whitespace token);
 // indented directives are fine, nothing else may share the line. Any other
@@ -122,9 +125,12 @@ public string ppPreprocess(string source, string targetOs, string[] errs) {
     int[] dropCr = [];
 
     // mode: 0 = outside regions, 1 = inside a region
+    // sawElse: true once `#else` has fired in the open region (`#else`
+    // must be the last branch, so a later `#on` is an error).
     int mode = 0;
     bool active = false;
     bool matchedAny = false;
+    bool sawElse = false;
     int regionOpenLine = 0;
     int regionOpenOsStart = 0;
     int regionOpenOsEnd = 0;
@@ -173,15 +179,21 @@ public string ppPreprocess(string source, string targetOs, string[] errs) {
                     return source;
                 }
                 if (mode == 1) {
-                    errs.add("preprocessor: '#on' inside an open '#on' region (nesting is forbidden), at line " + lineNo.toString());
-                    return source;
+                    if (sawElse) {
+                        errs.add("preprocessor: '#on' after '#else' in the same region ('#else' must be last), at line " + lineNo.toString());
+                        return source;
+                    }
+                    active = ppEq(osName, targetOs) && !matchedAny;
+                    matchedAny = matchedAny || ppEq(osName, targetOs);
+                } else {
+                    mode = 1;
+                    active = ppEq(osName, targetOs);
+                    matchedAny = active;
+                    sawElse = false;
+                    regionOpenLine = lineNo;
+                    regionOpenOsStart = nameStart;
+                    regionOpenOsEnd = nameEnd;
                 }
-                mode = 1;
-                active = ppEq(osName, targetOs);
-                matchedAny = active;
-                regionOpenLine = lineNo;
-                regionOpenOsStart = nameStart;
-                regionOpenOsEnd = nameEnd;
             } elif (ppEq(word, "else")) {
                 isDirective = true;
                 if (ppSkipBlanks(source, wordEnd, contentEnd) < contentEnd) {
@@ -193,6 +205,7 @@ public string ppPreprocess(string source, string targetOs, string[] errs) {
                     return source;
                 }
                 active = !matchedAny;
+                sawElse = true;
             } elif (ppEq(word, "off")) {
                 isDirective = true;
                 if (ppSkipBlanks(source, wordEnd, contentEnd) < contentEnd) {
@@ -204,6 +217,7 @@ public string ppPreprocess(string source, string targetOs, string[] errs) {
                     return source;
                 }
                 mode = 0;
+                sawElse = false;
             }
             // Any other `#word` is not a directive: pass through unchanged.
         }
