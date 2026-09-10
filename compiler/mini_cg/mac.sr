@@ -1,0 +1,373 @@
+mod export mini_cg_mac;
+
+// ============================================================================
+// MAC backend - MiniCg AAPCS64 emission helpers (split from mini_cg core).
+// ============================================================================
+// Holds the 28 macOS-only helpers: the AAPCS64 policy moved out of
+// `class MiniCg` (aapcsRegCount / aapcsStackBase / aapcsFirstArgReg /
+// aapcsIncomingStackOffset), the i-th AAPCS64 argument register (aapcsRegAt),
+// the DLL/name remaps (macImportLib / macImportName), the mac grant tables
+// (macModuleLib / macExportTable / macTableHas / macAddLib / macAddGrant /
+// macAddGrantAlias / macAddGrantNamed / macAllowed / registerMacImport /
+// checkMacModuleGrant / macModuleOf / macCallResolves / macResolveLib /
+// macResolveExport / macResolveAliasLib / macKnownExport / macBareLib) and
+// the Mach-O addressing layer (machoHeaderLen / machoCodeVaddr /
+// machoDataVaddr / computeMacGotAddresses). Of these, 21 are verbatim moves
+// of the 7dfd7c8 slots from the core (same bodies, `this.strEq` -> `cgStrEq`,
+// core state via `cg`); 7 are new mirrors of linux.sr shapes with Apple
+// values (aapcsRegAt, the four macho* helpers, checkMacModuleGrant,
+// macResolveAliasLib).
+//
+// All tables mirror silverc-rs src/macos.rs (MAC.md section 6): libSystem.B
+// carries the POSIX + pthread + posix_spawn + sysctlbyname + getentropy /
+// arc4random_buf + dlopen/dlsym + socket surface; libobjc carries the ONE
+// ObjC bridge seam (objc_getClass / sel_registerName / objc_msgSend);
+// appkit/quartz carry no direct C grants (Aqua via the objc bridge).
+// Linux-only spellings (getrandom, fork/execve, gettid, sysinfo) are
+// deliberately ABSENT. Darwin-only remaps (CreateProcessA-ladder ->
+// posix_spawn, CryptGenRandom-class -> getentropy, GetCurrentThreadId ->
+// pthread_mach_thread_np) follow MAC.md section 6; POSIX-shared names keep
+// their spelling under the libSystem owner.
+//
+// AAPCS64 values mirror MAC.md section 8 (X0-X7/V0-V7, [SP+0] stack args,
+// 16-byte SP at all times, X29/X30 chain, no red zone, X0/X1/V0 returns).
+// Mach-O values mirror silverc-rs src/macho.rs and the mini_pe MAC build():
+// TEXT_VMADDR 0x100000000, 16KB (0x4000) pages, 12-byte dyld stubs, 8-byte
+// __got bind slots. Full per-construct lowering is hardware-gated (MAC.md
+// section 10); these helpers pin the policy and address math.
+//
+// The file is UNGATED (no whole-file #on): the helpers must exist on every
+// target because the core wrappers call them; they are simply never CALLED
+// on Win64/SysV paths. There is deliberately NO duplicate `class MiniCg`
+// here: the type checker overwrites same-name classes, corrupting field
+// offsets, so the helpers live on `class MiniCgMac` and take `MiniCg cg`
+// when they touch core state (pure table/address helpers take no `cg`).
+// ============================================================================
+
+class MiniCgMac {
+    construct() {
+    }
+
+    public int aapcsRegCount() {
+        return 8;
+    }
+
+    public int aapcsStackBase() {
+        return 0;
+    }
+
+    public int aapcsFirstArgReg() {
+        return 0;
+    }
+
+    public int aapcsIncomingStackOffset(int i) {
+        return 16 + (i - 8) * 8;
+    }
+
+    // The i-th AAPCS64 integer argument register (X0-X7). Unlike sysvRegAt
+    // (which answers x64 register ids), A64 X indices are the identity
+    // mapping; the hardware-gated lowering interprets them as X registers.
+    public int aapcsRegAt(int i) {
+        return i;
+    }
+
+    public string macImportLib(string dll) {
+        if (cgStrEq(dll, "kernel32.dll")) { return "/usr/lib/libSystem.B.dylib"; }
+        if (cgStrEq(dll, "msvcrt.dll")) { return "/usr/lib/libSystem.B.dylib"; }
+        if (cgStrEq(dll, "ucrtbase.dll")) { return "/usr/lib/libSystem.B.dylib"; }
+        if (cgStrEq(dll, "ws2_32.dll")) { return "/usr/lib/libSystem.B.dylib"; }
+        return "";
+    }
+
+    public string macImportName(string dll, string name) {
+        if (cgStrEq(dll, "kernel32.dll")) {
+            if (cgStrEq(name, "ExitProcess")) { return "exit"; }
+            if (cgStrEq(name, "VirtualAlloc")) { return "mmap"; }
+            if (cgStrEq(name, "CloseHandle")) { return "close"; }
+            if (cgStrEq(name, "CreateFileA")) { return "open"; }
+            if (cgStrEq(name, "ReadFile")) { return "read"; }
+            if (cgStrEq(name, "WriteFile")) { return "write"; }
+            if (cgStrEq(name, "DeleteFileA")) { return "unlink"; }
+            if (cgStrEq(name, "MoveFileA")) { return "rename"; }
+            if (cgStrEq(name, "RemoveDirectoryA")) { return "rmdir"; }
+            if (cgStrEq(name, "GetFileAttributesA")) { return "stat"; }
+            if (cgStrEq(name, "FindFirstFileA")) { return "opendir"; }
+            if (cgStrEq(name, "FindNextFileA")) { return "readdir"; }
+            if (cgStrEq(name, "FindClose")) { return "closedir"; }
+            if (cgStrEq(name, "GetEnvironmentVariableA")) { return "getenv"; }
+            if (cgStrEq(name, "SetEnvironmentVariableA")) { return "setenv"; }
+            if (cgStrEq(name, "GetComputerNameA")) { return "gethostname"; }
+            if (cgStrEq(name, "GetCurrentProcessId")) { return "getpid"; }
+            if (cgStrEq(name, "Sleep")) { return "nanosleep"; }
+            if (cgStrEq(name, "GetTickCount") || cgStrEq(name, "GetTickCount64")) { return "clock_gettime"; }
+            if (cgStrEq(name, "QueryPerformanceCounter") || cgStrEq(name, "QueryPerformanceFrequency")) { return "clock_gettime"; }
+            if (cgStrEq(name, "GetLocalTime") || cgStrEq(name, "GetSystemTime")) { return "clock_gettime"; }
+            if (cgStrEq(name, "SetFilePointer") || cgStrEq(name, "GetFileSize")) { return "lseek"; }
+            if (cgStrEq(name, "lstrlenA")) { return "strlen"; }
+            return "";
+        }
+        // msvcrt/ucrtbase overlap on the same C library: libSystem carries
+        // every name both DLLs export except the Windows-only underscore
+        // helpers.
+        if (cgStrEq(dll, "msvcrt.dll") || cgStrEq(dll, "ucrtbase.dll")) {
+            if (cgStrEq(name, "_atoi64")) { return "atoll"; }
+            return name;
+        }
+        if (cgStrEq(dll, "ws2_32.dll")) {
+            if (cgStrEq(name, "closesocket")) { return "close"; }
+            if (cgStrEq(name, "socket") || cgStrEq(name, "bind") || cgStrEq(name, "listen") || cgStrEq(name, "accept") || cgStrEq(name, "recv") || cgStrEq(name, "send") || cgStrEq(name, "shutdown") || cgStrEq(name, "connect") || cgStrEq(name, "setsockopt") || cgStrEq(name, "getaddrinfo") || cgStrEq(name, "freeaddrinfo")) { return name; }
+            return "";
+        }
+        return "";
+    }
+
+    public string macModuleLib(string module) {
+        if (cgStrEq(module, "libsystem")) { return "/usr/lib/libSystem.B.dylib"; }
+        if (cgStrEq(module, "objc")) { return "/usr/lib/libobjc.A.dylib"; }
+        if (cgStrEq(module, "appkit")) { return "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit"; }
+        if (cgStrEq(module, "quartz")) { return "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore"; }
+        return "";
+    }
+
+    public string macExportTable(string lib) {
+        if (cgStrEq(lib, "/usr/lib/libSystem.B.dylib")) { return "exit _exit mmap munmap malloc free read write open close lseek stat fstat unlink rename mkdir rmdir opendir readdir closedir getenv setenv clock_gettime nanosleep localtime_r gmtime_r posix_spawn posix_spawnp posix_spawn_file_actions_init posix_spawn_file_actions_adddup2 posix_spawn_file_actions_destroy waitpid kill pipe dup2 getpid pthread_create pthread_join pthread_mach_thread_np sysconf sysctlbyname uname gethostname getlogin_r statvfs getentropy arc4random_buf dlopen dlsym rand srand getuid printf strlen strcmp strcpy memcpy memset socket connect bind listen accept send recv setsockopt getaddrinfo freeaddrinfo"; }
+        if (cgStrEq(lib, "/usr/lib/libobjc.A.dylib")) { return "objc_getClass sel_registerName objc_msgSend"; }
+        return "";
+    }
+
+    public bool macTableHas(string lib, string fn) {
+        string table = this.macExportTable(lib);
+        int i = 0;
+        while (i < table.length) {
+            while (i < table.length && table[i] == ' ') { i++; }
+            int start = i;
+            while (i < table.length && table[i] != ' ') { i++; }
+            if (i > start && cgStrEq(fn, projectSlice(table, start, i))) { return true; }
+        }
+        return false;
+    }
+
+    public void macAddLib(MiniCg cg, string lib) {
+        if (lib.length == 0) { return; }
+        for (int i = 0; i < cg.macLibs.length; i++) {
+            if (cgStrEq(cg.macLibs[i], lib)) { return; }
+        }
+        cg.macLibs.add(lib);
+    }
+
+    public void macAddGrant(MiniCg cg, string lib, string fn) {
+        if (lib.length == 0 || fn.length == 0) { return; }
+        string grant = lib + "|" + fn;
+        for (int i = 0; i < cg.macGrants.length; i++) {
+            if (cgStrEq(cg.macGrants[i], grant)) { return; }
+        }
+        cg.macGrants.add(grant);
+    }
+
+    public void macAddGrantAlias(MiniCg cg, string lib, string exportName, string localName) {
+        if (lib.length == 0 || exportName.length == 0 || localName.length == 0) { return; }
+        if (cgStrEq(exportName, localName)) { this.macAddGrant(cg, lib, exportName); return; }
+        for (int i = 0; i < cg.macAliasLocals.length; i++) {
+            if (cgStrEq(cg.macAliasLocals[i], localName) && cgStrEq(cg.macAliasExports[i], exportName) && cgStrEq(cg.macAliasLibs[i], lib)) { return; }
+        }
+        cg.macAliasLocals.add(localName);
+        cg.macAliasExports.add(exportName);
+        cg.macAliasLibs.add(lib);
+    }
+
+    public void macAddGrantNamed(MiniCg cg, string lib, Node nameNode) {
+        if (nameNode.isAlias && nameNode.strVal.length > 0) {
+            this.macAddGrantAlias(cg, lib, nameNode.name, nameNode.strVal);
+            return;
+        }
+        this.macAddGrant(cg, lib, nameNode.name);
+    }
+
+    public bool macAllowed(MiniCg cg, string lib, string fn) {
+        for (int i = 0; i < cg.macLibs.length; i++) {
+            if (cgStrEq(cg.macLibs[i], lib)) {
+                if (this.macTableHas(lib, fn)) { return true; }
+            }
+        }
+        string grant = lib + "|" + fn;
+        for (int i = 0; i < cg.macGrants.length; i++) {
+            if (cgStrEq(cg.macGrants[i], grant)) { return true; }
+        }
+        return false;
+    }
+
+    public void registerMacImport(MiniCg cg, Node node) {
+        string source = node.typeHint;
+        bool all = node.isStatic;
+        if (!cgStrEq(source, "mac") && source.length > 4) {
+            string prefix = projectSlice(source, 0, 4);
+            if (!cgStrEq(prefix, "mac.")) { return; }
+        } elif (!cgStrEq(source, "mac")) {
+            return;
+        }
+        if (cgStrEq(source, "mac")) {
+            if (all) {
+                this.macAddLib(cg, this.macModuleLib("libsystem"));
+                this.macAddLib(cg, this.macModuleLib("objc"));
+                this.macAddLib(cg, this.macModuleLib("appkit"));
+                this.macAddLib(cg, this.macModuleLib("quartz"));
+                return;
+            }
+            this.checkMacModuleGrant(cg, node.name, node);
+            for (int j = 0; j < node.childCount(); j++) {
+                this.checkMacModuleGrant(cg, node.child(j).name, node);
+            }
+            return;
+        }
+        string module = projectSlice(source, 4, source.length);
+        string lib = this.macModuleLib(module);
+        if (lib.length > 0) {
+            if (all) {
+                this.macAddLib(cg, lib);
+                return;
+            }
+            this.macAddGrantNamed(cg, lib, node);
+            for (int j = 0; j < node.childCount(); j++) {
+                this.macAddGrantNamed(cg, node.child(j));
+            }
+            return;
+        }
+    }
+
+    // Mirror of checkLinuxModuleGrant for bare `mac` named imports
+    // (`import libsystem from mac;` opens the whole lib, matching the parser
+    // grant and silverc-rs macos.rs). No custom-native arm: NativeModules
+    // carries win/lin files only, so unknown names are always undeclared.
+    public void checkMacModuleGrant(MiniCg cg, string modName, Node node) {
+        if (modName.length == 0) { return; }
+        string lib = this.macModuleLib(modName);
+        if (lib.length > 0) {
+            this.macAddLib(cg, lib);
+            return;
+        }
+        printline("Error: " + nativeUndeclaredMsg("mac." + modName));
+        exit(1);
+    }
+
+    public string macModuleOf(string lib) {
+        if (cgStrEq(lib, "/usr/lib/libSystem.B.dylib")) { return "libsystem"; }
+        if (cgStrEq(lib, "/usr/lib/libobjc.A.dylib")) { return "objc"; }
+        if (cgStrEq(lib, "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit")) { return "appkit"; }
+        if (cgStrEq(lib, "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore")) { return "quartz"; }
+        return lib;
+    }
+
+    public bool macCallResolves(MiniCg cg, string name) {
+        if (!cg.isMacTarget()) { return false; }
+        for (int i = 0; i < cg.macLibs.length; i++) {
+            if (this.macTableHas(cg.macLibs[i], name)) { return true; }
+        }
+        for (int g = 0; g < cg.macGrants.length; g++) {
+            string grant = cg.macGrants[g];
+            if (grant.length > name.length + 1 && cgStrEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') { return true; }
+        }
+        for (int a = 0; a < cg.macAliasLocals.length; a++) {
+            if (cgStrEq(cg.macAliasLocals[a], name)) { return true; }
+        }
+        return false;
+    }
+
+    public string macResolveLib(MiniCg cg, string name) {
+        for (int i = 0; i < cg.macLibs.length; i++) {
+            if (this.macTableHas(cg.macLibs[i], name)) { return cg.macLibs[i]; }
+        }
+        for (int g = 0; g < cg.macGrants.length; g++) {
+            string grant = cg.macGrants[g];
+            if (grant.length > name.length + 1 && cgStrEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') {
+                int bar = -1;
+                for (int k = 0; k < grant.length; k++) {
+                    if (grant[k] == '|') { bar = k; break; }
+                }
+                if (bar > 0) { return projectSlice(grant, 0, bar); }
+            }
+        }
+        return "";
+    }
+
+    public string macResolveExport(MiniCg cg, string name) {
+        for (int i = 0; i < cg.macLibs.length; i++) {
+            if (this.macTableHas(cg.macLibs[i], name)) { return name; }
+        }
+        for (int g = 0; g < cg.macGrants.length; g++) {
+            string grant = cg.macGrants[g];
+            if (grant.length > name.length + 1 && cgStrEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') { return name; }
+        }
+        for (int a = 0; a < cg.macAliasLocals.length; a++) {
+            if (cgStrEq(cg.macAliasLocals[a], name)) { return cg.macAliasExports[a]; }
+        }
+        return "";
+    }
+
+    // Mirror of linuxResolveAliasLib: owning lib of an aliased local name.
+    public string macResolveAliasLib(MiniCg cg, string name) {
+        for (int a = 0; a < cg.macAliasLocals.length; a++) {
+            if (cgStrEq(cg.macAliasLocals[a], name)) { return cg.macAliasLibs[a]; }
+        }
+        return "";
+    }
+
+    public bool macKnownExport(string name) {
+        if (this.macTableHas("/usr/lib/libSystem.B.dylib", name)) { return true; }
+        if (this.macTableHas("/usr/lib/libobjc.A.dylib", name)) { return true; }
+        return false;
+    }
+
+    public string macBareLib(string name) {
+        if (this.macTableHas("/usr/lib/libSystem.B.dylib", name)) { return "/usr/lib/libSystem.B.dylib"; }
+        if (this.macTableHas("/usr/lib/libobjc.A.dylib", name)) { return "/usr/lib/libobjc.A.dylib"; }
+        return "";
+    }
+
+    // MAC Mach-O backend (additive): fixed v1 header length in bytes:
+    // 32-byte mach_header_64 + 848 bytes of load commands (3x LC_SEGMENT_64
+    // 232 + 232 + 72, LC_LOAD_DYLINKER 32, LC_MAIN 24, libSystem
+    // LC_LOAD_DYLIB 56, LC_BUILD_VERSION 32, LC_SYMTAB 24, LC_DYSYMTAB 80,
+    // LC_DYLD_INFO_ONLY 48, LC_CODE_SIGNATURE 16). Mirrors the mini_pe MAC
+    // build() size math term for term; per-import tables (bind opcodes,
+    // symtab, signature pages) grow __LINKEDIT, never the header.
+    public int machoHeaderLen() {
+        return 32 + 232 + 232 + 72 + 32 + 24 + 56 + 32 + 24 + 80 + 48 + 16;
+    }
+
+    // MAC Mach-O backend (additive): __TEXT code-segment base. Mirrors the
+    // mini_pe MAC build() (TEXT_VMADDR + headerLen): emitted code runs at
+    // codeVaddr, so code offset N addresses TEXT_VMADDR + headerLen + N.
+    public int64 machoCodeVaddr() {
+        int64 base = 4294967296;
+        return base + int64(this.machoHeaderLen());
+    }
+
+    // MAC Mach-O backend (additive): __DATA segment base (writable __got +
+    // data). Mirrors the mini_pe MAC build(): the __TEXT segment (header +
+    // code + 12-byte dyld stubs per import) is 16KB-padded, __DATA follows
+    // it page-aligned. Call only after the final code length is known.
+    public int64 machoDataVaddr(MiniCg cg) {
+        int codeLen = cg.asm.buf.length;
+        int stubsLen = cg.importDlls.length * 12;
+        int PAGE = 0x4000;
+        int textEnd = this.machoHeaderLen() + codeLen + stubsLen;
+        int textFilesz = textEnd;
+        int m = textFilesz % PAGE;
+        if (m != 0) { textFilesz = textFilesz + (PAGE - m); }
+        int64 base = 4294967296;
+        return base + int64(textFilesz);
+    }
+
+    // MAC Mach-O backend (additive): absolute __got bind-slot addresses in
+    // flat import order (dataVaddr + i*8: __got opens __DATA, one 8-byte slot
+    // per import). Mirrors the mini_pe MAC build() gotLen math and the
+    // silverc-rs macho bind layout.
+    public int64[] computeMacGotAddresses(MiniCg cg) {
+        int64[] gotAddrs = [];
+        int64 dataVaddr = this.machoDataVaddr(cg);
+        for (int i = 0; i < cg.importDlls.length; i++) {
+            gotAddrs.add(dataVaddr + int64(i * 8));
+        }
+        return gotAddrs;
+    }
+}
