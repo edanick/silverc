@@ -160,6 +160,21 @@ class NotificationAction {
 // for field, so this is daemon-side, not a wire bug; short titles and
 // bodies (the common case) always work. Repro: Notify with body lengths
 // stepping 52/56/60/64/... bytes -- the %8==0 ones vanish.
+//
+// MAC BACKEND (Phase B, code-only -- MAC.md section 7/10, DEGRADED until an
+// Aqua backend lands and is probed on Mac hardware): show()'s `#on MAC`
+// branch keeps the parity line (printed above the region on every backend)
+// as the entire observable behavior -- the same documented no-op posture as
+// the self-host no-op bridge, never a stub that claims success falsely. The
+// Aqua route is UNUserNotificationCenter (requestAuthorization +
+// addNotificationRequest; NSUserNotification is deprecated and must not be
+// built on) through the ONE shared ObjC bridge seam (mac.objc:
+// objc_getClass / sel_registerName / objc_msgSend, granted in
+// src/macos.rs); without the user's notification grant it degrades to this
+// same no-op, and each denial path must return it (never crash, never
+// pretend). Headless/SSH (no WindowServer) keeps this no-op permanently.
+// No mac.* import is granted here until the Aqua backend lands (nothing
+// below calls it yet). Mirrors silverc-rs/std/notifications.sr MAC body.
 
 #on LINUX
 import * from linux.libc;
@@ -483,7 +498,6 @@ public void show(Notification note) {
     try {
         nativeToastShow(t, b, app);
     } catch (exception ex) { }
-    #off
     #on LINUX
     string t = note.title;
     string b = note.body;
@@ -491,5 +505,8 @@ public void show(Notification note) {
     try {
         dbusNotify(app, t, b);
     } catch (exception ex) { }
+    #on MAC
+    // headless: the parity line above is the whole behavior
+    // (UNUserNotificationCenter route is gated).
     #off
 }

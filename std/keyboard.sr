@@ -56,6 +56,20 @@
 // A null display (headless SSH) degrades to silent no-op / false, and
 // unknown names resolve to NoSymbol and are skipped. nameToVk keeps its
 // pure table + gated VkKeyScanA fallback (unknown -> 0 on Linux already).
+//
+// MAC BACKEND (Phase B, code-only -- MAC.md section 7/10, DEGRADED until an
+// Aqua backend lands and is probed on Mac hardware): every `#on MAC` branch
+// below degrades exactly like the Windows/Linux no-backend stubs (writes
+// are silent no-ops, isDown returns false, nameToVk resolves through the
+// pure keyNameToVk table only with unknown names reporting 0) -- never a
+// stub that claims success falsely. The Aqua route is Quartz CGEvent
+// (CGEventCreateKeyboardEvent/CGEventPost) through the ONE shared ObjC
+// bridge seam (mac.objc: objc_getClass / sel_registerName / objc_msgSend,
+// granted in src/macos.rs); synthesis needs the Accessibility TCC grant,
+// without which the backend must keep degrading like these branches. The
+// vk() table stays PURE (shared, ungated). No mac.* import is granted here
+// until the Aqua backend lands (nothing below calls it yet). Mirrors
+// silverc-rs/std/keyboard.sr MAC bodies.
 // ---------------------------------------------------------------------------
 
 mod export keyboard;
@@ -331,22 +345,24 @@ void press(string keyName) {
     int vk = nameToVk(keyName);
     #on WINDOWS
     keybd_event(vk, 0, 0, 0);
-    #off
     #on LINUX
     pressKeysym(keyNameToX(keyName), 1);
+    #on MAC
+    // headless: no key synthesis (Quartz CGEvent route is gated).
     #off
 }
 
 void press(int vk) {
     #on WINDOWS
     keybd_event(vk, 0, 0, 0);
-    #off
     #on LINUX
     int d = XOpenDisplay(null);
     if (d == 0) { return; }
     XTestFakeKeyEvent(d, vk, 1, 0);
     XFlush(d);
     XCloseDisplay(d);
+    #on MAC
+    // headless: no key synthesis (Quartz CGEvent route is gated).
     #off
 }
 
@@ -354,22 +370,24 @@ void release(string keyName) {
     int vk = nameToVk(keyName);
     #on WINDOWS
     keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
-    #off
     #on LINUX
     pressKeysym(keyNameToX(keyName), 0);
+    #on MAC
+    // headless: no key synthesis (Quartz CGEvent route is gated).
     #off
 }
 
 void release(int vk) {
     #on WINDOWS
     keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
-    #off
     #on LINUX
     int d = XOpenDisplay(null);
     if (d == 0) { return; }
     XTestFakeKeyEvent(d, vk, 0, 0);
     XFlush(d);
     XCloseDisplay(d);
+    #on MAC
+    // headless: no key synthesis (Quartz CGEvent route is gated).
     #off
 }
 
@@ -385,15 +403,19 @@ void send(string text) {
             #on WINDOWS
             int scan = VkKeyScanA(one);
             vk = scan & 0xFF;
+            #on MAC
+            // headless: no scan fallback; unknown names stay 0 and the
+            // key events below are skipped the same way.
             #off
         }
         #on WINDOWS
         keybd_event(vk, 0, 0, 0);
         keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
-        #off
         #on LINUX
         pressKeysym(keyNameToX(one), 1);
         pressKeysym(keyNameToX(one), 0);
+        #on MAC
+        // headless: no key synthesis (Quartz CGEvent route is gated).
         #off
     }
 }
@@ -405,9 +427,10 @@ bool isDown(string keyName) {
     if (vk == 0) { return false; }
     #on WINDOWS
     return (GetKeyState(vk) & 0x8000) != 0;
-    #off
     #on LINUX
     return queryKeycodeBitFor(keyNameToX(keyName));
+    #on MAC
+    return false;
     #off
     return false;
 }
@@ -415,9 +438,10 @@ bool isDown(string keyName) {
 bool isDown(int vk) {
     #on WINDOWS
     return (GetKeyState(vk) & 0x8000) != 0;
-    #off
     #on LINUX
     return queryKeycodeBit(vk);
+    #on MAC
+    return false;
     #off
     return false;
 }

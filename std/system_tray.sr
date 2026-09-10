@@ -80,6 +80,20 @@ mod export system_tray;
 // code (`--os WINDOWS`). Headless/SSH degrades exactly like the Windows
 // no-backend stubs (handle 0, pollClick 0, pollMenu "").
 //
+// MAC POSTURE (Phase B, code-only -- MAC.md section 7/10, DEGRADED until an
+// Aqua backend lands and is probed on Mac hardware): every `#on MAC` branch
+// below keeps the same headless-record behavior (handle 0, shown/tooltip/
+// menu recorded, pollClick 0, pollMenu "") -- the same safe fallbacks as
+// the Windows/Linux no-backend stubs, never a stub that claims success
+// falsely. The Aqua route is NSStatusItem (the native menu-bar item;
+// macOS HAS a tray equivalent, unlike stock GNOME) through the ONE shared
+// ObjC bridge seam (mac.objc: objc_getClass / sel_registerName /
+// objc_msgSend, granted in src/macos.rs); headless/SSH (no WindowServer)
+// keeps this record posture permanently. The trayAdd/... bridges stay
+// Windows-only by design like win32.registry; no mac.* import is granted
+// here until the Aqua backend lands (nothing below calls it yet). Mirrors
+// silverc-rs/std/system_tray.sr MAC bodies.
+//
 // COPY DIVERGENCE (documented; both sides intentional, neither broken):
 // silverc-rs\std\system_tray.sr is a SEPARATE rs-side copy of this module
 // for the sibling-checkout std/ resolution (rs exe-ancestor candidates land
@@ -143,6 +157,8 @@ class TrayIcon {
         this.menu = [];
         #on WINDOWS
         this.handle = trayAdd(name, icon);
+        #on MAC
+        // headless record: handle stays 0 (NSStatusItem route is gated).
         #off
         // Non-Windows fallback: no tray backend yet, `handle` stays 0
         // ("no icon") and every method below guards on it.
@@ -158,6 +174,8 @@ class TrayIcon {
         this.tooltip = t;
         #on WINDOWS
         if (this.shown && this.handle != 0) { traySetTooltip(this.handle, t); }
+        #on MAC
+        // headless record: the tooltip string above is the whole effect.
         #off
     }
 
@@ -165,6 +183,8 @@ class TrayIcon {
         if (!this.shown) {
             #on WINDOWS
             this.handle = trayAdd(this.tooltip, this.icon);
+            #on MAC
+            // headless record: `shown` below is the whole effect.
             #off
             this.shown = true;
         }
@@ -173,6 +193,8 @@ class TrayIcon {
     public void hide() {
         #on WINDOWS
         if (this.shown && this.handle != 0) { trayDelete(this.handle); }
+        #on MAC
+        // headless record: `shown` below is the whole effect.
         #off
         this.shown = false;
     }
@@ -180,6 +202,8 @@ class TrayIcon {
     public void dispose() {
         #on WINDOWS
         if (this.handle != 0) { trayRemove(this.handle); }
+        #on MAC
+        // headless record: the resets below are the whole effect.
         #off
         this.handle = 0;
         this.shown = false;
@@ -199,6 +223,8 @@ class TrayIcon {
         }
         #on WINDOWS
         if (this.handle != 0) { traySetMenu(this.handle, titles); }
+        #on MAC
+        // headless record: the retained menu above is the whole effect.
         #off
     }
 
@@ -210,6 +236,8 @@ class TrayIcon {
     public void run() {
         #on WINDOWS
         trayRunLoop();
+        #on MAC
+        // headless record: no message pump (NSStatusItem route is gated).
         #off
     }
 
@@ -217,6 +245,8 @@ class TrayIcon {
     public int pollClick() {
         #on WINDOWS
         return trayPollClick();
+        #on MAC
+        return 0;
         #off
         return 0;
     }
@@ -229,6 +259,8 @@ class TrayIcon {
             TrayMenuItem item = this.menu[cmd - 1];
             return item.getId();
         }
+        #on MAC
+        return "";
         #off
         return "";
     }

@@ -62,6 +62,19 @@
 // XDisplayWidth/XDisplayHeight on screen 0; colors ride literal pixels
 // (border 0, background white). A null display (headless SSH) leaves both
 // fields 0 and every method guards on them.
+//
+// MAC BACKEND (Phase B, code-only -- MAC.md §7/§10, DEGRADED until an Aqua
+// backend lands and is probed on Mac hardware): every `#on MAC` branch
+// below keeps the headless-window-record posture (handle stays 0, show/hide
+// keep `visible`, setTitle/setIcon record their strings, all guards hold)
+// -- the same safe fallbacks as the Windows/Linux no-backend stubs, never
+// a stub that claims success falsely. The Aqua route is a minimal AppKit
+// NSWindow client (initWithContentRect/setTitle/makeKeyAndOrderFront/
+// orderOut/close behind app.run()) through the ONE shared ObjC bridge seam
+// (mac.objc: objc_getClass / sel_registerName / objc_msgSend, granted in
+// src/macos.rs); headless/SSH (no WindowServer) keeps this record posture
+// permanently. No mac.* import is granted here until the Aqua backend lands
+// (nothing below calls it yet). Mirrors silverc-rs/std/gui.sr MAC bodies.
 // ---------------------------------------------------------------------------
 
 mod export gui;
@@ -69,7 +82,6 @@ mod export gui;
 #on WINDOWS
 import * from win32.user32;
 import * from win32.kernel32;
-#off
 #on LINUX
 import * from linux.x11;
 #off
@@ -101,7 +113,6 @@ class Window {
         if (x < 0) { x = 0; }
         if (y < 0) { y = 0; }
         this.handle = CreateWindowExA(0, "STATIC", title, 0x00CF0000, x, y, width, height, 0, 0, hinst, 0);
-        #off
         #on LINUX
         int d = XOpenDisplay(null);
         if (d != 0) {
@@ -120,6 +131,9 @@ class Window {
                 XCloseDisplay(d);
             }
         }
+        #on MAC
+        // headless record: handle/display stay 0 (AppKit NSWindow route is
+        // gated); every method below guards on the handle.
         #off
         // Non-Windows fallback: no window-system backend yet, `handle`
         // stays 0 ("no window") and every method below guards on it.
@@ -137,12 +151,13 @@ class Window {
         if (this.handle != 0) {
             #on WINDOWS
             SetWindowTextA(this.handle, t);
-            #off
             #on LINUX
             if (this.display != 0) {
                 XStoreName(this.display, this.handle, t);
                 XFlush(this.display);
             }
+            #on MAC
+            // headless record: the title string above is the whole effect.
             #off
         }
     }
@@ -158,6 +173,9 @@ class Window {
                 SendMessageA(this.handle, 0x80, 1, hicon); // ICON_BIG
                 SendMessageA(this.handle, 0x80, 0, hicon); // ICON_SMALL
             }
+            #on MAC
+            // headless record: the icon string above is the whole effect
+            // (no .ico path in any v1 backend; LINUX has no branch either).
             #off
             // LINUX: no .ico path in the X11 v1 backend; the icon string
             // stays recorded above (headless-record posture).
@@ -171,12 +189,13 @@ class Window {
             #on WINDOWS
             ShowWindow(this.handle, 5); // SW_SHOW
             UpdateWindow(this.handle);
-            #off
             #on LINUX
             if (this.display != 0) {
                 XMapWindow(this.display, this.handle);
                 XFlush(this.display);
             }
+            #on MAC
+            // headless record: `visible` below is the whole effect.
             #off
         }
         this.visible = true;
@@ -186,12 +205,13 @@ class Window {
         if (this.handle != 0) {
             #on WINDOWS
             ShowWindow(this.handle, 0); // SW_HIDE
-            #off
             #on LINUX
             if (this.display != 0) {
                 XUnmapWindow(this.display, this.handle);
                 XFlush(this.display);
             }
+            #on MAC
+            // headless record: `visible` below is the whole effect.
             #off
         }
         this.visible = false;
@@ -201,13 +221,14 @@ class Window {
         if (this.handle != 0) {
             #on WINDOWS
             DestroyWindow(this.handle);
-            #off
             #on LINUX
             if (this.display != 0) {
                 XDestroyWindow(this.display, this.handle);
                 XCloseDisplay(this.display);
                 this.display = 0;
             }
+            #on MAC
+            // headless record: the resets below are the whole effect.
             #off
         }
         this.handle = 0;
