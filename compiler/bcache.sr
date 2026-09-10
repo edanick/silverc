@@ -16,8 +16,10 @@ import * from linux.libc;
 // OVERHAUL.md --cache-bytecode — persistent bytecode cache.
 //
 // Cache layout under %APPDATA%\silver cache\<project>\ on WINDOWS
-// (unchanged) or /var/cache/silver/<project>/ on LINUX (additive, same
-// .sbcr/.srbc formats, `/` separators):
+// (unchanged), /var/cache/silver/<project>/ on LINUX (unchanged, same
+// .sbcr/.srbc formats, `/` separators), or /Library/Caches/Silver/<project>/
+// on MAC (MAC.md §5b, additive — machine-wide Library/Caches, capital
+// Silver; same formats, `/` separators, fixed root with no $HOME lookup):
 //
 //   project.sbcr            record file (one entry per .sr file, recursive)
 //   src/main.srbc           cached token stream mirroring the source tree
@@ -86,6 +88,12 @@ class CacheSession {
         this.dirtyCount = 0;
         #on LINUX
         this.dir = "/var/cache/silver/" + bcSanitize(projName);
+        ensureDirTree(this.dir);
+        this.loadRecords();
+        this.ok = true;
+        return;
+        #on MAC
+        this.dir = "/Library/Caches/Silver/" + bcSanitize(projName);
         ensureDirTree(this.dir);
         this.loadRecords();
         this.ok = true;
@@ -217,6 +225,8 @@ class CacheSession {
         string sbcriOut = this.dir + "\\project.sbcri";
         #on LINUX
         sbcriOut = this.dir + "/project.sbcri";
+        #on MAC
+        sbcriOut = this.dir + "/project.sbcri";
         #off
         file.writeString(sbcriOut, indexText);
 
@@ -224,6 +234,8 @@ class CacheSession {
         // streamed in bounded chunks like the .srbc artifacts.
         string sbcrOut = this.dir + "\\project.sbcr";
         #on LINUX
+        sbcrOut = this.dir + "/project.sbcr";
+        #on MAC
         sbcrOut = this.dir + "/project.sbcr";
         #off
         BcBinWriter bw = new BcBinWriter(sbcrOut);
@@ -270,6 +282,8 @@ class CacheSession {
     private void loadRecords() {
         string sbcriPath = this.dir + "\\project.sbcri";
         #on LINUX
+        sbcriPath = this.dir + "/project.sbcri";
+        #on MAC
         sbcriPath = this.dir + "/project.sbcri";
         #off
         string text = tryReadText(sbcriPath);
@@ -352,6 +366,15 @@ class CacheSession {
             dottedL = sliceRange(dottedL, 0, dottedL.length - 3);
         }
         return this.dir + "/" + dottedL + ".srbc";
+        #on MAC
+        string relM = this.relKey(keyOrAbs);
+        if (relM.length == 0) { return ""; }
+        string dottedM = relM;
+        if (dottedM.length >= 3 && dottedM[dottedM.length - 1] == 'r'
+            && dottedM[dottedM.length - 2] == 's' && dottedM[dottedM.length - 3] == '.') {
+            dottedM = sliceRange(dottedM, 0, dottedM.length - 3);
+        }
+        return this.dir + "/" + dottedM + ".srbc";
         #off
         string rel = this.relKey(keyOrAbs);
         if (rel.length == 0) { return ""; }
@@ -911,6 +934,9 @@ public string resolveRel(string root, string rel) {
     #on LINUX
     if (root.length == 0 || root == ".") { return rel; }
     return root + "/" + rel;
+    #on MAC
+    if (root.length == 0 || root == ".") { return rel; }
+    return root + "/" + rel;
     #off
     string winRel = bcReplaceAll(rel, "/", "\\");
     if (root.length == 0 || root == ".") { return winRel; }
@@ -934,6 +960,19 @@ public void ensureDirTree(string dir) {
         }
     }
     if (curL.length >= 2) { fs.createDir(curL); }
+    return;
+    #on MAC
+    string curM = "";
+    for (int i = 0; i < dir.length; i++) {
+        char c = dir[i];
+        if (c == '\\' || c == '/') {
+            if (curM.length >= 2) { fs.createDir(curM); }
+            curM = curM + '/';
+        } else {
+            curM = curM + c;
+        }
+    }
+    if (curM.length >= 2) { fs.createDir(curM); }
     return;
     #off
     string cur = "";
