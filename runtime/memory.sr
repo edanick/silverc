@@ -4,9 +4,10 @@ import * from sysinfo;
 
 #on WINDOWS
 import * from win32.kernel32;
-#off
 #on LINUX
 import * from linux.libc;
+#on MAC
+import * from mac.libsystem;
 #off
 #on LINUX
 import { rename as renameFile } from linux.libc;
@@ -263,7 +264,8 @@ public string smResultString(int result) {
 // resident unless BOTH the Silver bump is near OOM (>= 90% of the process
 // budget) AND system pressure via /proc/meminfo MemAvailable is >= 90%
 // (sysinfo.memoryUsagePercent). Ordinary workloads below either gate never
-// create /tmp/*.sm files. Arrays/dicts/pin barriers are follow-up.
+// create spill files (/tmp/*.sm on Linux, /tmp/silver/*.sm on macOS,
+// %TEMP% on Windows). Arrays/dicts/pin barriers are follow-up.
 // ---------------------------------------------------------------------------
 
 // Mirror of the --runtime heap reserve emitted by both compilers
@@ -361,9 +363,12 @@ string smSession() {
     return "sess-" + sysinfo.pid().toString();
 }
 
-// $TMPDIR or /tmp through sysinfo (which already encodes that fallback);
-// never duplicated here.
+// Spill dir per OS (MAC.md §5d): macOS is the fixed /tmp/silver/
+// subdirectory (no $TMPDIR lookup); Windows rides sysinfo.tempDir()
+// (%TEMP%) and Linux $TMPDIR-or-/tmp through sysinfo (which already
+// encodes that fallback) — never duplicated here.
 string smTempDir() {
+    if (sysinfo.os() == "macos") { return "/tmp/silver"; }
     string t = sysinfo.tempDir();
     if (t.length != 0) { return t; }
     if (sysinfo.os() == "linux") { return "/tmp"; }
@@ -375,6 +380,7 @@ string smJoinPath(string dir, string name) {
     char last = dir[dir.length - 1];
     if (last == '/' || last == '\\') { return dir + name; }
     if (sysinfo.os() == "linux") { return dir + "/" + name; }
+    if (sysinfo.os() == "macos") { return dir + "/" + name; }
     return dir + "\\" + name;
 }
 
@@ -428,7 +434,9 @@ public int64 smManaged() {
     return smSt[SM_ST_MANAGED];
 }
 
-// Flat spill name: <tempdir>/<fnv1-64-hex>.sm — no PID, no subdirs. The
+// Flat spill name: <tempdir>/<fnv1-64-hex>.sm — no PID, no subdirs
+// (<tempdir> is smTempDir(): fixed /tmp/silver/ on macOS per MAC.md §5d,
+// $TMPDIR-or-/tmp on Linux, %TEMP% on Windows). The
 // hashed virtual path carries the opaque session salt (with getpid as its
 // only pid use), page/kind/owner/generation. On collision the salt grows
 // (SALTED_NAME) and the winner hash is kept in smSt[SM_ST_NAME_HASH].
@@ -646,6 +654,12 @@ public string smWritePage(byte[] payload, int kind) {
     if (smSt[SM_ST_PAGEFILE] + (int64)fileBytes.length > smSt[SM_ST_PAGE_BUDGET]) { smFl[SM_FL_LAST_ERR] = SM_ERR_SIZE; return ""; }
     string tmp = path + ".tmp";
     smOwnedTmps.add(tmp);
+    // MAC.md §5d (mac-gated only): ensure /tmp/silver/ exists (create if
+    // missing, mode 0755 = 493) before the first spill write. mkdir fails
+    // harmlessly when the directory already exists; the result is ignored.
+    #on MAC
+    mkdir("/tmp/silver", 493);
+    #off
     smFileWrite(tmp, fileBytes);
     if (!smFileExists(tmp)) { smUntrackTmp(tmp); smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return ""; }
     smFileRename(tmp, path);
