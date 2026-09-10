@@ -61,6 +61,15 @@ mod export sysinfo;
 // $LANG value (e.g. "en_US.UTF-8"), not a LANGID quirk -- documented
 // difference. os() answers "linux" under LINUX. Separator note: `/`, no
 // drive letters (diskTotal/Free stat "/"), case-sensitive.
+//
+// MAC BACKEND (Phase B, code-only -- MAC.md section 10, UNVALIDATED until
+// probed on Mac hardware): sysctlbyname family (hw.memsize, hw.model for
+// cpuModel, hw.usermem for memoryFree) + sysconf + uname +
+// gethostname + getlogin_r + env.get + statvfs, mirroring the LINUX bodies
+// statement-for-statement. There is NO /proc on macOS -- any /proc read
+// ported from Linux is a bug; the /proc helpers below stay LINUX-only and
+// their MAC counterparts live in the sysctl helpers above. APFS note:
+// disk paths use `/` with no drive letters (same as Linux).
 
 // Writable string buffer of n bytes (spaces) for NUL-terminated Win32 data.
 string blankBuf(int n) {
@@ -72,17 +81,19 @@ string blankBuf(int n) {
 #on WINDOWS
 import * from win32.advapi32;
 import * from win32.kernel32;
-#off
 #on LINUX
 import * from linux.libc;
+#on MAC
+import * from mac.libsystem;
 #off
 
 public string os() {
     #on WINDOWS
     return "windows";
-    #off
     #on LINUX
     return "linux";
+    #on MAC
+    return "macos";
     #off
     return "";
 }
@@ -100,7 +111,6 @@ public string arch() {
     if (archCode == 9) { return "x86_64"; }
     if (archCode == 12) { return "aarch64"; }
     return "unknown";
-    #off
     #on LINUX
     int[] u = new int[49];
     int rc = uname(u);
@@ -109,6 +119,17 @@ public string arch() {
     if (machine == "x86_64") { return "x86_64"; }
     if (machine == "aarch64") { return "aarch64"; }
     if (machine == "i386" || machine == "i686") { return "x86"; }
+    return "unknown";
+    #on MAC
+    // Darwin utsname: 5 x 256-byte fields; machine is the 5th (offset
+    // 1024). Apple Silicon reports "arm64" (not "aarch64").
+    // UNVALIDATED code-only (see the header).
+    int[] u = new int[160];
+    int rc = uname(u);
+    if (rc != 0) { return "unknown"; }
+    string machine = macUtsField(u, 1024);
+    if (machine == "arm64") { return "arm64"; }
+    if (machine == "x86_64") { return "x86_64"; }
     return "unknown";
     #off
     return "unknown";
@@ -122,8 +143,7 @@ public string hostname() {
     string result = "";
     for (int i = 0; i < size && buf[i] != char(0); i++) { result += char(buf[i]); }
     return result;
-    #off
-    #on LINUX
+    #else
     string buf = blankBuf(256);
     int rc = gethostname(buf, 256);
     if (rc != 0) { return ""; }
@@ -139,9 +159,12 @@ public int cpuCores() {
     int[] si = new int[6];
     GetSystemInfo(si);
     return si[4] & 0xFFFFFFFF;
-    #off
     #on LINUX
     return sysconf(84);
+    #on MAC
+    // _SC_NPROCESSORS_ONLN is 58 on Darwin (84 is Linux-only).
+    // UNVALIDATED code-only (see the header).
+    return sysconf(58);
     #off
     return 0;
 }
@@ -161,6 +184,10 @@ public string cpuModel() {
     #off
     #on LINUX
     return procCpuModel();
+    #on MAC
+    // hw.model reports the Apple Silicon model string (e.g. Apple M5).
+    // UNVALIDATED code-only (see the header).
+    return macSysctlString("hw.model");
     #off
     return "";
 }
@@ -174,9 +201,12 @@ public int64 memoryTotal() {
     int ok = GlobalMemoryStatusEx(ms);
     if (ok == 0) { return 0; }
     return ms[1] / 1024 / 1024;
-    #off
     #on LINUX
     return procMemValue("MemTotal") / 1024;
+    #on MAC
+    // hw.memsize is bytes; the contract is megabytes like the other
+    // branches. UNVALIDATED code-only (see the header).
+    return macSysctlU64("hw.memsize") / 1024 / 1024;
     #off
     return 0;
 }
@@ -188,9 +218,13 @@ public int64 memoryFree() {
     int ok = GlobalMemoryStatusEx(ms);
     if (ok == 0) { return 0; }
     return ms[2] / 1024 / 1024;
-    #off
     #on LINUX
     return procMemValue("MemAvailable") / 1024;
+    #on MAC
+    // hw.usermem is user-available bytes (excludes wired kernel memory):
+    // the closest sysctl analog of "free" without mach vm_statistics
+    // plumbing (gated on hardware probes). UNVALIDATED code-only.
+    return macSysctlU64("hw.usermem") / 1024 / 1024;
     #off
     return 0;
 }
@@ -204,12 +238,15 @@ public double memoryUsagePercent() {
     int ok = GlobalMemoryStatusEx(ms);
     if (ok == 0) { return 0; }
     return double((ms[0] >> 32) & 0xFFFFFFFF);
-    #off
     #on LINUX
     int64 total = procMemValue("MemTotal");
     if (total <= 0) { return 0; }
     int64 avail = procMemValue("MemAvailable");
     return double(total - avail) / double(total) * 100.0;
+    #on MAC
+    int64 total = memoryTotal();
+    if (total <= 0) { return 0; }
+    return double(total - memoryFree()) / double(total) * 100.0;
     #off
     return 0;
 }
@@ -220,8 +257,11 @@ public int64 diskTotal() {
     int64 freeBytes = 0;
     GetDiskFreeSpaceExA("C:\\", null, &totalBytes, &freeBytes);
     return totalBytes / 1024 / 1024 / 1024;
-    #off
-    #on LINUX
+    #else
+    // statvfs slot equivalence (verified against Darwin statvfs64: f_bsize
+    // slot 0, f_frsize slot 1, f_blocks slot 2, f_bavail slot 4 -- the same
+    // first-five slots as glibc), so the LINUX body is shared.
+    // UNVALIDATED code-only (see the header).
     int[] sv = new int[14];
     int rc = statvfs("/", sv);
     if (rc != 0) { return 0; }
@@ -237,8 +277,8 @@ public int64 diskFree() {
     int64 freeBytes = 0;
     GetDiskFreeSpaceExA("C:\\", null, &totalBytes, &freeBytes);
     return freeBytes / 1024 / 1024 / 1024;
-    #off
-    #on LINUX
+    #else
+    // Same statvfs slot equivalence as diskTotal (f_bavail slot 4).
     int[] sv = new int[14];
     int rc = statvfs("/", sv);
     if (rc != 0) { return 0; }
@@ -263,8 +303,7 @@ public string[] networkIPs() {
 public int pid() {
     #on WINDOWS
     return GetCurrentProcessId();
-    #off
-    #on LINUX
+    #else
     return getpid();
     #off
     return 0;
@@ -275,10 +314,16 @@ public string processName() { return "silver-app"; }
 public int64 uptime() {
     #on WINDOWS
     return GetTickCount64() / 1000;
-    #off
     #on LINUX
     int[] ts = new int[2];
     clock_gettime(1, ts);
+    int64 sec = ts[0];
+    return sec;
+    #on MAC
+    // CLOCK_MONOTONIC is 6 on Darwin (1 is Linux-only).
+    // UNVALIDATED code-only (see the header).
+    int[] ts = new int[2];
+    clock_gettime(6, ts);
     int64 sec = ts[0];
     return sec;
     #off
@@ -303,6 +348,15 @@ public string username() {
         if (result.length() > 0) { return result; }
     }
     return sysProcEnvValue("USER");
+    #on MAC
+    string buf = blankBuf(256);
+    int rc = getlogin_r(buf, 256);
+    if (rc == 0) {
+        string result = "";
+        for (int i = 0; i < 256 && buf[i] != char(0); i++) { result += char(buf[i]); }
+        if (result.length() > 0) { return result; }
+    }
+    return env.get("USER");
     #off
     return "";
 }
@@ -310,9 +364,10 @@ public string username() {
 public string homeDir() {
     #on WINDOWS
     return env.get("USERPROFILE");
-    #off
     #on LINUX
     return sysProcEnvValue("HOME");
+    #on MAC
+    return env.get("HOME");
     #off
     return "";
 }
@@ -320,9 +375,12 @@ public string homeDir() {
 public string tempDir() {
     #on WINDOWS
     return env.get("TEMP");
-    #off
     #on LINUX
     string t = sysProcEnvValue("TMPDIR");
+    if (t.length() == 0) { t = "/tmp"; }
+    return t;
+    #on MAC
+    string t = env.get("TMPDIR");
     if (t.length() == 0) { t = "/tmp"; }
     return t;
     #off
@@ -339,9 +397,12 @@ public string lang() {
     result += char(((langId >> 8) & 0xFF));
     result += char((langId & 0xFF));
     return result;
-    #off
     #on LINUX
     return sysProcEnvValue("LANG");
+    #on MAC
+    // v1 answers $LANG like Linux (CFLocaleCopyCurrent when GUI-linked is
+    // a v2 step per MAC.md section 6).
+    return env.get("LANG");
     #off
     return "";
 }
@@ -349,11 +410,61 @@ public string lang() {
 public string env(string name) {
     #on WINDOWS
     return env.get(name);
-    #off
     #on LINUX
     return sysProcEnvValue(name);
+    #on MAC
+    return env.get(name);
     #off
     return "";
+}
+
+// -- MAC-only private helpers (sysctl decodes) ---------------------------
+//
+// sysctlbyname(name, oldp, oldlenp, newp, newlen): the macOS replacement
+// for Linux /proc + sysconf reads (there is NO /proc on macOS). All values
+// below are re-derived from macOS headers, never copied from Linux tables,
+// and every one is UNVALIDATED code-only until probed on Mac hardware
+// (MAC.md section 10): wrong constants that still assemble are this port's
+// most dangerous bug class.
+
+// One 256-byte NUL-terminated Darwin utsname field at byte offset off.
+string macUtsField(int[] u, int off) {
+    #on MAC
+    string r = "";
+    for (int i = 0; i < 256; i++) {
+        int b = (u[(off + i) / 8] >> (((off + i) % 8) * 8)) & 0xFF;
+        if (b == 0) { break; }
+        r += char(b);
+    }
+    return r;
+    #off
+    return "";
+}
+
+// String-valued sysctl (e.g. hw.model), or "" when the call fails.
+string macSysctlString(string name) {
+    #on MAC
+    string buf = blankBuf(256);
+    int len = 256;
+    int rc = sysctlbyname(name, buf, &len, null, 0);
+    if (rc != 0) { return ""; }
+    string r = "";
+    for (int i = 0; i < len && buf[i] != char(0); i++) { r += char(buf[i]); }
+    return r;
+    #off
+    return "";
+}
+
+// 64-bit-valued sysctl (e.g. hw.memsize), or 0 when the call fails.
+int64 macSysctlU64(string name) {
+    #on MAC
+    int[] buf = new int[1];
+    int len = 8;
+    int rc = sysctlbyname(name, buf, &len, null, 0);
+    if (rc != 0) { return 0; }
+    return buf[0];
+    #off
+    return 0;
 }
 
 // -- LINUX-only private helpers (struct decodes + /proc readers) ----------

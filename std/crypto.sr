@@ -47,6 +47,14 @@ import * from fs;
 // layout -- byte[] must not cross the boundary packed). A failed getrandom
 // keeps the zero fill, matching the old fallback.
 //
+// MAC BACKEND (Phase B, code-only -- MAC.md section 10, UNVALIDATED until
+// probed on Mac hardware): cryptoRandomRange rides libSystem rand() with
+// the same span shape (shared through `#else`); randomBytes reads real
+// entropy from arc4random_buf into a packed int[] and unpacks one byte per
+// slot (the same uuid.sr layout). getrandom(2) is Linux-only and does not
+// exist on macOS -- it is never called here. randomBytes MUST return real
+// bytes on macOS (never the zero fill).
+//
 // COMPILER NOTE: silverc-rs cannot consume exported CLASS types from
 // source modules (rsaKeyPair as a user-local type fails with the standard
 // rs parser error "unknown keyword rsaKeyPair"), so rsaGenerate's return
@@ -63,9 +71,10 @@ import * from fs;
 #on WINDOWS
 import { CryptAcquireContextA, CryptGenRandom, CryptReleaseContext } from win32.advapi32;
 import * from win32.msvcrt;
-#off
 #on LINUX
 import * from linux.libc;
+#on MAC
+import * from mac.libsystem;
 #off
 
 class rsaKeyPair {
@@ -84,8 +93,7 @@ private int cryptoRandomRange(int min, int max) {
     #on WINDOWS
     int span = max - min + 1;
     return min + rand() % span;
-    #off
-    #on LINUX
+    #else
     int span = max - min + 1;
     return min + rand() % span;
     #off
@@ -221,7 +229,6 @@ public byte[] randomBytes(int count) {
         CryptReleaseContext(prov, 0);
     }
     return result;
-    #off
     #on LINUX
     if (count <= 0) { return []; }
     int slots = (count + 7) / 8;
@@ -231,6 +238,16 @@ public byte[] randomBytes(int count) {
     if (n < 0) { return result; }
     if (n > count) { n = count; }
     for (int i = 0; i < n; i++) {
+        result[i] = (packed[i / 8] >> ((i % 8) * 8)) & 0xFF;
+    }
+    return result;
+    #on MAC
+    if (count <= 0) { return []; }
+    int slots = (count + 7) / 8;
+    int[] packed = new int[slots];
+    arc4random_buf(packed, count);
+    byte[] result = new byte[count];
+    for (int i = 0; i < count; i++) {
         result[i] = (packed[i / 8] >> ((i % 8) * 8)) & 0xFF;
     }
     return result;
