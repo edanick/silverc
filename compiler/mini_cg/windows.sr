@@ -1,0 +1,420 @@
+mod export mini_cg_windows;
+
+// ============================================================================
+// WINDOWS backend - MiniCg Win64 emission helpers (split from mini_cg core).
+// ============================================================================
+// Holds the 18 Win64-only helpers moved out of `class MiniCg`: the win32 grant
+// tables (win32ModuleDll / win32ExportTable / win32TableHas / win32AddDll /
+// win32AddGrant / win32AddGrantAlias / win32AddGrantNamed / win32Allowed /
+// registerWin32Import / checkWin32ModuleGrant / win32ModuleOf /
+// win32CallResolves) plus the Windows-only emitters (genExitCall /
+// genCursorXCall / genCursorYCall / genCursorPosCall / genOsVersionCall /
+// genOsBuildCall). All bodies are Win64-only: RCX/RDX/R8/R9 + 32-byte shadow
+// space, kernel32/msvcrt/ucrtbase/version.dll imports.
+//
+// The file is UNGATED (no whole-file #on): the helpers must exist on both
+// targets because the core wrappers call them; they are simply never CALLED
+// on Linux. There is deliberately NO duplicate `class MiniCg` here: the type
+// checker overwrites same-name classes, corrupting field offsets, so the
+// helpers live on `class MiniCgWindows` and take `MiniCg cg` when they touch
+// core state (pure table helpers take no `cg`).
+// ============================================================================
+
+class MiniCgWindows {
+    construct() {
+    }
+
+    private bool strEq(string a, string b) {
+        if (a.length != b.length) { return false; }
+        for (int i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    public string win32ModuleDll(string module) {
+        if (this.strEq(module, "kernel32")) { return "kernel32.dll"; }
+        if (this.strEq(module, "ws2_32")) { return "ws2_32.dll"; }
+        if (this.strEq(module, "winhttp")) { return "winhttp.dll"; }
+        if (this.strEq(module, "wininet")) { return "wininet.dll"; }
+        if (this.strEq(module, "shell32")) { return "shell32.dll"; }
+        if (this.strEq(module, "msvcrt")) { return "msvcrt.dll"; }
+        if (this.strEq(module, "user32")) { return "user32.dll"; }
+        if (this.strEq(module, "registry") || this.strEq(module, "advapi32")) { return "advapi32.dll"; }
+        if (this.strEq(module, "version")) { return "version.dll"; }
+        return "";
+    }
+
+    public string win32ExportTable(string dll) {
+        if (this.strEq(dll, "kernel32.dll")) { return "CreateFileA ReadFile WriteFile CloseHandle GetFileSize GetFileSizeEx SetFilePointer FlushFileBuffers DeleteFileA MoveFileA CopyFileA GetFileAttributesA SetFileAttributesA CreateDirectoryA RemoveDirectoryA SetCurrentDirectoryA GetCurrentDirectoryA GetFullPathNameA FindFirstFileA FindNextFileA FindClose GetStdHandle SetConsoleTextAttribute GetConsoleScreenBufferInfo SetConsoleCursorPosition GetConsoleMode SetConsoleMode ReadConsoleA WriteConsoleA GetModuleHandleA GetModuleFileNameA LoadLibraryA GetProcAddress Sleep GetTickCount GetTickCount64 GetLastError CreateProcessA CreateProcessW WaitForSingleObject GetExitCodeProcess TerminateProcess OpenProcess GetProcessId CreatePipe GetProcessHeap HeapFree GlobalAlloc GlobalFree VirtualAlloc VirtualFree GetCurrentProcessId GetCurrentProcess GetCurrentThreadId GetCurrentThread GetEnvironmentVariableA GetEnvironmentVariableW SetEnvironmentVariableA SetEnvironmentVariableW ExpandEnvironmentStringsA GetEnvironmentStringsA FreeEnvironmentStringsA GetTempPathA GetComputerNameA QueryPerformanceCounter QueryPerformanceFrequency GetVersionExA GetSystemDirectoryA GetWindowsDirectoryA GetLocalTime GetSystemTime GetSystemInfo GlobalMemoryStatusEx GetDiskFreeSpaceExA GetUserDefaultUILanguage OutputDebugStringA IsDebuggerPresent GetCommandLineA SetThreadPriority QueryFullProcessImageNameA GetFileAttributesW lstrlenA lstrcpyA lstrcatA lstrcmpA CreateProcess"; }
+        if (this.strEq(dll, "ws2_32.dll")) { return "WSAStartup WSACleanup socket bind listen accept recv send shutdown closesocket connect select setsockopt ioctlsocket htons inet_addr getaddrinfo freeaddrinfo WSAGetLastError"; }
+        if (this.strEq(dll, "winhttp.dll")) { return "WinHttpOpen WinHttpConnect WinHttpOpenRequest WinHttpSendRequest WinHttpReceiveResponse WinHttpQueryHeaders WinHttpQueryDataAvailable WinHttpReadData WinHttpCloseHandle WinHttpSetOption"; }
+        if (this.strEq(dll, "wininet.dll")) { return "InternetOpenA InternetConnectA InternetOpenUrlA InternetReadFile InternetReadFileExA InternetCloseHandle HttpSendRequestA HttpSendRequestExA InternetQueryDataAvailable InternetSetOptionA InternetQueryOptionA HttpQueryInfoA InternetWriteFile InternetGetConnectedState InternetCrackUrlA InternetCanonicalizeUrlA InternetSetStatusCallback"; }
+        if (this.strEq(dll, "shell32.dll")) { return "ShellExecuteA ShellExecuteW ShellExecuteExA ShellExecuteExW"; }
+        if (this.strEq(dll, "msvcrt.dll")) { return "memcpy memset memmove memcmp strlen strcmp strchr strstr strrchr strcpy strcat strncmp strncat strncpy strtok strpbrk strspn strcspn atoi atol strtol malloc free realloc calloc printf fprintf sprintf sscanf fopen fclose fread fwrite fflush fgets fputs fseek ftell system getenv putenv time rand srand abs labs toupper tolower isalpha isdigit isspace isprint isalnum isxdigit isupper islower"; }
+        if (this.strEq(dll, "user32.dll")) { return "keybd_event VkKeyScanA GetKeyState GetAsyncKeyState GetKeyboardState SetKeyboardState MapVirtualKeyA SendInput mouse_event GetCursorPos SetCursorPos SetCursor ClipCursor GetClipCursor GetDoubleClickTime SetDoubleClickTime GetForegroundWindow GetWindowTextA GetWindowThreadProcessId RegisterHotKey UnregisterHotKey MessageBeep RegisterRawInputDevices GetRawInputData GetRawInputDeviceList RegisterClassExA CreateWindowExA ShowWindow UpdateWindow SetWindowTextA DestroyWindow GetMessageA TranslateMessage DispatchMessageA DefWindowProcA PostQuitMessage GetSystemMetrics LoadIconA LoadCursorA LoadImageA SendMessageA GetCursorX GetCursorY"; }
+        if (this.strEq(dll, "advapi32.dll")) { return "RegOpenKeyExA RegCreateKeyExA RegQueryValueExA RegSetValueExA RegDeleteValueA RegDeleteKeyA RegEnumKeyExA RegEnumValueA RegQueryInfoKeyA RegCloseKey GetUserNameA"; }
+        if (this.strEq(dll, "version.dll")) { return "GetFileVersionInfoSizeA GetFileVersionInfoA VerQueryValueA"; }
+        return "";
+    }
+
+    public bool win32TableHas(string dll, string fn) {
+        // OVERHAUL.md --cache-bytecode / --watch: GetFileTime supplies the
+        // creation/write timestamps recorded per .sr file in the .sbcr record
+        // and polled by the watcher. It sits beside the other handle-based
+        // file APIs (CreateFileA/GetFileSize).
+        if (this.strEq(fn, "GetFileTime")) { return true; }
+        string table = this.win32ExportTable(dll);
+        int i = 0;
+        while (i < table.length) {
+            while (i < table.length && table[i] == ' ') { i = i + 1; }
+            int start = i;
+            while (i < table.length && table[i] != ' ') { i = i + 1; }
+            if (i > start && this.strEq(fn, projectSlice(table, start, i))) { return true; }
+        }
+        return false;
+    }
+
+    public void win32AddDll(MiniCg cg, string dll) {
+        if (dll.length == 0) { return; }
+        for (int i = 0; i < cg.win32Dlls.length; i++) {
+            if (this.strEq(cg.win32Dlls[i], dll)) { return; }
+        }
+        cg.win32Dlls.add(dll);
+    }
+
+    public void win32AddGrant(MiniCg cg, string dll, string fn) {
+        if (dll.length == 0 || fn.length == 0) { return; }
+        string grant = dll + "|" + fn;
+        for (int i = 0; i < cg.win32Grants.length; i++) {
+            if (this.strEq(cg.win32Grants[i], grant)) { return; }
+        }
+        cg.win32Grants.add(grant);
+    }
+
+    public void win32AddGrantAlias(MiniCg cg, string dll, string exportName, string localName) {
+        if (dll.length == 0 || exportName.length == 0 || localName.length == 0) { return; }
+        if (this.strEq(exportName, localName)) { this.win32AddGrant(cg, dll, exportName); return; }
+        for (int i = 0; i < cg.win32AliasLocals.length; i++) {
+            if (this.strEq(cg.win32AliasLocals[i], localName) && this.strEq(cg.win32AliasExports[i], exportName) && this.strEq(cg.win32AliasDlls[i], dll)) { return; }
+        }
+        cg.win32AliasLocals.add(localName);
+        cg.win32AliasExports.add(exportName);
+        cg.win32AliasDlls.add(dll);
+    }
+
+    public void win32AddGrantNamed(MiniCg cg, string dll, Node nameNode) {
+        if (nameNode.isAlias && nameNode.strVal.length > 0) {
+            this.win32AddGrantAlias(cg, dll, nameNode.name, nameNode.strVal);
+            return;
+        }
+        this.win32AddGrant(cg, dll, nameNode.name);
+    }
+
+    public bool win32Allowed(MiniCg cg, string dll, string fn) {
+        for (int i = 0; i < cg.win32Dlls.length; i++) {
+            if (this.strEq(cg.win32Dlls[i], dll)) {
+                if (this.win32TableHas(dll, fn)) { return true; }
+            }
+        }
+        string grant = dll + "|" + fn;
+        for (int i = 0; i < cg.win32Grants.length; i++) {
+            if (this.strEq(cg.win32Grants[i], grant)) { return true; }
+        }
+        return false;
+    }
+
+    public void registerWin32Import(MiniCg cg, Node node) {
+        string source = node.typeHint;
+        bool all = node.isStatic;
+        if (!this.strEq(source, "win32") && source.length > 6) {
+            string prefix = projectSlice(source, 0, 6);
+            if (!this.strEq(prefix, "win32.")) { return; }
+        } elif (!this.strEq(source, "win32")) {
+            return;
+        }
+        if (this.strEq(source, "win32")) {
+            if (all) {
+                this.win32AddDll(cg, this.win32ModuleDll("kernel32"));
+                this.win32AddDll(cg, this.win32ModuleDll("ws2_32"));
+                this.win32AddDll(cg, this.win32ModuleDll("winhttp"));
+                this.win32AddDll(cg, this.win32ModuleDll("wininet"));
+                this.win32AddDll(cg, this.win32ModuleDll("shell32"));
+                this.win32AddDll(cg, this.win32ModuleDll("msvcrt"));
+                this.win32AddDll(cg, this.win32ModuleDll("user32"));
+                this.win32AddDll(cg, this.win32ModuleDll("registry"));
+                this.win32AddDll(cg, this.win32ModuleDll("version"));
+                return;
+            }
+            this.checkWin32ModuleGrant(cg, node.name, node);
+            for (int j = 0; j < node.childCount(); j++) {
+                this.checkWin32ModuleGrant(cg, node.child(j).name, node);
+            }
+            return;
+        }
+        string module = projectSlice(source, 6, source.length);
+        string dll = this.win32ModuleDll(module);
+        if (dll.length > 0) {
+            if (all) {
+                this.win32AddDll(cg, dll);
+                return;
+            }
+            this.win32AddGrantNamed(cg, dll, node);
+            for (int j = 0; j < node.childCount(); j++) {
+                this.win32AddGrantNamed(cg, dll, node.child(j));
+            }
+            return;
+        }
+        if (cg.customNative.declared(module)) {
+            string winf = cg.customNative.winFile(module);
+            if (winf.length == 0) {
+                printline("Error: " + nativeUndeclaredMsg(source));
+                exit(1);
+                return;
+            }
+            if (all) {
+                printline("Error: " + nativeStarMsg(source));
+                exit(1);
+                return;
+            }
+            this.win32AddGrantNamed(cg, winf, node);
+            for (int j2 = 0; j2 < node.childCount(); j2++) {
+                this.win32AddGrantNamed(cg, winf, node.child(j2));
+            }
+            return;
+        }
+        printline("Error: " + nativeUndeclaredMsg(source));
+        exit(1);
+    }
+
+    public void checkWin32ModuleGrant(MiniCg cg, string modName, Node node) {
+        if (modName.length == 0) { return; }
+        string dll = this.win32ModuleDll(modName);
+        if (dll.length > 0) {
+            this.win32AddDll(cg, dll);
+            return;
+        }
+        if (cg.customNative.declared(modName)) {
+            printline("Error: " + nativeStarMsg("win32." + modName));
+            exit(1);
+            return;
+        }
+        printline("Error: " + nativeUndeclaredMsg("win32." + modName));
+        exit(1);
+    }
+
+    public string win32ModuleOf(string dll) {
+        if (this.strEq(dll, "kernel32.dll")) { return "kernel32"; }
+        if (this.strEq(dll, "ws2_32.dll")) { return "ws2_32"; }
+        if (this.strEq(dll, "winhttp.dll")) { return "winhttp"; }
+        if (this.strEq(dll, "wininet.dll")) { return "wininet"; }
+        if (this.strEq(dll, "shell32.dll")) { return "shell32"; }
+        if (this.strEq(dll, "msvcrt.dll")) { return "msvcrt"; }
+        if (this.strEq(dll, "user32.dll")) { return "user32"; }
+        if (this.strEq(dll, "advapi32.dll")) { return "registry"; }
+        if (this.strEq(dll, "version.dll")) { return "version"; }
+        return dll;
+    }
+
+    public bool win32CallResolves(MiniCg cg, string name) {
+        for (int i = 0; i < cg.win32Dlls.length; i++) {
+            if (this.win32TableHas(cg.win32Dlls[i], name)) { return true; }
+            if (this.strEq(name, "CreateProcess") && this.win32TableHas(cg.win32Dlls[i], "CreateProcessA")) { return true; }
+        }
+        for (int g = 0; g < cg.win32Grants.length; g++) {
+            string grant = cg.win32Grants[g];
+            if (grant.length > name.length + 1 && this.strEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') { return true; }
+            if (this.strEq(name, "CreateProcess") && this.strEq(grant, "kernel32.dll|CreateProcessA")) { return true; }
+        }
+        for (int a = 0; a < cg.win32AliasLocals.length; a++) {
+            if (this.strEq(cg.win32AliasLocals[a], name)) { return true; }
+        }
+        return false;
+    }
+
+    public void genExitCall(MiniCg cg, Node call) {
+        if (call.childCount() > 0) {
+            cg.genExpr(call.child(0));
+            cg.asm.movRR64(1, 0);
+        } else {
+            cg.asm.xorRR64(1, 1);
+        }
+        cg.addImportPatch("kernel32.dll", "ExitProcess");
+        int s3 = 0xDEADBEEFCAFEBABE;
+        cg.asm.emitImm64(0, s3);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.emitCallSetup(0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+    }
+
+    public void genCursorXCall(MiniCg cg) {
+        cg.allocLocal("__cursor_padding");
+        int pointOff = cg.allocLocal("__cursor_point");
+        cg.asm.movRI64(0, 0);
+        cg.asm.movMBaseR(5, 0, pointOff);
+        cg.asm.movMBaseR(5, 0, pointOff + 8);
+        cg.asm.leaRBase(1, 5, pointOff);
+        cg.asm.emitCallSetup(0);
+        cg.addImportPatch("user32.dll", "GetCursorPos");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        // movsxd rax, dword ptr [rbp + disp32]
+        cg.asm.emitU8(0x48);
+        cg.asm.emitU8(0x63);
+        cg.asm.emitU8(0x85);
+        cg.asm.emitU32(pointOff);
+    }
+
+    public void genCursorYCall(MiniCg cg) {
+        cg.allocLocal("__cursor_padding");
+        int pointOff = cg.allocLocal("__cursor_point");
+        cg.asm.movRI64(0, 0);
+        cg.asm.movMBaseR(5, 0, pointOff);
+        cg.asm.movMBaseR(5, 0, pointOff + 8);
+        cg.asm.leaRBase(1, 5, pointOff);
+        cg.asm.emitCallSetup(0);
+        cg.addImportPatch("user32.dll", "GetCursorPos");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        // movsxd rax, dword ptr [rbp + disp32]
+        cg.asm.emitU8(0x48);
+        cg.asm.emitU8(0x63);
+        cg.asm.emitU8(0x85);
+        cg.asm.emitU32(pointOff + 4);
+    }
+
+    public void genCursorPosCall(MiniCg cg, Node call, int argStart) {
+        if (call.childCount() <= argStart) {
+            cg.asm.xorRR64(0, 0);
+            return;
+        }
+        int arrOff = cg.allocLocal("__cursor_array");
+        cg.genExpr(call.child(argStart));
+        cg.asm.movMBaseR(5, 0, arrOff);
+
+        // POINT is two packed int32 values. One 8-byte local is exactly the
+        // required storage and remains addressable through RBP while the
+        // external call is active.
+        int pointOff = cg.allocLocal("__cursor_point");
+        cg.asm.xorRR64(0, 0);
+        cg.asm.movMBaseR(5, 0, pointOff);
+        cg.asm.leaRBase(1, 5, pointOff);
+        cg.asm.emitCallSetup(0);
+        cg.addImportPatch("user32.dll", "GetCursorPos");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+
+        // Copy signed 32-bit POINT.x into pos[0].
+        cg.asm.emitU8(0x48);
+        cg.asm.emitU8(0x63);
+        cg.asm.emitU8(0x85);
+        cg.asm.emitU32(pointOff);
+        cg.asm.movRMBase(1, 5, arrOff);
+        cg.asm.movMBaseR(1, 0, 0);
+        // Copy POINT.y into pos[1].
+        cg.asm.emitU8(0x48);
+        cg.asm.emitU8(0x63);
+        cg.asm.emitU8(0x85);
+        cg.asm.emitU32(pointOff + 4);
+        cg.asm.movRMBase(1, 5, arrOff);
+        cg.asm.addRI32(1, 8);
+        cg.asm.movMBaseR(1, 0, 0);
+    }
+
+    public void genOsVersionCall(MiniCg cg) {
+        // os.version - returns the Windows version string (e.g. "10.0").
+        // Uses RtlGetVersion from ntdll.dll to get the real OS version,
+        // then formats it as "major.minor".
+        int verOff = cg.allocLocal("__os_ver");
+
+        // Zero out RTL_OSVERSIONINFOW on the stack (284 bytes).
+        for (int zi = 0; zi < 36; zi++) {
+            cg.asm.movRI64(0, 0);
+            cg.asm.movMBaseR(5, 0, verOff + zi * 8);
+        }
+        // dwOSVersionInfoSize = 284
+        cg.asm.movRI64(0, 284);
+        cg.asm.movMBaseR(5, 0, verOff);
+
+        // RtlGetVersion(&ver)
+        cg.asm.emitCallSetup(0);
+        cg.asm.leaRBase(1, 5, verOff);
+        cg.addImportPatch("ntdll.dll", "RtlGetVersion");
+        cg.asm.emitImm64(0, 0xDEADBEEFCAFEBAD0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+
+        // Check if build >= 22000 → Windows 11 (major == 10 with high build)
+        int os110 = cg.newLabel();
+        int osDone = cg.newLabel();
+        cg.asm.movRMBase(0, 5, verOff + 4);              // dwMajorVersion
+        cg.asm.cmpRI32(0, 10);
+        cg.asm.jneLabel(osDone);                          // Not 10 → emit "10.0"
+        // Major == 10: check build number for Win 11
+        cg.asm.movRMBase(0, 5, verOff + 12);             // dwBuildNumber
+        cg.asm.cmpRI32(0, 22000);
+        cg.asm.jlLabel(osDone);                          // build < 22000 → Win 10
+        // Win 11
+        cg.emitLlmaiStringLiteral("11.0");
+        return;
+        cg.asm.bindLabel(osDone);
+        // Win 10 or unknown → emit "10.0"
+        cg.emitLlmaiStringLiteral("10.0");
+    }
+
+    public void genOsBuildCall(MiniCg cg) {
+        // os.build - returns the Windows build number as a string.
+        int verOff = cg.allocLocal("__os_bver");
+
+        // Zero out RTL_OSVERSIONINFOW on the stack (284 bytes).
+        for (int zi = 0; zi < 36; zi++) {
+            cg.asm.movRI64(0, 0);
+            cg.asm.movMBaseR(5, 0, verOff + zi * 8);
+        }
+        // dwOSVersionInfoSize = 284
+        cg.asm.movRI64(0, 284);
+        cg.asm.movMBaseR(5, 0, verOff);
+
+        // RtlGetVersion(&ver)
+        cg.asm.emitCallSetup(0);
+        cg.asm.leaRBase(1, 5, verOff);
+        cg.addImportPatch("ntdll.dll", "RtlGetVersion");
+        cg.asm.emitImm64(0, 0xDEADBEEFCAFEBAD0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+
+        // Allocate a 12-byte buffer for itoa output
+        cg.asm.movRI64(1, 12);
+        cg.addImportPatch("msvcrt.dll", "malloc");
+        cg.asm.emitImm64(0, 0xDEADBEEFCAFEBAD5);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.emitCallSetup(0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        int bufOff = cg.allocLocal("__os_bbuf");
+        cg.asm.movMBaseR(5, 0, bufOff);
+
+        // itoa(buildNumber, buffer, 10)
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRMBase(1, 5, verOff + 12);             // R1 = dwBuildNumber
+        cg.asm.movRMBase(2, 5, bufOff);                  // R2 = buffer
+        cg.asm.movRI64(8, 10);                            // R8 = radix 10
+        cg.addImportPatch("msvcrt.dll", "_itoa");
+        cg.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+
+        // Return buffer
+        cg.asm.movRMBase(0, 5, bufOff);
+    }
+}

@@ -1,0 +1,1405 @@
+mod export mini_cg_linux;
+
+// ============================================================================
+// LINUX backend - MiniCg SysV emission helpers (split from mini_cg core).
+// ============================================================================
+// Holds the 46 SysV-only helpers moved out of `class MiniCg`: the linux grant
+// tables (linuxModuleLib / linuxExportTable / linuxTableHas / linuxAddLib /
+// linuxAddGrant / linuxAddGrantAlias / linuxAddGrantNamed / linuxAllowed /
+// registerLinuxImport / checkLinuxModuleGrant / linuxModuleOf /
+// linuxResolveLib / linuxResolveExport / linuxResolveAliasLib /
+// linuxKnownExport / linuxBareLib), DLL/name remaps (linuxImportLib /
+// linuxImportName), SysV ABI addressing (sysvRegAt), ELF addressing
+// (elfCodeVaddr / elfDataVaddr / computeGotAddresses), the cargs/stack layer
+// (emitLinuxStackCapture / emitLinuxStackTopLoad / genLinuxCargsCall), the
+// float-aware variadic tails (emitLinuxVariadicTail / emitLinuxSprintfStaged)
+// and the genLinux* file/os/input/print tails plus the mmap heap redirect
+// (emitLinuxHeapAllocFromR8). All bodies are SysV-only: RDI/RSI/RDX/RCX/R8/R9,
+// no shadow space, libc.so.6/libX11/libXtst imports, GOT patching.
+//
+// The file is UNGATED (no whole-file #on): the helpers must exist on both
+// targets because the core wrappers call them; they are simply never CALLED
+// on Windows. There is deliberately NO duplicate `class MiniCg` here: the
+// type checker overwrites same-name classes, corrupting field offsets, so the
+// helpers live on `class MiniCgLinux` and take `MiniCg cg` when they touch
+// core state (pure table/address helpers take no `cg`).
+// ============================================================================
+
+class MiniCgLinux {
+    construct() {
+    }
+
+    private bool strEq(string a, string b) {
+        if (a.length != b.length) { return false; }
+        for (int i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    public int sysvRegAt(int i) {
+        if (i == 0) { return 7; }
+        if (i == 1) { return 6; }
+        if (i == 2) { return 2; }
+        if (i == 3) { return 1; }
+        if (i == 4) { return 8; }
+        return 9;
+    }
+
+    public string linuxImportLib(string dll) {
+        if (this.strEq(dll, "kernel32.dll")) { return "libc.so.6"; }
+        if (this.strEq(dll, "msvcrt.dll")) { return "libc.so.6"; }
+        if (this.strEq(dll, "ucrtbase.dll")) { return "libc.so.6"; }
+        if (this.strEq(dll, "ws2_32.dll")) { return "libc.so.6"; }
+        return "";
+    }
+
+    public string linuxImportName(string dll, string name) {
+        if (this.strEq(dll, "kernel32.dll")) {
+            if (this.strEq(name, "ExitProcess")) { return "exit"; }
+            if (this.strEq(name, "VirtualAlloc")) { return "mmap"; }
+            if (this.strEq(name, "CloseHandle")) { return "close"; }
+            if (this.strEq(name, "CreateFileA")) { return "open"; }
+            if (this.strEq(name, "ReadFile")) { return "read"; }
+            if (this.strEq(name, "WriteFile")) { return "write"; }
+            if (this.strEq(name, "DeleteFileA")) { return "unlink"; }
+            if (this.strEq(name, "MoveFileA")) { return "rename"; }
+            if (this.strEq(name, "RemoveDirectoryA")) { return "rmdir"; }
+            if (this.strEq(name, "GetFileAttributesA")) { return "stat"; }
+            if (this.strEq(name, "FindFirstFileA")) { return "opendir"; }
+            if (this.strEq(name, "FindNextFileA")) { return "readdir"; }
+            if (this.strEq(name, "FindClose")) { return "closedir"; }
+            if (this.strEq(name, "GetEnvironmentVariableA")) { return "getenv"; }
+            if (this.strEq(name, "SetEnvironmentVariableA")) { return "setenv"; }
+            if (this.strEq(name, "GetComputerNameA")) { return "gethostname"; }
+            if (this.strEq(name, "GetCurrentProcessId")) { return "getpid"; }
+            if (this.strEq(name, "Sleep")) { return "nanosleep"; }
+            if (this.strEq(name, "GetTickCount") || this.strEq(name, "GetTickCount64")) { return "clock_gettime"; }
+            if (this.strEq(name, "QueryPerformanceCounter") || this.strEq(name, "QueryPerformanceFrequency")) { return "clock_gettime"; }
+            if (this.strEq(name, "GetLocalTime") || this.strEq(name, "GetSystemTime")) { return "clock_gettime"; }
+            if (this.strEq(name, "SetFilePointer") || this.strEq(name, "GetFileSize")) { return "lseek"; }
+            if (this.strEq(name, "lstrlenA")) { return "strlen"; }
+            return "";
+        }
+        // msvcrt/ucrtbase overlap on the same C library: glibc carries every
+        // name both DLLs export except the Windows-only underscore helpers.
+        if (this.strEq(dll, "msvcrt.dll") || this.strEq(dll, "ucrtbase.dll")) {
+            if (this.strEq(name, "_atoi64")) { return "atoll"; }
+            return name;
+        }
+        if (this.strEq(dll, "ws2_32.dll")) {
+            if (this.strEq(name, "closesocket")) { return "close"; }
+            if (this.strEq(name, "socket") || this.strEq(name, "bind") || this.strEq(name, "listen") || this.strEq(name, "accept") || this.strEq(name, "recv") || this.strEq(name, "send") || this.strEq(name, "shutdown") || this.strEq(name, "connect") || this.strEq(name, "setsockopt") || this.strEq(name, "getaddrinfo") || this.strEq(name, "freeaddrinfo")) { return name; }
+            return "";
+        }
+        return "";
+    }
+
+    public string linuxModuleLib(string module) {
+        if (this.strEq(module, "libc")) { return "libc.so.6"; }
+        if (this.strEq(module, "x11")) { return "libX11.so.6"; }
+        if (this.strEq(module, "xtst")) { return "libXtst.so.6"; }
+        return "";
+    }
+
+    public string linuxExportTable(string lib) {
+        if (this.strEq(lib, "libc.so.6")) { return "exit mmap munmap malloc free read write open close lseek stat unlink rename mkdir rmdir opendir readdir closedir getenv setenv clock_gettime nanosleep localtime_r gmtime_r fork execve waitpid kill pipe dup2 _exit execvpe getpid pthread_create pthread_join sysconf uname gethostname getlogin_r statvfs getrandom rand srand getuid printf strlen strcmp strcpy memcpy memset socket connect bind listen accept send recv setsockopt getaddrinfo freeaddrinfo"; }
+        if (this.strEq(lib, "libX11.so.6")) { return "XOpenDisplay XCloseDisplay XQueryPointer XWarpPointer XFlush XCreateSimpleWindow XMapWindow XUnmapWindow XDestroyWindow XStoreName XDefaultRootWindow XScreenCount XDisplayWidth XDisplayHeight XStringToKeysym XKeysymToKeycode XQueryKeymap"; }
+        if (this.strEq(lib, "libXtst.so.6")) { return "XTestFakeButtonEvent XTestFakeKeyEvent XTestFakeMotionEvent XTestQueryExtension"; }
+        return "";
+    }
+
+    public bool linuxTableHas(string lib, string fn) {
+        string table = this.linuxExportTable(lib);
+        int i = 0;
+        while (i < table.length) {
+            while (i < table.length && table[i] == ' ') { i++; }
+            int start = i;
+            while (i < table.length && table[i] != ' ') { i++; }
+            if (i > start && this.strEq(fn, projectSlice(table, start, i))) { return true; }
+        }
+        return false;
+    }
+
+    public void linuxAddLib(MiniCg cg, string lib) {
+        if (lib.length == 0) { return; }
+        for (int i = 0; i < cg.linuxLibs.length; i++) {
+            if (this.strEq(cg.linuxLibs[i], lib)) { return; }
+        }
+        cg.linuxLibs.add(lib);
+    }
+
+    public void linuxAddGrant(MiniCg cg, string lib, string fn) {
+        if (lib.length == 0 || fn.length == 0) { return; }
+        string grant = lib + "|" + fn;
+        for (int i = 0; i < cg.linuxGrants.length; i++) {
+            if (this.strEq(cg.linuxGrants[i], grant)) { return; }
+        }
+        cg.linuxGrants.add(grant);
+    }
+
+    public void linuxAddGrantAlias(MiniCg cg, string lib, string exportName, string localName) {
+        if (lib.length == 0 || exportName.length == 0 || localName.length == 0) { return; }
+        if (this.strEq(exportName, localName)) { this.linuxAddGrant(cg, lib, exportName); return; }
+        for (int i = 0; i < cg.linuxAliasLocals.length; i++) {
+            if (this.strEq(cg.linuxAliasLocals[i], localName) && this.strEq(cg.linuxAliasExports[i], exportName) && this.strEq(cg.linuxAliasLibs[i], lib)) { return; }
+        }
+        cg.linuxAliasLocals.add(localName);
+        cg.linuxAliasExports.add(exportName);
+        cg.linuxAliasLibs.add(lib);
+    }
+
+    public void linuxAddGrantNamed(MiniCg cg, string lib, Node nameNode) {
+        if (nameNode.isAlias && nameNode.strVal.length > 0) {
+            this.linuxAddGrantAlias(cg, lib, nameNode.name, nameNode.strVal);
+            return;
+        }
+        this.linuxAddGrant(cg, lib, nameNode.name);
+    }
+
+    public bool linuxAllowed(MiniCg cg, string lib, string fn) {
+        for (int i = 0; i < cg.linuxLibs.length; i++) {
+            if (this.strEq(cg.linuxLibs[i], lib)) {
+                if (this.linuxTableHas(lib, fn)) { return true; }
+            }
+        }
+        string grant = lib + "|" + fn;
+        for (int i = 0; i < cg.linuxGrants.length; i++) {
+            if (this.strEq(cg.linuxGrants[i], grant)) { return true; }
+        }
+        return false;
+    }
+
+    public void registerLinuxImport(MiniCg cg, Node node) {
+        string source = node.typeHint;
+        bool all = node.isStatic;
+        if (!this.strEq(source, "linux") && source.length > 6) {
+            string prefix = projectSlice(source, 0, 6);
+            if (!this.strEq(prefix, "linux.")) { return; }
+        } elif (!this.strEq(source, "linux")) {
+            return;
+        }
+        if (this.strEq(source, "linux")) {
+            if (all) {
+                this.linuxAddLib(cg, this.linuxModuleLib("libc"));
+                this.linuxAddLib(cg, this.linuxModuleLib("x11"));
+                this.linuxAddLib(cg, this.linuxModuleLib("xtst"));
+                return;
+            }
+            this.checkLinuxModuleGrant(cg, node.name, node);
+            for (int j = 0; j < node.childCount(); j++) {
+                this.checkLinuxModuleGrant(cg, node.child(j).name, node);
+            }
+            return;
+        }
+        string module = projectSlice(source, 6, source.length);
+        string lib = this.linuxModuleLib(module);
+        if (lib.length > 0) {
+            if (all) {
+                this.linuxAddLib(cg, lib);
+                return;
+            }
+            this.linuxAddGrantNamed(cg, lib, node);
+            for (int j = 0; j < node.childCount(); j++) {
+                this.linuxAddGrantNamed(cg, lib, node.child(j));
+            }
+            return;
+        }
+        if (cg.customNative.declared(module)) {
+            string lin = cg.customNative.linFile(module);
+            if (lin.length == 0) {
+                printline("Error: " + nativeUndeclaredMsg(source));
+                exit(1);
+                return;
+            }
+            if (all) {
+                printline("Error: " + nativeStarMsg(source));
+                exit(1);
+                return;
+            }
+            this.linuxAddGrantNamed(cg, lin, node);
+            for (int j2 = 0; j2 < node.childCount(); j2++) {
+                this.linuxAddGrantNamed(cg, lin, node.child(j2));
+            }
+            return;
+        }
+        printline("Error: " + nativeUndeclaredMsg(source));
+        exit(1);
+    }
+
+    public void checkLinuxModuleGrant(MiniCg cg, string modName, Node node) {
+        if (modName.length == 0) { return; }
+        string lib = this.linuxModuleLib(modName);
+        if (lib.length > 0) {
+            this.linuxAddLib(cg, lib);
+            return;
+        }
+        if (cg.customNative.declared(modName)) {
+            printline("Error: " + nativeStarMsg("linux." + modName));
+            exit(1);
+            return;
+        }
+        printline("Error: " + nativeUndeclaredMsg("linux." + modName));
+        exit(1);
+    }
+
+    public string linuxModuleOf(string lib) {
+        if (this.strEq(lib, "libc.so.6")) { return "libc"; }
+        if (this.strEq(lib, "libX11.so.6")) { return "x11"; }
+        if (this.strEq(lib, "libXtst.so.6")) { return "xtst"; }
+        return lib;
+    }
+
+    public string linuxResolveLib(MiniCg cg, string name) {
+        for (int i = 0; i < cg.linuxLibs.length; i++) {
+            if (this.linuxTableHas(cg.linuxLibs[i], name)) { return cg.linuxLibs[i]; }
+        }
+        for (int g = 0; g < cg.linuxGrants.length; g++) {
+            string grant = cg.linuxGrants[g];
+            if (grant.length > name.length + 1 && this.strEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') {
+                return projectSlice(grant, 0, grant.length - name.length - 1);
+            }
+        }
+        return "";
+    }
+
+    public string linuxResolveExport(MiniCg cg, string name) {
+        for (int a = 0; a < cg.linuxAliasLocals.length; a++) {
+            if (this.strEq(cg.linuxAliasLocals[a], name)) { return cg.linuxAliasExports[a]; }
+        }
+        return name;
+    }
+
+    public string linuxResolveAliasLib(MiniCg cg, string name) {
+        for (int a = 0; a < cg.linuxAliasLocals.length; a++) {
+            if (this.strEq(cg.linuxAliasLocals[a], name)) { return cg.linuxAliasLibs[a]; }
+        }
+        return "";
+    }
+
+    public bool linuxKnownExport(string name) {
+        if (this.linuxTableHas("libc.so.6", name)) { return true; }
+        if (this.linuxTableHas("libX11.so.6", name)) { return true; }
+        if (this.linuxTableHas("libXtst.so.6", name)) { return true; }
+        return false;
+    }
+
+    public string linuxBareLib(string name) {
+        if (this.linuxTableHas("libc.so.6", name)) { return "libc.so.6"; }
+        if (this.linuxTableHas("libX11.so.6", name)) { return "libX11.so.6"; }
+        if (this.linuxTableHas("libXtst.so.6", name)) { return "libXtst.so.6"; }
+        return "";
+    }
+
+    public int elfCodeVaddr() {
+        return 0x400000 + 0x1000;
+    }
+
+    public int elfDataVaddr(MiniCg cg) {
+        int codeLen = cg.asm.buf.length;
+        int PAGE = 0x1000;
+        int rxFilesz = codeLen;
+        int m = rxFilesz % PAGE;
+        if (m != 0) { rxFilesz = rxFilesz + (PAGE - m); }
+        return 0x400000 + 0x1000 + rxFilesz;
+    }
+
+    public int[] computeGotAddresses(MiniCg cg) {
+        int[] gotAddrs = [];
+        int dataLen = cg.stringData.length + cg.globalAreaSize;
+        int PAGE = 0x1000;
+        int dataFilesz = dataLen;
+        int m = dataFilesz % PAGE;
+        if (m != 0) { dataFilesz = dataFilesz + (PAGE - m); }
+        int rwVaddr = this.elfDataVaddr(cg) + dataFilesz;
+        for (int i = 0; i < cg.importDlls.length; i++) {
+            gotAddrs.add(rwVaddr + 24 + i * 8);
+        }
+        return gotAddrs;
+    }
+
+    public void emitLinuxStackCapture(MiniCg cg) {
+        int stIdx = cg.findGlobal("__linux_stack_top");
+        cg.asm.movRR64(0, 4);
+        int sp = cg.asm.buf.length;
+        cg.asm.emitImm64(1, 0);
+        cg.globalPatchOffsets.add(sp + 2);
+        cg.globalPatchIndices.add(stIdx);
+        cg.asm.movMBaseR(1, 0, 0);
+    }
+
+    public void emitLinuxStackTopLoad(MiniCg cg) {
+        int stIdx = cg.findGlobal("__linux_stack_top");
+        int sp = cg.asm.buf.length;
+        cg.asm.emitImm64(0, 0);
+        cg.globalPatchOffsets.add(sp + 2);
+        cg.globalPatchIndices.add(stIdx);
+        cg.asm.movRMBase(0, 0, 0);
+    }
+
+    public void genLinuxCargsCall(MiniCg cg) {
+        this.emitLinuxStackTopLoad(cg);
+        int rspOff = cg.allocLocal("__cargs_rsp");
+        cg.asm.movMBaseR(5, 0, rspOff);
+        int argcOff = cg.allocLocal("__cargs_argc");
+        int arrOff = cg.allocLocal("__cargs_arr");
+        int iOff = cg.allocLocal("__cargs_i");
+        // argc = [RSP0]
+        cg.asm.movRMBase(0, 5, rspOff);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.movMBaseR(5, 0, argcOff);
+        // size = (argc+1)*8 into R8; malloc + zero via the heap helper.
+        cg.asm.movRMBase(0, 5, argcOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.shlR64Imm(0, 3);
+        cg.asm.movRR64(8, 0);
+        this.emitLinuxHeapAllocFromR8(cg);
+        cg.asm.movMBaseR(5, 0, arrOff);
+        // [arr] = argc
+        cg.asm.movRMBase(1, 5, argcOff);
+        cg.asm.movRMBase(0, 5, arrOff);
+        cg.asm.movMBaseR(0, 1, 0);
+        // i = 0; while i < argc: arr[8+i*8] = argv[i]
+        cg.asm.xorRR64(0, 0);
+        cg.asm.movMBaseR(5, 0, iOff);
+        int loopL = cg.newLabel();
+        int doneL = cg.newLabel();
+        cg.asm.bindLabel(loopL);
+        cg.asm.movRMBase(0, 5, iOff);
+        cg.asm.movRMBase(1, 5, argcOff);
+        cg.asm.cmpRR64(0, 1);
+        cg.asm.jgeLabel(doneL);
+        // argv[i]: R10 = RSP0 + 8 + i*8; R10 = [R10]
+        cg.asm.movRMBase(10, 5, rspOff);
+        cg.asm.addRI32(10, 8);
+        cg.asm.movRMBase(11, 5, iOff);
+        cg.asm.shlR64Imm(11, 3);
+        cg.asm.addRR64(10, 11);
+        cg.asm.movRMBase(10, 10, 0);
+        // arr[8+i*8] = argv[i]
+        cg.asm.movRMBase(11, 5, arrOff);
+        cg.asm.addRI32(11, 8);
+        cg.asm.movRMBase(1, 5, iOff);
+        cg.asm.shlR64Imm(1, 3);
+        cg.asm.addRR64(11, 1);
+        cg.asm.movMBaseR(11, 10, 0);
+        // i++
+        cg.asm.movRMBase(0, 5, iOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, iOff);
+        cg.asm.jmpLabel(loopL);
+        cg.asm.bindLabel(doneL);
+        // Arrays point at their first element: skip the length word.
+        cg.asm.movRMBase(0, 5, arrOff);
+        cg.asm.addRI32(0, 8);
+    }
+
+    public void emitLinuxVariadicTail(MiniCg cg, string lib, string fn, int[] fixedOffs, int[] valOffs, Node[] vals) {
+        int firstFixed = fixedOffs.length;
+        int gpNeed = 0;
+        int xmNeed = 0;
+        for (int i = 0; i < vals.length; i++) {
+            if (cg.isFloatLike(vals[i])) { xmNeed = xmNeed + 1; } else { gpNeed = gpNeed + 1; }
+        }
+        int gpMax = 6 - firstFixed;
+        int gpOver = gpNeed - gpMax;
+        if (gpOver < 0) { gpOver = 0; }
+        int xmOver = xmNeed - 8;
+        if (xmOver < 0) { xmOver = 0; }
+        cg.emitAbiCallSetup((gpOver + xmOver) * 8);
+        for (int f = 0; f < firstFixed; f++) {
+            cg.asm.movRMBase(this.sysvRegAt(f), 5, fixedOffs[f]);
+        }
+        int gp = 0;
+        int xm = 0;
+        int st = 0;
+        int al = 0;
+        for (int i = 0; i < vals.length; i++) {
+            if (cg.isFloatLike(vals[i])) {
+                if (xm < 8) {
+                    cg.asm.movRMBase(0, 5, valOffs[i]);
+                    cg.emitMovqXmmGpr(xm, 0);
+                    xm = xm + 1;
+                    al = al + 1;
+                } else {
+                    cg.asm.movRMBase(0, 5, valOffs[i]);
+                    cg.asm.movMBaseR(4, 0, st * 8);
+                    st = st + 1;
+                }
+            } else {
+                if (gp < gpMax) {
+                    cg.asm.movRMBase(this.sysvRegAt(firstFixed + gp), 5, valOffs[i]);
+                    gp = gp + 1;
+                } else {
+                    cg.asm.movRMBase(0, 5, valOffs[i]);
+                    cg.asm.movMBaseR(4, 0, st * 8);
+                    st = st + 1;
+                }
+            }
+        }
+        cg.addImportPatchDirect(lib, fn);
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(10, 0, 0);
+        cg.asm.movRI64(0, al);
+        cg.asm.callR64(10);
+        cg.emitAbiCallTeardown();
+    }
+
+    public void emitLinuxSprintfStaged(MiniCg cg, bool isFloat) {
+        cg.asm.movRR64(7, 1);
+        cg.asm.movRR64(6, 2);
+        cg.asm.movRR64(2, 8);
+        if (isFloat) {
+            cg.emitMovqXmmGpr(0, 2);
+        }
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "sprintf");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(10, 0, 0);
+        cg.asm.xorRR64(0, 0);
+        if (isFloat) {
+            cg.asm.incR64(0);
+        }
+        cg.asm.callR64(10);
+        cg.emitAbiCallTeardown();
+    }
+
+    public void genLinuxEprintCall(MiniCg cg, Node call, bool newline) {
+        if (call.childCount() < 1) { return; }
+        Node arg = call.child(0);
+        cg.genExpr(arg);
+        int msgOff = cg.allocLocal("__emsg");
+        cg.asm.movMBaseR(5, 0, msgOff);
+        int lenOff = cg.allocLocal("__elen");
+        cg.asm.movRMBase(7, 5, msgOff);
+        cg.addImportPatchDirect("libc.so.6", "strlen");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.emitAbiCallSetup(0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movMBaseR(5, 0, lenOff);
+        cg.asm.movRI64(7, 2);
+        cg.asm.movRMBase(6, 5, msgOff);
+        cg.asm.movRMBase(2, 5, lenOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "write");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        if (newline) {
+            int nlIdx = cg.addString("\n");
+            int sp = cg.asm.buf.length;
+            cg.asm.emitImm64(0, 0);
+            cg.stringPatchOffsets.add(sp + 2);
+            cg.stringPatchIndices.add(nlIdx);
+            cg.asm.movRR64(6, 0);
+            cg.asm.movRI64(7, 2);
+            cg.asm.movRI64(2, 1);
+            cg.emitAbiCallSetup(0);
+            cg.addImportPatchDirect("libc.so.6", "write");
+            cg.asm.emitImm64(0, 0);
+            cg.asm.movRMBase(0, 0, 0);
+            cg.asm.callR64(0);
+            cg.emitAbiCallTeardown();
+        }
+    }
+
+    public void genLinuxGetEnvCall(MiniCg cg, Node call) {
+        int keyIdx = 0;
+        if (call.isMember) { keyIdx = 1; }
+        if (call.childCount() <= keyIdx) { cg.emitLlmaiStringLiteral(""); return; }
+        cg.genExpr(call.child(keyIdx));
+        int keyOff = cg.allocLocal("__env_linux_key");
+        cg.asm.movMBaseR(5, 0, keyOff);
+        cg.asm.movRMBase(7, 5, keyOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "getenv");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int notFound = cg.newLabel();
+        int done = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(notFound);
+        cg.asm.jmpLabel(done);
+        cg.asm.bindLabel(notFound);
+        cg.emitLlmaiStringLiteral("");
+        cg.asm.bindLabel(done);
+    }
+
+    public void genLinuxFileExists(MiniCg cg, int pathOff) {
+        cg.asm.movRMBase(7, 5, pathOff);
+        cg.asm.xorRR64(6, 6);
+        cg.asm.xorRR64(2, 2);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "open");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int feNo = cg.newLabel();
+        int feDone = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jlLabel(feNo);
+        cg.asm.movRR64(7, 0);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "close");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movRI64(0, 1);
+        cg.asm.jmpLabel(feDone);
+        cg.asm.bindLabel(feNo);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.bindLabel(feDone);
+    }
+
+    public void genLinuxFileDeleteCall(MiniCg cg, Node call) {
+        int pathIdx = 1;
+        if (call.childCount() <= pathIdx) { cg.asm.xorRR64(0, 0); return; }
+        cg.genExpr(call.child(pathIdx));
+        int pathOff = cg.allocLocal("__fldel_path");
+        cg.asm.movMBaseR(5, 0, pathOff);
+        cg.asm.movRMBase(7, 5, pathOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "unlink");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+    }
+
+    public void genLinuxFolderDeleteCall(MiniCg cg, Node call) {
+        int pathIdx = 1;
+        if (call.childCount() <= pathIdx) { cg.asm.xorRR64(0, 0); return; }
+        cg.genExpr(call.child(pathIdx));
+        int pathOff = cg.allocLocal("__frmdir_path");
+        cg.asm.movMBaseR(5, 0, pathOff);
+        cg.asm.movRMBase(7, 5, pathOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "rmdir");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+    }
+
+    public void genLinuxFileRenameCall(MiniCg cg, Node call) {
+        if (call.childCount() < 3) { cg.asm.xorRR64(0, 0); return; }
+        cg.genExpr(call.child(1));
+        int srcOff = cg.allocLocal("__flren_src");
+        cg.asm.movMBaseR(5, 0, srcOff);
+        cg.genExpr(call.child(2));
+        int dstOff = cg.allocLocal("__flren_dst");
+        cg.asm.movMBaseR(5, 0, dstOff);
+        cg.asm.movRMBase(7, 5, srcOff);
+        cg.asm.movRMBase(6, 5, dstOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "rename");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+    }
+
+    public void genLinuxFileCopyCall(MiniCg cg, Node call) {
+        if (call.childCount() < 3) { cg.asm.xorRR64(0, 0); return; }
+        cg.genExpr(call.child(1));
+        int srcOff = cg.allocLocal("__fcp_src");
+        cg.asm.movMBaseR(5, 0, srcOff);
+        cg.genExpr(call.child(2));
+        int dstOff = cg.allocLocal("__fcp_dst");
+        cg.asm.movMBaseR(5, 0, dstOff);
+        cg.asm.movRMBase(7, 5, srcOff);
+        cg.asm.xorRR64(6, 6);
+        cg.asm.xorRR64(2, 2);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "open");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int srcFdOff = cg.allocLocal("__fcp_srcfd");
+        cg.asm.movMBaseR(5, 0, srcFdOff);
+        int copyFail0 = cg.newLabel();
+        int copyFailSrc = cg.newLabel();
+        int copyFailLoop = cg.newLabel();
+        int copyLoop = cg.newLabel();
+        int copyDone = cg.newLabel();
+        int copyEnd = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jlLabel(copyFail0);
+        cg.asm.movRMBase(7, 5, dstOff);
+        cg.asm.movRI64(6, 0x241);
+        cg.asm.movRI64(2, 0x1A4);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "open");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int dstFdOff = cg.allocLocal("__fcp_dstfd");
+        cg.asm.movMBaseR(5, 0, dstFdOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jlLabel(copyFailSrc);
+        cg.asm.movRI64(8, 8192);
+        this.emitLinuxHeapAllocFromR8(cg);
+        int bufOff = cg.allocLocal("__fcp_buf");
+        cg.asm.movMBaseR(5, 0, bufOff);
+        int nOff = cg.allocLocal("__fcp_n");
+        cg.asm.bindLabel(copyLoop);
+        cg.asm.movRMBase(7, 5, srcFdOff);
+        cg.asm.movRMBase(6, 5, bufOff);
+        cg.asm.movRI64(2, 8192);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "read");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movMBaseR(5, 0, nOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jlLabel(copyFailLoop);
+        cg.asm.jeLabel(copyDone);
+        cg.asm.movRMBase(7, 5, dstFdOff);
+        cg.asm.movRMBase(6, 5, bufOff);
+        cg.asm.movRMBase(2, 5, nOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "write");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.jmpLabel(copyLoop);
+        cg.asm.bindLabel(copyDone);
+        cg.asm.movRMBase(7, 5, srcFdOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "close");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movRMBase(7, 5, dstFdOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "close");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movRMBase(7, 5, bufOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "free");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movRI64(0, 1);
+        cg.asm.jmpLabel(copyEnd);
+        cg.asm.bindLabel(copyFailSrc);
+        cg.asm.movRMBase(7, 5, srcFdOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "close");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.bindLabel(copyFail0);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.jmpLabel(copyEnd);
+        cg.asm.bindLabel(copyFailLoop);
+        cg.asm.movRMBase(7, 5, srcFdOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "close");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movRMBase(7, 5, dstFdOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "close");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.xorRR64(0, 0);
+        cg.asm.bindLabel(copyEnd);
+    }
+
+    public void genLinuxFileSize(MiniCg cg, int pathOff) {
+        cg.asm.movRI64(8, 144);
+        this.emitLinuxHeapAllocFromR8(cg);
+        int stOff = cg.allocLocal("__fsz_linux_st");
+        cg.asm.movMBaseR(5, 0, stOff);
+        cg.asm.movRMBase(7, 5, pathOff);
+        cg.asm.movRMBase(6, 5, stOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "stat");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int fszBad = cg.newLabel();
+        int fszDone = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jneLabel(fszBad);
+        cg.asm.movRMBase(0, 5, stOff);
+        cg.asm.movRMBase(0, 0, 48);
+        cg.asm.jmpLabel(fszDone);
+        cg.asm.bindLabel(fszBad);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.bindLabel(fszDone);
+    }
+
+    public void genLinuxFolderSizeCall(MiniCg cg, Node call) {
+        int pathIdx = 1;
+        if (call.childCount() <= pathIdx) { cg.asm.xorRR64(0, 0); return; }
+        cg.genExpr(call.child(pathIdx));
+        int initOff = cg.allocLocal("__fdsz_init");
+        cg.asm.movMBaseR(5, 0, initOff);
+        int totalOff = cg.allocLocal("__fdsz_total");
+        cg.asm.xorRR64(0, 0);
+        cg.asm.movMBaseR(5, 0, totalOff);
+        cg.asm.movRI64(8, 1024);
+        this.emitLinuxHeapAllocFromR8(cg);
+        int stackOff = cg.allocLocal("__fdsz_stack");
+        cg.asm.movMBaseR(5, 0, stackOff);
+        cg.asm.movRMBase(0, 5, stackOff);
+        cg.asm.movRMBase(1, 5, initOff);
+        cg.asm.movMBaseR(0, 1, 0);
+        int topOff = cg.allocLocal("__fdsz_top");
+        cg.asm.movRI64(0, 1);
+        cg.asm.movMBaseR(5, 0, topOff);
+        cg.asm.movRI64(8, 144);
+        this.emitLinuxHeapAllocFromR8(cg);
+        int stOff = cg.allocLocal("__fdsz_st");
+        cg.asm.movMBaseR(5, 0, stOff);
+        int curOff = cg.allocLocal("__fdsz_cur");
+        int dirOff = cg.allocLocal("__fdsz_dir");
+        int nodeOff = cg.allocLocal("__fdsz_node");
+        int len1Off = cg.allocLocal("__fdsz_len1");
+        int len2Off = cg.allocLocal("__fdsz_len2");
+        int childOff = cg.allocLocal("__fdsz_child");
+        int outerLoop = cg.newLabel();
+        int outerDone = cg.newLabel();
+        int innerLoop = cg.newLabel();
+        int innerDone = cg.newLabel();
+        int innerNext = cg.newLabel();
+        int checkChild = cg.newLabel();
+        int pushDir = cg.newLabel();
+        int addFile = cg.newLabel();
+        cg.asm.bindLabel(outerLoop);
+        cg.asm.movRMBase(0, 5, topOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jleLabel(outerDone);
+        cg.asm.movRMBase(0, 5, topOff);
+        cg.asm.decR64(0);
+        cg.asm.movMBaseR(5, 0, topOff);
+        cg.asm.movRMBase(10, 5, stackOff);
+        cg.asm.movRMBase(11, 5, topOff);
+        cg.asm.shlR64Imm(11, 3);
+        cg.asm.addRR64(10, 11);
+        cg.asm.movRMBase(10, 10, 0);
+        cg.asm.movMBaseR(5, 10, curOff);
+        cg.asm.movRMBase(7, 5, curOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "opendir");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movMBaseR(5, 0, dirOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(outerLoop);
+        cg.asm.bindLabel(innerLoop);
+        cg.asm.movRMBase(7, 5, dirOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "readdir");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movMBaseR(5, 0, nodeOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(innerDone);
+        cg.asm.movRMBase(0, 5, nodeOff);
+        cg.asm.movzxByteMBase(1, 0, 19);
+        cg.asm.cmpRI32(1, 46);
+        cg.asm.jneLabel(checkChild);
+        cg.asm.movRMBase(0, 5, nodeOff);
+        cg.asm.movzxByteMBase(1, 0, 20);
+        cg.asm.cmpRI32(1, 0);
+        cg.asm.jeLabel(innerNext);
+        cg.asm.cmpRI32(1, 46);
+        cg.asm.jneLabel(checkChild);
+        cg.asm.movRMBase(0, 5, nodeOff);
+        cg.asm.movzxByteMBase(1, 0, 21);
+        cg.asm.cmpRI32(1, 0);
+        cg.asm.jeLabel(innerNext);
+        cg.asm.bindLabel(checkChild);
+        cg.asm.movRMBase(7, 5, curOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "strlen");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movMBaseR(5, 0, len1Off);
+        cg.asm.movRMBase(0, 5, nodeOff);
+        cg.asm.addRI32(0, 19);
+        cg.asm.movRR64(7, 0);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "strlen");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movMBaseR(5, 0, len2Off);
+        cg.asm.movRMBase(0, 5, len1Off);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movRMBase(1, 5, len2Off);
+        cg.asm.addRR64(0, 1);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movRR64(8, 0);
+        this.emitLinuxHeapAllocFromR8(cg);
+        cg.asm.movMBaseR(5, 0, childOff);
+        cg.asm.movRMBase(7, 5, childOff);
+        cg.asm.movRMBase(6, 5, curOff);
+        cg.asm.movRMBase(2, 5, len1Off);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "memcpy");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movRMBase(0, 5, childOff);
+        cg.asm.movRMBase(1, 5, len1Off);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movRI64(1, 47);
+        cg.asm.movMBaseByteR(0, 1, 0);
+        cg.asm.movRMBase(0, 5, childOff);
+        cg.asm.movRMBase(1, 5, len1Off);
+        cg.asm.addRI32(1, 1);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movRMBase(1, 5, nodeOff);
+        cg.asm.addRI32(1, 19);
+        cg.asm.movRR64(6, 1);
+        cg.asm.movRMBase(2, 5, len2Off);
+        cg.asm.movRR64(7, 0);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "memcpy");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movRMBase(0, 5, childOff);
+        cg.asm.movRMBase(1, 5, len1Off);
+        cg.asm.addRI32(1, 1);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movRMBase(1, 5, len2Off);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movRI64(1, 0);
+        cg.asm.movMBaseByteR(0, 1, 0);
+        cg.asm.movRMBase(7, 5, childOff);
+        cg.asm.movRMBase(6, 5, stOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "stat");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jneLabel(innerNext);
+        cg.asm.movRMBase(0, 5, stOff);
+        cg.asm.movRMBase(0, 0, 24);
+        cg.asm.andRImm(0, 0xF000);
+        cg.asm.cmpRI32(0, 0x4000);
+        cg.asm.jeLabel(pushDir);
+        cg.asm.jmpLabel(addFile);
+        cg.asm.bindLabel(pushDir);
+        cg.asm.movRMBase(0, 5, topOff);
+        cg.asm.cmpRI32(0, 128);
+        cg.asm.jgeLabel(innerNext);
+        cg.asm.movRMBase(10, 5, stackOff);
+        cg.asm.movRMBase(11, 5, topOff);
+        cg.asm.shlR64Imm(11, 3);
+        cg.asm.addRR64(10, 11);
+        cg.asm.movRMBase(11, 5, childOff);
+        cg.asm.movMBaseR(10, 11, 0);
+        cg.asm.movRMBase(0, 5, topOff);
+        cg.asm.incR64(0);
+        cg.asm.movMBaseR(5, 0, topOff);
+        cg.asm.jmpLabel(innerNext);
+        cg.asm.bindLabel(addFile);
+        cg.asm.movRMBase(0, 5, stOff);
+        cg.asm.movRMBase(0, 0, 48);
+        cg.asm.movRMBase(1, 5, totalOff);
+        cg.asm.addRR64(1, 0);
+        cg.asm.movMBaseR(5, 1, totalOff);
+        cg.asm.bindLabel(innerNext);
+        cg.asm.jmpLabel(innerLoop);
+        cg.asm.bindLabel(innerDone);
+        cg.asm.movRMBase(7, 5, dirOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "closedir");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.jmpLabel(outerLoop);
+        cg.asm.bindLabel(outerDone);
+        cg.asm.movRMBase(0, 5, totalOff);
+    }
+
+    public void genLinuxIsDir(MiniCg cg) {
+        int pathOff = cg.allocLocal("__id_linux_path");
+        cg.asm.movMBaseR(5, 0, pathOff);
+        cg.asm.movRI64(8, 144);
+        this.emitLinuxHeapAllocFromR8(cg);
+        int stOff = cg.allocLocal("__id_linux_st");
+        cg.asm.movMBaseR(5, 0, stOff);
+        cg.asm.movRMBase(7, 5, pathOff);
+        cg.asm.movRMBase(6, 5, stOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "stat");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int idNo = cg.newLabel();
+        int idDone = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jneLabel(idNo);
+        cg.asm.movRMBase(0, 5, stOff);
+        cg.asm.movRMBase(0, 0, 24);
+        cg.asm.andRImm(0, 0xF000);
+        cg.asm.cmpRI32(0, 0x4000);
+        cg.asm.jneLabel(idNo);
+        cg.asm.movRI64(0, 1);
+        cg.asm.jmpLabel(idDone);
+        cg.asm.bindLabel(idNo);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.bindLabel(idDone);
+    }
+
+    public void genLinuxIsFile(MiniCg cg) {
+        int pathOff = cg.allocLocal("__if_linux_path");
+        cg.asm.movMBaseR(5, 0, pathOff);
+        cg.asm.movRI64(8, 144);
+        this.emitLinuxHeapAllocFromR8(cg);
+        int stOff = cg.allocLocal("__if_linux_st");
+        cg.asm.movMBaseR(5, 0, stOff);
+        cg.asm.movRMBase(7, 5, pathOff);
+        cg.asm.movRMBase(6, 5, stOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "stat");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int ifNo = cg.newLabel();
+        int ifDone = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jneLabel(ifNo);
+        cg.asm.movRMBase(0, 5, stOff);
+        cg.asm.movRMBase(0, 0, 24);
+        cg.asm.andRImm(0, 0xF000);
+        cg.asm.cmpRI32(0, 0x8000);
+        cg.asm.jneLabel(ifNo);
+        cg.asm.movRI64(0, 1);
+        cg.asm.jmpLabel(ifDone);
+        cg.asm.bindLabel(ifNo);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.bindLabel(ifDone);
+    }
+
+    public void genLinuxIsDriveRoot(MiniCg cg, int pathOff) {
+        int drNo = cg.newLabel();
+        int drDone = cg.newLabel();
+        cg.asm.movRMBase(0, 5, pathOff);
+        cg.asm.movzxByteMBase(1, 0, 0);
+        cg.asm.cmpRI32(1, 47);
+        cg.asm.jneLabel(drNo);
+        cg.asm.movzxByteMBase(1, 0, 1);
+        cg.asm.cmpRI32(1, 0);
+        cg.asm.jneLabel(drNo);
+        cg.asm.movRI64(0, 1);
+        cg.asm.jmpLabel(drDone);
+        cg.asm.bindLabel(drNo);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.bindLabel(drDone);
+    }
+
+    public void genLinuxEmptyStringArray(MiniCg cg) {
+        cg.asm.movRI64(8, 80);
+        this.emitLinuxHeapAllocFromR8(cg);
+        cg.asm.movRI64(1, 8);
+        cg.asm.movMBaseR(0, 1, 0);
+        cg.asm.movRI64(1, 0);
+        cg.asm.movMBaseR(0, 1, 8);
+        cg.asm.addRI32(0, 16);
+    }
+
+    public void emitLinuxDirentTest(MiniCg cg, int nodeOff, int filter, int skip) {
+        cg.asm.movRMBase(0, 5, nodeOff);
+        int checkFilter = cg.newLabel();
+        cg.asm.movzxByteMBase(1, 0, 19);
+        cg.asm.cmpRI32(1, 46);
+        cg.asm.jneLabel(checkFilter);
+        cg.asm.movzxByteMBase(1, 0, 20);
+        cg.asm.cmpRI32(1, 0);
+        cg.asm.jeLabel(skip);
+        cg.asm.cmpRI32(1, 46);
+        cg.asm.jneLabel(checkFilter);
+        cg.asm.movzxByteMBase(1, 0, 21);
+        cg.asm.cmpRI32(1, 0);
+        cg.asm.jeLabel(skip);
+        cg.asm.bindLabel(checkFilter);
+        if (filter == 1) {
+            cg.asm.movRMBase(0, 5, nodeOff);
+            cg.asm.movzxByteMBase(1, 0, 18);
+            cg.asm.cmpRI32(1, 4);
+            cg.asm.jeLabel(skip);
+        } elif (filter == 2) {
+            cg.asm.movRMBase(0, 5, nodeOff);
+            cg.asm.movzxByteMBase(1, 0, 18);
+            cg.asm.cmpRI32(1, 4);
+            cg.asm.jneLabel(skip);
+        }
+    }
+
+    public void genLinuxFolderEntriesCall(MiniCg cg, Node call, int filter) {
+        int pathIdx = 1;
+        if (call.childCount() <= pathIdx) {
+            this.genLinuxEmptyStringArray(cg);
+            return;
+        }
+        cg.genExpr(call.child(pathIdx));
+        int dirOff = cg.allocLocal("__fde_dir");
+        cg.asm.movMBaseR(5, 0, dirOff);
+        cg.asm.movRMBase(7, 5, dirOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "opendir");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int hOff = cg.allocLocal("__fde_h");
+        cg.asm.movMBaseR(5, 0, hOff);
+        int noFiles = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(noFiles);
+        int cntOff = cg.allocLocal("__fde_cnt");
+        cg.asm.xorRR64(0, 0);
+        cg.asm.movMBaseR(5, 0, cntOff);
+        int nodeOff = cg.allocLocal("__fde_node");
+        int p1Loop = cg.newLabel();
+        int p1Skip = cg.newLabel();
+        int p1Done = cg.newLabel();
+        cg.asm.bindLabel(p1Loop);
+        cg.asm.movRMBase(7, 5, hOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "readdir");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movMBaseR(5, 0, nodeOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(p1Done);
+        this.emitLinuxDirentTest(cg, nodeOff, filter, p1Skip);
+        cg.asm.movRMBase(0, 5, cntOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, cntOff);
+        cg.asm.bindLabel(p1Skip);
+        cg.asm.jmpLabel(p1Loop);
+        cg.asm.bindLabel(p1Done);
+        cg.asm.movRMBase(7, 5, hOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "closedir");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movRMBase(0, 5, cntOff);
+        cg.asm.addRI32(0, 2);
+        cg.asm.shlR64Imm(0, 3);
+        cg.asm.movRR64(8, 0);
+        this.emitLinuxHeapAllocFromR8(cg);
+        int arrOff = cg.allocLocal("__fde_arr");
+        cg.asm.movMBaseR(5, 0, arrOff);
+        cg.asm.movRMBase(1, 5, cntOff);
+        cg.asm.movRMBase(0, 5, arrOff);
+        cg.asm.movMBaseR(0, 1, 0);
+        cg.asm.movRMBase(1, 5, cntOff);
+        cg.asm.movRMBase(0, 5, arrOff);
+        cg.asm.movMBaseR(0, 1, 8);
+        cg.asm.movRMBase(7, 5, dirOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "opendir");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movMBaseR(5, 0, hOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(noFiles);
+        int widxOff = cg.allocLocal("__fde_widx");
+        cg.asm.xorRR64(0, 0);
+        cg.asm.movMBaseR(5, 0, widxOff);
+        int p2Loop = cg.newLabel();
+        int p2Skip = cg.newLabel();
+        int p2Done = cg.newLabel();
+        cg.asm.bindLabel(p2Loop);
+        cg.asm.movRMBase(7, 5, hOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "readdir");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movMBaseR(5, 0, nodeOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(p2Done);
+        this.emitLinuxDirentTest(cg, nodeOff, filter, p2Skip);
+        cg.asm.movRMBase(0, 5, nodeOff);
+        cg.asm.addRI32(0, 19);
+        cg.asm.movRR64(7, 0);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "strlen");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int nlenOff = cg.allocLocal("__fde_nlen");
+        cg.asm.movMBaseR(5, 0, nlenOff);
+        cg.asm.movRMBase(0, 5, nlenOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movRR64(8, 0);
+        this.emitLinuxHeapAllocFromR8(cg);
+        int bufOff = cg.allocLocal("__fde_buf");
+        cg.asm.movMBaseR(5, 0, bufOff);
+        cg.asm.movRMBase(7, 5, bufOff);
+        cg.asm.movRMBase(0, 5, nodeOff);
+        cg.asm.addRI32(0, 19);
+        cg.asm.movRR64(6, 0);
+        cg.asm.movRMBase(2, 5, nlenOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "memcpy");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movRMBase(0, 5, bufOff);
+        cg.asm.movRMBase(1, 5, nlenOff);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movRI64(1, 0);
+        cg.asm.movMBaseByteR(0, 1, 0);
+        cg.asm.movRMBase(0, 5, widxOff);
+        cg.asm.shlR64Imm(0, 3);
+        cg.asm.addRI32(0, 16);
+        cg.asm.movRMBase(1, 5, arrOff);
+        cg.asm.addRR64(1, 0);
+        cg.asm.movRMBase(0, 5, bufOff);
+        cg.asm.movMBaseR(1, 0, 0);
+        cg.asm.movRMBase(0, 5, widxOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, widxOff);
+        cg.asm.bindLabel(p2Skip);
+        cg.asm.jmpLabel(p2Loop);
+        cg.asm.bindLabel(p2Done);
+        cg.asm.movRMBase(7, 5, hOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "closedir");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movRMBase(0, 5, arrOff);
+        cg.asm.addRI32(0, 16);
+        int feDone = cg.newLabel();
+        cg.asm.jmpLabel(feDone);
+        cg.asm.bindLabel(noFiles);
+        this.genLinuxEmptyStringArray(cg);
+        cg.asm.bindLabel(feDone);
+    }
+
+    public void genLinuxReadStringFile(MiniCg cg, int pathOff) {
+        cg.asm.movRI64(8, 144);
+        this.emitLinuxHeapAllocFromR8(cg);
+        int stOff = cg.allocLocal("__rs_linux_st");
+        cg.asm.movMBaseR(5, 0, stOff);
+        cg.asm.movRMBase(7, 5, pathOff);
+        cg.asm.movRMBase(6, 5, stOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "stat");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int rsErr = cg.newLabel();
+        int rsDone = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jneLabel(rsErr);
+        cg.asm.movRMBase(0, 5, stOff);
+        cg.asm.movRMBase(0, 0, 48);
+        int sizeOff = cg.allocLocal("__rs_linux_size");
+        cg.asm.movMBaseR(5, 0, sizeOff);
+        cg.asm.movRMBase(8, 5, sizeOff);
+        cg.asm.addRI32(8, 1);
+        this.emitLinuxHeapAllocFromR8(cg);
+        int bufOff = cg.allocLocal("__rs_linux_buf");
+        cg.asm.movMBaseR(5, 0, bufOff);
+        cg.asm.movRMBase(7, 5, pathOff);
+        cg.asm.xorRR64(6, 6);
+        cg.asm.xorRR64(2, 2);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "open");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int hfileOff = cg.allocLocal("__rs_linux_hfile");
+        cg.asm.movMBaseR(5, 0, hfileOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jlLabel(rsErr);
+        cg.asm.movRMBase(7, 5, hfileOff);
+        cg.asm.movRMBase(6, 5, bufOff);
+        cg.asm.movRMBase(2, 5, sizeOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "read");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jlLabel(rsErr);
+        int breadOff = cg.allocLocal("__rs_linux_bread");
+        cg.asm.movMBaseR(5, 0, breadOff);
+        cg.asm.movRMBase(0, 5, bufOff);
+        cg.asm.movRMBase(1, 5, breadOff);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movRI64(1, 0);
+        cg.asm.movMBaseByteR(0, 1, 0);
+        cg.asm.movRMBase(7, 5, hfileOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "close");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movRMBase(0, 5, bufOff);
+        cg.asm.jmpLabel(rsDone);
+        cg.asm.bindLabel(rsErr);
+        cg.emitThrowException("file not found");
+        cg.asm.bindLabel(rsDone);
+    }
+
+    public void genLinuxInputCall(MiniCg cg) {
+        int bufSize = 4096;
+        int sizeOff = cg.allocLocal("__in_size");
+        cg.asm.movRI64(0, bufSize);
+        cg.asm.movMBaseR(5, 0, sizeOff);
+        cg.asm.movRMBase(8, 5, sizeOff);
+        this.emitLinuxHeapAllocFromR8(cg);
+        int bufOff = cg.allocLocal("__in_buf");
+        cg.asm.movMBaseR(5, 0, bufOff);
+        int breadOff = cg.allocLocal("__in_bread");
+        cg.asm.movRI64(0, 0);
+        cg.asm.movMBaseR(5, 0, breadOff);
+        // read(0, buf, 4096)
+        cg.asm.xorRR64(7, 7);
+        cg.asm.movRMBase(6, 5, bufOff);
+        cg.asm.movRMBase(2, 5, sizeOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "read");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int readOk = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jgeLabel(readOk);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.bindLabel(readOk);
+        cg.asm.movMBaseR(5, 0, breadOff);
+        // Null-terminate the buffer at the bytes-read position
+        cg.asm.movRMBase(0, 5, bufOff);
+        cg.asm.movRMBase(1, 5, breadOff);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movRI64(1, 0);
+        cg.asm.movMBaseByteR(0, 1, 0);
+        // Return buffer pointer in RAX
+        cg.asm.movRMBase(0, 5, bufOff);
+    }
+
+    public void emitLinuxHeapAllocFromR8(MiniCg cg) {
+        cg.asm.pushR64(8);
+        cg.asm.movRR64(7, 8);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "malloc");
+        if (cg.runtimeMode) {
+            cg.heapAllocPatchPos.add(cg.asm.buf.length + 2);
+        }
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int okLbl = cg.newLabel();
+        int doneLbl = cg.newLabel();
+        cg.asm.orRR64(0, 0);
+        cg.asm.jneLabel(okLbl);
+        cg.asm.popR64(1);
+        cg.asm.jmpLabel(doneLbl);
+        cg.asm.bindLabel(okLbl);
+        cg.asm.movRR64(7, 0);
+        cg.asm.xorRR64(6, 6);
+        cg.asm.popR64(2);
+        cg.asm.pushR64(7);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "memset");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.popR64(0);
+        cg.asm.bindLabel(doneLbl);
+    }
+
+    public void genLinuxWriteBytesFile(MiniCg cg, int pathOff, int bufOff, int sizeOff) {
+        int hfileOff = cg.allocLocal("__wb_hfile");
+        int writtenOff = cg.allocLocal("__wb_written");
+        cg.asm.movRI64(0, 0);
+        cg.asm.movMBaseR(5, 0, writtenOff);
+        cg.asm.movRMBase(7, 5, pathOff);
+        cg.asm.movRI64(6, 0x241);
+        cg.asm.movRI64(2, 0x1A4);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "open");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movMBaseR(5, 0, hfileOff);
+        cg.asm.movRMBase(7, 5, hfileOff);
+        cg.asm.movRMBase(6, 5, bufOff);
+        cg.asm.movRMBase(2, 5, sizeOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "write");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movMBaseR(5, 0, writtenOff);
+        cg.asm.movRMBase(7, 5, hfileOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "close");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+    }
+}

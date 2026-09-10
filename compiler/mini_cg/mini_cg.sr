@@ -1,57 +1,39 @@
 // ============================================================================
-// WINDOWS-TARGET MODULE — Win64 native code generator (the .text emitter).
+// SHARED CORE - MiniCg native code generator (the .text emitter).
 // ============================================================================
-// Region keying here differs from the std modules: std's `#on WINDOWS` gates
-// the HOST OS a running program talks to, while compiler-machinery regions
-// gate what the COMPILER EMITS as its output target. On a Linux build of
-// silverc the `#on WINDOWS` regions below are excluded and the mirrored
-// `#on LINUX` comment slots mark where the Linux backend slots in.
+// Three-file layout (compiler/mini_cg/):
+//   mini_cg.sr (this file) - shared core: `class MiniCg` props + construct,
+//     shared emitters, and one-line delegation wrappers for every backend
+//     helper. All existing call sites stay untouched: they keep calling
+//     `this.<name>(...)` on MiniCg and the wrapper forwards to the backend.
+//   linux.sr - `class MiniCgLinux`: SysV-only helpers (46 methods: grant
+//     tables, ELF addressing, SysV ABI tails, genLinux* file/os/input/print
+//     tails). UNGATED so the helpers exist on both targets; they are simply
+//     never CALLED on Windows.
+//   windows.sr - `class MiniCgWindows`: Win64-only helpers (18 methods: win32
+//     grant tables plus ExitProcess/cursor/version emitters). UNGATED for the
+//     same reason; never CALLED on Linux.
 //
-// THE Win64 ABI IS WOVEN THROUGH THE CORE (deliberately NOT region-wrapped).
-// The Linux backend replaces the ABI layer WHOLESALE — it cannot be filled in
-// piecemeal at region boundaries:
-//   * Calling convention: every generated call uses the Win64 shape —
-//     arguments in RCX/RDX/R8/R9 (asm regs 1/2/8/9), 32 bytes of shadow space
-//     + 16-byte RSP alignment via asm.emitCallSetup/emitCallTeardown, stack
-//     params at [RBP+48] in the emitFunctionBody prologues, results in RAX.
-//   * Runtime imports: addImportPatch sites hardcode Windows DLL exports
-//     (kernel32.dll, msvcrt.dll, ucrtbase.dll, version.dll). ~200 patch sites
-//     weave through the gen* emitters — msvcrt/ucrtbase malloc/free/printf/
-//     strcmp/strlen/strtoll/strcpy for the string model, kernel32
-//     GetStdHandle/HeapAlloc/GetProcessHeap/VirtualAlloc for memory. The
-//     Linux backend repoints these at libc/syscalls and its own resolution.
-//   * Exception model: __exc_active/__exc_value globals (the registration
-//     block is region-marked) + emitThrowException/emitExcCheck/
-//     emitExceptionJump — cooperative label-dispatch unwinding, NOT SEH.
-//   * Program exit: ExitProcess thunks in every entry stub (region-marked).
-//   * PE coupling: patchGlobalRefs/patchStringRefs/patchRuntimeRefs hardcode
-//     the 0x140000000 default image base; entry/mainLabel offsets feed
-//     mini_pe (the PE emitter — also a WINDOWS-TARGET module).
+// Delegation shape: helpers that touch core state take `MiniCg cg` as their
+// first parameter and read/write it as `cg.*` (calls to staying core methods
+// likewise go through `cg.`); calls to same-backend helpers stay `this.`
+// (with `cg` forwarded when the callee needs it); pure helpers (string
+// tables, address arithmetic) take no `cg` and keep `this.strEq` on the
+// backend-local copy. There is deliberately NO duplicate `class MiniCg` in
+// the backends: the type checker overwrites same-name classes, which would
+// corrupt field offsets - helpers + delegation instead.
 //
-// THE REGIONS MARK ONLY THE CLEANLY-SEPARABLE WINDOWS-EMISSION BLOCKS:
-//   1. the synthesized no-main entry (ExitProcess) in genProgram
-//   2. patchImportRefs — the absolute-address IAT patch pass
-//   3. the --runtime Windows heap: emitRtStateAddr / emitRuntimeFunctions /
-//      emitRuntimeEntryStub / patchRuntimeRefs (VirtualAlloc + HeapAlloc)
-//   4. emitUtf8ConsoleSetup — SetConsoleOutputCP(65001)
-//   5. emitGlobalInitStub's entry/exit tail (ExitProcess)
-//   6. genBinaryMetadataStatus / genBinaryMetadataField — the PE VERSIONINFO
-//      bridge over version.dll (GetFileVersionInfoSizeA / GetFileVersionInfoA
-//      / VerQueryValueA)
-// Every wrap is body-level: signatures stay universal. The `#on LINUX`
-// slots at these boundaries now hold the Linux backend (mmap heap, GOT
-// patching, SysV calls, libc exits); the woven Win64 core dispatches beside
-// them at runtime via MiniCg.targetOs (driver: ppTargetOsFor), so --os
-// WINDOWS emission is unchanged. (Compiler machinery — the std
-// no-placeholder rule, UNIFIED_CORE_LIBRARY.md §2, does not apply.)
-// computeIatAddresses stays ungated with a Linux branch: it is pure
-// layout arithmetic, PE on WINDOWS and ELF-GOT on LINUX.
-//
-// The win32 grant tables (win32ModuleDll / win32ExportTable / win32Allowed /
-// registerWin32Import) are the win32 LANGUAGE FEATURE — the same class as
-// parser.sr's win32 import machinery — and stay ungated: they are what lets
-// user code call DLL exports, and the Linux backend keeps the feature shape
-// (re-pointing it at its own FFI story) rather than deleting it.
+// What STAYS in this core file untouched:
+//   * every SHARED / SHARED_WITH_ON method;
+//   * all same-name #on twins, kept paired and region-gated (emitRtStateAddr,
+//     emitRuntimeFunctions, emitRuntimeEntryStub, appendRuntimeData,
+//     patchRuntimeRefs, genBinaryMetadataStatus, genBinaryMetadataField);
+//   * the 17 B3 remap-shared emitters whose msvcrt/ucrtbase DLLs remap inside
+//     addImportPatch (genStmt, genByteArrayLiteral, genStructLiteral, genExpr,
+//     genMatchPattern, genMemberAccess, genSlice, genArrayAll, genArrayReverse,
+//     genArrayMap, genLambdaMap, genLambdaFilter, genArrayIndexOf,
+//     genArraySort, genArrayUnique, genArrayJoin, genArrayAdd);
+//   * the trailing PeImport / PeDllGroup helper classes.
 // ============================================================================
 
 class StrEntry {
@@ -236,6 +218,8 @@ class MiniCg {
     // codegenTick after each function body is generated so long compiles
     // show movement.
     public prop ProgressReporter progress;
+    public prop MiniCgLinux linuxBackend;
+    public prop MiniCgWindows windowsBackend;
 
     construct (MiniAsm asm) {
         this.asm = asm;
@@ -347,6 +331,8 @@ class MiniCg {
         this.anonRelocPatchOffsets = [];
         this.fnPtrParamNames = [];
         this.userModuleNames = [];
+        this.linuxBackend = new MiniCgLinux();
+        this.windowsBackend = new MiniCgWindows();
     }
 
     public void collectClassLayouts(Node[] program) {
@@ -849,12 +835,7 @@ class MiniCg {
 
     // The i-th SysV argument register (RDI/RSI/RDX/RCX/R8/R9).
     public int sysvRegAt(int i) {
-        if (i == 0) { return 7; }
-        if (i == 1) { return 6; }
-        if (i == 2) { return 2; }
-        if (i == 3) { return 1; }
-        if (i == 4) { return 8; }
-        return 9;
+        return this.linuxBackend.sysvRegAt(i);
     }
 
     // ABI call-setup dispatch (mirrors silverc-rs emit_aligned_call_setup /
@@ -900,11 +881,7 @@ class MiniCg {
     // "" keeps the original pair (dedicated branch, or an honest loader
     // failure for Windows-only APIs with no Linux equivalent).
     public string linuxImportLib(string dll) {
-        if (this.strEq(dll, "kernel32.dll")) { return "libc.so.6"; }
-        if (this.strEq(dll, "msvcrt.dll")) { return "libc.so.6"; }
-        if (this.strEq(dll, "ucrtbase.dll")) { return "libc.so.6"; }
-        if (this.strEq(dll, "ws2_32.dll")) { return "libc.so.6"; }
-        return "";
+        return this.linuxBackend.linuxImportLib(dll);
     }
 
     // LINUX.md §6: libc equivalent of one win32 export. "" keeps the
@@ -913,44 +890,7 @@ class MiniCg {
     // Windows-only APIs (process/registry/toast/wininet/X11 gaps, listed in
     // the commit notes) that fail loudly at load when actually called.
     public string linuxImportName(string dll, string name) {
-        if (this.strEq(dll, "kernel32.dll")) {
-            if (this.strEq(name, "ExitProcess")) { return "exit"; }
-            if (this.strEq(name, "VirtualAlloc")) { return "mmap"; }
-            if (this.strEq(name, "CloseHandle")) { return "close"; }
-            if (this.strEq(name, "CreateFileA")) { return "open"; }
-            if (this.strEq(name, "ReadFile")) { return "read"; }
-            if (this.strEq(name, "WriteFile")) { return "write"; }
-            if (this.strEq(name, "DeleteFileA")) { return "unlink"; }
-            if (this.strEq(name, "MoveFileA")) { return "rename"; }
-            if (this.strEq(name, "RemoveDirectoryA")) { return "rmdir"; }
-            if (this.strEq(name, "GetFileAttributesA")) { return "stat"; }
-            if (this.strEq(name, "FindFirstFileA")) { return "opendir"; }
-            if (this.strEq(name, "FindNextFileA")) { return "readdir"; }
-            if (this.strEq(name, "FindClose")) { return "closedir"; }
-            if (this.strEq(name, "GetEnvironmentVariableA")) { return "getenv"; }
-            if (this.strEq(name, "SetEnvironmentVariableA")) { return "setenv"; }
-            if (this.strEq(name, "GetComputerNameA")) { return "gethostname"; }
-            if (this.strEq(name, "GetCurrentProcessId")) { return "getpid"; }
-            if (this.strEq(name, "Sleep")) { return "nanosleep"; }
-            if (this.strEq(name, "GetTickCount") || this.strEq(name, "GetTickCount64")) { return "clock_gettime"; }
-            if (this.strEq(name, "QueryPerformanceCounter") || this.strEq(name, "QueryPerformanceFrequency")) { return "clock_gettime"; }
-            if (this.strEq(name, "GetLocalTime") || this.strEq(name, "GetSystemTime")) { return "clock_gettime"; }
-            if (this.strEq(name, "SetFilePointer") || this.strEq(name, "GetFileSize")) { return "lseek"; }
-            if (this.strEq(name, "lstrlenA")) { return "strlen"; }
-            return "";
-        }
-        // msvcrt/ucrtbase overlap on the same C library: glibc carries every
-        // name both DLLs export except the Windows-only underscore helpers.
-        if (this.strEq(dll, "msvcrt.dll") || this.strEq(dll, "ucrtbase.dll")) {
-            if (this.strEq(name, "_atoi64")) { return "atoll"; }
-            return name;
-        }
-        if (this.strEq(dll, "ws2_32.dll")) {
-            if (this.strEq(name, "closesocket")) { return "close"; }
-            if (this.strEq(name, "socket") || this.strEq(name, "bind") || this.strEq(name, "listen") || this.strEq(name, "accept") || this.strEq(name, "recv") || this.strEq(name, "send") || this.strEq(name, "shutdown") || this.strEq(name, "connect") || this.strEq(name, "setsockopt") || this.strEq(name, "getaddrinfo") || this.strEq(name, "freeaddrinfo")) { return name; }
-            return "";
-        }
-        return "";
+        return this.linuxBackend.linuxImportName(dll, name);
     }
 
     // Import-patch core WITHOUT the register shuffle, for call sites that
@@ -975,81 +915,38 @@ class MiniCg {
     // Map a linux module name (the part after "linux.") to its shared lib.
     // Mirrors compiler/parser.sr linuxModuleNameLib.
     public string linuxModuleLib(string module) {
-        if (this.strEq(module, "libc")) { return "libc.so.6"; }
-        if (this.strEq(module, "x11")) { return "libX11.so.6"; }
-        if (this.strEq(module, "xtst")) { return "libXtst.so.6"; }
-        return "";
+        return this.linuxBackend.linuxModuleLib(module);
     }
 
     // Export tables mirror compiler/parser.sr linuxLibExportTable word for
     // word so codegen grants exactly what the parser resolves.
     public string linuxExportTable(string lib) {
-        if (this.strEq(lib, "libc.so.6")) { return "exit mmap munmap malloc free read write open close lseek stat unlink rename mkdir rmdir opendir readdir closedir getenv setenv clock_gettime nanosleep localtime_r gmtime_r fork execve waitpid kill pipe dup2 _exit execvpe getpid pthread_create pthread_join sysconf uname gethostname getlogin_r statvfs getrandom rand srand getuid printf strlen strcmp strcpy memcpy memset socket connect bind listen accept send recv setsockopt getaddrinfo freeaddrinfo"; }
-        if (this.strEq(lib, "libX11.so.6")) { return "XOpenDisplay XCloseDisplay XQueryPointer XWarpPointer XFlush XCreateSimpleWindow XMapWindow XUnmapWindow XDestroyWindow XStoreName XDefaultRootWindow XScreenCount XDisplayWidth XDisplayHeight XStringToKeysym XKeysymToKeycode XQueryKeymap"; }
-        if (this.strEq(lib, "libXtst.so.6")) { return "XTestFakeButtonEvent XTestFakeKeyEvent XTestFakeMotionEvent XTestQueryExtension"; }
-        return "";
+        return this.linuxBackend.linuxExportTable(lib);
     }
 
     public bool linuxTableHas(string lib, string fn) {
-        string table = this.linuxExportTable(lib);
-        int i = 0;
-        while (i < table.length) {
-            while (i < table.length && table[i] == ' ') { i++; }
-            int start = i;
-            while (i < table.length && table[i] != ' ') { i++; }
-            if (i > start && this.strEq(fn, projectSlice(table, start, i))) { return true; }
-        }
-        return false;
+        return this.linuxBackend.linuxTableHas(lib, fn);
     }
 
     public void linuxAddLib(string lib) {
-        if (lib.length == 0) { return; }
-        for (int i = 0; i < this.linuxLibs.length; i++) {
-            if (this.strEq(this.linuxLibs[i], lib)) { return; }
-        }
-        this.linuxLibs.add(lib);
+        this.linuxBackend.linuxAddLib(this, lib);
     }
 
     public void linuxAddGrant(string lib, string fn) {
-        if (lib.length == 0 || fn.length == 0) { return; }
-        string grant = lib + "|" + fn;
-        for (int i = 0; i < this.linuxGrants.length; i++) {
-            if (this.strEq(this.linuxGrants[i], grant)) { return; }
-        }
-        this.linuxGrants.add(grant);
+        this.linuxBackend.linuxAddGrant(this, lib, fn);
     }
 
     public void linuxAddGrantAlias(string lib, string exportName, string localName) {
-        if (lib.length == 0 || exportName.length == 0 || localName.length == 0) { return; }
-        if (this.strEq(exportName, localName)) { this.linuxAddGrant(lib, exportName); return; }
-        for (int i = 0; i < this.linuxAliasLocals.length; i++) {
-            if (this.strEq(this.linuxAliasLocals[i], localName) && this.strEq(this.linuxAliasExports[i], exportName) && this.strEq(this.linuxAliasLibs[i], lib)) { return; }
-        }
-        this.linuxAliasLocals.add(localName);
-        this.linuxAliasExports.add(exportName);
-        this.linuxAliasLibs.add(lib);
+        this.linuxBackend.linuxAddGrantAlias(this, lib, exportName, localName);
     }
 
     public void linuxAddGrantNamed(string lib, Node nameNode) {
-        if (nameNode.isAlias && nameNode.strVal.length > 0) {
-            this.linuxAddGrantAlias(lib, nameNode.name, nameNode.strVal);
-            return;
-        }
-        this.linuxAddGrant(lib, nameNode.name);
+        this.linuxBackend.linuxAddGrantNamed(this, lib, nameNode);
     }
 
     // True when `fn` may be called as a free function targeting `lib`.
     public bool linuxAllowed(string lib, string fn) {
-        for (int i = 0; i < this.linuxLibs.length; i++) {
-            if (this.strEq(this.linuxLibs[i], lib)) {
-                if (this.linuxTableHas(lib, fn)) { return true; }
-            }
-        }
-        string grant = lib + "|" + fn;
-        for (int i = 0; i < this.linuxGrants.length; i++) {
-            if (this.strEq(this.linuxGrants[i], grant)) { return true; }
-        }
-        return false;
+        return this.linuxBackend.linuxAllowed(this, lib, fn);
     }
 
     // Register one parsed import statement (node.kind == 105), mirroring
@@ -1057,84 +954,16 @@ class MiniCg {
     // custom rules mirror win32 (`import * from linux;` still grants fixed
     // only).
     public void registerLinuxImport(Node node) {
-        string source = node.typeHint;
-        bool all = node.isStatic;
-        if (!this.strEq(source, "linux") && source.length > 6) {
-            string prefix = projectSlice(source, 0, 6);
-            if (!this.strEq(prefix, "linux.")) { return; }
-        } elif (!this.strEq(source, "linux")) {
-            return;
-        }
-        if (this.strEq(source, "linux")) {
-            if (all) {
-                this.linuxAddLib(this.linuxModuleLib("libc"));
-                this.linuxAddLib(this.linuxModuleLib("x11"));
-                this.linuxAddLib(this.linuxModuleLib("xtst"));
-                return;
-            }
-            this.checkLinuxModuleGrant(node.name, node);
-            for (int j = 0; j < node.childCount(); j++) {
-                this.checkLinuxModuleGrant(node.child(j).name, node);
-            }
-            return;
-        }
-        string module = projectSlice(source, 6, source.length);
-        string lib = this.linuxModuleLib(module);
-        if (lib.length > 0) {
-            if (all) {
-                this.linuxAddLib(lib);
-                return;
-            }
-            this.linuxAddGrantNamed(lib, node);
-            for (int j = 0; j < node.childCount(); j++) {
-                this.linuxAddGrantNamed(lib, node.child(j));
-            }
-            return;
-        }
-        if (this.customNative.declared(module)) {
-            string lin = this.customNative.linFile(module);
-            if (lin.length == 0) {
-                printline("Error: " + nativeUndeclaredMsg(source));
-                exit(1);
-                return;
-            }
-            if (all) {
-                printline("Error: " + nativeStarMsg(source));
-                exit(1);
-                return;
-            }
-            this.linuxAddGrantNamed(lin, node);
-            for (int j2 = 0; j2 < node.childCount(); j2++) {
-                this.linuxAddGrantNamed(lin, node.child(j2));
-            }
-            return;
-        }
-        printline("Error: " + nativeUndeclaredMsg(source));
-        exit(1);
+        this.linuxBackend.registerLinuxImport(this, node);
     }
 
     private void checkLinuxModuleGrant(string modName, Node node) {
-        if (modName.length == 0) { return; }
-        string lib = this.linuxModuleLib(modName);
-        if (lib.length > 0) {
-            this.linuxAddLib(lib);
-            return;
-        }
-        if (this.customNative.declared(modName)) {
-            printline("Error: " + nativeStarMsg("linux." + modName));
-            exit(1);
-            return;
-        }
-        printline("Error: " + nativeUndeclaredMsg("linux." + modName));
-        exit(1);
+        this.linuxBackend.checkLinuxModuleGrant(this, modName, node);
     }
 
     // Inverse of linuxModuleLib: first module alias for a shared lib.
     public string linuxModuleOf(string lib) {
-        if (this.strEq(lib, "libc.so.6")) { return "libc"; }
-        if (this.strEq(lib, "libX11.so.6")) { return "x11"; }
-        if (this.strEq(lib, "libXtst.so.6")) { return "xtst"; }
-        return lib;
+        return this.linuxBackend.linuxModuleOf(lib);
     }
 
     // True when a bare call to `name` resolves as a granted linux export.
@@ -1159,46 +988,25 @@ class MiniCg {
     // full-lib tables and plain grants first, aliased grants (by local name)
     // second — mirroring silverc-rs linux::resolve order. "" lib = no hit.
     public string linuxResolveLib(string name) {
-        for (int i = 0; i < this.linuxLibs.length; i++) {
-            if (this.linuxTableHas(this.linuxLibs[i], name)) { return this.linuxLibs[i]; }
-        }
-        for (int g = 0; g < this.linuxGrants.length; g++) {
-            string grant = this.linuxGrants[g];
-            if (grant.length > name.length + 1 && this.strEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') {
-                return projectSlice(grant, 0, grant.length - name.length - 1);
-            }
-        }
-        return "";
+        return this.linuxBackend.linuxResolveLib(this, name);
     }
 
     public string linuxResolveExport(string name) {
-        for (int a = 0; a < this.linuxAliasLocals.length; a++) {
-            if (this.strEq(this.linuxAliasLocals[a], name)) { return this.linuxAliasExports[a]; }
-        }
-        return name;
+        return this.linuxBackend.linuxResolveExport(this, name);
     }
 
     public string linuxResolveAliasLib(string name) {
-        for (int a = 0; a < this.linuxAliasLocals.length; a++) {
-            if (this.strEq(this.linuxAliasLocals[a], name)) { return this.linuxAliasLibs[a]; }
-        }
-        return "";
+        return this.linuxBackend.linuxResolveAliasLib(this, name);
     }
 
     // True when `name` sits in any linux export table (granted or not).
     public bool linuxKnownExport(string name) {
-        if (this.linuxTableHas("libc.so.6", name)) { return true; }
-        if (this.linuxTableHas("libX11.so.6", name)) { return true; }
-        if (this.linuxTableHas("libXtst.so.6", name)) { return true; }
-        return false;
+        return this.linuxBackend.linuxKnownExport(name);
     }
 
     // First lib whose export table holds `name` ("" when none).
     public string linuxBareLib(string name) {
-        if (this.linuxTableHas("libc.so.6", name)) { return "libc.so.6"; }
-        if (this.linuxTableHas("libX11.so.6", name)) { return "libX11.so.6"; }
-        if (this.linuxTableHas("libXtst.so.6", name)) { return "libXtst.so.6"; }
-        return "";
+        return this.linuxBackend.linuxBareLib(name);
     }
 
     // ------------------------------------------------------------------
@@ -1210,64 +1018,24 @@ class MiniCg {
 
     // Map a win32 module name (the part after "win32.") to its DLL.
     public string win32ModuleDll(string module) {
-        if (this.strEq(module, "kernel32")) { return "kernel32.dll"; }
-        if (this.strEq(module, "ws2_32")) { return "ws2_32.dll"; }
-        if (this.strEq(module, "winhttp")) { return "winhttp.dll"; }
-        if (this.strEq(module, "wininet")) { return "wininet.dll"; }
-        if (this.strEq(module, "shell32")) { return "shell32.dll"; }
-        if (this.strEq(module, "msvcrt")) { return "msvcrt.dll"; }
-        if (this.strEq(module, "user32")) { return "user32.dll"; }
-        if (this.strEq(module, "registry") || this.strEq(module, "advapi32")) { return "advapi32.dll"; }
-        if (this.strEq(module, "version")) { return "version.dll"; }
-        return "";
+        return this.windowsBackend.win32ModuleDll(module);
     }
 
     // The export table of a supported DLL as a space-separated name list.
     public string win32ExportTable(string dll) {
-        if (this.strEq(dll, "kernel32.dll")) { return "CreateFileA ReadFile WriteFile CloseHandle GetFileSize GetFileSizeEx SetFilePointer FlushFileBuffers DeleteFileA MoveFileA CopyFileA GetFileAttributesA SetFileAttributesA CreateDirectoryA RemoveDirectoryA SetCurrentDirectoryA GetCurrentDirectoryA GetFullPathNameA FindFirstFileA FindNextFileA FindClose GetStdHandle SetConsoleTextAttribute GetConsoleScreenBufferInfo SetConsoleCursorPosition GetConsoleMode SetConsoleMode ReadConsoleA WriteConsoleA GetModuleHandleA GetModuleFileNameA LoadLibraryA GetProcAddress Sleep GetTickCount GetTickCount64 GetLastError CreateProcessA CreateProcessW WaitForSingleObject GetExitCodeProcess TerminateProcess OpenProcess GetProcessId CreatePipe GetProcessHeap HeapFree GlobalAlloc GlobalFree VirtualAlloc VirtualFree GetCurrentProcessId GetCurrentProcess GetCurrentThreadId GetCurrentThread GetEnvironmentVariableA GetEnvironmentVariableW SetEnvironmentVariableA SetEnvironmentVariableW ExpandEnvironmentStringsA GetEnvironmentStringsA FreeEnvironmentStringsA GetTempPathA GetComputerNameA QueryPerformanceCounter QueryPerformanceFrequency GetVersionExA GetSystemDirectoryA GetWindowsDirectoryA GetLocalTime GetSystemTime GetSystemInfo GlobalMemoryStatusEx GetDiskFreeSpaceExA GetUserDefaultUILanguage OutputDebugStringA IsDebuggerPresent GetCommandLineA SetThreadPriority QueryFullProcessImageNameA GetFileAttributesW lstrlenA lstrcpyA lstrcatA lstrcmpA CreateProcess"; }
-        if (this.strEq(dll, "ws2_32.dll")) { return "WSAStartup WSACleanup socket bind listen accept recv send shutdown closesocket connect select setsockopt ioctlsocket htons inet_addr getaddrinfo freeaddrinfo WSAGetLastError"; }
-        if (this.strEq(dll, "winhttp.dll")) { return "WinHttpOpen WinHttpConnect WinHttpOpenRequest WinHttpSendRequest WinHttpReceiveResponse WinHttpQueryHeaders WinHttpQueryDataAvailable WinHttpReadData WinHttpCloseHandle WinHttpSetOption"; }
-        if (this.strEq(dll, "wininet.dll")) { return "InternetOpenA InternetConnectA InternetOpenUrlA InternetReadFile InternetReadFileExA InternetCloseHandle HttpSendRequestA HttpSendRequestExA InternetQueryDataAvailable InternetSetOptionA InternetQueryOptionA HttpQueryInfoA InternetWriteFile InternetGetConnectedState InternetCrackUrlA InternetCanonicalizeUrlA InternetSetStatusCallback"; }
-        if (this.strEq(dll, "shell32.dll")) { return "ShellExecuteA ShellExecuteW ShellExecuteExA ShellExecuteExW"; }
-        if (this.strEq(dll, "msvcrt.dll")) { return "memcpy memset memmove memcmp strlen strcmp strchr strstr strrchr strcpy strcat strncmp strncat strncpy strtok strpbrk strspn strcspn atoi atol strtol malloc free realloc calloc printf fprintf sprintf sscanf fopen fclose fread fwrite fflush fgets fputs fseek ftell system getenv putenv time rand srand abs labs toupper tolower isalpha isdigit isspace isprint isalnum isxdigit isupper islower"; }
-        if (this.strEq(dll, "user32.dll")) { return "keybd_event VkKeyScanA GetKeyState GetAsyncKeyState GetKeyboardState SetKeyboardState MapVirtualKeyA SendInput mouse_event GetCursorPos SetCursorPos SetCursor ClipCursor GetClipCursor GetDoubleClickTime SetDoubleClickTime GetForegroundWindow GetWindowTextA GetWindowThreadProcessId RegisterHotKey UnregisterHotKey MessageBeep RegisterRawInputDevices GetRawInputData GetRawInputDeviceList RegisterClassExA CreateWindowExA ShowWindow UpdateWindow SetWindowTextA DestroyWindow GetMessageA TranslateMessage DispatchMessageA DefWindowProcA PostQuitMessage GetSystemMetrics LoadIconA LoadCursorA LoadImageA SendMessageA GetCursorX GetCursorY"; }
-        if (this.strEq(dll, "advapi32.dll")) { return "RegOpenKeyExA RegCreateKeyExA RegQueryValueExA RegSetValueExA RegDeleteValueA RegDeleteKeyA RegEnumKeyExA RegEnumValueA RegQueryInfoKeyA RegCloseKey GetUserNameA"; }
-        if (this.strEq(dll, "version.dll")) { return "GetFileVersionInfoSizeA GetFileVersionInfoA VerQueryValueA"; }
-        return "";
+        return this.windowsBackend.win32ExportTable(dll);
     }
 
     public bool win32TableHas(string dll, string fn) {
-        // OVERHAUL.md --cache-bytecode / --watch: GetFileTime supplies the
-        // creation/write timestamps recorded per .sr file in the .sbcr record
-        // and polled by the watcher. It sits beside the other handle-based
-        // file APIs (CreateFileA/GetFileSize).
-        if (this.strEq(fn, "GetFileTime")) { return true; }
-        string table = this.win32ExportTable(dll);
-        int i = 0;
-        while (i < table.length) {
-            while (i < table.length && table[i] == ' ') { i = i + 1; }
-            int start = i;
-            while (i < table.length && table[i] != ' ') { i = i + 1; }
-            if (i > start && this.strEq(fn, projectSlice(table, start, i))) { return true; }
-        }
-        return false;
+        return this.windowsBackend.win32TableHas(dll, fn);
     }
 
     public void win32AddDll(string dll) {
-        if (dll.length == 0) { return; }
-        for (int i = 0; i < this.win32Dlls.length; i++) {
-            if (this.strEq(this.win32Dlls[i], dll)) { return; }
-        }
-        this.win32Dlls.add(dll);
+        this.windowsBackend.win32AddDll(this, dll);
     }
 
     public void win32AddGrant(string dll, string fn) {
-        if (dll.length == 0 || fn.length == 0) { return; }
-        string grant = dll + "|" + fn;
-        for (int i = 0; i < this.win32Grants.length; i++) {
-            if (this.strEq(this.win32Grants[i], grant)) { return; }
-        }
-        this.win32Grants.add(grant);
+        this.windowsBackend.win32AddGrant(this, dll, fn);
     }
 
     // Aliased single-export grant: the
@@ -1276,37 +1044,17 @@ class MiniCg {
     // user symbol sharing the export's real name never collides with the
     // DLL call.
     public void win32AddGrantAlias(string dll, string exportName, string localName) {
-        if (dll.length == 0 || exportName.length == 0 || localName.length == 0) { return; }
-        if (this.strEq(exportName, localName)) { this.win32AddGrant(dll, exportName); return; }
-        for (int i = 0; i < this.win32AliasLocals.length; i++) {
-            if (this.strEq(this.win32AliasLocals[i], localName) && this.strEq(this.win32AliasExports[i], exportName) && this.strEq(this.win32AliasDlls[i], dll)) { return; }
-        }
-        this.win32AliasLocals.add(localName);
-        this.win32AliasExports.add(exportName);
-        this.win32AliasDlls.add(dll);
+        this.windowsBackend.win32AddGrantAlias(this, dll, exportName, localName);
     }
 
     // Register one import-list name node: `X` or `X as Y`.
     public void win32AddGrantNamed(string dll, Node nameNode) {
-        if (nameNode.isAlias && nameNode.strVal.length > 0) {
-            this.win32AddGrantAlias(dll, nameNode.name, nameNode.strVal);
-            return;
-        }
-        this.win32AddGrant(dll, nameNode.name);
+        this.windowsBackend.win32AddGrantNamed(this, dll, nameNode);
     }
 
     // True when `fn` may be called as a free function targeting `dll`.
     public bool win32Allowed(string dll, string fn) {
-        for (int i = 0; i < this.win32Dlls.length; i++) {
-            if (this.strEq(this.win32Dlls[i], dll)) {
-                if (this.win32TableHas(dll, fn)) { return true; }
-            }
-        }
-        string grant = dll + "|" + fn;
-        for (int i = 0; i < this.win32Grants.length; i++) {
-            if (this.strEq(this.win32Grants[i], grant)) { return true; }
-        }
-        return false;
+        return this.windowsBackend.win32Allowed(this, dll, fn);
     }
 
     // Register one parsed import statement (node.kind == 105 with
@@ -1316,82 +1064,11 @@ class MiniCg {
     // skip the std-internal rule (manifest opt-in). `import * from win32;`
     // still grants fixed modules only.
     public void registerWin32Import(Node node) {
-        string source = node.typeHint;
-        bool all = node.isStatic;
-        if (!this.strEq(source, "win32") && source.length > 6) {
-            string prefix = projectSlice(source, 0, 6);
-            if (!this.strEq(prefix, "win32.")) { return; }
-        } elif (!this.strEq(source, "win32")) {
-            return;
-        }
-        if (this.strEq(source, "win32")) {
-            if (all) {
-                this.win32AddDll(this.win32ModuleDll("kernel32"));
-                this.win32AddDll(this.win32ModuleDll("ws2_32"));
-                this.win32AddDll(this.win32ModuleDll("winhttp"));
-                this.win32AddDll(this.win32ModuleDll("wininet"));
-                this.win32AddDll(this.win32ModuleDll("shell32"));
-                this.win32AddDll(this.win32ModuleDll("msvcrt"));
-                this.win32AddDll(this.win32ModuleDll("user32"));
-                this.win32AddDll(this.win32ModuleDll("registry"));
-                this.win32AddDll(this.win32ModuleDll("version"));
-                return;
-            }
-            this.checkWin32ModuleGrant(node.name, node);
-            for (int j = 0; j < node.childCount(); j++) {
-                this.checkWin32ModuleGrant(node.child(j).name, node);
-            }
-            return;
-        }
-        string module = projectSlice(source, 6, source.length);
-        string dll = this.win32ModuleDll(module);
-        if (dll.length > 0) {
-            if (all) {
-                this.win32AddDll(dll);
-                return;
-            }
-            this.win32AddGrantNamed(dll, node);
-            for (int j = 0; j < node.childCount(); j++) {
-                this.win32AddGrantNamed(dll, node.child(j));
-            }
-            return;
-        }
-        if (this.customNative.declared(module)) {
-            string winf = this.customNative.winFile(module);
-            if (winf.length == 0) {
-                printline("Error: " + nativeUndeclaredMsg(source));
-                exit(1);
-                return;
-            }
-            if (all) {
-                printline("Error: " + nativeStarMsg(source));
-                exit(1);
-                return;
-            }
-            this.win32AddGrantNamed(winf, node);
-            for (int j2 = 0; j2 < node.childCount(); j2++) {
-                this.win32AddGrantNamed(winf, node.child(j2));
-            }
-            return;
-        }
-        printline("Error: " + nativeUndeclaredMsg(source));
-        exit(1);
+        this.windowsBackend.registerWin32Import(this, node);
     }
 
     private void checkWin32ModuleGrant(string modName, Node node) {
-        if (modName.length == 0) { return; }
-        string dll = this.win32ModuleDll(modName);
-        if (dll.length > 0) {
-            this.win32AddDll(dll);
-            return;
-        }
-        if (this.customNative.declared(modName)) {
-            printline("Error: " + nativeStarMsg("win32." + modName));
-            exit(1);
-            return;
-        }
-        printline("Error: " + nativeUndeclaredMsg("win32." + modName));
-        exit(1);
+        this.windowsBackend.checkWin32ModuleGrant(this, modName, node);
     }
 
     private bool customDeclaredCg(string name) {
@@ -1461,16 +1138,7 @@ class MiniCg {
 
     // Inverse of win32ModuleDll: first module alias for a DLL.
     public string win32ModuleOf(string dll) {
-        if (this.strEq(dll, "kernel32.dll")) { return "kernel32"; }
-        if (this.strEq(dll, "ws2_32.dll")) { return "ws2_32"; }
-        if (this.strEq(dll, "winhttp.dll")) { return "winhttp"; }
-        if (this.strEq(dll, "wininet.dll")) { return "wininet"; }
-        if (this.strEq(dll, "shell32.dll")) { return "shell32"; }
-        if (this.strEq(dll, "msvcrt.dll")) { return "msvcrt"; }
-        if (this.strEq(dll, "user32.dll")) { return "user32"; }
-        if (this.strEq(dll, "advapi32.dll")) { return "registry"; }
-        if (this.strEq(dll, "version.dll")) { return "version"; }
-        return dll;
+        return this.windowsBackend.win32ModuleOf(dll);
     }
 
     public bool strEq(string a, string b) {
@@ -1787,7 +1455,7 @@ class MiniCg {
     // runs at rxVaddr, so code offset N addresses 0x401000 + N. Pure
     // layout math, shared by every Linux patch pass.
     public int elfCodeVaddr() {
-        return 0x400000 + 0x1000;
+        return this.linuxBackend.elfCodeVaddr();
     }
 
     // LINUX SysV backend (additive): ELF RW data-segment base (strings +
@@ -1795,12 +1463,7 @@ class MiniCg {
     // segment is page-padded, data follows it page-aligned. Call only after
     // the final code length is known (same point computeIatAddresses runs).
     public int elfDataVaddr() {
-        int codeLen = this.asm.buf.length;
-        int PAGE = 0x1000;
-        int rxFilesz = codeLen;
-        int m = rxFilesz % PAGE;
-        if (m != 0) { rxFilesz = rxFilesz + (PAGE - m); }
-        return 0x400000 + 0x1000 + rxFilesz;
+        return this.linuxBackend.elfDataVaddr(this);
     }
 
     // LINUX SysV backend (additive): absolute GOT slot addresses in flat
@@ -1811,17 +1474,7 @@ class MiniCg {
     // libc symbols (~dozens); the R tables then always fit their page and
     // the fixed rxOff = PAGE layout shared with mini_pe stays valid.
     public int[] computeGotAddresses() {
-        int[] gotAddrs = [];
-        int dataLen = this.stringData.length + this.globalAreaSize;
-        int PAGE = 0x1000;
-        int dataFilesz = dataLen;
-        int m = dataFilesz % PAGE;
-        if (m != 0) { dataFilesz = dataFilesz + (PAGE - m); }
-        int rwVaddr = this.elfDataVaddr() + dataFilesz;
-        for (int i = 0; i < this.importDlls.length; i++) {
-            gotAddrs.add(rwVaddr + 24 + i * 8);
-        }
-        return gotAddrs;
+        return this.linuxBackend.computeGotAddresses(this);
     }
 
     public void patchImportRefs(int[] code, int[] iatAddrs, int rdataRva) {
@@ -2881,25 +2534,14 @@ int strIdx = this.stringPatchIndices[i];
     // __linux_stack_top global slot (see genProgram). Runs first in the
     // Linux entry stub while RSP is still the kernel _start stack.
     public void emitLinuxStackCapture() {
-        int stIdx = this.findGlobal("__linux_stack_top");
-        this.asm.movRR64(0, 4);
-        int sp = this.asm.buf.length;
-        this.asm.emitImm64(1, 0);
-        this.globalPatchOffsets.add(sp + 2);
-        this.globalPatchIndices.add(stIdx);
-        this.asm.movMBaseR(1, 0, 0);
+        this.linuxBackend.emitLinuxStackCapture(this);
     }
 
     // LINUX SysV backend (additive): load the captured _start RSP into RAX.
     // Exactly one dereference: RAX = [slot] = RSP. (A second deref would
     // yield [RSP] = argc and corrupt every cargs rebuild.)
     public void emitLinuxStackTopLoad() {
-        int stIdx = this.findGlobal("__linux_stack_top");
-        int sp = this.asm.buf.length;
-        this.asm.emitImm64(0, 0);
-        this.globalPatchOffsets.add(sp + 2);
-        this.globalPatchIndices.add(stIdx);
-        this.asm.movRMBase(0, 0, 0);
+        this.linuxBackend.emitLinuxStackTopLoad(this);
     }
 
     // LINUX SysV backend (additive): rebuild argv from the captured _start
@@ -2907,60 +2549,7 @@ int strIdx = this.stringPatchIndices[i];
     // the WINDOWS parser produces ([argc, arg0, ...], arr+8 returned).
     // Mirrors silverc-rs emit_cargs_linux.
     public void genLinuxCargsCall() {
-        this.emitLinuxStackTopLoad();
-        int rspOff = this.allocLocal("__cargs_rsp");
-        this.asm.movMBaseR(5, 0, rspOff);
-        int argcOff = this.allocLocal("__cargs_argc");
-        int arrOff = this.allocLocal("__cargs_arr");
-        int iOff = this.allocLocal("__cargs_i");
-        // argc = [RSP0]
-        this.asm.movRMBase(0, 5, rspOff);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.movMBaseR(5, 0, argcOff);
-        // size = (argc+1)*8 into R8; malloc + zero via the heap helper.
-        this.asm.movRMBase(0, 5, argcOff);
-        this.asm.addRI32(0, 1);
-        this.asm.shlR64Imm(0, 3);
-        this.asm.movRR64(8, 0);
-        this.emitLinuxHeapAllocFromR8();
-        this.asm.movMBaseR(5, 0, arrOff);
-        // [arr] = argc
-        this.asm.movRMBase(1, 5, argcOff);
-        this.asm.movRMBase(0, 5, arrOff);
-        this.asm.movMBaseR(0, 1, 0);
-        // i = 0; while i < argc: arr[8+i*8] = argv[i]
-        this.asm.xorRR64(0, 0);
-        this.asm.movMBaseR(5, 0, iOff);
-        int loopL = this.newLabel();
-        int doneL = this.newLabel();
-        this.asm.bindLabel(loopL);
-        this.asm.movRMBase(0, 5, iOff);
-        this.asm.movRMBase(1, 5, argcOff);
-        this.asm.cmpRR64(0, 1);
-        this.asm.jgeLabel(doneL);
-        // argv[i]: R10 = RSP0 + 8 + i*8; R10 = [R10]
-        this.asm.movRMBase(10, 5, rspOff);
-        this.asm.addRI32(10, 8);
-        this.asm.movRMBase(11, 5, iOff);
-        this.asm.shlR64Imm(11, 3);
-        this.asm.addRR64(10, 11);
-        this.asm.movRMBase(10, 10, 0);
-        // arr[8+i*8] = argv[i]
-        this.asm.movRMBase(11, 5, arrOff);
-        this.asm.addRI32(11, 8);
-        this.asm.movRMBase(1, 5, iOff);
-        this.asm.shlR64Imm(1, 3);
-        this.asm.addRR64(11, 1);
-        this.asm.movMBaseR(11, 10, 0);
-        // i++
-        this.asm.movRMBase(0, 5, iOff);
-        this.asm.addRI32(0, 1);
-        this.asm.movMBaseR(5, 0, iOff);
-        this.asm.jmpLabel(loopL);
-        this.asm.bindLabel(doneL);
-        // Arrays point at their first element: skip the length word.
-        this.asm.movRMBase(0, 5, arrOff);
-        this.asm.addRI32(0, 8);
+        this.linuxBackend.genLinuxCargsCall(this);
     }
 
     public void patchForwardCalls(int[] code) {
@@ -3458,6 +3047,10 @@ int strIdx = this.stringPatchIndices[i];
                     this.genStructLiteral(initNode, stmt.typeHint);
                 } else {
                     this.genExpr(initNode);
+                    // `double d = n;` widens the integer to a real double
+                    // (silverc-rs does this in its decl-init arm); without it
+                    // the raw integer bits landed in the double slot.
+                    this.coerceDeclToDouble(stmt.typeHint, initNode);
                 }
                 if (stmt.isLive && off != 0 && this.isLiveHeapType(stmt.typeHint)) {
                     if (this.strEq(stmt.typeHint, "string") || this.strEq(stmt.typeHint, "string?")) {
@@ -8384,19 +7977,7 @@ public void genNewCall(Node call) {
     // same-named class method (net.sr's socket.send / listener.accept)
     // never hijacks another module's ws2_32 call.
     public bool win32CallResolves(string name) {
-        for (int i = 0; i < this.win32Dlls.length; i++) {
-            if (this.win32TableHas(this.win32Dlls[i], name)) { return true; }
-            if (this.strEq(name, "CreateProcess") && this.win32TableHas(this.win32Dlls[i], "CreateProcessA")) { return true; }
-        }
-        for (int g = 0; g < this.win32Grants.length; g++) {
-            string grant = this.win32Grants[g];
-            if (grant.length > name.length + 1 && this.strEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') { return true; }
-            if (this.strEq(name, "CreateProcess") && this.strEq(grant, "kernel32.dll|CreateProcessA")) { return true; }
-        }
-        for (int a = 0; a < this.win32AliasLocals.length; a++) {
-            if (this.strEq(this.win32AliasLocals[a], name)) { return true; }
-        }
-        return false;
+        return this.windowsBackend.win32CallResolves(this, name);
     }
 
     // DOCS/261 custom resolve for the generic dispatcher below: the owning
@@ -11615,6 +11196,7 @@ public void genNewCall(Node call) {
                 this.genStructLiteral(rhs, lhsType);
             } else {
                 this.genExpr(rhs);
+                this.coerceStoreToDouble(lhs, rhs);
             }
             // Declared-then-assigned objects (`FBox b; b = new FBox();`) and
             // untyped vars (`var v; v = new C();`) get their class registered
@@ -11692,6 +11274,7 @@ public void genNewCall(Node call) {
                 }
 
                 this.genExpr(rhs);
+                this.coerceStoreToDouble(lhs, rhs);
                 this.asm.pushR64(0);
                 this.asm.movRMBase(0, 5, thisOff);
                 this.asm.addRI32(0, fieldOff);
@@ -11712,6 +11295,7 @@ public void genNewCall(Node call) {
                     return;
                 }
                 this.genExpr(rhs);
+                this.coerceStoreToDouble(lhs, rhs);
                 this.asm.pushR64(0);
                 if (off != 0) {
                     this.asm.movRMBase(0, 5, off);
@@ -11740,6 +11324,7 @@ public void genNewCall(Node call) {
                     this.genExpr(obj);
                     this.asm.pushR64(0);
                     this.genExpr(rhs);
+                    this.coerceStoreToDouble(lhs, rhs);
                     this.asm.movRR64(12, 0);
                     this.asm.popR64(0);
                     this.asm.addRI32(0, fieldOff);
@@ -11777,6 +11362,7 @@ public void genNewCall(Node call) {
                 this.genExpr(idxNode);
                 this.asm.pushR64(0);
                 this.genExpr(rhs);
+                this.coerceStoreToDouble(lhs, rhs);
                 this.asm.pushR64(0);
                 this.asm.movRMBase(11, 5, arrOff);
                 this.asm.popR64(12);
@@ -11805,6 +11391,7 @@ public void genNewCall(Node call) {
                 this.asm.addRR64(0, 11);
                 this.asm.pushR64(0);
                 this.genExpr(rhs);
+                this.coerceStoreToDouble(lhs, rhs);
                 this.asm.movRR64(12, 0);
                 this.asm.popR64(0);
                 if (arrIsByte) {
@@ -12200,60 +11787,53 @@ public void genNewCall(Node call) {
         return false;
     }
 
+    // True when an integer value must be widened before it lands in a
+    // float64 slot: the value expression is not already a double, and is not
+    // a string/char (those never convert).  Shared by the two coercion
+    // helpers below so declaration and assignment agree.
+    public bool floatStoreNeedsWiden(Node rhs) {
+        if (this.isFloatLike(rhs)) { return false; }
+        if (this.isStringLike(rhs)) { return false; }
+        string rt = this.inferExprType(rhs);
+        if (this.strEq(rt, "string")) { return false; }
+        if (this.strEq(rt, "char")) { return false; }
+        return true;
+    }
+
+    // Convert the integer already in RAX to its IEEE-754 double bit pattern
+    // when the assignment destination is a declared float64 slot.  Mirrors
+    // silverc-rs coerce_int_rhs_to_float: without it `d = n`, `obj.f = n` and
+    // `pts[i] = n` stored the raw integer into a double slot and every later
+    // read came back a denormal (3 read back as 1.4822e-323).  isFloatLike
+    // resolves the destination's declared type through the same local/field/
+    // array tables the read path uses, so the two directions cannot disagree.
+    public void coerceStoreToDouble(Node lhs, Node rhs) {
+        if (!this.isFloatLike(lhs)) { return; }
+        if (!this.floatStoreNeedsWiden(rhs)) { return; }
+        this.emitCvtsi2sdRax();
+        this.asm.movqR64XMM(0, 0);
+    }
+
+    // Same conversion driven by a declared type name rather than an lhs node:
+    // the `double d = n;` declaration path knows its destination only from the
+    // statement's type hint.
+    public void coerceDeclToDouble(string declType, Node rhs) {
+        bool isFlt = this.strEq(declType, "float");
+        if (this.strEq(declType, "float64")) { isFlt = true; }
+        if (this.strEq(declType, "double")) { isFlt = true; }
+        if (!isFlt) { return; }
+        if (!this.floatStoreNeedsWiden(rhs)) { return; }
+        this.emitCvtsi2sdRax();
+        this.asm.movqR64XMM(0, 0);
+    }
+
     // LINUX SysV backend (additive): shared float-aware variadic tail for
     // printf (one fixed arg: RDI=fmt) and sprintf (two: RDI=dest, RSI=fmt).
     // GP values fill the remaining registers, floats ride XMM0-7, the rest
     // spills at [RSP+0]; AL carries the live XMM count through an R10-staged
     // call (mirrors silverc-rs emit_printf_call / interp emission).
     public void emitLinuxVariadicTail(string lib, string fn, int[] fixedOffs, int[] valOffs, Node[] vals) {
-        int firstFixed = fixedOffs.length;
-        int gpNeed = 0;
-        int xmNeed = 0;
-        for (int i = 0; i < vals.length; i++) {
-            if (this.isFloatLike(vals[i])) { xmNeed = xmNeed + 1; } else { gpNeed = gpNeed + 1; }
-        }
-        int gpMax = 6 - firstFixed;
-        int gpOver = gpNeed - gpMax;
-        if (gpOver < 0) { gpOver = 0; }
-        int xmOver = xmNeed - 8;
-        if (xmOver < 0) { xmOver = 0; }
-        this.emitAbiCallSetup((gpOver + xmOver) * 8);
-        for (int f = 0; f < firstFixed; f++) {
-            this.asm.movRMBase(this.sysvRegAt(f), 5, fixedOffs[f]);
-        }
-        int gp = 0;
-        int xm = 0;
-        int st = 0;
-        int al = 0;
-        for (int i = 0; i < vals.length; i++) {
-            if (this.isFloatLike(vals[i])) {
-                if (xm < 8) {
-                    this.asm.movRMBase(0, 5, valOffs[i]);
-                    this.emitMovqXmmGpr(xm, 0);
-                    xm = xm + 1;
-                    al = al + 1;
-                } else {
-                    this.asm.movRMBase(0, 5, valOffs[i]);
-                    this.asm.movMBaseR(4, 0, st * 8);
-                    st = st + 1;
-                }
-            } else {
-                if (gp < gpMax) {
-                    this.asm.movRMBase(this.sysvRegAt(firstFixed + gp), 5, valOffs[i]);
-                    gp = gp + 1;
-                } else {
-                    this.asm.movRMBase(0, 5, valOffs[i]);
-                    this.asm.movMBaseR(4, 0, st * 8);
-                    st = st + 1;
-                }
-            }
-        }
-        this.addImportPatchDirect(lib, fn);
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(10, 0, 0);
-        this.asm.movRI64(0, al);
-        this.asm.callR64(10);
-        this.emitAbiCallTeardown();
+        this.linuxBackend.emitLinuxVariadicTail(this, lib, fn, fixedOffs, valOffs, vals);
     }
 
     // LINUX SysV backend (additive): sprintf(buf, fmt, value) where RCX=buf,
@@ -12261,22 +11841,7 @@ public void genNewCall(Node call) {
     // Shuffles to RDI/RSI/RDX, stages XMM0 + AL for %g floats, and calls
     // through an R10-staged GOT slot.
     public void emitLinuxSprintfStaged(bool isFloat) {
-        this.asm.movRR64(7, 1);
-        this.asm.movRR64(6, 2);
-        this.asm.movRR64(2, 8);
-        if (isFloat) {
-            this.emitMovqXmmGpr(0, 2);
-        }
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "sprintf");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(10, 0, 0);
-        this.asm.xorRR64(0, 0);
-        if (isFloat) {
-            this.asm.incR64(0);
-        }
-        this.asm.callR64(10);
-        this.emitAbiCallTeardown();
+        this.linuxBackend.emitLinuxSprintfStaged(this, isFloat);
     }
 
     public void genPrintCall(Node call, bool newline) {
@@ -12495,45 +12060,7 @@ public void genNewCall(Node call) {
     // LINUX SysV backend (additive): write(2, msg, len) (+ "\n"), mirroring
     // silverc-rs emit_stderr_write_linux. Only string arguments reach here.
     public void genLinuxEprintCall(Node call, bool newline) {
-        if (call.childCount() < 1) { return; }
-        Node arg = call.child(0);
-        this.genExpr(arg);
-        int msgOff = this.allocLocal("__emsg");
-        this.asm.movMBaseR(5, 0, msgOff);
-        int lenOff = this.allocLocal("__elen");
-        this.asm.movRMBase(7, 5, msgOff);
-        this.addImportPatchDirect("libc.so.6", "strlen");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.emitAbiCallSetup(0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movMBaseR(5, 0, lenOff);
-        this.asm.movRI64(7, 2);
-        this.asm.movRMBase(6, 5, msgOff);
-        this.asm.movRMBase(2, 5, lenOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "write");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        if (newline) {
-            int nlIdx = this.addString("\n");
-            int sp = this.asm.buf.length;
-            this.asm.emitImm64(0, 0);
-            this.stringPatchOffsets.add(sp + 2);
-            this.stringPatchIndices.add(nlIdx);
-            this.asm.movRR64(6, 0);
-            this.asm.movRI64(7, 2);
-            this.asm.movRI64(2, 1);
-            this.emitAbiCallSetup(0);
-            this.addImportPatchDirect("libc.so.6", "write");
-            this.asm.emitImm64(0, 0);
-            this.asm.movRMBase(0, 0, 0);
-            this.asm.callR64(0);
-            this.emitAbiCallTeardown();
-        }
+        this.linuxBackend.genLinuxEprintCall(this, call, newline);
     }
 
     public void genCharToString(Node expr) {
@@ -13348,19 +12875,7 @@ public void genNewCall(Node call) {
     }
 
     public void genExitCall(Node call) {
-        if (call.childCount() > 0) {
-            this.genExpr(call.child(0));
-            this.asm.movRR64(1, 0);
-        } else {
-            this.asm.xorRR64(1, 1);
-        }
-        this.addImportPatch("kernel32.dll", "ExitProcess");
-        int s3 = 0xDEADBEEFCAFEBABE;
-        this.asm.emitImm64(0, s3);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.emitCallSetup(0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
+        this.windowsBackend.genExitCall(this, call);
     }
 
     public void genCargsCall(Node call) {
@@ -13683,83 +13198,15 @@ public void genNewCall(Node call) {
     // values, so reserve two adjacent 8-byte locals, pass their address to
     // user32!GetCursorPos, and load the returned coordinate with MOVSXD.
     public void genCursorXCall() {
-        this.allocLocal("__cursor_padding");
-        int pointOff = this.allocLocal("__cursor_point");
-        this.asm.movRI64(0, 0);
-        this.asm.movMBaseR(5, 0, pointOff);
-        this.asm.movMBaseR(5, 0, pointOff + 8);
-        this.asm.leaRBase(1, 5, pointOff);
-        this.asm.emitCallSetup(0);
-        this.addImportPatch("user32.dll", "GetCursorPos");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-        // movsxd rax, dword ptr [rbp + disp32]
-        this.asm.emitU8(0x48);
-        this.asm.emitU8(0x63);
-        this.asm.emitU8(0x85);
-        this.asm.emitU32(pointOff);
+        this.windowsBackend.genCursorXCall(this);
     }
 
     public void genCursorYCall() {
-        this.allocLocal("__cursor_padding");
-        int pointOff = this.allocLocal("__cursor_point");
-        this.asm.movRI64(0, 0);
-        this.asm.movMBaseR(5, 0, pointOff);
-        this.asm.movMBaseR(5, 0, pointOff + 8);
-        this.asm.leaRBase(1, 5, pointOff);
-        this.asm.emitCallSetup(0);
-        this.addImportPatch("user32.dll", "GetCursorPos");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-        // movsxd rax, dword ptr [rbp + disp32]
-        this.asm.emitU8(0x48);
-        this.asm.emitU8(0x63);
-        this.asm.emitU8(0x85);
-        this.asm.emitU32(pointOff + 4);
+        this.windowsBackend.genCursorYCall(this);
     }
 
     public void genCursorPosCall(Node call, int argStart) {
-        if (call.childCount() <= argStart) {
-            this.asm.xorRR64(0, 0);
-            return;
-        }
-        int arrOff = this.allocLocal("__cursor_array");
-        this.genExpr(call.child(argStart));
-        this.asm.movMBaseR(5, 0, arrOff);
-
-        // POINT is two packed int32 values. One 8-byte local is exactly the
-        // required storage and remains addressable through RBP while the
-        // external call is active.
-        int pointOff = this.allocLocal("__cursor_point");
-        this.asm.xorRR64(0, 0);
-        this.asm.movMBaseR(5, 0, pointOff);
-        this.asm.leaRBase(1, 5, pointOff);
-        this.asm.emitCallSetup(0);
-        this.addImportPatch("user32.dll", "GetCursorPos");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-
-        // Copy signed 32-bit POINT.x into pos[0].
-        this.asm.emitU8(0x48);
-        this.asm.emitU8(0x63);
-        this.asm.emitU8(0x85);
-        this.asm.emitU32(pointOff);
-        this.asm.movRMBase(1, 5, arrOff);
-        this.asm.movMBaseR(1, 0, 0);
-        // Copy POINT.y into pos[1].
-        this.asm.emitU8(0x48);
-        this.asm.emitU8(0x63);
-        this.asm.emitU8(0x85);
-        this.asm.emitU32(pointOff + 4);
-        this.asm.movRMBase(1, 5, arrOff);
-        this.asm.addRI32(1, 8);
-        this.asm.movMBaseR(1, 0, 0);
+        this.windowsBackend.genCursorPosCall(this, call, argStart);
     }
 
     public void genGetEnvCall(Node call) {
@@ -13837,27 +13284,7 @@ public void genNewCall(Node call) {
     // directly (NUL-terminated, owned by libc, never freed). SysV regs +
     // addImportPatchDirect + emitAbiCallSetup/teardown.
     public void genLinuxGetEnvCall(Node call) {
-        int keyIdx = 0;
-        if (call.isMember) { keyIdx = 1; }
-        if (call.childCount() <= keyIdx) { this.emitLlmaiStringLiteral(""); return; }
-        this.genExpr(call.child(keyIdx));
-        int keyOff = this.allocLocal("__env_linux_key");
-        this.asm.movMBaseR(5, 0, keyOff);
-        this.asm.movRMBase(7, 5, keyOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "getenv");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        int notFound = this.newLabel();
-        int done = this.newLabel();
-        this.asm.cmpRI32(0, 0);
-        this.asm.jeLabel(notFound);
-        this.asm.jmpLabel(done);
-        this.asm.bindLabel(notFound);
-        this.emitLlmaiStringLiteral("");
-        this.asm.bindLabel(done);
+        this.linuxBackend.genLinuxGetEnvCall(this, call);
     }
 
     // RAX = 1 when the string at strOff starts with `prefix`, else 0.
@@ -13963,31 +13390,7 @@ public void genNewCall(Node call) {
     // genLinuxWriteBytesFile open/close shape (SysV regs RDI/RSI/RDX =
     // asm regs 7/6/2 + addImportPatchDirect + emitAbiCallSetup/teardown).
     public void genLinuxFileExists(int pathOff) {
-        this.asm.movRMBase(7, 5, pathOff);
-        this.asm.xorRR64(6, 6);
-        this.asm.xorRR64(2, 2);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "open");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        int feNo = this.newLabel();
-        int feDone = this.newLabel();
-        this.asm.cmpRI32(0, 0);
-        this.asm.jlLabel(feNo);
-        this.asm.movRR64(7, 0);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "close");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movRI64(0, 1);
-        this.asm.jmpLabel(feDone);
-        this.asm.bindLabel(feNo);
-        this.asm.xorRR64(0, 0);
-        this.asm.bindLabel(feDone);
+        this.linuxBackend.genLinuxFileExists(this, pathOff);
     }
 
     public void genFileDeleteCall(Node call) {
@@ -14013,18 +13416,7 @@ public void genNewCall(Node call) {
     // silverc/std/fs.sr's #on LINUX delete body and the genLinuxWriteBytesFile
     // shape (SysV regs + addImportPatchDirect + emitAbiCallSetup/teardown).
     public void genLinuxFileDeleteCall(Node call) {
-        int pathIdx = 1;
-        if (call.childCount() <= pathIdx) { this.asm.xorRR64(0, 0); return; }
-        this.genExpr(call.child(pathIdx));
-        int pathOff = this.allocLocal("__fldel_path");
-        this.asm.movMBaseR(5, 0, pathOff);
-        this.asm.movRMBase(7, 5, pathOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "unlink");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
+        this.linuxBackend.genLinuxFileDeleteCall(this, call);
     }
 
     public void genFolderDeleteCall(Node call) {
@@ -14050,18 +13442,7 @@ public void genNewCall(Node call) {
     // silverc/std/fs.sr folder create/delete posture and the
     // genLinuxWriteBytesFile shape (SysV regs + addImportPatchDirect).
     public void genLinuxFolderDeleteCall(Node call) {
-        int pathIdx = 1;
-        if (call.childCount() <= pathIdx) { this.asm.xorRR64(0, 0); return; }
-        this.genExpr(call.child(pathIdx));
-        int pathOff = this.allocLocal("__frmdir_path");
-        this.asm.movMBaseR(5, 0, pathOff);
-        this.asm.movRMBase(7, 5, pathOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "rmdir");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
+        this.linuxBackend.genLinuxFolderDeleteCall(this, call);
     }
 
     public void genFileRenameCall(Node call) {
@@ -14092,21 +13473,7 @@ public void genNewCall(Node call) {
     // silverc/std/fs.sr's #on LINUX rename body (renameFile alias) and the
     // genLinuxWriteBytesFile shape (SysV regs + addImportPatchDirect).
     public void genLinuxFileRenameCall(Node call) {
-        if (call.childCount() < 3) { this.asm.xorRR64(0, 0); return; }
-        this.genExpr(call.child(1));
-        int srcOff = this.allocLocal("__flren_src");
-        this.asm.movMBaseR(5, 0, srcOff);
-        this.genExpr(call.child(2));
-        int dstOff = this.allocLocal("__flren_dst");
-        this.asm.movMBaseR(5, 0, dstOff);
-        this.asm.movRMBase(7, 5, srcOff);
-        this.asm.movRMBase(6, 5, dstOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "rename");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
+        this.linuxBackend.genLinuxFileRenameCall(this, call);
     }
 
 
@@ -14142,126 +13509,7 @@ public void genNewCall(Node call) {
     // (linuxImportName leaves it unmapped), so this dedicated branch replaces
     // the failing remap. Returns 1 on success, 0 on failure (BOOL posture).
     public void genLinuxFileCopyCall(Node call) {
-        if (call.childCount() < 3) { this.asm.xorRR64(0, 0); return; }
-        this.genExpr(call.child(1));
-        int srcOff = this.allocLocal("__fcp_src");
-        this.asm.movMBaseR(5, 0, srcOff);
-        this.genExpr(call.child(2));
-        int dstOff = this.allocLocal("__fcp_dst");
-        this.asm.movMBaseR(5, 0, dstOff);
-        this.asm.movRMBase(7, 5, srcOff);
-        this.asm.xorRR64(6, 6);
-        this.asm.xorRR64(2, 2);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "open");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        int srcFdOff = this.allocLocal("__fcp_srcfd");
-        this.asm.movMBaseR(5, 0, srcFdOff);
-        int copyFail0 = this.newLabel();
-        int copyFailSrc = this.newLabel();
-        int copyFailLoop = this.newLabel();
-        int copyLoop = this.newLabel();
-        int copyDone = this.newLabel();
-        int copyEnd = this.newLabel();
-        this.asm.cmpRI32(0, 0);
-        this.asm.jlLabel(copyFail0);
-        this.asm.movRMBase(7, 5, dstOff);
-        this.asm.movRI64(6, 0x241);
-        this.asm.movRI64(2, 0x1A4);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "open");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        int dstFdOff = this.allocLocal("__fcp_dstfd");
-        this.asm.movMBaseR(5, 0, dstFdOff);
-        this.asm.cmpRI32(0, 0);
-        this.asm.jlLabel(copyFailSrc);
-        this.asm.movRI64(8, 8192);
-        this.emitLinuxHeapAllocFromR8();
-        int bufOff = this.allocLocal("__fcp_buf");
-        this.asm.movMBaseR(5, 0, bufOff);
-        int nOff = this.allocLocal("__fcp_n");
-        this.asm.bindLabel(copyLoop);
-        this.asm.movRMBase(7, 5, srcFdOff);
-        this.asm.movRMBase(6, 5, bufOff);
-        this.asm.movRI64(2, 8192);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "read");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movMBaseR(5, 0, nOff);
-        this.asm.cmpRI32(0, 0);
-        this.asm.jlLabel(copyFailLoop);
-        this.asm.jeLabel(copyDone);
-        this.asm.movRMBase(7, 5, dstFdOff);
-        this.asm.movRMBase(6, 5, bufOff);
-        this.asm.movRMBase(2, 5, nOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "write");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.jmpLabel(copyLoop);
-        this.asm.bindLabel(copyDone);
-        this.asm.movRMBase(7, 5, srcFdOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "close");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movRMBase(7, 5, dstFdOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "close");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movRMBase(7, 5, bufOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "free");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movRI64(0, 1);
-        this.asm.jmpLabel(copyEnd);
-        this.asm.bindLabel(copyFailSrc);
-        this.asm.movRMBase(7, 5, srcFdOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "close");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.bindLabel(copyFail0);
-        this.asm.xorRR64(0, 0);
-        this.asm.jmpLabel(copyEnd);
-        this.asm.bindLabel(copyFailLoop);
-        this.asm.movRMBase(7, 5, srcFdOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "close");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movRMBase(7, 5, dstFdOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "close");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.xorRR64(0, 0);
-        this.asm.bindLabel(copyEnd);
+        this.linuxBackend.genLinuxFileCopyCall(this, call);
     }
 
     public void genFileSizeCall(Node call) {
@@ -14330,28 +13578,7 @@ public void genNewCall(Node call) {
     // path below. SysV regs + addImportPatchDirect + emitAbiCallSetup/
     // teardown, beside the unchanged WINDOWS block.
     public void genLinuxFileSize(int pathOff) {
-        this.asm.movRI64(8, 144);
-        this.emitLinuxHeapAllocFromR8();
-        int stOff = this.allocLocal("__fsz_linux_st");
-        this.asm.movMBaseR(5, 0, stOff);
-        this.asm.movRMBase(7, 5, pathOff);
-        this.asm.movRMBase(6, 5, stOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "stat");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        int fszBad = this.newLabel();
-        int fszDone = this.newLabel();
-        this.asm.cmpRI32(0, 0);
-        this.asm.jneLabel(fszBad);
-        this.asm.movRMBase(0, 5, stOff);
-        this.asm.movRMBase(0, 0, 48);
-        this.asm.jmpLabel(fszDone);
-        this.asm.bindLabel(fszBad);
-        this.asm.xorRR64(0, 0);
-        this.asm.bindLabel(fszDone);
+        this.linuxBackend.genLinuxFileSize(this, pathOff);
     }
 
     public void genFolderSizeCall(Node call) {
@@ -14380,203 +13607,7 @@ public void genNewCall(Node call) {
     // recursion) sums every descendant file. SysV regs + addImportPatchDirect
     // + emitAbiCallSetup/teardown, beside the unchanged WINDOWS block.
     public void genLinuxFolderSizeCall(Node call) {
-        int pathIdx = 1;
-        if (call.childCount() <= pathIdx) { this.asm.xorRR64(0, 0); return; }
-        this.genExpr(call.child(pathIdx));
-        int initOff = this.allocLocal("__fdsz_init");
-        this.asm.movMBaseR(5, 0, initOff);
-        int totalOff = this.allocLocal("__fdsz_total");
-        this.asm.xorRR64(0, 0);
-        this.asm.movMBaseR(5, 0, totalOff);
-        this.asm.movRI64(8, 1024);
-        this.emitLinuxHeapAllocFromR8();
-        int stackOff = this.allocLocal("__fdsz_stack");
-        this.asm.movMBaseR(5, 0, stackOff);
-        this.asm.movRMBase(0, 5, stackOff);
-        this.asm.movRMBase(1, 5, initOff);
-        this.asm.movMBaseR(0, 1, 0);
-        int topOff = this.allocLocal("__fdsz_top");
-        this.asm.movRI64(0, 1);
-        this.asm.movMBaseR(5, 0, topOff);
-        this.asm.movRI64(8, 144);
-        this.emitLinuxHeapAllocFromR8();
-        int stOff = this.allocLocal("__fdsz_st");
-        this.asm.movMBaseR(5, 0, stOff);
-        int curOff = this.allocLocal("__fdsz_cur");
-        int dirOff = this.allocLocal("__fdsz_dir");
-        int nodeOff = this.allocLocal("__fdsz_node");
-        int len1Off = this.allocLocal("__fdsz_len1");
-        int len2Off = this.allocLocal("__fdsz_len2");
-        int childOff = this.allocLocal("__fdsz_child");
-        int outerLoop = this.newLabel();
-        int outerDone = this.newLabel();
-        int innerLoop = this.newLabel();
-        int innerDone = this.newLabel();
-        int innerNext = this.newLabel();
-        int checkChild = this.newLabel();
-        int pushDir = this.newLabel();
-        int addFile = this.newLabel();
-        this.asm.bindLabel(outerLoop);
-        this.asm.movRMBase(0, 5, topOff);
-        this.asm.cmpRI32(0, 0);
-        this.asm.jleLabel(outerDone);
-        this.asm.movRMBase(0, 5, topOff);
-        this.asm.decR64(0);
-        this.asm.movMBaseR(5, 0, topOff);
-        this.asm.movRMBase(10, 5, stackOff);
-        this.asm.movRMBase(11, 5, topOff);
-        this.asm.shlR64Imm(11, 3);
-        this.asm.addRR64(10, 11);
-        this.asm.movRMBase(10, 10, 0);
-        this.asm.movMBaseR(5, 10, curOff);
-        this.asm.movRMBase(7, 5, curOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "opendir");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movMBaseR(5, 0, dirOff);
-        this.asm.cmpRI32(0, 0);
-        this.asm.jeLabel(outerLoop);
-        this.asm.bindLabel(innerLoop);
-        this.asm.movRMBase(7, 5, dirOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "readdir");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movMBaseR(5, 0, nodeOff);
-        this.asm.cmpRI32(0, 0);
-        this.asm.jeLabel(innerDone);
-        this.asm.movRMBase(0, 5, nodeOff);
-        this.asm.movzxByteMBase(1, 0, 19);
-        this.asm.cmpRI32(1, 46);
-        this.asm.jneLabel(checkChild);
-        this.asm.movRMBase(0, 5, nodeOff);
-        this.asm.movzxByteMBase(1, 0, 20);
-        this.asm.cmpRI32(1, 0);
-        this.asm.jeLabel(innerNext);
-        this.asm.cmpRI32(1, 46);
-        this.asm.jneLabel(checkChild);
-        this.asm.movRMBase(0, 5, nodeOff);
-        this.asm.movzxByteMBase(1, 0, 21);
-        this.asm.cmpRI32(1, 0);
-        this.asm.jeLabel(innerNext);
-        this.asm.bindLabel(checkChild);
-        this.asm.movRMBase(7, 5, curOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "strlen");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movMBaseR(5, 0, len1Off);
-        this.asm.movRMBase(0, 5, nodeOff);
-        this.asm.addRI32(0, 19);
-        this.asm.movRR64(7, 0);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "strlen");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movMBaseR(5, 0, len2Off);
-        this.asm.movRMBase(0, 5, len1Off);
-        this.asm.addRI32(0, 1);
-        this.asm.movRMBase(1, 5, len2Off);
-        this.asm.addRR64(0, 1);
-        this.asm.addRR64(0, 1);
-        this.asm.movRR64(8, 0);
-        this.emitLinuxHeapAllocFromR8();
-        this.asm.movMBaseR(5, 0, childOff);
-        this.asm.movRMBase(7, 5, childOff);
-        this.asm.movRMBase(6, 5, curOff);
-        this.asm.movRMBase(2, 5, len1Off);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "memcpy");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movRMBase(0, 5, childOff);
-        this.asm.movRMBase(1, 5, len1Off);
-        this.asm.addRR64(0, 1);
-        this.asm.movRI64(1, 47);
-        this.asm.movMBaseByteR(0, 1, 0);
-        this.asm.movRMBase(0, 5, childOff);
-        this.asm.movRMBase(1, 5, len1Off);
-        this.asm.addRI32(1, 1);
-        this.asm.addRR64(0, 1);
-        this.asm.movRMBase(1, 5, nodeOff);
-        this.asm.addRI32(1, 19);
-        this.asm.movRR64(6, 1);
-        this.asm.movRMBase(2, 5, len2Off);
-        this.asm.movRR64(7, 0);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "memcpy");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movRMBase(0, 5, childOff);
-        this.asm.movRMBase(1, 5, len1Off);
-        this.asm.addRI32(1, 1);
-        this.asm.addRR64(0, 1);
-        this.asm.movRMBase(1, 5, len2Off);
-        this.asm.addRR64(0, 1);
-        this.asm.movRI64(1, 0);
-        this.asm.movMBaseByteR(0, 1, 0);
-        this.asm.movRMBase(7, 5, childOff);
-        this.asm.movRMBase(6, 5, stOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "stat");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.cmpRI32(0, 0);
-        this.asm.jneLabel(innerNext);
-        this.asm.movRMBase(0, 5, stOff);
-        this.asm.movRMBase(0, 0, 24);
-        this.asm.andRImm(0, 0xF000);
-        this.asm.cmpRI32(0, 0x4000);
-        this.asm.jeLabel(pushDir);
-        this.asm.jmpLabel(addFile);
-        this.asm.bindLabel(pushDir);
-        this.asm.movRMBase(0, 5, topOff);
-        this.asm.cmpRI32(0, 128);
-        this.asm.jgeLabel(innerNext);
-        this.asm.movRMBase(10, 5, stackOff);
-        this.asm.movRMBase(11, 5, topOff);
-        this.asm.shlR64Imm(11, 3);
-        this.asm.addRR64(10, 11);
-        this.asm.movRMBase(11, 5, childOff);
-        this.asm.movMBaseR(10, 11, 0);
-        this.asm.movRMBase(0, 5, topOff);
-        this.asm.incR64(0);
-        this.asm.movMBaseR(5, 0, topOff);
-        this.asm.jmpLabel(innerNext);
-        this.asm.bindLabel(addFile);
-        this.asm.movRMBase(0, 5, stOff);
-        this.asm.movRMBase(0, 0, 48);
-        this.asm.movRMBase(1, 5, totalOff);
-        this.asm.addRR64(1, 0);
-        this.asm.movMBaseR(5, 1, totalOff);
-        this.asm.bindLabel(innerNext);
-        this.asm.jmpLabel(innerLoop);
-        this.asm.bindLabel(innerDone);
-        this.asm.movRMBase(7, 5, dirOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "closedir");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.jmpLabel(outerLoop);
-        this.asm.bindLabel(outerDone);
-        this.asm.movRMBase(0, 5, totalOff);
+        this.linuxBackend.genLinuxFolderSizeCall(this, call);
     }
 
     public void genIsDirCall(Node call) {
@@ -14615,34 +13646,7 @@ public void genNewCall(Node call) {
     // isDirPath). A failed stat reports 0, matching the WINDOWS
     // invalid-attributes path below.
     public void genLinuxIsDir() {
-        int pathOff = this.allocLocal("__id_linux_path");
-        this.asm.movMBaseR(5, 0, pathOff);
-        this.asm.movRI64(8, 144);
-        this.emitLinuxHeapAllocFromR8();
-        int stOff = this.allocLocal("__id_linux_st");
-        this.asm.movMBaseR(5, 0, stOff);
-        this.asm.movRMBase(7, 5, pathOff);
-        this.asm.movRMBase(6, 5, stOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "stat");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        int idNo = this.newLabel();
-        int idDone = this.newLabel();
-        this.asm.cmpRI32(0, 0);
-        this.asm.jneLabel(idNo);
-        this.asm.movRMBase(0, 5, stOff);
-        this.asm.movRMBase(0, 0, 24);
-        this.asm.andRImm(0, 0xF000);
-        this.asm.cmpRI32(0, 0x4000);
-        this.asm.jneLabel(idNo);
-        this.asm.movRI64(0, 1);
-        this.asm.jmpLabel(idDone);
-        this.asm.bindLabel(idNo);
-        this.asm.xorRR64(0, 0);
-        this.asm.bindLabel(idDone);
+        this.linuxBackend.genLinuxIsDir(this);
     }
 
     public void genIsFileCall(Node call) {
@@ -14681,34 +13685,7 @@ public void genNewCall(Node call) {
     // isDirPath). A failed stat reports 0, matching the WINDOWS
     // invalid-attributes path below.
     public void genLinuxIsFile() {
-        int pathOff = this.allocLocal("__if_linux_path");
-        this.asm.movMBaseR(5, 0, pathOff);
-        this.asm.movRI64(8, 144);
-        this.emitLinuxHeapAllocFromR8();
-        int stOff = this.allocLocal("__if_linux_st");
-        this.asm.movMBaseR(5, 0, stOff);
-        this.asm.movRMBase(7, 5, pathOff);
-        this.asm.movRMBase(6, 5, stOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "stat");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        int ifNo = this.newLabel();
-        int ifDone = this.newLabel();
-        this.asm.cmpRI32(0, 0);
-        this.asm.jneLabel(ifNo);
-        this.asm.movRMBase(0, 5, stOff);
-        this.asm.movRMBase(0, 0, 24);
-        this.asm.andRImm(0, 0xF000);
-        this.asm.cmpRI32(0, 0x8000);
-        this.asm.jneLabel(ifNo);
-        this.asm.movRI64(0, 1);
-        this.asm.jmpLabel(ifDone);
-        this.asm.bindLabel(ifNo);
-        this.asm.xorRR64(0, 0);
-        this.asm.bindLabel(ifDone);
+        this.linuxBackend.genLinuxIsFile(this);
     }
 
     public void genIsDriveRootCall(Node call) {
@@ -14753,20 +13730,7 @@ public void genNewCall(Node call) {
     // LINUX SysV backend (additive): no drive letters on Linux; only "/"
     // is a root. A single-char "/" path reports 1, everything else 0.
     public void genLinuxIsDriveRoot(int pathOff) {
-        int drNo = this.newLabel();
-        int drDone = this.newLabel();
-        this.asm.movRMBase(0, 5, pathOff);
-        this.asm.movzxByteMBase(1, 0, 0);
-        this.asm.cmpRI32(1, 47);
-        this.asm.jneLabel(drNo);
-        this.asm.movzxByteMBase(1, 0, 1);
-        this.asm.cmpRI32(1, 0);
-        this.asm.jneLabel(drNo);
-        this.asm.movRI64(0, 1);
-        this.asm.jmpLabel(drDone);
-        this.asm.bindLabel(drNo);
-        this.asm.xorRR64(0, 0);
-        this.asm.bindLabel(drDone);
+        this.linuxBackend.genLinuxIsDriveRoot(this, pathOff);
     }
 
     public void genFolderEntriesCall(Node call, int filter) {
@@ -15018,13 +13982,7 @@ public void genNewCall(Node call) {
     // (mirrors emitEmptyStringArray layout [8,0] +16 but through the SysV
     // heap helper, not the Win64 shuffle path).
     public void genLinuxEmptyStringArray() {
-        this.asm.movRI64(8, 80);
-        this.emitLinuxHeapAllocFromR8();
-        this.asm.movRI64(1, 8);
-        this.asm.movMBaseR(0, 1, 0);
-        this.asm.movRI64(1, 0);
-        this.asm.movMBaseR(0, 1, 8);
-        this.asm.addRI32(0, 16);
+        this.linuxBackend.genLinuxEmptyStringArray(this);
     }
 
     // LINUX SysV backend (additive): branch to skip when the dirent at
@@ -15033,31 +13991,7 @@ public void genNewCall(Node call) {
     // filter via d_type at offset 18 (4=dir, 8=file). Mirrors emitEntryTest
     // shape but for libc dirent instead of WIN32_FIND_DATA.
     public void emitLinuxDirentTest(int nodeOff, int filter, int skip) {
-        this.asm.movRMBase(0, 5, nodeOff);
-        int checkFilter = this.newLabel();
-        this.asm.movzxByteMBase(1, 0, 19);
-        this.asm.cmpRI32(1, 46);
-        this.asm.jneLabel(checkFilter);
-        this.asm.movzxByteMBase(1, 0, 20);
-        this.asm.cmpRI32(1, 0);
-        this.asm.jeLabel(skip);
-        this.asm.cmpRI32(1, 46);
-        this.asm.jneLabel(checkFilter);
-        this.asm.movzxByteMBase(1, 0, 21);
-        this.asm.cmpRI32(1, 0);
-        this.asm.jeLabel(skip);
-        this.asm.bindLabel(checkFilter);
-        if (filter == 1) {
-            this.asm.movRMBase(0, 5, nodeOff);
-            this.asm.movzxByteMBase(1, 0, 18);
-            this.asm.cmpRI32(1, 4);
-            this.asm.jeLabel(skip);
-        } elif (filter == 2) {
-            this.asm.movRMBase(0, 5, nodeOff);
-            this.asm.movzxByteMBase(1, 0, 18);
-            this.asm.cmpRI32(1, 4);
-            this.asm.jneLabel(skip);
-        }
+        this.linuxBackend.emitLinuxDirentTest(this, nodeOff, filter, skip);
     }
 
     // LINUX SysV backend (additive): folder entries via libc
@@ -15067,159 +14001,7 @@ public void genNewCall(Node call) {
     // (count then fill, array header [cnt,cnt] +16). SysV regs +
     // addImportPatchDirect + emitAbiCallSetup/teardown.
     public void genLinuxFolderEntriesCall(Node call, int filter) {
-        int pathIdx = 1;
-        if (call.childCount() <= pathIdx) {
-            this.genLinuxEmptyStringArray();
-            return;
-        }
-        this.genExpr(call.child(pathIdx));
-        int dirOff = this.allocLocal("__fde_dir");
-        this.asm.movMBaseR(5, 0, dirOff);
-        this.asm.movRMBase(7, 5, dirOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "opendir");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        int hOff = this.allocLocal("__fde_h");
-        this.asm.movMBaseR(5, 0, hOff);
-        int noFiles = this.newLabel();
-        this.asm.cmpRI32(0, 0);
-        this.asm.jeLabel(noFiles);
-        int cntOff = this.allocLocal("__fde_cnt");
-        this.asm.xorRR64(0, 0);
-        this.asm.movMBaseR(5, 0, cntOff);
-        int nodeOff = this.allocLocal("__fde_node");
-        int p1Loop = this.newLabel();
-        int p1Skip = this.newLabel();
-        int p1Done = this.newLabel();
-        this.asm.bindLabel(p1Loop);
-        this.asm.movRMBase(7, 5, hOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "readdir");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movMBaseR(5, 0, nodeOff);
-        this.asm.cmpRI32(0, 0);
-        this.asm.jeLabel(p1Done);
-        this.emitLinuxDirentTest(nodeOff, filter, p1Skip);
-        this.asm.movRMBase(0, 5, cntOff);
-        this.asm.addRI32(0, 1);
-        this.asm.movMBaseR(5, 0, cntOff);
-        this.asm.bindLabel(p1Skip);
-        this.asm.jmpLabel(p1Loop);
-        this.asm.bindLabel(p1Done);
-        this.asm.movRMBase(7, 5, hOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "closedir");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movRMBase(0, 5, cntOff);
-        this.asm.addRI32(0, 2);
-        this.asm.shlR64Imm(0, 3);
-        this.asm.movRR64(8, 0);
-        this.emitLinuxHeapAllocFromR8();
-        int arrOff = this.allocLocal("__fde_arr");
-        this.asm.movMBaseR(5, 0, arrOff);
-        this.asm.movRMBase(1, 5, cntOff);
-        this.asm.movRMBase(0, 5, arrOff);
-        this.asm.movMBaseR(0, 1, 0);
-        this.asm.movRMBase(1, 5, cntOff);
-        this.asm.movRMBase(0, 5, arrOff);
-        this.asm.movMBaseR(0, 1, 8);
-        this.asm.movRMBase(7, 5, dirOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "opendir");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movMBaseR(5, 0, hOff);
-        this.asm.cmpRI32(0, 0);
-        this.asm.jeLabel(noFiles);
-        int widxOff = this.allocLocal("__fde_widx");
-        this.asm.xorRR64(0, 0);
-        this.asm.movMBaseR(5, 0, widxOff);
-        int p2Loop = this.newLabel();
-        int p2Skip = this.newLabel();
-        int p2Done = this.newLabel();
-        this.asm.bindLabel(p2Loop);
-        this.asm.movRMBase(7, 5, hOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "readdir");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movMBaseR(5, 0, nodeOff);
-        this.asm.cmpRI32(0, 0);
-        this.asm.jeLabel(p2Done);
-        this.emitLinuxDirentTest(nodeOff, filter, p2Skip);
-        this.asm.movRMBase(0, 5, nodeOff);
-        this.asm.addRI32(0, 19);
-        this.asm.movRR64(7, 0);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "strlen");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        int nlenOff = this.allocLocal("__fde_nlen");
-        this.asm.movMBaseR(5, 0, nlenOff);
-        this.asm.movRMBase(0, 5, nlenOff);
-        this.asm.addRI32(0, 1);
-        this.asm.movRR64(8, 0);
-        this.emitLinuxHeapAllocFromR8();
-        int bufOff = this.allocLocal("__fde_buf");
-        this.asm.movMBaseR(5, 0, bufOff);
-        this.asm.movRMBase(7, 5, bufOff);
-        this.asm.movRMBase(0, 5, nodeOff);
-        this.asm.addRI32(0, 19);
-        this.asm.movRR64(6, 0);
-        this.asm.movRMBase(2, 5, nlenOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "memcpy");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movRMBase(0, 5, bufOff);
-        this.asm.movRMBase(1, 5, nlenOff);
-        this.asm.addRR64(0, 1);
-        this.asm.movRI64(1, 0);
-        this.asm.movMBaseByteR(0, 1, 0);
-        this.asm.movRMBase(0, 5, widxOff);
-        this.asm.shlR64Imm(0, 3);
-        this.asm.addRI32(0, 16);
-        this.asm.movRMBase(1, 5, arrOff);
-        this.asm.addRR64(1, 0);
-        this.asm.movRMBase(0, 5, bufOff);
-        this.asm.movMBaseR(1, 0, 0);
-        this.asm.movRMBase(0, 5, widxOff);
-        this.asm.addRI32(0, 1);
-        this.asm.movMBaseR(5, 0, widxOff);
-        this.asm.bindLabel(p2Skip);
-        this.asm.jmpLabel(p2Loop);
-        this.asm.bindLabel(p2Done);
-        this.asm.movRMBase(7, 5, hOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "closedir");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movRMBase(0, 5, arrOff);
-        this.asm.addRI32(0, 16);
-        int feDone = this.newLabel();
-        this.asm.jmpLabel(feDone);
-        this.asm.bindLabel(noFiles);
-        this.genLinuxEmptyStringArray();
-        this.asm.bindLabel(feDone);
+        this.linuxBackend.genLinuxFolderEntriesCall(this, call, filter);
     }
 
     // Branch to `skip` when the entry described by findData at fdOff should be
@@ -15274,93 +14056,11 @@ public void genNewCall(Node call) {
     }
 
     public void genOsVersionCall() {
-        // os.version - returns the Windows version string (e.g. "10.0").
-        // Uses RtlGetVersion from ntdll.dll to get the real OS version,
-        // then formats it as "major.minor".
-        int verOff = this.allocLocal("__os_ver");
-
-        // Zero out RTL_OSVERSIONINFOW on the stack (284 bytes).
-        for (int zi = 0; zi < 36; zi++) {
-            this.asm.movRI64(0, 0);
-            this.asm.movMBaseR(5, 0, verOff + zi * 8);
-        }
-        // dwOSVersionInfoSize = 284
-        this.asm.movRI64(0, 284);
-        this.asm.movMBaseR(5, 0, verOff);
-
-        // RtlGetVersion(&ver)
-        this.asm.emitCallSetup(0);
-        this.asm.leaRBase(1, 5, verOff);
-        this.addImportPatch("ntdll.dll", "RtlGetVersion");
-        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-
-        // Check if build >= 22000 → Windows 11 (major == 10 with high build)
-        int os110 = this.newLabel();
-        int osDone = this.newLabel();
-        this.asm.movRMBase(0, 5, verOff + 4);              // dwMajorVersion
-        this.asm.cmpRI32(0, 10);
-        this.asm.jneLabel(osDone);                          // Not 10 → emit "10.0"
-        // Major == 10: check build number for Win 11
-        this.asm.movRMBase(0, 5, verOff + 12);             // dwBuildNumber
-        this.asm.cmpRI32(0, 22000);
-        this.asm.jlLabel(osDone);                          // build < 22000 → Win 10
-        // Win 11
-        this.emitLlmaiStringLiteral("11.0");
-        return;
-        this.asm.bindLabel(osDone);
-        // Win 10 or unknown → emit "10.0"
-        this.emitLlmaiStringLiteral("10.0");
+        this.windowsBackend.genOsVersionCall(this);
     }
 
     public void genOsBuildCall() {
-        // os.build - returns the Windows build number as a string.
-        int verOff = this.allocLocal("__os_bver");
-
-        // Zero out RTL_OSVERSIONINFOW on the stack (284 bytes).
-        for (int zi = 0; zi < 36; zi++) {
-            this.asm.movRI64(0, 0);
-            this.asm.movMBaseR(5, 0, verOff + zi * 8);
-        }
-        // dwOSVersionInfoSize = 284
-        this.asm.movRI64(0, 284);
-        this.asm.movMBaseR(5, 0, verOff);
-
-        // RtlGetVersion(&ver)
-        this.asm.emitCallSetup(0);
-        this.asm.leaRBase(1, 5, verOff);
-        this.addImportPatch("ntdll.dll", "RtlGetVersion");
-        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-
-        // Allocate a 12-byte buffer for itoa output
-        this.asm.movRI64(1, 12);
-        this.addImportPatch("msvcrt.dll", "malloc");
-        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD5);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.emitCallSetup(0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-        int bufOff = this.allocLocal("__os_bbuf");
-        this.asm.movMBaseR(5, 0, bufOff);
-
-        // itoa(buildNumber, buffer, 10)
-        this.asm.emitCallSetup(0);
-        this.asm.movRMBase(1, 5, verOff + 12);             // R1 = dwBuildNumber
-        this.asm.movRMBase(2, 5, bufOff);                  // R2 = buffer
-        this.asm.movRI64(8, 10);                            // R8 = radix 10
-        this.addImportPatch("msvcrt.dll", "_itoa");
-        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-
-        // Return buffer
-        this.asm.movRMBase(0, 5, bufOff);
+        this.windowsBackend.genOsBuildCall(this);
     }
 
     public void genGetExtCall(Node call) {
@@ -15535,74 +14235,7 @@ public void genNewCall(Node call) {
     // path; an empty file yields "". SysV regs + addImportPatchDirect +
     // emitAbiCallSetup/teardown, beside the unchanged WINDOWS block.
     public void genLinuxReadStringFile(int pathOff) {
-        this.asm.movRI64(8, 144);
-        this.emitLinuxHeapAllocFromR8();
-        int stOff = this.allocLocal("__rs_linux_st");
-        this.asm.movMBaseR(5, 0, stOff);
-        this.asm.movRMBase(7, 5, pathOff);
-        this.asm.movRMBase(6, 5, stOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "stat");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        int rsErr = this.newLabel();
-        int rsDone = this.newLabel();
-        this.asm.cmpRI32(0, 0);
-        this.asm.jneLabel(rsErr);
-        this.asm.movRMBase(0, 5, stOff);
-        this.asm.movRMBase(0, 0, 48);
-        int sizeOff = this.allocLocal("__rs_linux_size");
-        this.asm.movMBaseR(5, 0, sizeOff);
-        this.asm.movRMBase(8, 5, sizeOff);
-        this.asm.addRI32(8, 1);
-        this.emitLinuxHeapAllocFromR8();
-        int bufOff = this.allocLocal("__rs_linux_buf");
-        this.asm.movMBaseR(5, 0, bufOff);
-        this.asm.movRMBase(7, 5, pathOff);
-        this.asm.xorRR64(6, 6);
-        this.asm.xorRR64(2, 2);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "open");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        int hfileOff = this.allocLocal("__rs_linux_hfile");
-        this.asm.movMBaseR(5, 0, hfileOff);
-        this.asm.cmpRI32(0, 0);
-        this.asm.jlLabel(rsErr);
-        this.asm.movRMBase(7, 5, hfileOff);
-        this.asm.movRMBase(6, 5, bufOff);
-        this.asm.movRMBase(2, 5, sizeOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "read");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.cmpRI32(0, 0);
-        this.asm.jlLabel(rsErr);
-        int breadOff = this.allocLocal("__rs_linux_bread");
-        this.asm.movMBaseR(5, 0, breadOff);
-        this.asm.movRMBase(0, 5, bufOff);
-        this.asm.movRMBase(1, 5, breadOff);
-        this.asm.addRR64(0, 1);
-        this.asm.movRI64(1, 0);
-        this.asm.movMBaseByteR(0, 1, 0);
-        this.asm.movRMBase(7, 5, hfileOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "close");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movRMBase(0, 5, bufOff);
-        this.asm.jmpLabel(rsDone);
-        this.asm.bindLabel(rsErr);
-        this.emitThrowException("file not found");
-        this.asm.bindLabel(rsDone);
+        this.linuxBackend.genLinuxReadStringFile(this, pathOff);
     }
 
     // input() builtin: reads a line from stdin via GetStdHandle + ReadFile.
@@ -15680,41 +14313,7 @@ public void genNewCall(Node call) {
     // NUL-terminated at the bytes-read position. A negative read (error)
     // yields the empty string.
     public void genLinuxInputCall() {
-        int bufSize = 4096;
-        int sizeOff = this.allocLocal("__in_size");
-        this.asm.movRI64(0, bufSize);
-        this.asm.movMBaseR(5, 0, sizeOff);
-        this.asm.movRMBase(8, 5, sizeOff);
-        this.emitLinuxHeapAllocFromR8();
-        int bufOff = this.allocLocal("__in_buf");
-        this.asm.movMBaseR(5, 0, bufOff);
-        int breadOff = this.allocLocal("__in_bread");
-        this.asm.movRI64(0, 0);
-        this.asm.movMBaseR(5, 0, breadOff);
-        // read(0, buf, 4096)
-        this.asm.xorRR64(7, 7);
-        this.asm.movRMBase(6, 5, bufOff);
-        this.asm.movRMBase(2, 5, sizeOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "read");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        int readOk = this.newLabel();
-        this.asm.cmpRI32(0, 0);
-        this.asm.jgeLabel(readOk);
-        this.asm.xorRR64(0, 0);
-        this.asm.bindLabel(readOk);
-        this.asm.movMBaseR(5, 0, breadOff);
-        // Null-terminate the buffer at the bytes-read position
-        this.asm.movRMBase(0, 5, bufOff);
-        this.asm.movRMBase(1, 5, breadOff);
-        this.asm.addRR64(0, 1);
-        this.asm.movRI64(1, 0);
-        this.asm.movMBaseByteR(0, 1, 0);
-        // Return buffer pointer in RAX
-        this.asm.movRMBase(0, 5, bufOff);
+        this.linuxBackend.genLinuxInputCall(this);
     }
 
     public void emitLlmaiStringLiteral(string s) {
@@ -15733,36 +14332,7 @@ public void genNewCall(Node call) {
     // fallback through here cannot recurse). In runtimeMode the malloc
     // reference is recorded for the patchRuntimeRefs redirect.
     public void emitLinuxHeapAllocFromR8() {
-        this.asm.pushR64(8);
-        this.asm.movRR64(7, 8);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "malloc");
-        if (this.runtimeMode) {
-            this.heapAllocPatchPos.add(this.asm.buf.length + 2);
-        }
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        int okLbl = this.newLabel();
-        int doneLbl = this.newLabel();
-        this.asm.orRR64(0, 0);
-        this.asm.jneLabel(okLbl);
-        this.asm.popR64(1);
-        this.asm.jmpLabel(doneLbl);
-        this.asm.bindLabel(okLbl);
-        this.asm.movRR64(7, 0);
-        this.asm.xorRR64(6, 6);
-        this.asm.popR64(2);
-        this.asm.pushR64(7);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "memset");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.popR64(0);
-        this.asm.bindLabel(doneLbl);
+        this.linuxBackend.emitLinuxHeapAllocFromR8(this);
     }
 
     // Call-site wrappers for the inline GetProcessHeap/HeapAlloc pairs: on
@@ -16525,37 +15095,7 @@ public void genNewCall(Node call) {
     // sizeOff their count. Mirrors silverc-rs gen_write_bytes_linux and the
     // genLinuxEprintCall write shape (SysV regs + addImportPatchDirect).
     public void genLinuxWriteBytesFile(int pathOff, int bufOff, int sizeOff) {
-        int hfileOff = this.allocLocal("__wb_hfile");
-        int writtenOff = this.allocLocal("__wb_written");
-        this.asm.movRI64(0, 0);
-        this.asm.movMBaseR(5, 0, writtenOff);
-        this.asm.movRMBase(7, 5, pathOff);
-        this.asm.movRI64(6, 0x241);
-        this.asm.movRI64(2, 0x1A4);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "open");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movMBaseR(5, 0, hfileOff);
-        this.asm.movRMBase(7, 5, hfileOff);
-        this.asm.movRMBase(6, 5, bufOff);
-        this.asm.movRMBase(2, 5, sizeOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "write");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        this.asm.movMBaseR(5, 0, writtenOff);
-        this.asm.movRMBase(7, 5, hfileOff);
-        this.emitAbiCallSetup(0);
-        this.addImportPatchDirect("libc.so.6", "close");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
+        this.linuxBackend.genLinuxWriteBytesFile(this, pathOff, bufOff, sizeOff);
     }
 }
 
