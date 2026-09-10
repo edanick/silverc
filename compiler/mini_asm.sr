@@ -830,4 +830,210 @@ class MiniAsm {
         this.emitU8(0x7E);
         this.emitU8(0xC0 | ((xmm & 7) << 3) | (r64 & 7));
     }
-}
+}
+
+#on MAC
+// MAC BACKEND (Phase A.3, code-only -- MAC.md section 10, UNVALIDATED until
+// probed on Mac hardware): A64 instruction encoders beside the x64 encoders
+// above (which are untouched). Fixed-width 32-bit little-endian ARM64
+// emission mirroring silverc-rs/src/arm64.rs bit-for-bit (DDI0487 A64
+// tables; where MAC.md and the manual disagree the manual wins). Covers the
+// v1 set: adrp/adr/add-imm12/sub-imm12 for addresses, ldr/str
+// (unsigned-offset plus pre/post-index), stp/ldp (X29/X30 frame chain),
+// movz/movk/movn, ldr-literal, b/bl/blr/ret, cbz/cbnz/b.cond, svc (reserved
+// -- v1 calls go through libSystem, never raw syscalls), nop. v1 emits
+// plain ret with no PAC/BTI (valid on Apple Silicon user-space ad-hoc).
+// Pure data: formulas are exact ports of the Rust enc_* helpers; range
+// asserts are omitted in v1 (callers pass valid inputs; the byte-vector
+// harness pins the tables). Emitted via the universal emitU32 (LE).
+
+// General-purpose numbers (W/X view selected by opcode).
+public const int A64_X0 = 0;
+public const int A64_X1 = 1;
+public const int A64_X2 = 2;
+public const int A64_X3 = 3;
+public const int A64_X4 = 4;
+public const int A64_X5 = 5;
+public const int A64_X6 = 6;
+public const int A64_X7 = 7;
+public const int A64_X16 = 16;
+public const int A64_X17 = 17;
+public const int A64_FP = 29;
+public const int A64_LR = 30;
+public const int A64_SP = 31;
+
+// A64 branch conditions for b.cond.
+public const int A64_EQ = 0;
+public const int A64_NE = 1;
+public const int A64_CS = 2;
+public const int A64_CC = 3;
+public const int A64_MI = 4;
+public const int A64_PL = 5;
+public const int A64_VS = 6;
+public const int A64_VC = 7;
+public const int A64_HI = 8;
+public const int A64_LS = 9;
+public const int A64_GE = 10;
+public const int A64_LT = 11;
+public const int A64_GT = 12;
+public const int A64_LE = 13;
+public const int A64_AL = 14;
+
+// adr Rd, <label>: PC-relative byte offset (+-1MB).
+public int a64EncAdr(int rd, int imm21) {
+    return 0x10000000 | ((imm21 & 3) << 29) | (((imm21 >> 2) & 524287) << 5) | rd;
+}
+
+// adrp Rd, <label>: PC-relative 4KB-page offset (+-4GB in pages).
+public int a64EncAdrp(int rd, int pageOff) {
+    return 0x90000000 | ((pageOff & 3) << 29) | (((pageOff >> 2) & 524287) << 5) | rd;
+}
+
+// Page offset of target from the page containing pc (for adrp).
+public int a64AdrpPageOff(int64 target, int64 pc) {
+    return int((target >> 12) - (pc >> 12));
+}
+
+// add Xd, Xn, #imm12 {, lsl #12} (64-bit).
+public int a64EncAddImm(int rd, int rn, int imm12, bool shift12) {
+    int s = 0;
+    if (shift12) { s = 1; }
+    return 0x91000000 | (s << 22) | (imm12 << 10) | (rn << 5) | rd;
+}
+
+// sub Xd, Xn, #imm12 {, lsl #12} (64-bit).
+public int a64EncSubImm(int rd, int rn, int imm12, bool shift12) {
+    int s = 0;
+    if (shift12) { s = 1; }
+    return 0xD1000000 | (s << 22) | (imm12 << 10) | (rn << 5) | rd;
+}
+
+// ldr Xt, [Xn, #off]: unsigned offset, 8-byte units (64-bit).
+public int a64EncLdrImm(int rt, int rn, int byteOff) {
+    return 0xF9400000 | ((byteOff / 8) << 10) | (rn << 5) | rt;
+}
+
+// str Xt, [Xn, #off]: unsigned offset, 8-byte units (64-bit).
+public int a64EncStrImm(int rt, int rn, int byteOff) {
+    return 0xF9000000 | ((byteOff / 8) << 10) | (rn << 5) | rt;
+}
+
+// ldr Xt, [Xn, #imm9]!: pre-indexed, byte units (64-bit).
+public int a64EncLdrPre(int rt, int rn, int imm9) {
+    return 0xF8400C00 | ((imm9 & 511) << 12) | (rn << 5) | rt;
+}
+
+// str Xt, [Xn, #imm9]!: pre-indexed, byte units (64-bit).
+public int a64EncStrPre(int rt, int rn, int imm9) {
+    return 0xF8000C00 | ((imm9 & 511) << 12) | (rn << 5) | rt;
+}
+
+// ldr Xt, [Xn], #imm9: post-indexed, byte units (64-bit).
+public int a64EncLdrPost(int rt, int rn, int imm9) {
+    return 0xF8400800 | ((imm9 & 511) << 12) | (rn << 5) | rt;
+}
+
+// str Xt, [Xn], #imm9: post-indexed, byte units (64-bit).
+public int a64EncStrPost(int rt, int rn, int imm9) {
+    return 0xF8000800 | ((imm9 & 511) << 12) | (rn << 5) | rt;
+}
+
+// stp Xt1, Xt2, [Xn, #off]: signed offset, 8-byte units (64-bit).
+public int a64EncStp(int rt1, int rt2, int rn, int byteOff) {
+    return 0xA9000000 | (((byteOff / 8) & 127) << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+
+// ldp Xt1, Xt2, [Xn, #off]: signed offset, 8-byte units (64-bit).
+public int a64EncLdp(int rt1, int rt2, int rn, int byteOff) {
+    return 0xA9400000 | (((byteOff / 8) & 127) << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+
+// stp Xt1, Xt2, [Xn, #imm7]!: pre-indexed pair store (64-bit).
+public int a64EncStpPre(int rt1, int rt2, int rn, int byteOff) {
+    return 0xA9800000 | (((byteOff / 8) & 127) << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+
+// ldp Xt1, Xt2, [Xn], #imm7: post-indexed pair load (64-bit).
+public int a64EncLdpPost(int rt1, int rt2, int rn, int byteOff) {
+    return 0xA8C00000 | (((byteOff / 8) & 127) << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+
+// ldr Xt, <label>: PC-relative word offset (+-1MB, 64-bit literal).
+public int a64EncLdrLiteral(int rt, int byteOff) {
+    return 0x58000000 | (((byteOff / 4) & 524287) << 5) | rt;
+}
+
+// movz Xd, #imm16 {, lsl #hw*16}.
+public int a64EncMovz(int rd, int imm16, int hw) {
+    return 0xD2800000 | (hw << 21) | (imm16 << 5) | rd;
+}
+
+// movk Xd, #imm16 {, lsl #hw*16} (keeps the other halfwords).
+public int a64EncMovk(int rd, int imm16, int hw) {
+    return 0xF2800000 | (hw << 21) | (imm16 << 5) | rd;
+}
+
+// movn Xd, #imm16 {, lsl #hw*16} (move inverted).
+public int a64EncMovn(int rd, int imm16, int hw) {
+    return 0x92800000 | (hw << 21) | (imm16 << 5) | rd;
+}
+
+// b <label>: unconditional PC-relative branch (+-128MB).
+public int a64EncB(int byteOff) {
+    return 0x14000000 | ((byteOff / 4) & 67108863);
+}
+
+// bl <label>: branch with link (+-128MB).
+public int a64EncBl(int byteOff) {
+    return 0x94000000 | ((byteOff / 4) & 67108863);
+}
+
+// blr Xn: branch to register (dyld-stub calls, objc_msgSend).
+public int a64EncBlr(int rn) {
+    return 0xD63F0000 | (rn << 5);
+}
+
+// ret {Xn}: return (default X30).
+public int a64EncRet(int rn) {
+    return 0xD65F0000 | (rn << 5);
+}
+
+// cbz Xt, <label>: branch if zero (+-1MB).
+public int a64EncCbz(int rt, int byteOff) {
+    return 0xB4000000 | (((byteOff / 4) & 524287) << 5) | rt;
+}
+
+// cbnz Xt, <label>: branch if nonzero (+-1MB).
+public int a64EncCbnz(int rt, int byteOff) {
+    return 0xB5000000 | (((byteOff / 4) & 524287) << 5) | rt;
+}
+
+// b.<cond> <label>: conditional branch (+-1MB).
+public int a64EncBcond(int cond, int byteOff) {
+    return 0x54000000 | (((byteOff / 4) & 524287) << 5) | cond;
+}
+
+// svc #imm16: supervisor call (reserved; v1 never emits it).
+public int a64EncSvc(int imm16) {
+    return 0xD4000001 | (imm16 << 5);
+}
+
+// nop: canonical hint.
+public int a64EncNop() {
+    return 0xD503201F;
+}
+
+// Emit one A64 word little-endian through the universal byte emitter.
+public void a64EmitWord(MiniAsm asm, int word) {
+    asm.emitU32(word);
+}
+
+// Entry-stub shape pinned by the harness (frame chain, zero X0, return):
+// stp x29,x30,[sp,#-16]! ; add x29,sp,#0 ; movz x0,#0 ; ret.
+public void a64EmitEntryStub(MiniAsm asm) {
+    asm.emitU32(a64EncStpPre(29, 30, 31, -16));
+    asm.emitU32(a64EncAddImm(29, 31, 0, false));
+    asm.emitU32(a64EncMovz(0, 0, 0));
+    asm.emitU32(a64EncRet(30));
+}
+#off
