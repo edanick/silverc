@@ -161,6 +161,28 @@ string drvFileStem(string path) {
 // silverc-rs's resolve_imports: the input file's directory first (sibling
 // modules such as helper.sr), then std/ and silveri/src in the locations the
 // test suites and checkouts use.
+// Nested module resolution (flat-first) mirrors push_module_candidates:
+// per base dir `<name>.sr` first, then dotted `a.b` -> `a/b.sr`, then the
+// `<name>/<name>.sr` package convention.
+
+// Map dots in `name` to `sep` (`mini_cg.windows` -> `mini_cg/windows.sr`
+// with sep "/").
+string drvDottedPath(string name, string sep) {
+    string out = "";
+    for (int i = 0; i < name.length; i++) {
+        if (name[i] == '.') { out = out + sep; }
+        else { out = out + name[i]; }
+    }
+    return out;
+}
+
+// True when `name` is a dotted child of the baked-in `root` module
+// (`mini_cg.windows` under `mini_cg`).
+bool drvIsDottedChild(string name, string root) {
+    if (name.length <= root.length) { return false; }
+    return projectFind(name, root + ".", 0) == 0;
+}
+
 string findModulePath(string name, string inputFile) {
     if (projectBuiltin(name)) { return ""; }
     // Modules the driver already prepends above (llmai/exception/bom/process/
@@ -169,57 +191,145 @@ string findModulePath(string name, string inputFile) {
     // modules shared by name with the compiler internals (lexer, token) are
     // NOT excluded: a standalone program imports the sibling/source-level
     // module, exactly as silverc-rs resolves `import lexer;` / `import token;`.
+    // Dotted children of the baked-ins (mini_cg.windows, mini_asm.*,
+    // mini_pe.*, parser.*, node.*, project.*, ...) are excluded too:
+    // standalone user programs must never pull compiler internals from disk
+    // (the .srp move phase wires the real nested backends instead).
     if ( cliArgEq(name, "project")
         || cliArgEq(name, "exception") || cliArgEq(name, "bom")
         || cliArgEq(name, "process") || cliArgEq(name, "notifications")
         || cliArgEq(name, "http") || cliArgEq(name, "mini_asm")
         || cliArgEq(name, "mini_cg") || cliArgEq(name, "mini_pe")
-        || cliArgEq(name, "parser") || cliArgEq(name, "node")) { return ""; }
+        || cliArgEq(name, "parser") || cliArgEq(name, "node")
+        || drvIsDottedChild(name, "project") || drvIsDottedChild(name, "exception")
+        || drvIsDottedChild(name, "bom") || drvIsDottedChild(name, "process")
+        || drvIsDottedChild(name, "notifications") || drvIsDottedChild(name, "http")
+        || drvIsDottedChild(name, "mini_asm") || drvIsDottedChild(name, "mini_cg")
+        || drvIsDottedChild(name, "mini_pe") || drvIsDottedChild(name, "parser")
+        || drvIsDottedChild(name, "node")) { return ""; }
+    bool drvHasDot = projectFind(name, ".", 0) >= 0;
+    string drvDottedSlash = drvDottedPath(name, "/");
+    string drvDottedBack = drvDottedPath(name, "\\");
     string[] candidates = [];
-    // Same directory as the input source (sibling modules).
+    // Same directory as the input source (sibling modules). The sibling
+    // prefix carries the input file's own separator, so both flavors are
+    // probed for the nested layouts; flat `<name>.sr` stays first.
     int lastSep = -1;
     for (int ci = 0; ci < inputFile.length; ci++) {
         if (inputFile[ci] == '\\' || inputFile[ci] == '/') { lastSep = ci; }
     }
     if (lastSep >= 0) {
-        candidates.add(projectSlice(inputFile, 0, lastSep + 1) + name + ".sr");
+        string sibBase = projectSlice(inputFile, 0, lastSep + 1);
+        candidates.add(sibBase + name + ".sr");
+        if (drvHasDot) {
+            candidates.add(sibBase + drvDottedBack + ".sr");
+            candidates.add(sibBase + drvDottedSlash + ".sr");
+        }
+        candidates.add(sibBase + name + "\\" + name + ".sr");
+        candidates.add(sibBase + name + "/" + name + ".sr");
     }
     candidates.add(name + ".sr");
+    if (drvHasDot) {
+        candidates.add(drvDottedBack + ".sr");
+        candidates.add(drvDottedSlash + ".sr");
+    }
+    candidates.add(name + "\\" + name + ".sr");
+    candidates.add(name + "/" + name + ".sr");
     candidates.add("std\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("std\\" + drvDottedBack + ".sr"); }
+    candidates.add("std\\" + name + "\\" + name + ".sr");
     candidates.add("silverc\\std\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("silverc\\std\\" + drvDottedBack + ".sr"); }
+    candidates.add("silverc\\std\\" + name + "\\" + name + ".sr");
     candidates.add("..\\std\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("..\\std\\" + drvDottedBack + ".sr"); }
+    candidates.add("..\\std\\" + name + "\\" + name + ".sr");
     candidates.add("..\\silverc\\std\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("..\\silverc\\std\\" + drvDottedBack + ".sr"); }
+    candidates.add("..\\silverc\\std\\" + name + "\\" + name + ".sr");
     candidates.add("..\\..\\std\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("..\\..\\std\\" + drvDottedBack + ".sr"); }
+    candidates.add("..\\..\\std\\" + name + "\\" + name + ".sr");
     candidates.add("..\\..\\silverc\\std\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("..\\..\\silverc\\std\\" + drvDottedBack + ".sr"); }
+    candidates.add("..\\..\\silverc\\std\\" + name + "\\" + name + ".sr");
     // Compiler-internal modules (e.g. progress.sr) live under compiler/.
     // stdlib modules that import them (project -> progress) must resolve them
     // for standalone compiles, not just .srp builds. std/ stays ahead so
     // stdlib names never get shadowed by a same-named compiler module.
     candidates.add("compiler\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("compiler\\" + drvDottedBack + ".sr"); }
+    candidates.add("compiler\\" + name + "\\" + name + ".sr");
     candidates.add("silverc\\compiler\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("silverc\\compiler\\" + drvDottedBack + ".sr"); }
+    candidates.add("silverc\\compiler\\" + name + "\\" + name + ".sr");
     candidates.add("..\\compiler\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("..\\compiler\\" + drvDottedBack + ".sr"); }
+    candidates.add("..\\compiler\\" + name + "\\" + name + ".sr");
     candidates.add("..\\silverc\\compiler\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("..\\silverc\\compiler\\" + drvDottedBack + ".sr"); }
+    candidates.add("..\\silverc\\compiler\\" + name + "\\" + name + ".sr");
     candidates.add("..\\..\\compiler\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("..\\..\\compiler\\" + drvDottedBack + ".sr"); }
+    candidates.add("..\\..\\compiler\\" + name + "\\" + name + ".sr");
     candidates.add("..\\..\\silverc\\compiler\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("..\\..\\silverc\\compiler\\" + drvDottedBack + ".sr"); }
+    candidates.add("..\\..\\silverc\\compiler\\" + name + "\\" + name + ".sr");
     candidates.add("..\\silveri\\src\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("..\\silveri\\src\\" + drvDottedBack + ".sr"); }
+    candidates.add("..\\silveri\\src\\" + name + "\\" + name + ".sr");
     candidates.add("silveri\\src\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("silveri\\src\\" + drvDottedBack + ".sr"); }
+    candidates.add("silveri\\src\\" + name + "\\" + name + ".sr");
     candidates.add("..\\..\\silveri\\src\\" + name + ".sr");
+    if (drvHasDot) { candidates.add("..\\..\\silveri\\src\\" + drvDottedBack + ".sr"); }
+    candidates.add("..\\..\\silveri\\src\\" + name + "\\" + name + ".sr");
     #on LINUX
     candidates.add("std/" + name + ".sr");
+    if (drvHasDot) { candidates.add("std/" + drvDottedSlash + ".sr"); }
+    candidates.add("std/" + name + "/" + name + ".sr");
     candidates.add("silverc/std/" + name + ".sr");
+    if (drvHasDot) { candidates.add("silverc/std/" + drvDottedSlash + ".sr"); }
+    candidates.add("silverc/std/" + name + "/" + name + ".sr");
     candidates.add("../std/" + name + ".sr");
+    if (drvHasDot) { candidates.add("../std/" + drvDottedSlash + ".sr"); }
+    candidates.add("../std/" + name + "/" + name + ".sr");
     candidates.add("../silverc/std/" + name + ".sr");
+    if (drvHasDot) { candidates.add("../silverc/std/" + drvDottedSlash + ".sr"); }
+    candidates.add("../silverc/std/" + name + "/" + name + ".sr");
     candidates.add("../../std/" + name + ".sr");
+    if (drvHasDot) { candidates.add("../../std/" + drvDottedSlash + ".sr"); }
+    candidates.add("../../std/" + name + "/" + name + ".sr");
     candidates.add("../../silverc/std/" + name + ".sr");
+    if (drvHasDot) { candidates.add("../../silverc/std/" + drvDottedSlash + ".sr"); }
+    candidates.add("../../silverc/std/" + name + "/" + name + ".sr");
     candidates.add("compiler/" + name + ".sr");
+    if (drvHasDot) { candidates.add("compiler/" + drvDottedSlash + ".sr"); }
+    candidates.add("compiler/" + name + "/" + name + ".sr");
     candidates.add("silverc/compiler/" + name + ".sr");
+    if (drvHasDot) { candidates.add("silverc/compiler/" + drvDottedSlash + ".sr"); }
+    candidates.add("silverc/compiler/" + name + "/" + name + ".sr");
     candidates.add("../compiler/" + name + ".sr");
+    if (drvHasDot) { candidates.add("../compiler/" + drvDottedSlash + ".sr"); }
+    candidates.add("../compiler/" + name + "/" + name + ".sr");
     candidates.add("../silverc/compiler/" + name + ".sr");
+    if (drvHasDot) { candidates.add("../silverc/compiler/" + drvDottedSlash + ".sr"); }
+    candidates.add("../silverc/compiler/" + name + "/" + name + ".sr");
     candidates.add("../../compiler/" + name + ".sr");
+    if (drvHasDot) { candidates.add("../../compiler/" + drvDottedSlash + ".sr"); }
+    candidates.add("../../compiler/" + name + "/" + name + ".sr");
     candidates.add("../../silverc/compiler/" + name + ".sr");
+    if (drvHasDot) { candidates.add("../../silverc/compiler/" + drvDottedSlash + ".sr"); }
+    candidates.add("../../silverc/compiler/" + name + "/" + name + ".sr");
     candidates.add("../silveri/src/" + name + ".sr");
+    if (drvHasDot) { candidates.add("../silveri/src/" + drvDottedSlash + ".sr"); }
+    candidates.add("../silveri/src/" + name + "/" + name + ".sr");
     candidates.add("silveri/src/" + name + ".sr");
+    if (drvHasDot) { candidates.add("silveri/src/" + drvDottedSlash + ".sr"); }
+    candidates.add("silveri/src/" + name + "/" + name + ".sr");
     candidates.add("../../silveri/src/" + name + ".sr");
+    if (drvHasDot) { candidates.add("../../silveri/src/" + drvDottedSlash + ".sr"); }
+    candidates.add("../../silveri/src/" + name + "/" + name + ".sr");
     #off
     for (int i = 0; i < candidates.length; i++) {
         string src = tryReadFile(candidates[i]);

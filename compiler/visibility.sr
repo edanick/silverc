@@ -645,52 +645,153 @@ bool visBuiltinModule(string name) {
 // Locate a source-level module by name, returning its path (or "" when the
 // module is native/builtin or cannot be found). Mirrors the driver's
 // findModulePath resolution exactly so enforcement sees the same files the
-// aggregate compile collects.
+// aggregate compile collects (flat-first nested resolution: `<name>.sr`,
+// then dotted `a.b` -> `a/b.sr`, then `<name>/<name>.sr`).
+
+// Map dots in `name` to `sep` (`mini_cg.windows` -> `mini_cg/windows.sr`
+// with sep "/").
+string visDottedPath(string name, string sep) {
+    string out = "";
+    for (int i = 0; i < name.length; i++) {
+        if (name[i] == '.') { out = out + sep; }
+        else { out = out + name[i]; }
+    }
+    return out;
+}
+
+// True when `name` is a dotted child of the baked-in `root` module
+// (`mini_cg.windows` under `mini_cg`).
+bool visIsDottedChild(string name, string root) {
+    if (name.length <= root.length) { return false; }
+    return projectFind(name, root + ".", 0) == 0;
+}
+
 string visFindModulePath(string name, string inputFile) {
     if (visBuiltinModule(name)) { return ""; }
+    // Dotted children of the compiler baked-ins resolve to internals on
+    // disk; the driver excludes them too, so enforcement must match.
     if ( cliArgEq(name, "mini_asm")
         || cliArgEq(name, "mini_cg") || cliArgEq(name, "mini_pe")
-        || cliArgEq(name, "parser") || cliArgEq(name, "node")) { return ""; }
+        || cliArgEq(name, "parser") || cliArgEq(name, "node")
+        || visIsDottedChild(name, "mini_asm") || visIsDottedChild(name, "mini_cg")
+        || visIsDottedChild(name, "mini_pe") || visIsDottedChild(name, "parser")
+        || visIsDottedChild(name, "node")) { return ""; }
+    bool visHasDot = projectFind(name, ".", 0) >= 0;
+    string visDottedSlash = visDottedPath(name, "/");
+    string visDottedBack = visDottedPath(name, "\\");
     string[] candidates = [];
     int lastSep = -1;
     for (int ci = 0; ci < inputFile.length; ci++) {
         if (inputFile[ci] == '\\' || inputFile[ci] == '/') { lastSep = ci; }
     }
     if (lastSep >= 0) {
-        candidates.add(projectSlice(inputFile, 0, lastSep + 1) + name + ".sr");
+        string visSibBase = projectSlice(inputFile, 0, lastSep + 1);
+        candidates.add(visSibBase + name + ".sr");
+        if (visHasDot) {
+            candidates.add(visSibBase + visDottedBack + ".sr");
+            candidates.add(visSibBase + visDottedSlash + ".sr");
+        }
+        candidates.add(visSibBase + name + "\\" + name + ".sr");
+        candidates.add(visSibBase + name + "/" + name + ".sr");
     }
     candidates.add(name + ".sr");
+    if (visHasDot) {
+        candidates.add(visDottedBack + ".sr");
+        candidates.add(visDottedSlash + ".sr");
+    }
+    candidates.add(name + "\\" + name + ".sr");
+    candidates.add(name + "/" + name + ".sr");
     candidates.add("std\\" + name + ".sr");
+    if (visHasDot) { candidates.add("std\\" + visDottedBack + ".sr"); }
+    candidates.add("std\\" + name + "\\" + name + ".sr");
     candidates.add("silverc\\std\\" + name + ".sr");
+    if (visHasDot) { candidates.add("silverc\\std\\" + visDottedBack + ".sr"); }
+    candidates.add("silverc\\std\\" + name + "\\" + name + ".sr");
     candidates.add("..\\std\\" + name + ".sr");
+    if (visHasDot) { candidates.add("..\\std\\" + visDottedBack + ".sr"); }
+    candidates.add("..\\std\\" + name + "\\" + name + ".sr");
     candidates.add("..\\silverc\\std\\" + name + ".sr");
+    if (visHasDot) { candidates.add("..\\silverc\\std\\" + visDottedBack + ".sr"); }
+    candidates.add("..\\silverc\\std\\" + name + "\\" + name + ".sr");
     candidates.add("..\\..\\std\\" + name + ".sr");
+    if (visHasDot) { candidates.add("..\\..\\std\\" + visDottedBack + ".sr"); }
+    candidates.add("..\\..\\std\\" + name + "\\" + name + ".sr");
     candidates.add("..\\..\\silverc\\std\\" + name + ".sr");
+    if (visHasDot) { candidates.add("..\\..\\silverc\\std\\" + visDottedBack + ".sr"); }
+    candidates.add("..\\..\\silverc\\std\\" + name + "\\" + name + ".sr");
     candidates.add("compiler\\" + name + ".sr");
+    if (visHasDot) { candidates.add("compiler\\" + visDottedBack + ".sr"); }
+    candidates.add("compiler\\" + name + "\\" + name + ".sr");
     candidates.add("silverc\\compiler\\" + name + ".sr");
+    if (visHasDot) { candidates.add("silverc\\compiler\\" + visDottedBack + ".sr"); }
+    candidates.add("silverc\\compiler\\" + name + "\\" + name + ".sr");
     candidates.add("..\\compiler\\" + name + ".sr");
+    if (visHasDot) { candidates.add("..\\compiler\\" + visDottedBack + ".sr"); }
+    candidates.add("..\\compiler\\" + name + "\\" + name + ".sr");
     candidates.add("..\\silverc\\compiler\\" + name + ".sr");
+    if (visHasDot) { candidates.add("..\\silverc\\compiler\\" + visDottedBack + ".sr"); }
+    candidates.add("..\\silverc\\compiler\\" + name + "\\" + name + ".sr");
     candidates.add("..\\..\\compiler\\" + name + ".sr");
+    if (visHasDot) { candidates.add("..\\..\\compiler\\" + visDottedBack + ".sr"); }
+    candidates.add("..\\..\\compiler\\" + name + "\\" + name + ".sr");
     candidates.add("..\\..\\silverc\\compiler\\" + name + ".sr");
+    if (visHasDot) { candidates.add("..\\..\\silverc\\compiler\\" + visDottedBack + ".sr"); }
+    candidates.add("..\\..\\silverc\\compiler\\" + name + "\\" + name + ".sr");
     candidates.add("..\\silveri\\src\\" + name + ".sr");
+    if (visHasDot) { candidates.add("..\\silveri\\src\\" + visDottedBack + ".sr"); }
+    candidates.add("..\\silveri\\src\\" + name + "\\" + name + ".sr");
     candidates.add("silveri\\src\\" + name + ".sr");
+    if (visHasDot) { candidates.add("silveri\\src\\" + visDottedBack + ".sr"); }
+    candidates.add("silveri\\src\\" + name + "\\" + name + ".sr");
     candidates.add("..\\..\\silveri\\src\\" + name + ".sr");
+    if (visHasDot) { candidates.add("..\\..\\silveri\\src\\" + visDottedBack + ".sr"); }
+    candidates.add("..\\..\\silveri\\src\\" + name + "\\" + name + ".sr");
     #on LINUX
     candidates.add("std/" + name + ".sr");
+    if (visHasDot) { candidates.add("std/" + visDottedSlash + ".sr"); }
+    candidates.add("std/" + name + "/" + name + ".sr");
     candidates.add("silverc/std/" + name + ".sr");
+    if (visHasDot) { candidates.add("silverc/std/" + visDottedSlash + ".sr"); }
+    candidates.add("silverc/std/" + name + "/" + name + ".sr");
     candidates.add("../std/" + name + ".sr");
+    if (visHasDot) { candidates.add("../std/" + visDottedSlash + ".sr"); }
+    candidates.add("../std/" + name + "/" + name + ".sr");
     candidates.add("../silverc/std/" + name + ".sr");
+    if (visHasDot) { candidates.add("../silverc/std/" + visDottedSlash + ".sr"); }
+    candidates.add("../silverc/std/" + name + "/" + name + ".sr");
     candidates.add("../../std/" + name + ".sr");
+    if (visHasDot) { candidates.add("../../std/" + visDottedSlash + ".sr"); }
+    candidates.add("../../std/" + name + "/" + name + ".sr");
     candidates.add("../../silverc/std/" + name + ".sr");
+    if (visHasDot) { candidates.add("../../silverc/std/" + visDottedSlash + ".sr"); }
+    candidates.add("../../silverc/std/" + name + "/" + name + ".sr");
     candidates.add("compiler/" + name + ".sr");
+    if (visHasDot) { candidates.add("compiler/" + visDottedSlash + ".sr"); }
+    candidates.add("compiler/" + name + "/" + name + ".sr");
     candidates.add("silverc/compiler/" + name + ".sr");
+    if (visHasDot) { candidates.add("silverc/compiler/" + visDottedSlash + ".sr"); }
+    candidates.add("silverc/compiler/" + name + "/" + name + ".sr");
     candidates.add("../compiler/" + name + ".sr");
+    if (visHasDot) { candidates.add("../compiler/" + visDottedSlash + ".sr"); }
+    candidates.add("../compiler/" + name + "/" + name + ".sr");
     candidates.add("../silverc/compiler/" + name + ".sr");
+    if (visHasDot) { candidates.add("../silverc/compiler/" + visDottedSlash + ".sr"); }
+    candidates.add("../silverc/compiler/" + name + "/" + name + ".sr");
     candidates.add("../../compiler/" + name + ".sr");
+    if (visHasDot) { candidates.add("../../compiler/" + visDottedSlash + ".sr"); }
+    candidates.add("../../compiler/" + name + "/" + name + ".sr");
     candidates.add("../../silverc/compiler/" + name + ".sr");
+    if (visHasDot) { candidates.add("../../silverc/compiler/" + visDottedSlash + ".sr"); }
+    candidates.add("../../silverc/compiler/" + name + "/" + name + ".sr");
     candidates.add("../silveri/src/" + name + ".sr");
+    if (visHasDot) { candidates.add("../silveri/src/" + visDottedSlash + ".sr"); }
+    candidates.add("../silveri/src/" + name + "/" + name + ".sr");
     candidates.add("silveri/src/" + name + ".sr");
+    if (visHasDot) { candidates.add("silveri/src/" + visDottedSlash + ".sr"); }
+    candidates.add("silveri/src/" + name + "/" + name + ".sr");
     candidates.add("../../silveri/src/" + name + ".sr");
+    if (visHasDot) { candidates.add("../../silveri/src/" + visDottedSlash + ".sr"); }
+    candidates.add("../../silveri/src/" + name + "/" + name + ".sr");
     #off
     for (int i = 0; i < candidates.length; i++) {
         string src = visTryReadFile(candidates[i]);

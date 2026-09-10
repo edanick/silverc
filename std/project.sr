@@ -283,6 +283,19 @@ string[] projectAddEntry(string root, string entry, string[] excludes) {
     return projectWalk(root, entry, excludes);
 }
 
+// Nested module resolution (flat-first): mirrors silverc-rs
+// push_module_candidates. `name` with dots maps to a nested path
+// (`mini_cg.windows` -> `mini_cg/windows.sr`); `sep` is the target's
+// separator ("/" on LINUX, "\\" on WINDOWS).
+string projectDottedPath(string name, string sep) {
+    string out = "";
+    for (int i = 0; i < name.length; i++) {
+        if (name[i] == '.') { out = out + sep; }
+        else { out = out + name[i]; }
+    }
+    return out;
+}
+
 string projectSourcePath(string root, string[] sourceDirs, string moduleName) {
     for (int i = 0; i < sourceDirs.length; i = i + 1) {
         string sourceDir = sourceDirs[i];
@@ -301,6 +314,34 @@ string projectSourcePath(string root, string[] sourceDirs, string moduleName) {
         }
         if (!cliArgEq(candidate, "") && file.exists(candidate)) {
             return candidate;
+        }
+        if (!projectHasSuffix(sourceDir, ".sr")) {
+            // Dotted nested layout (`a.b` -> `a/b.sr`): probed only when
+            // the flat `<module>.sr` above missed, so every existing import
+            // resolves byte-identically.
+            if (projectFind(moduleName, ".", 0) >= 0) {
+                string dotted = "";
+                #on LINUX
+                dotted = projectJoin(root, sourceDir + "/" + projectDottedPath(moduleName, "/") + ".sr");
+                #off
+                #on WINDOWS
+                dotted = projectJoin(root, sourceDir + "\\" + projectDottedPath(moduleName, "\\") + ".sr");
+                #off
+                if (!cliArgEq(dotted, "") && file.exists(dotted)) {
+                    return dotted;
+                }
+            }
+            // Package convention (`<name>` -> `<name>/<name>.sr`): last.
+            string packaged = "";
+            #on LINUX
+            packaged = projectJoin(root, sourceDir + "/" + moduleName + "/" + moduleName + ".sr");
+            #off
+            #on WINDOWS
+            packaged = projectJoin(root, sourceDir + "\\" + moduleName + "\\" + moduleName + ".sr");
+            #off
+            if (!cliArgEq(packaged, "") && file.exists(packaged)) {
+                return packaged;
+            }
         }
     }
     return "";
@@ -326,7 +367,7 @@ string projectImportModule(string statement) {
         i = i + 1;
     }
     int start = i;
-    while (i < statement.length && ((statement[i] >= 'a' && statement[i] <= 'z') || (statement[i] >= 'A' && statement[i] <= 'Z') || (statement[i] >= '0' && statement[i] <= '9') || statement[i] == '_')) {
+    while (i < statement.length && ((statement[i] >= 'a' && statement[i] <= 'z') || (statement[i] >= 'A' && statement[i] <= 'Z') || (statement[i] >= '0' && statement[i] <= '9') || statement[i] == '_' || statement[i] == '.')) {
         i = i + 1;
     }
     return projectSlice(statement, start, i);
