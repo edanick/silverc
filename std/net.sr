@@ -1,9 +1,10 @@
 #on WINDOWS
 import * from win32.ws2_32;
 import { memcpy } from win32.msvcrt;
-#off
 #on LINUX
 import * from linux.libc;
+#on MAC
+import * from mac.libsystem;
 #off
 
 mod export net;
@@ -69,6 +70,24 @@ mod export net;
 //   ai_canonname at 32, ai_next at 40 = node slot 5 on both). The Linux
 //   walk therefore reads saPtr from nodeBuf[3] (not [4]); the IPv4 word
 //   inside the sockaddr is at sa slot 0 high half on both.
+//
+// MAC BACKEND (Phase B, code-only -- MAC.md section 10, UNVALIDATED until
+// probed on Mac hardware): POSIX sockets via mac.libsystem -- the closest
+// thing to a freebie in the port (MAC.md section 4). Same-name calls
+// (socket/connect/bind/listen/accept/send/recv/close/getaddrinfo) ride the
+// LINUX bodies through `#else`; SOCKET_ERROR = -1 likewise. Deliberate
+// divergences, re-derived from macOS headers (never copied):
+// - AF_INET = 2, SOCK_STREAM = 1: the same values on Darwin (safe).
+// - setRecvTimeoutRaw speaks Darwin sockopt: SOL_SOCKET = 0xFFFF,
+//   SO_RCVTIMEO = 0x1006 (NOT Linux's 1/21), value = struct timeval
+//   {sec, usec} 16 bytes = int[2] (Darwin tv_sec is 8 bytes, tv_usec
+//   4 + 4 pad -- the int[2] pack shape still holds for small values).
+// - lookup() reads Darwin struct addrinfo: ai_addr at offset 32 = node
+//   slot 4 (like Windows, NOT Linux's slot 3 -- Darwin keeps canonname at
+//   24, ai_addr at 32, ai_next at 40).
+// - No WSAStartup anywhere; closesocket -> close; inet_addr ->
+//   parseDotted (pure, shared).
+//
 // BEHAVIOR NOTES: tls_client's connect() opens a plain TCP socket and
 // stores it as the context (EncryptMessage/DecryptMessage are
 // unimplemented in every compiler; setCA/setCert store their paths).
@@ -83,8 +102,7 @@ class socket {
     public void send(string data) {
         #on WINDOWS
         sendRaw(this.fd, data);
-        #off
-        #on LINUX
+        #else
         sendRaw(this.fd, data);
         #off
     }
@@ -92,8 +110,7 @@ class socket {
     public string receive(int maxLen) {
         #on WINDOWS
         return recvRaw(this.fd, maxLen);
-        #off
-        #on LINUX
+        #else
         return recvRaw(this.fd, maxLen);
         #off
         return "";
@@ -102,8 +119,7 @@ class socket {
     public void close() {
         #on WINDOWS
         closeRaw(this.fd);
-        #off
-        #on LINUX
+        #else
         closeRaw(this.fd);
         #off
     }
@@ -123,8 +139,7 @@ class listener {
         int client = acceptRaw(this.fd);
         if (client < 0) { return null; }
         return new socket(client);
-        #off
-        #on LINUX
+        #else
         int client = acceptRaw(this.fd);
         if (client < 0) { return null; }
         return new socket(client);
@@ -135,8 +150,7 @@ class listener {
     public void close() {
         #on WINDOWS
         closeRaw(this.fd);
-        #off
-        #on LINUX
+        #else
         closeRaw(this.fd);
         #off
     }
@@ -168,8 +182,7 @@ class tls_client {
         if (sock < 0) { return false; }
         this.context = sock;
         return true;
-        #off
-        #on LINUX
+        #else
         int sock = connectRaw(this.host, this.port);
         if (sock < 0) { return false; }
         this.context = sock;
@@ -181,8 +194,7 @@ class tls_client {
     public void send(string data) {
         #on WINDOWS
         sendRaw(this.context, data);
-        #off
-        #on LINUX
+        #else
         sendRaw(this.context, data);
         #off
     }
@@ -190,8 +202,7 @@ class tls_client {
     public string receive() {
         #on WINDOWS
         return recvRaw(this.context, 8192);
-        #off
-        #on LINUX
+        #else
         return recvRaw(this.context, 8192);
         #off
         return "";
@@ -200,8 +211,7 @@ class tls_client {
     public void close() {
         #on WINDOWS
         closeRaw(this.context);
-        #off
-        #on LINUX
+        #else
         closeRaw(this.context);
         #off
     }
@@ -214,8 +224,7 @@ public socket connect(string host, int port) {
     int sock = connectRaw(host, port);
     if (sock < 0) { return null; }
     return new socket(sock);
-    #off
-    #on LINUX
+    #else
     int sock = connectRaw(host, port);
     if (sock < 0) { return null; }
     return new socket(sock);
@@ -230,8 +239,7 @@ public listener listen(int port) {
     int sock = listenRaw(port);
     if (sock < 0) { return null; }
     return new listener(sock);
-    #off
-    #on LINUX
+    #else
     int sock = listenRaw(port);
     if (sock < 0) { return null; }
     return new listener(sock);
@@ -250,8 +258,7 @@ public listener listen(int port) {
 public int connectRaw(string host, int port) {
     #on WINDOWS
     return openTcp(host, port);
-    #off
-    #on LINUX
+    #else
     return openTcp(host, port);
     #off
     return -1;
@@ -276,8 +283,7 @@ public int bindRaw(int port) {
         return -1;
     }
     return sock;
-    #off
-    #on LINUX
+    #else
     int sock = socket(2, 1, 0);
     if (sock < 0) { return -1; }
     int pHi = (port >> 8) & 0xFF;
@@ -300,8 +306,7 @@ public int bindRaw(int port) {
 public int listenRaw(int port) {
     #on WINDOWS
     return bindListen(port);
-    #off
-    #on LINUX
+    #else
     return bindListen(port);
     #off
     return -1;
@@ -314,8 +319,7 @@ public int acceptRaw(int fd) {
     int client = accept(fd, null, null);
     if (client > 2147483647) { client = client - 4294967296; }
     return client;
-    #off
-    #on LINUX
+    #else
     int client = accept(fd, null, null);
     if (client > 2147483647) { client = client - 4294967296; }
     return client;
@@ -336,8 +340,7 @@ public void sendRaw(int fd, string data) {
         packedBuf[i / 8] = packedBuf[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
     }
     send(fd, packedBuf, len, 0);
-    #off
-    #on LINUX
+    #else
     int len = data.length;
     if (len <= 0) { return; }
     int slots = (len + 7) / 8;
@@ -367,8 +370,7 @@ public void sendBytesRaw(int fd, byte[] data) {
         packedBuf[i / 8] = packedBuf[i / 8] | (b << ((i % 8) * 8));
     }
     send(fd, packedBuf, len, 0);
-    #off
-    #on LINUX
+    #else
     int len = data.length;
     if (len <= 0) { return; }
     int slots = (len + 7) / 8;
@@ -397,8 +399,7 @@ public void sendRawLen(int fd, string data, int len) {
         packedBuf[i / 8] = packedBuf[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
     }
     send(fd, packedBuf, len, 0);
-    #off
-    #on LINUX
+    #else
     if (len <= 0) { return; }
     if (len > data.length) { len = data.length; }
     int slots = (len + 7) / 8;
@@ -428,8 +429,7 @@ public string recvRaw(int fd, int maxLen) {
         result += c.toString();
     }
     return result;
-    #off
-    #on LINUX
+    #else
     if (maxLen <= 0) { return ""; }
     int slots = (maxLen + 7) / 8;
     int[] buf = new int[slots];
@@ -451,8 +451,7 @@ public string recvRaw(int fd, int maxLen) {
 public void closeRaw(int fd) {
     #on WINDOWS
     closesocket(fd);
-    #off
-    #on LINUX
+    #else
     close(fd);
     #off
 }
@@ -469,12 +468,16 @@ public void setRecvTimeoutRaw(int fd, int ms) {
     int[] opt = new int[1];
     opt[0] = ms;
     setsockopt(fd, 0xFFFF, 0x1006, opt, 4);
-    #off
     #on LINUX
     int[] opt = new int[2];
     opt[0] = ms / 1000;
     opt[1] = (ms % 1000) * 1000;
     setsockopt(fd, 1, 21, opt, 16);
+    #on MAC
+    int[] opt = new int[2];
+    opt[0] = ms / 1000;
+    opt[1] = (ms % 1000) * 1000;
+    setsockopt(fd, 0xFFFF, 0x1006, opt, 16);
     #off
 }
 
@@ -507,8 +510,7 @@ int openTcp(string host, int port) {
         return -1;
     }
     return sock;
-    #off
-    #on LINUX
+    #else
     int sock = socket(2, 1, 0);
     if (sock < 0) { return -1; }
     int ip = parseDotted(host);
@@ -552,8 +554,7 @@ int bindListen(int port) {
         return -1;
     }
     return sock;
-    #off
-    #on LINUX
+    #else
     int sock = socket(2, 1, 0);
     if (sock < 0) { return -1; }
     int pHi = (port >> 8) & 0xFF;
@@ -625,7 +626,6 @@ public string[] lookup(string host, int family = 2) {
     }
     freeaddrinfo(res[0]);
     return addresses;
-    #off
     #on LINUX
     int[] hints = new int[6];
     hints[0] = family << 32;
@@ -639,6 +639,34 @@ public string[] lookup(string host, int family = 2) {
         int[] nodeBuf = new int[6];
         memcpy(nodeBuf, node, 48);
         int saPtr = nodeBuf[3];
+        int next = nodeBuf[5];
+        if (saPtr != 0) {
+            int[] sa = new int[2];
+            memcpy(sa, saPtr, 16);
+            int ip = (sa[0] >> 32) & 0xFFFFFFFF;
+            string ipStr = ((ip >> 0) & 0xFF) + "." + ((ip >> 8) & 0xFF) + "." + ((ip >> 16) & 0xFF) + "." + ((ip >> 24) & 0xFF);
+            addresses.push(ipStr);
+        }
+        node = next;
+    }
+    freeaddrinfo(res[0]);
+    return addresses;
+    #on MAC
+    // Darwin struct addrinfo keeps ai_addr at offset 32 = node slot 4
+    // (like Windows, NOT Linux's slot 3 -- see the header).
+    // UNVALIDATED code-only.
+    int[] hints = new int[6];
+    hints[0] = family << 32;
+    hints[1] = 1;
+    int[] res = new int[1];
+    int ret = getaddrinfo(host, null, hints, res);
+    if (ret != 0) { string[] empty = []; return empty; }
+    string[] addresses = [];
+    int node = res[0];
+    while (node != 0) {
+        int[] nodeBuf = new int[6];
+        memcpy(nodeBuf, node, 48);
+        int saPtr = nodeBuf[4];
         int next = nodeBuf[5];
         if (saPtr != 0) {
             int[] sa = new int[2];

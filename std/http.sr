@@ -42,11 +42,20 @@ mod export http;
 // region; the net.* calls dispatch bare-name+arity like every other
 // protocol module (ftp, ws, ...). No response-code branching: any 2xx/3xx/
 // 4xx/5xx body returns alike, matching the winhttp bodies' posture.
+//
+// MAC BACKEND (Phase B, code-only -- MAC.md section 10, UNVALIDATED until
+// probed on Mac hardware): plain HTTP/1.0 over net's `#on MAC` branches
+// (same helpers, same calls -- protocols ride net on every OS). The pure
+// URL helpers and httpFetch carry explicit MAC branches (their bodies are
+// textually identical to the LINUX ones; they stay branched rather than
+// region-free so Windows builds keep their historical shape
+// byte-identically). Mirrors silverc-rs/std/http.sr MAC bodies.
 
 #on WINDOWS
 import * from win32.winhttp;
-#off
 #on LINUX
+import * from net;
+#on MAC
 import * from net;
 #off
 
@@ -98,12 +107,43 @@ string urlHost(string url) {
     if (colon >= 0 && colon < end) { end = colon; }
     if (slash >= 0 && slash < end) { end = slash; }
     return tail.substr(0, end);
+    #on MAC
+    int scheme = url.indexOf("://");
+    int start = 0;
+    if (scheme >= 0) { start = scheme + 3; }
+    string tail = url.substr(start, url.length() - start);
+    int colon = tail.indexOf(":");
+    int slash = tail.indexOf("/");
+    int end = tail.length();
+    if (colon >= 0 && colon < end) { end = colon; }
+    if (slash >= 0 && slash < end) { end = slash; }
+    return tail.substr(0, end);
     #off
     return "";
 }
 
 int urlPort(string url) {
     #on LINUX
+    int scheme = url.indexOf("://");
+    int start = 0;
+    if (scheme >= 0) { start = scheme + 3; }
+    string tail = url.substr(start, url.length() - start);
+    int colon = tail.indexOf(":");
+    if (colon < 0) {
+        if (url.substr(0, 5) == "https") { return 443; }
+        return 80;
+    }
+    string after = tail.substr(colon + 1, tail.length() - colon - 1);
+    int slash = after.indexOf("/");
+    string num = after;
+    if (slash >= 0) { num = after.substr(0, slash); }
+    int port = 0;
+    for (int i = 0; i < num.length(); i++) {
+        if (num[i] < '0' || num[i] > '9') { return 80; }
+        port = port * 10 + (int(num[i]) - 48);
+    }
+    return port;
+    #on MAC
     int scheme = url.indexOf("://");
     int start = 0;
     if (scheme >= 0) { start = scheme + 3; }
@@ -136,6 +176,14 @@ string urlPath(string url) {
     int slash = tail.indexOf("/");
     if (slash < 0) { return "/"; }
     return tail.substr(slash, tail.length() - slash);
+    #on MAC
+    int scheme = url.indexOf("://");
+    int start = 0;
+    if (scheme >= 0) { start = scheme + 3; }
+    string tail = url.substr(start, url.length() - start);
+    int slash = tail.indexOf("/");
+    if (slash < 0) { return "/"; }
+    return tail.substr(slash, tail.length() - slash);
     #off
     return "/";
 }
@@ -160,8 +208,7 @@ public string get(string url) {
     }
     WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session);
     return result;
-    #off
-    #on LINUX
+    #else
     return httpFetch("GET", url, "");
     #off
     return "";
@@ -188,8 +235,7 @@ public string post(string url, string body) {
     }
     WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session);
     return result;
-    #off
-    #on LINUX
+    #else
     return httpFetch("POST", url, body);
     #off
     return "";
@@ -215,20 +261,42 @@ public string delete(string url) {
     }
     WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session);
     return result;
-    #off
-    #on LINUX
+    #else
     return httpFetch("DELETE", url, "");
     #off
     return "";
 }
 
-// LINUX-only fetch over net (see the header): one request head (+body),
+// LINUX-only fetch over net (see the header, MAC branch is the identical
+// fetch over net's MAC branches): one request head (+body),
 // drain to close, strip response headers. The winhttp bodies above return
 // the RAW response (headers included); this helper returns the BODY after
 // the first blank line ("" when the reply carries none) -- the portable
 // contract going forward.
 string httpFetch(string method, string url, string body) {
     #on LINUX
+    string host = urlHost(url);
+    int port = urlPort(url);
+    string path = urlPath(url);
+    int fd = connectRaw(host, port);
+    if (fd < 0) { return ""; }
+    string head = method + " " + path + " HTTP/1.0\r\nHost: " + host + "\r\nConnection: close\r\n";
+    if (method == "POST") {
+        head = head + "Content-Type: application/json\r\nContent-Length: " + body.length + "\r\n";
+    }
+    head = head + "\r\n";
+    sendRaw(fd, head + body);
+    string result = "";
+    while (true) {
+        string chunk = recvRaw(fd, 4096);
+        if (chunk.length() == 0) { break; }
+        result += chunk;
+    }
+    closeRaw(fd);
+    int sep = result.indexOf("\r\n\r\n");
+    if (sep < 0) { return ""; }
+    return result.substr(sep + 4, result.length() - sep - 4);
+    #on MAC
     string host = urlHost(url);
     int port = urlPort(url);
     string path = urlPath(url);
