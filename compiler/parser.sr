@@ -50,6 +50,15 @@ class Parser {
     private bool linuxAllModules;
     private string[] linuxOpenModules;
     private string[] linuxGrantNames;
+    // MAC.md Phase C -- mac grants, mirroring the linux trio above: a full
+    // open (`import * from mac;`), opened module names (`mac.libsystem`,
+    // `mac.objc`), and individually granted export names. Used by the same
+    // unknown-method walk so free libSystem/objc calls are never flagged.
+    // No public mac.* module initially (std-internal, enforced by
+    // visibility.sr, mirroring how Linux started).
+    private bool macAllModules;
+    private string[] macOpenModules;
+    private string[] macGrantNames;
     // DOCS/261 -- per-project custom native modules (`.srp` `nativeModules`).
     // Declared custom names resolve per target OS (bare `import { f } from m;`
     // uses the `windows` file on WINDOWS/MAC, the `linux` file on LINUX; star
@@ -99,6 +108,9 @@ class Parser {
         this.linuxAllModules = false;
         this.linuxOpenModules = [];
         this.linuxGrantNames = [];
+        this.macAllModules = false;
+        this.macOpenModules = [];
+        this.macGrantNames = [];
         this.customNative = new NativeModules();
         this.customTargetOs = "";
         this.modExportNames = [];
@@ -659,6 +671,7 @@ class Parser {
         }
         if (this.win32Resolvable(name)) { return true; }
         if (this.linuxResolvable(name)) { return true; }
+        if (this.macResolvable(name)) { return true; }
         if (name.length > 0) {
             bool allCaps = true;
             for (int c = 0; c < name.length; c++) {
@@ -685,6 +698,7 @@ class Parser {
         if (this.isBuiltinCallableName(name)) { return true; }
         if (this.win32Resolvable(name)) { return true; }
         if (this.linuxResolvable(name)) { return true; }
+        if (this.macResolvable(name)) { return true; }
         // ALL-CAPS identifiers stay native-call placeholders.
         if (name.length > 0) {
             bool allCaps = true;
@@ -742,6 +756,47 @@ class Parser {
 
     private bool linuxTableHas(string lib, string fn) {
         string table = this.linuxLibExportTable(lib);
+        int i = 0;
+        while (i < table.length) {
+            while (i < table.length && table[i] == ' ') { i++; }
+            int start = i;
+            while (i < table.length && table[i] != ' ') { i++; }
+            if (i > start && this.strEq(fn, this.sliceStr(table, start, i))) { return true; }
+        }
+        return false;
+    }
+
+    // Mirror of linuxResolvable for the mac grant trio above: a full `mac`
+    // open, an opened `mac.<module>`, or a granted export name (aliases answer
+    // to their local name only) resolves a free libSystem/objc call.
+    private bool macResolvable(string name) {
+        if (this.macAllModules) { return true; }
+        for (int g = 0; g < this.macGrantNames.length; g++) {
+            if (this.strEq(this.macGrantNames[g], name)) { return true; }
+        }
+        for (int m = 0; m < this.macOpenModules.length; m++) {
+            string lib = this.macModuleNameLib(this.macOpenModules[m]);
+            if (lib.length > 0 && this.macTableHas(lib, name)) { return true; }
+        }
+        return false;
+    }
+
+    private string macModuleNameLib(string module) {
+        if (this.strEq(module, "libsystem")) { return "/usr/lib/libSystem.B.dylib"; }
+        if (this.strEq(module, "objc")) { return "/usr/lib/libobjc.A.dylib"; }
+        if (this.strEq(module, "appkit")) { return "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit"; }
+        if (this.strEq(module, "quartz")) { return "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore"; }
+        return "";
+    }
+
+    private string macLibExportTable(string lib) {
+        if (this.strEq(lib, "/usr/lib/libSystem.B.dylib")) { return "exit _exit mmap munmap malloc free read write open close lseek stat fstat unlink rename mkdir rmdir opendir readdir closedir getenv setenv clock_gettime nanosleep localtime_r gmtime_r posix_spawn posix_spawnp posix_spawn_file_actions_init posix_spawn_file_actions_adddup2 posix_spawn_file_actions_destroy waitpid kill pipe dup2 getpid pthread_create pthread_join pthread_mach_thread_np sysconf sysctlbyname uname gethostname getlogin_r statvfs getentropy arc4random_buf dlopen dlsym rand srand getuid printf strlen strcmp strcpy memcpy memset socket connect bind listen accept send recv setsockopt getaddrinfo freeaddrinfo"; }
+        if (this.strEq(lib, "/usr/lib/libobjc.A.dylib")) { return "objc_getClass sel_registerName objc_msgSend"; }
+        return "";
+    }
+
+    private bool macTableHas(string lib, string fn) {
+        string table = this.macLibExportTable(lib);
         int i = 0;
         while (i < table.length) {
             while (i < table.length && table[i] == ' ') { i++; }
@@ -1364,12 +1419,12 @@ class Parser {
             node.typeHint = src;
         }
         // `X as Y` import aliasing. An alias binds a DLL/lib export under a
-        // different local call name, which only carries meaning on win32
-        // and linux imports (fs.sr's `rename as renameFile` dodges the
+        // different local call name, which only carries meaning on win32,
+        // linux and mac imports (fs.sr's `rename as renameFile` dodges the
         // module's own rename/2); on a Silver-module import it would
         // silently rebind the module's own symbols, so reject it.
-        if (this.importHasAlias(node) && !this.importSourceIsWin32(node.typeHint) && !this.importSourceIsLinux(node.typeHint)) {
-            this.recordError("aliased import names (X as Y) are only allowed on win32/linux imports, at line " + node.line.toString() + ", column " + node.col.toString());
+        if (this.importHasAlias(node) && !this.importSourceIsWin32(node.typeHint) && !this.importSourceIsLinux(node.typeHint) && !this.importSourceIsMac(node.typeHint)) {
+            this.recordError("aliased import names (X as Y) are only allowed on win32/linux/mac imports, at line " + node.line.toString() + ", column " + node.col.toString());
         }
         // Remember win32 grants for the post-parse unknown-method walk
         // (DOCS/213): free Win32 calls resolve only through these imports.
@@ -1377,6 +1432,9 @@ class Parser {
         // Remember linux grants beside them (LINUX.md Phase B): free libc
         // calls resolve only through linux imports.
         this.recordLinuxImportGrant(node);
+        // Remember mac grants beside them (MAC.md Phase C): free libSystem
+        // calls resolve only through mac imports.
+        this.recordMacImportGrant(node);
         // DOCS/261 bare custom grants resolve per target OS beside them.
         this.recordCustomBareGrant(node);
         this.expectSemi();
@@ -1414,6 +1472,12 @@ class Parser {
     private bool importSourceIsLinux(string src) {
         if (this.strEq(src, "linux")) { return true; }
         if (src.length > 6 && this.strEq(this.sliceStr(src, 0, 6), "linux.")) { return true; }
+        return false;
+    }
+
+    private bool importSourceIsMac(string src) {
+        if (this.strEq(src, "mac")) { return true; }
+        if (src.length > 4 && this.strEq(this.sliceStr(src, 0, 4), "mac.")) { return true; }
         return false;
     }
 
@@ -1560,6 +1624,44 @@ class Parser {
         this.recordError(nativeUndeclaredMsg("linux." + modName) + ", at line " + node.line.toString() + ", column " + node.col.toString());
     }
 
+    private void recordMacImportGrant(Node node) {
+        string src = node.typeHint;
+        if (this.strEq(src, "mac")) {
+            if (node.isStatic) { this.macAllModules = true; return; }
+            this.checkMacModuleName(node.name, node);
+            for (int j = 0; j < node.childCount(); j++) {
+                this.checkMacModuleName(node.child(j).name, node);
+            }
+            return;
+        }
+        if (src.length > 4 && this.strEq(this.sliceStr(src, 0, 4), "mac.")) {
+            string module = this.sliceStr(src, 4, src.length);
+            string lib = this.macModuleNameLib(module);
+            if (lib.length > 0) {
+                if (node.isStatic) {
+                    this.macOpenModules.add(module);
+                    return;
+                }
+                this.macGrantNames.add(this.importLocalName(node));
+                for (int j2 = 0; j2 < node.childCount(); j2++) {
+                    this.macGrantNames.add(this.importLocalName(node.child(j2)));
+                }
+                return;
+            }
+            this.recordError(nativeUndeclaredMsg(src) + ", at line " + node.line.toString() + ", column " + node.col.toString());
+        }
+    }
+
+    private void checkMacModuleName(string modName, Node node) {
+        if (modName.length == 0) { return; }
+        string lib = this.macModuleNameLib(modName);
+        if (lib.length > 0) {
+            this.macOpenModules.add(modName);
+            return;
+        }
+        this.recordError(nativeUndeclaredMsg("mac." + modName) + ", at line " + node.line.toString() + ", column " + node.col.toString());
+    }
+
     // DOCS/261 bare custom grants (`import { f } from m;`,
     // `import * from m;`): declared names resolve per target OS with no `#on`
     // regions. Undeclared bare names are Silver (no grant, no error);
@@ -1568,9 +1670,10 @@ class Parser {
     private void recordCustomBareGrant(Node node) {
         string src = node.typeHint;
         if (src.length == 0) { return; }
-        if (this.strEq(src, "win32") || this.strEq(src, "linux")) { return; }
+        if (this.strEq(src, "win32") || this.strEq(src, "linux") || this.strEq(src, "mac")) { return; }
         if (src.length > 6 && this.strEq(this.sliceStr(src, 0, 6), "win32.")) { return; }
         if (src.length > 6 && this.strEq(this.sliceStr(src, 0, 6), "linux.")) { return; }
+        if (src.length > 4 && this.strEq(this.sliceStr(src, 0, 4), "mac.")) { return; }
         // Precedence: project-local sources, `.qs` bundle modules, and std
         // modules beat custom native names; a colliding fixed name resolves
         // to the fixed module (handled above). Std names never grant here.
