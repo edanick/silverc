@@ -5,8 +5,8 @@ mod export sqlite;
 // bridge (a real SQLite bridge means either sqlite3.dll FFI or the SQLite
 // file format; that is a separate feature ticket).
 //
-// SCOPE: open() wraps the path in a connection (the (path, sql) shapes flow
-// through connection/statement). execute() is a silent no-op; query()
+// SCOPE: open() wraps the path in a connection (the (path, statement-text)
+// shapes flow through connection/statement). execute() is a silent no-op; query()
 // returns an empty result (rows stay empty -- there is no row framing to
 // fill them with, so hasNext-less result.get is unreachable by
 // construction); transaction() runs BEGIN/COMMIT execute() calls around
@@ -15,8 +15,8 @@ mod export sqlite;
 // real SQLite file nothing happens and nothing crashes.
 //
 // STORAGE SHAPE: row's storage is two parallel `= []`-initialized string[]
-// arrays (std/sql.sr row / std/mongo.sr doc precedent), with set()/has()
-// alongside get() (the mongo.sr posture) so the class is usable by a
+// arrays (the parallel string[] row shape), with set()/has()
+// alongside get() so the class is usable by a
 // future bridge; result's rows field is `= []`-initialized in construct().
 //
 // PUBLIC API: class row -- construct(), get(string) -> string,
@@ -26,8 +26,7 @@ mod export sqlite;
 // result, prepare(string) -> statement, transaction(void () callback),
 // close(); free function open(string) -> connection. The transaction
 // fn-parameter is zero-arg, so handlers needing payload must reach it
-// through outer scope/module state the same way graphql/http_server
-// handlers do.
+// through outer scope/module state (the shared zero-arg handler posture).
 //
 // DISPATCH: `sqlite` is builtin-reserved on NEITHER compiler --
 // silverc-rs's builtin_modules_set (src/main.rs:81 lists fs/json/yaml/env/
@@ -39,7 +38,7 @@ mod export sqlite;
 
 class row {
     // Storage is two parallel `= []`-initialized string[] arrays (the
-    // sql.sr row / mongo.sr doc precedent), initialized in construct.
+    // parallel string[] row shape), initialized in construct.
     private string[] names;
     private string[] values;
 
@@ -62,7 +61,7 @@ class row {
     }
 
     // The value stored under `name`, or null when absent (the kvp.get
-    // contract -- sql.sr row keeps the same contract). On this build rows
+    // contract -- kept identical here). On this build rows
     // are never populated (no bridge exists), so every get() returns null;
     // the parallel-array implementation exists so a future bridge can fill
     // rows without an API change.
@@ -76,7 +75,7 @@ class row {
     }
 
     // True when `name` is present (get returns null for absent names, so
-    // has() is the non-null check callers want -- the sql.sr row posture).
+    // has() is the non-null check callers want).
     public bool has(string name) {
         for (int i = 0; i < this.names.length; i++) {
             if (this.names[i] == name) {
@@ -96,18 +95,18 @@ class result {
 }
 
 class statement {
-    private string sql;
+    private string stmtText;
     private connection conn;
 
-    construct(string sql, connection conn) {
-        this.sql = sql;
+    construct(string stmtText, connection conn) {
+        this.stmtText = stmtText;
         this.conn = conn;
     }
 
-    // Delegates to this.conn.execute(this.sql); `params` remain
+    // Delegates to this.conn.execute(this.stmtText); `params` remain
     // carried-unused (execute() is a no-op -- see SCOPE above).
     public void execute(object[] params) {
-        this.conn.execute(this.sql);
+        this.conn.execute(this.stmtText);
     }
 }
 
@@ -119,20 +118,20 @@ class connection {
     }
 
     // No-op: no SQLite bridge exists to hand the statement to.
-    public void execute(string sql) { }
+    public void execute(string stmtText) { }
 
     // Returns an empty result: rows stay EMPTY -- there is no bridge to
     // produce rows, so reading them is unreachable by construction.
-    public result query(string sql) {
+    public result query(string stmtText) {
         return new result();
     }
 
-    public statement prepare(string sql) {
-        return new statement(sql, this);
+    public statement prepare(string stmtText) {
+        return new statement(stmtText, this);
     }
 
-    // The zero-arg `void () callback` spelling (the DOCS/259 form, the
-    // graphql.sr precedent). Behavior on this build: BEGIN and COMMIT are
+    // The zero-arg `void () callback` spelling (the DOCS/259 form).
+    // Behavior on this build: BEGIN and COMMIT are
     // no-op execute() calls; the callback still runs between them, so the
     // caller's side effects happen. There is no ROLLBACK path -- no
     // failure can occur inside the no-op execute() calls.
