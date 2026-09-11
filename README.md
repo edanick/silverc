@@ -34,8 +34,20 @@ setx PATH "$env:PATH;C:\bin"
 Both use the same location, `~/.local/bin`:
 
 ```bash
-mkdir -p ~/.local/bin
-cp silverc ~/.local/bin/silverc
+test -d ~/.local/bin || mkdir -p ~/.local/bin
+```
+
+Copy it from your Downloads folder:
+
+```bash
+cp ~/Downloads/silverc ~/.local/bin/silverc
+chmod +x ~/.local/bin/silverc
+```
+
+Or download it straight there with curl:
+
+```bash
+curl -L -o ~/.local/bin/silverc <download-url>
 chmod +x ~/.local/bin/silverc
 ```
 
