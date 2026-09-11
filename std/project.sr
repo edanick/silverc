@@ -932,6 +932,38 @@ string[] projectQsSources(string content) {
     return result;
 }
 
+// Locate a shipped std SOURCE file for a `.qs` bundle bare import name
+// (`net` -> `std/net.sr`), mirroring where the driver's findModuleSource
+// would find it. Probes the cwd-relative std candidates; returns "" when
+// no file exists. Names with separators or parent references are never
+// files (a bundle must not escape the std directory).
+string projectQsStdPath(string mod) {
+    if (mod.length == 0) { return ""; }
+    for (int i = 0; i < mod.length; i++) {
+        if (!projectQsWord(mod[i]) && mod[i] != '.') { return ""; }
+    }
+    if (projectFind(mod, "..", 0) >= 0) { return ""; }
+    string[] candidates = [];
+    candidates.add("std\\" + mod + ".sr");
+    candidates.add("silverc\\std\\" + mod + ".sr");
+    candidates.add("..\\std\\" + mod + ".sr");
+    candidates.add("..\\silverc\\std\\" + mod + ".sr");
+    candidates.add("..\\..\\std\\" + mod + ".sr");
+    candidates.add("..\\..\\silverc\\std\\" + mod + ".sr");
+    #on LINUX or MAC
+    candidates.add("std/" + mod + ".sr");
+    candidates.add("silverc/std/" + mod + ".sr");
+    candidates.add("../std/" + mod + ".sr");
+    candidates.add("../silverc/std/" + mod + ".sr");
+    candidates.add("../../std/" + mod + ".sr");
+    candidates.add("../../silverc/std/" + mod + ".sr");
+    #off
+    for (int k = 0; k < candidates.length; k++) {
+        if (file.exists(candidates[k])) { return candidates[k]; }
+    }
+    return "";
+}
+
 bool projectQsWord(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
 }
@@ -1402,6 +1434,10 @@ string projectBuildSource(string projectPath, bool emitMarkers) {
     // `import * from X;` statements in the code resolve to the library.
     string[] imports = projectManifestImports(manifest);
     string[] allBundleStems = [];
+    // Shipped std SOURCE modules already collected for consumed bundles
+    // (keyed by module name, so every spelling dedups): two libraries
+    // needing `net` inline it once.
+    string[] qsStdDone = [];
     for (int qi = 0; qi < imports.length; qi++) {
         string qsPath0 = projectJoin(root, imports[qi]);
         string qsContent0 = file.readString(qsPath0);
@@ -1446,6 +1482,33 @@ string projectBuildSource(string projectPath, bool emitMarkers) {
                                 }
                             }
                             if (!silver && (projectIsStdModule(mod) || projectBuiltin(mod))) { silver = true; }
+                            // Shipped std SOURCE modules (`net`, `time`,
+                            // `uuid`, ...: a `std/<name>.sr` file normal
+                            // resolution would find) are Silver, never
+                            // native. Their real text joins the aggregate
+                            // (collected once, with their own imports
+                            // resolved) so qualified calls resolve exactly
+                            // like single-file builds; the import itself
+                            // stays dropped downstream like any Silver one.
+                            // This never touches native codegen dispatch.
+                            if (!silver) {
+                                string stdPath = projectQsStdPath(mod);
+                                if (stdPath != "") {
+                                    silver = true;
+                                    bool stdSeen = false;
+                                    for (int di = 0; di < qsStdDone.length; di++) {
+                                        if (qsStdDone[di] == mod) { stdSeen = true; }
+                                    }
+                                    if (!stdSeen) {
+                                        qsStdDone.add(mod);
+                                        string stdRoot = projectDirname(stdPath);
+                                        string[] stdDirs = [];
+                                        stdDirs.add("");
+                                        string stdText = projectCollect(stdPath, stdRoot, stdDirs, visited, emitMarkers, progress);
+                                        body += stdText + "\n";
+                                    }
+                                }
+                            }
                             if (!silver && !nmBuild.declared(mod)) {
                                 printline("Error: " + nativeUndeclaredMsg(mod));
                                 exit(1);
