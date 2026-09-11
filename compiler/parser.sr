@@ -1749,15 +1749,17 @@ class Parser {
         node.name = this.advance().text;
         this.registerDeclaredType(node.name);
         if (this.check(110)) {
-            node.kind = 103;
+            // `def Name = enum { ... };` is not Silver. Enums are declared
+            // as `enum Name { ... }` (DOCS/212). Swallow the legacy body so
+            // the user gets this single error instead of a cascade, and
+            // fall back to a plain unit so later passes still see the
+            // declared type name.
+            Token eqTok = this.peek();
+            this.recordError(eqTok.line.toString() + ":" + eqTok.col.toString() + ": `def " + node.name + " = enum ...` is not Silver; declare enums as `enum " + node.name + " { ... }` (see DOCS/212)");
             this.advance();
-            this.expect(31);
-            this.expect(102);
-            while (!this.check(103) && !this.check(0)) {
-                node.children.add(this.parsePattern());
-                if (this.check(107)) { this.advance(); }
-            }
-            this.expect(103);
+            if (this.check(31)) { this.advance(); }
+            if (this.check(102)) { this.skipBalancedBraces(); }
+            node.kind = 110;
             this.expectSemi();
         } else {
             node.kind = 110;
