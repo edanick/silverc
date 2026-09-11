@@ -21,8 +21,8 @@
 // first parameter and read/write it as `cg.*` (calls to staying core methods
 // likewise go through `cg.`); calls to same-backend helpers stay `this.`
 // (with `cg` forwarded when the callee needs it); pure helpers (string
-// tables, address arithmetic) take no `cg` and call the shared free function
-// `cgStrEq` above. There is deliberately NO duplicate `class MiniCg` in
+// tables, address arithmetic) take no `cg` and compare with the unified
+// `==`. There is deliberately NO duplicate `class MiniCg` in
 // the backends: the type checker overwrites same-name classes, which would
 // corrupt field offsets - helpers + delegation instead.
 //
@@ -47,18 +47,6 @@ class StrEntry {
         this.text = text;
         this.dataOffset = 0;
     }
-}
-
-// Shared byte-wise string equality for the MiniCg backends: the pure table /
-// address helpers in linux.sr, windows.sr and mac.sr need it without a `cg`
-// receiver, so it lives here once as a free function instead of a private
-// copy per backend class. Core's `MiniCg.strEq` method below stays untouched.
-bool cgStrEq(string a, string b) {
-    if (a.length != b.length) { return false; }
-    for (int i = 0; i < a.length; i++) {
-        if (a[i] != b[i]) { return false; }
-    }
-    return true;
 }
 
 class MiniCg {
@@ -390,10 +378,10 @@ class MiniCg {
             if (item.kind == 102) {
                 int start = this.classFieldNames.length;
                 int cnt = 0;
-                if (!this.strEq(item.parentClass, "")) {
+                if (item.parentClass != "") {
                     int parentIdx = -1;
                     for (int pi = 0; pi < this.classNames.length; pi++) {
-                        if (this.strEq(this.classNames[pi], item.parentClass)) {
+                        if (this.classNames[pi] == item.parentClass) {
                             parentIdx = pi;
                         }
                     }
@@ -426,20 +414,20 @@ class MiniCg {
                         this.methodClassNames.add(item.name);
                     }
                 }
-                if (!this.strEq(item.parentClass, "")) {
+                if (item.parentClass != "") {
                     int parentIdx = -1;
                     for (int pi = 0; pi < this.classNames.length; pi++) {
-                        if (this.strEq(this.classNames[pi], item.parentClass)) {
+                        if (this.classNames[pi] == item.parentClass) {
                             parentIdx = pi;
                         }
                     }
                     if (parentIdx >= 0) {
                         int savedLen = this.methodNames.length;
                         for (int mi = 0; mi < savedLen; mi++) {
-                            if (this.strEq(this.methodClassNames[mi], item.parentClass) && !this.strEq(this.methodClassNames[mi], "")) {
+                            if (this.methodClassNames[mi] == item.parentClass && this.methodClassNames[mi] != "") {
                                 bool hasOverride = false;
                                 for (int mj = 0; mj < this.methodNames.length; mj++) {
-                                    if (this.strEq(this.methodClassNames[mj], item.name) && this.strEq(this.methodNames[mj], this.methodNames[mi])) {
+                                    if (this.methodClassNames[mj] == item.name && this.methodNames[mj] == this.methodNames[mi]) {
                                         hasOverride = true;
                                     }
                                 }
@@ -468,20 +456,6 @@ class MiniCg {
                 classIdx = classIdx + 1;
             }
         }
-    }
-
-
-    public bool typeNameEq(string bare, string typed) {
-        // Class-name comparison that tolerates a nullable suffix: a receiver
-        // typed `Node?` resolves to the same class layout as `Node`.
-        if (this.strEq(bare, typed)) { return true; }
-        if (typed.length == bare.length + 1 && typed[typed.length - 1] == '?') {
-            for (int i = 0; i < bare.length; i++) {
-                if (typed[i] != bare[i]) { return false; }
-            }
-            return true;
-        }
-        return false;
     }
 
     public bool isDictType(string t) {
@@ -514,16 +488,16 @@ class MiniCg {
 
     public string inferReceiverType(Node expr) {
         if (expr.kind == 6) {
-            if (this.strEq(expr.name, "this")) { return this.currentClassName; }
+            if (expr.name == "this") { return this.currentClassName; }
             return this.getLocalType(expr.name);
         }
         return this.inferExprType(expr);
     }
 
     public bool isClassName(string t) {
-        if (this.strEq(t, "")) { return false; }
+        if (t == "") { return false; }
         for (int i = 0; i < this.classNames.length; i++) {
-            if (this.strEq(this.classNames[i], t)) { return true; }
+            if (this.classNames[i] == t) { return true; }
         }
         return false;
     }
@@ -537,7 +511,7 @@ class MiniCg {
             string m = this.userModuleNames[i];
             if (name.length <= m.length) { continue; }
             if (name[m.length] != '.') { continue; }
-            if (this.strEqIgnoreCase(projectSlice(name, 0, m.length), m)) { return true; }
+            if (string.equals(projectSlice(name, 0, m.length), m, StringCase.INSENSITIVE)) { return true; }
         }
         return false;
     }
@@ -578,23 +552,9 @@ class MiniCg {
 
     public bool hasUserModuleName(string name) {
         for (int i = 0; i < this.userModuleNames.length; i++) {
-            if (this.strEqIgnoreCase(this.userModuleNames[i], name)) { return true; }
+            if (string.equals(this.userModuleNames[i], name, StringCase.INSENSITIVE)) { return true; }
         }
         return false;
-    }
-
-    // ASCII case-insensitive equality (mirrors the Rust compiler's
-    // eq_ignore_ascii_case).
-    private bool strEqIgnoreCase(string a, string b) {
-        if (a.length != b.length) { return false; }
-        for (int i = 0; i < a.length; i++) {
-            char ca = a[i];
-            char cb = b[i];
-            if (ca >= 'A' && ca <= 'Z') { ca = char(ca + 32); }
-            if (cb >= 'A' && cb <= 'Z') { cb = char(cb + 32); }
-            if (ca != cb) { return false; }
-        }
-        return true;
     }
 
     // Built-in stdlib module names never carry user Silver classes, so they
@@ -603,7 +563,7 @@ class MiniCg {
     private bool isStdlibModuleName(string name) {
         string[] stdlibModules = ["math", "fs", "file", "folder", "json", "http", "llmai", "LLMAI", "env", "url", "hash", "path", "keyboard", "mouse", "bom", "binary_metadata", "process", "console", "gui", "registry", "os"];
         for (int i = 0; i < stdlibModules.length; i++) {
-            if (this.strEq(stdlibModules[i], name)) { return true; }
+            if (stdlibModules[i] == name) { return true; }
         }
         return false;
     }
@@ -615,13 +575,13 @@ class MiniCg {
     // the class - to C).
     public string findClassForExpr(Node expr) {
         if (expr.kind == 6) {
-            if (this.strEq(expr.name, "this")) {
-                if (!this.strEq(this.currentClassName, "")) { return this.currentClassName; }
+            if (expr.name == "this") {
+                if (this.currentClassName != "") { return this.currentClassName; }
             }
             string t = this.getLocalType(expr.name);
             if (this.isClassName(t)) { return t; }
             if (this.isClassName(expr.name)) { return expr.name; }
-            if (!this.strEq(this.currentClassName, "")) {
+            if (this.currentClassName != "") {
                 string ft = this.findFieldType(this.currentClassName, expr.name);
                 if (this.isClassName(ft)) { return ft; }
             }
@@ -630,7 +590,7 @@ class MiniCg {
         if (expr.kind == 13) {
             if (expr.childCount() > 0) {
                 string ot = this.inferExprType(expr.child(0));
-                if (!this.strEq(ot, "")) {
+                if (ot != "") {
                     string ft = this.findFieldType(ot, expr.name);
                     if (this.isClassName(ft)) { return ft; }
                 }
@@ -651,7 +611,7 @@ class MiniCg {
                 // Class-returning user function (mirrors rs FunctionCall arm
                 // via func_return_structs).
                 for (int ri = 0; ri < this.funcNames.length; ri++) {
-                    if (this.strEq(this.funcNames[ri], expr.name) && this.strEq(this.funcClasses[ri], "")) {
+                    if (this.funcNames[ri] == expr.name && this.funcClasses[ri] == "") {
                         string rt = this.funcRetTypes[ri];
                         if (this.isClassName(rt)) { return rt; }
                         break;
@@ -667,14 +627,14 @@ class MiniCg {
         int start = -1;
         int cnt = 0;
         for (int i = 0; i < this.classNames.length; i++) {
-            if (this.typeNameEq(this.classNames[i], className)) {
+            if ((this.classNames[i] == className || className == this.classNames[i] + "?")) {
                 start = this.classFieldStarts[i];
                 cnt = this.classFieldCounts[i];
             }
         }
         if (start < 0) { return -1; }
         for (int i = 0; i < cnt; i++) {
-            if (this.strEq(this.classFieldNames[start + i], fieldName)) {
+            if (this.classFieldNames[start + i] == fieldName) {
                 return this.classFieldOffsets[start + i];
             }
         }
@@ -685,14 +645,14 @@ class MiniCg {
         int start = -1;
         int cnt = 0;
         for (int i = 0; i < this.classNames.length; i++) {
-            if (this.typeNameEq(this.classNames[i], className)) {
+            if ((this.classNames[i] == className || className == this.classNames[i] + "?")) {
                 start = this.classFieldStarts[i];
                 cnt = this.classFieldCounts[i];
             }
         }
         if (start < 0) { return ""; }
         for (int i = 0; i < cnt; i++) {
-            if (this.strEq(this.classFieldNames[start + i], fieldName)) {
+            if (this.classFieldNames[start + i] == fieldName) {
                 return this.classFieldTypes[start + i];
             }
         }
@@ -701,7 +661,7 @@ class MiniCg {
 
     public string getLocalType(string name) {
         for (int i = this.localNames.length - 1; i >= 0; i = i - 1) {
-            if (this.strEq(this.localNames[i], name)) {
+            if (this.localNames[i] == name) {
                 if (i < this.localTypes.length) {
                     return this.localTypes[i];
                 }
@@ -709,7 +669,7 @@ class MiniCg {
             }
         }
         for (int i = 0; i < this.globalNames.length; i++) {
-            if (this.strEq(this.globalNames[i], name)) {
+            if (this.globalNames[i] == name) {
                 if (i < this.globalTypes.length) {
                     return this.globalTypes[i];
                 }
@@ -722,7 +682,7 @@ class MiniCg {
 
     public void setLocalType(string name, string typeName) {
         for (int i = this.localNames.length - 1; i >= 0; i = i - 1) {
-            if (this.strEq(this.localNames[i], name)) {
+            if (this.localNames[i] == name) {
                 while (this.localTypes.length <= i) {
                     this.localTypes.add("");
                 }
@@ -734,7 +694,7 @@ class MiniCg {
 
     public void setLocalOffset(string name, int off) {
         for (int i = this.localNames.length - 1; i >= 0; i = i - 1) {
-            if (this.strEq(this.localNames[i], name)) {
+            if (this.localNames[i] == name) {
                 this.localOffsets[i] = off;
                 return;
             }
@@ -770,7 +730,7 @@ class MiniCg {
     public int addString(string s) {
         for (int i = 0; i < this.strings.length; i++) {
             StrEntry se = this.strings[i];
-            if (this.strEq(se.text, s)) {
+            if (se.text == s) {
                 return i;
             }
         }
@@ -793,7 +753,7 @@ class MiniCg {
 
     public int findImport(string dll, string name) {
         for (int i = 0; i < this.importDlls.length; i++) {
-            if (this.strEq(this.importDlls[i], dll) && this.strEq(this.importFuncs[i], name)) {
+            if (this.importDlls[i] == dll && this.importFuncs[i] == name) {
                 return i;
             }
         }
@@ -840,7 +800,7 @@ class MiniCg {
         // OVERHAUL.md --runtime: remember every HeapAlloc reference so the
         // driver can repoint it at the embedded __silver_rt_alloc slot after
         // the ordinary IAT patch pass.
-        if (this.runtimeMode && this.strEq(name, "HeapAlloc") && this.strEq(dll, "kernel32.dll")) {
+        if (this.runtimeMode && name == "HeapAlloc" && dll == "kernel32.dll") {
             this.heapAllocPatchPos.add(this.asm.buf.length + 2);
         }
         return idx;
@@ -857,14 +817,14 @@ class MiniCg {
     // True when this compilation targets Linux (driver sets targetOs via
     // ppTargetOsFor; "" behaves as WINDOWS).
     public bool isLinuxTarget() {
-        return this.strEq(this.targetOs, "LINUX");
+        return this.targetOs == "LINUX";
     }
 
     // True when compiling for macOS (AAPCS64 ABI + Mach-O output). All macOS
     // branches hang off this helper so Win64/SysV paths stay byte-identical
     // when false (mirrors silverc-rs is_mac()).
     public bool isMacTarget() {
-        return this.strEq(this.targetOs, "MAC");
+        return this.targetOs == "MAC";
     }
 
     // --- AAPCS64 policy (MAC.md section 8, macOS ARM64 only, code-only) ---
@@ -1083,10 +1043,10 @@ class MiniCg {
         }
         for (int g = 0; g < this.linuxGrants.length; g++) {
             string grant = this.linuxGrants[g];
-            if (grant.length > name.length + 1 && this.strEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') { return true; }
+            if (grant.length > name.length + 1 && projectSlice(grant, grant.length - name.length, grant.length) == name && grant[grant.length - name.length - 1] == '|') { return true; }
         }
         for (int a = 0; a < this.linuxAliasLocals.length; a++) {
-            if (this.strEq(this.linuxAliasLocals[a], name)) { return true; }
+            if (this.linuxAliasLocals[a] == name) { return true; }
         }
         return false;
     }
@@ -1278,9 +1238,9 @@ class MiniCg {
     public void registerCustomBareImport(Node node) {
         string source = node.typeHint;
         if (source.length == 0) { return; }
-        if (this.strEq(source, "win32") || this.strEq(source, "linux")) { return; }
-        if (source.length > 6 && this.strEq(projectSlice(source, 0, 6), "win32.")) { return; }
-        if (source.length > 6 && this.strEq(projectSlice(source, 0, 6), "linux.")) { return; }
+        if (source == "win32" || source == "linux") { return; }
+        if (source.length > 6 && projectSlice(source, 0, 6) == "win32.") { return; }
+        if (source.length > 6 && projectSlice(source, 0, 6) == "linux.") { return; }
         if (projectIsStdModule(source) || projectBuiltin(source)) { return; }
         if (!this.customNative.declared(source)) { return; }
         string target = this.customEffectiveTarget();
@@ -1290,7 +1250,7 @@ class MiniCg {
             exit(1);
             return;
         }
-        bool isLinux = this.strEq(target, "LINUX");
+        bool isLinux = target == "LINUX";
         if (node.isStatic) {
             if (!this.customNative.starAllowed(source, target)) {
                 printline("Error: " + nativeStarMsg(source));
@@ -1330,14 +1290,6 @@ class MiniCg {
         return this.windowsBackend.win32ModuleOf(dll);
     }
 
-    public bool strEq(string a, string b) {
-        if (a.length != b.length) { return false; }
-        for (int i = 0; i < a.length; i++) {
-            if (a[i] != b[i]) { return false; }
-        }
-        return true;
-    }
-
     public int findLocal(string name) {
         // Search from the most recent local backward. The flat local table has
         // no lexical scopes and codegen appends temporaries as it goes, so a
@@ -1348,7 +1300,7 @@ class MiniCg {
         // forward scan used to get wrong: every catch after the first resolved
         // to the FIRST catch's slot and read the first thrown value.
         for (int i = this.localNames.length - 1; i >= 0; i = i - 1) {
-            if (this.strEq(this.localNames[i], name)) {
+            if (this.localNames[i] == name) {
                 return this.localOffsets[i];
             }
         }
@@ -1357,7 +1309,7 @@ class MiniCg {
 
     public int findGlobal(string name) {
         for (int i = 0; i < this.globalNames.length; i++) {
-            if (this.strEq(this.globalNames[i], name)) {
+            if (this.globalNames[i] == name) {
                 return i;
             }
         }
@@ -1375,7 +1327,7 @@ class MiniCg {
         if (lhs.name.length == 0) { return; }
         if (this.findLocal(lhs.name) != 0) { return; }
         if (this.findGlobal(lhs.name) >= 0) { return; }
-        if (!this.strEq(this.currentClassName, "")) {
+        if (this.currentClassName != "") {
             if (this.findFieldOffset(this.currentClassName, lhs.name) >= 0) { return; }
         }
         printline(lhs.line.toString() + ":" + lhs.col.toString() + ": Undefined variable '" + lhs.name + "'");
@@ -1475,7 +1427,6 @@ class MiniCg {
         this.emitThrowException("division by zero");
         this.asm.bindLabel(ok);
     }
-
 
     public void emitIndexBoundsCheck() {
         // RAX = array pointer, RCX = index (unscaled). Throws
@@ -1598,7 +1549,7 @@ class MiniCg {
         for (int i = 0; i < this.importDlls.length; i++) {
             int gIdx = -1;
             for (int j = 0; j < uniqueDlls.length; j++) {
-                if (this.strEq(uniqueDlls[j], this.importDlls[i])) {
+                if (uniqueDlls[j] == this.importDlls[i]) {
                     gIdx = j;
                     break;
                 }
@@ -1814,13 +1765,13 @@ int strIdx = this.stringPatchIndices[i];
                 // modules (their dormant grant is harmless; calls resolve
                 // user-first, lazily).
                 string src = pi.typeHint;
-                bool srcIsWin32 = this.strEq(src, "win32");
+                bool srcIsWin32 = src == "win32";
                 if (!srcIsWin32 && src.length > 6) {
-                    if (this.strEq(projectSlice(src, 0, 6), "win32.")) { srcIsWin32 = true; }
+                    if (projectSlice(src, 0, 6) == "win32.") { srcIsWin32 = true; }
                 }
-                bool srcIsLinux = this.strEq(src, "linux");
+                bool srcIsLinux = src == "linux";
                 if (!srcIsLinux && src.length > 6) {
-                    if (this.strEq(projectSlice(src, 0, 6), "linux.")) { srcIsLinux = true; }
+                    if (projectSlice(src, 0, 6) == "linux.") { srcIsLinux = true; }
                 }
                 bool srcIsCustom = false;
                 if (!srcIsWin32 && !srcIsLinux && src.length > 0 && this.customNative.declared(src)) { srcIsCustom = true; }
@@ -2122,7 +2073,7 @@ int strIdx = this.stringPatchIndices[i];
         if (func.childCount() < 1) { return; }
         Node params = func.child(0);
         for (int ri = 0; ri < this.refCalleeNames.length; ri++) {
-            if (this.strEq(this.refCalleeNames[ri], func.name)) {
+            if (this.refCalleeNames[ri] == func.name) {
                 int idx = this.refCalleeParams[ri];
                 if (idx >= 0 && idx < params.childCount()) {
                     this.refParams.add(params.child(idx).name);
@@ -2133,7 +2084,7 @@ int strIdx = this.stringPatchIndices[i];
 
     public bool isRefParam(string name) {
         for (int ri = 0; ri < this.refParams.length; ri++) {
-            if (this.strEq(this.refParams[ri], name)) { return true; }
+            if (this.refParams[ri] == name) { return true; }
         }
         return false;
     }
@@ -2144,7 +2095,7 @@ int strIdx = this.stringPatchIndices[i];
         int off = this.asm.buf.length;
         bool existed = false;
         for (int i = 0; i < this.funcNames.length; i++) {
-            if (this.strEq(this.funcNames[i], fname) && this.funcOffsets[i] == -1) {
+            if (this.funcNames[i] == fname && this.funcOffsets[i] == -1) {
                 this.funcOffsets[i] = off;
                 existed = true;
             }
@@ -2655,7 +2606,7 @@ int strIdx = this.stringPatchIndices[i];
             // receive the default zero initializer or entry's captured RSP is
             // clobbered and cargs dereferences null. No WINDOWS global bears
             // this name, so the skip is behavior-neutral there.
-            if (this.strEq(this.globalNames[gi], "__linux_stack_top")) { continue; }
+            if (this.globalNames[gi] == "__linux_stack_top") { continue; }
             Node initExpr = this.globalInits[gi];
             if (initExpr.kind == 255) {
                 string gt = this.globalTypes[gi];
@@ -2784,7 +2735,7 @@ int strIdx = this.stringPatchIndices[i];
                 }
             } else {
                 for (int j = 0; j < this.funcNames.length; j++) {
-                    if (this.strEq(this.funcNames[j], targetName) && this.strEq(this.funcClasses[j], targetClass)) {
+                    if (this.funcNames[j] == targetName && this.funcClasses[j] == targetClass) {
                         targetOff = this.funcOffsets[j];
                     }
                 }
@@ -2801,7 +2752,7 @@ int strIdx = this.stringPatchIndices[i];
     this.currentFunctionName = func.name;
     int emitIdx = -1;
     for (int fi = 0; fi < this.funcNames.length; fi++) {
-        if (this.funcOffsets[fi] == -1 && this.strEq(this.funcNames[fi], func.name) && this.strEq(this.funcClasses[fi], className)) {
+        if (this.funcOffsets[fi] == -1 && this.funcNames[fi] == func.name && this.funcClasses[fi] == className) {
             emitIdx = fi;
             break;
         }
@@ -2833,7 +2784,7 @@ int strIdx = this.stringPatchIndices[i];
         for (int i = 0; i < params.childCount(); i++) {
             this.allocLocal(params.child(i).name);
             this.localTypes[this.localTypes.length - 1] = params.child(i).typeHint;
-            if (this.strEq(params.child(i).typeHint, "void ()")) {
+            if (params.child(i).typeHint == "void ()") {
                 // DOCS/259: an 8-byte function address, stored like an int.
                 this.fnPtrParamNames.add(params.child(i).name);
             }
@@ -2842,13 +2793,13 @@ int strIdx = this.stringPatchIndices[i];
     this.emitFunctionBody(func);
 }    public void emitFunction(Node func) {
     this.currentFunctionName = func.name;
-    if (this.strEq(func.name, "main")) {
+    if (func.name == "main") {
         this.mainLabelOffset = this.asm.buf.length;
         this.hasMain = true;
     }
     int emitIdx = -1;
     for (int fi = 0; fi < this.funcNames.length; fi++) {
-        if (this.funcOffsets[fi] == -1 && this.strEq(this.funcNames[fi], func.name)) {
+        if (this.funcOffsets[fi] == -1 && this.funcNames[fi] == func.name) {
             emitIdx = fi;
             break;
         }
@@ -2876,7 +2827,7 @@ int strIdx = this.stringPatchIndices[i];
         for (int i = 0; i < paramsFn.childCount(); i++) {
             this.allocLocal(paramsFn.child(i).name);
             this.localTypes[this.localTypes.length - 1] = paramsFn.child(i).typeHint;
-            if (this.strEq(paramsFn.child(i).typeHint, "void ()")) {
+            if (paramsFn.child(i).typeHint == "void ()") {
                 // DOCS/259: an 8-byte function address, stored like an int.
                 this.fnPtrParamNames.add(paramsFn.child(i).name);
             }
@@ -2910,14 +2861,14 @@ int strIdx = this.stringPatchIndices[i];
     public void emitFunctionBody(Node func) {
 
         int isMethod = 0;
-        if (!this.strEq(this.currentClassName, "")) {
+        if (this.currentClassName != "") {
             isMethod = 1;
         }
         string savedClass = this.currentClassName;
         int retLbl = this.newLabel();
         int exitLbl = this.newLabel();
         this.currentReturnLabel = retLbl;
-        this.currentIsMain = this.strEq(func.name, "main") && this.strEq(this.currentClassName, "");
+        this.currentIsMain = func.name == "main" && this.currentClassName == "";
         // Reserve member-call argument slots before emitting the function
         // prologue.  Calls can nest while generating expressions; keeping a
         // fixed pool avoids changing stackSize after RSP has been reserved.
@@ -3156,7 +3107,7 @@ int strIdx = this.stringPatchIndices[i];
                 // `var x = expr;` has no declared type; infer it from the
                 // initializer so `x.length` / `x.pop()` / `x.map()` dispatch
                 // to array codegen instead of an unresolvable user call.
-                if ((this.strEq(declType, "") || this.strEq(declType, "var")) && node.childCount() > 0) {
+                if ((declType == "" || declType == "var") && node.childCount() > 0) {
                     declType = this.inferExprType(node.child(0));
                 }
                 this.localTypes[this.localTypes.length - 1] = declType;
@@ -3186,7 +3137,6 @@ int strIdx = this.stringPatchIndices[i];
             this.genStmt(block.child(i));
         }
     }
-
 
     public void genProgram2(Node[] program) {
         for (int i = 0; i < program.length; i++) {
@@ -3220,7 +3170,7 @@ int strIdx = this.stringPatchIndices[i];
             for (int di = 0; di + 1 < stmt.childCount(); di = di + 1) {
                 string name = stmt.child(di).name;
                 int localOff = this.allocLocal(name);
-                if (!this.strEq(elemType, "")) {
+                if (elemType != "") {
                     this.setLocalType(name, elemType);
                 }
                 this.asm.movRMBase(0, 5, arrOff);
@@ -3254,7 +3204,7 @@ int strIdx = this.stringPatchIndices[i];
                 // HeapAlloc(HEAP_ZERO_MEMORY) runtime-sized lowering (same
                 // shape the `return new byte[n];` workaround path uses).
                 bool isDynByteNew = initNode.op == 2 && initNode.childCount() == 1;
-                if (this.strEq(stmt.typeHint, "byte[]") && initNode.kind == 19 && !isDynByteNew) {
+                if (stmt.typeHint == "byte[]" && initNode.kind == 19 && !isDynByteNew) {
                     this.genByteArrayLiteral(initNode);
                 } elif (initNode.kind == 74) {
                     this.genStructLiteral(initNode, stmt.typeHint);
@@ -3266,7 +3216,7 @@ int strIdx = this.stringPatchIndices[i];
                     this.coerceDeclToDouble(stmt.typeHint, initNode);
                 }
                 if (stmt.isLive && off != 0 && this.isLiveHeapType(stmt.typeHint)) {
-                    if (this.strEq(stmt.typeHint, "string") || this.strEq(stmt.typeHint, "string?")) {
+                    if (stmt.typeHint == "string" || stmt.typeHint == "string?") {
                         this.emitLlmaiStringDup();
                     }
                     this.asm.movMBaseR(5, 0, off);
@@ -3287,7 +3237,7 @@ int strIdx = this.stringPatchIndices[i];
                     isArrTy = true;
                 }
             }
-            bool isFnArrTy = this.strEq(localTy, "void ()[]");
+            bool isFnArrTy = localTy == "void ()[]";
             if (off != 0) {
                 if (isFnArrTy) {
                     // DOCS/259 G3: fn-typed array locals auto-allocate 8
@@ -3349,7 +3299,7 @@ int strIdx = this.stringPatchIndices[i];
             this.genGlobalStore(eaIdx);
             this.emitExceptionJump();
         } elif (stmt.kind == 59) {
-            bool hasCatch = !this.strEq(stmt.name, "");
+            bool hasCatch = stmt.name != "";
             bool hasFinally = stmt.hasFinally;
             int catchLbl = this.newLabel();
             int afterLbl = this.newLabel();
@@ -3671,7 +3621,6 @@ int strIdx = this.stringPatchIndices[i];
         this.loopStartStack = ns;
     }
 
-
     public void popLoopEnd() {
         int[] ns = [];
         for (int i = 0; i < this.loopEndStack.length - 1; i++) {
@@ -3728,7 +3677,7 @@ int strIdx = this.stringPatchIndices[i];
         // offset registered for that field.
         int fieldCnt = 0;
         for (int ci = 0; ci < this.classNames.length; ci++) {
-            if (this.typeNameEq(this.classNames[ci], typeName)) {
+            if ((this.classNames[ci] == typeName || typeName == this.classNames[ci] + "?")) {
                 fieldCnt = this.classFieldCounts[ci];
             }
         }
@@ -3754,7 +3703,7 @@ int strIdx = this.stringPatchIndices[i];
             // Nested struct literal: the field type is itself a struct, so
             // recurse with that type instead of treating `{...}` as a dict.
             string fieldType = this.findFieldType(typeName, key.name);
-            if (value.kind == 74 && this.typeNameEq(fieldType, typeName)) {
+            if (value.kind == 74 && (fieldType == typeName || typeName == fieldType + "?")) {
                 this.genStructLiteral(value, fieldType);
             } elif (value.kind == 74) {
                 this.genStructLiteral(value, fieldType);
@@ -4082,7 +4031,7 @@ int strIdx = this.stringPatchIndices[i];
         string constString = "";
         int constIdx = 0;
         for (int ci = 0; ci < this.constNames.length; ci++) {
-            if (this.strEq(this.constNames[ci], expr.name)) {
+            if (this.constNames[ci] == expr.name) {
                 constVal = this.constValues[ci];
                 if (ci < this.constStringValues.length) {
                     constString = this.constStringValues[ci];
@@ -4102,9 +4051,9 @@ int strIdx = this.stringPatchIndices[i];
             } else {
                 this.asm.emitImm64(0, constVal);
             }
-        } else if (this.strEq(expr.name, "cargs")) {
+        } else if (expr.name == "cargs") {
             this.genCargsCall(expr);
-        } elif (this.strEq(expr.name, "getCommandLine")) {
+        } elif (expr.name == "getCommandLine") {
             this.genGetCommandLineCall(expr);
         } else {
             int off = this.findLocal(expr.name);
@@ -4117,7 +4066,7 @@ int strIdx = this.stringPatchIndices[i];
                 int gi = this.findGlobal(expr.name);
                 if (gi >= 0) {
                     this.genGlobalLoad(gi);
-                } else if (!this.strEq(this.currentClassName, "")) {
+                } else if (this.currentClassName != "") {
                     // Bare class field read: `field` inside a method resolves
                     // to `this.field` (parity with silverc-rs gen_expr).  The
                     // old fallback loaded [rbp+0] - the saved frame pointer -
@@ -4366,7 +4315,7 @@ int strIdx = this.stringPatchIndices[i];
 
     public bool isFnPtrParam(string name) {
         for (int i = 0; i < this.fnPtrParamNames.length; i++) {
-            if (this.strEq(this.fnPtrParamNames[i], name)) { return true; }
+            if (this.fnPtrParamNames[i] == name) { return true; }
         }
         return false;
     }
@@ -4416,18 +4365,18 @@ int strIdx = this.stringPatchIndices[i];
     }
 
     public void genMatchPattern(Node pattern, int armBody, int nextArm, string subjType) {
-        if (pattern.kind == 0 && this.strEq(pattern.name, "_")) {
+        if (pattern.kind == 0 && pattern.name == "_") {
             // Wildcard: always matches.
-        } elif (pattern.kind == 0 && !this.strEq(pattern.name, "")) {
+        } elif (pattern.kind == 0 && pattern.name != "") {
             // Binding pattern: always matches; the subject becomes a fresh
             // local visible to the arm's guard and body.
             int off = this.allocLocal(pattern.name);
             this.asm.movRR64(1, 0);
             this.asm.movMBaseR(5, 1, off);
-            if (!this.strEq(subjType, "")) {
+            if (subjType != "") {
                 this.setLocalType(pattern.name, subjType);
             }
-        } elif (pattern.kind == 0 && this.strEq(pattern.name, "")) {
+        } elif (pattern.kind == 0 && pattern.name == "") {
             // Integer literal: match when the subject equals it.
             this.asm.cmpRI32(0, pattern.intVal);
             this.asm.jeLabel(armBody);
@@ -4469,7 +4418,7 @@ int strIdx = this.stringPatchIndices[i];
             bool foundEnum = false;
             int enumVal = 0;
             for (int ci = 0; ci < this.constNames.length; ci++) {
-                if (this.strEq(this.constNames[ci], pattern.name)) {
+                if (this.constNames[ci] == pattern.name) {
                     if (ci < this.constIsString.length && this.constIsString[ci] == 0) {
                         enumVal = this.constValues[ci];
                         foundEnum = true;
@@ -4508,17 +4457,17 @@ int strIdx = this.stringPatchIndices[i];
     }
 
     public void genMatchTuplePattern(Node pattern, int elemLbl, int nextArm, string subjType) {
-        if (pattern.kind == 0 && this.strEq(pattern.name, "_")) {
+        if (pattern.kind == 0 && pattern.name == "_") {
             // Wildcard element: always matches.
-        } elif (pattern.kind == 0 && !this.strEq(pattern.name, "")) {
+        } elif (pattern.kind == 0 && pattern.name != "") {
             // Binding pattern: store the element value into a fresh local.
             int off = this.allocLocal(pattern.name);
             this.asm.movRR64(1, 0);
             this.asm.movMBaseR(5, 1, off);
-            if (!this.strEq(subjType, "")) {
+            if (subjType != "") {
                 this.setLocalType(pattern.name, subjType);
             }
-        } elif (pattern.kind == 0 && this.strEq(pattern.name, "")) {
+        } elif (pattern.kind == 0 && pattern.name == "") {
             // Integer literal: match when elem equals it.
             this.asm.cmpRI32(0, pattern.intVal);
             this.asm.jneLabel(nextArm);
@@ -4533,10 +4482,10 @@ int strIdx = this.stringPatchIndices[i];
         string fieldName = expr.name;
         if (obj.kind == 6) {
             for (int ei = 0; ei < this.enumNames.length; ei++) {
-                if (this.strEq(this.enumNames[ei], obj.name)) {
+                if (this.enumNames[ei] == obj.name) {
                     string fullName = obj.name + "." + fieldName;
                     for (int ci = 0; ci < this.constNames.length; ci++) {
-                        if (this.strEq(this.constNames[ci], fullName)) {
+                        if (this.constNames[ci] == fullName) {
                             this.asm.emitImm64(0, this.constValues[ci]);
                             return;
                         }
@@ -4551,15 +4500,15 @@ int strIdx = this.stringPatchIndices[i];
         // UNKNOWN=3) exactly as the collected enum would evaluate. MACOS is
         // kept as a deprecated alias for 2 (pre-rename sources); new MAC code
         // uses DARWIN only (MAC.md 1b, unit F).
-        if (obj.kind == 6 && this.strEq(obj.name, "OSTypes")) {
-            if (this.strEq(fieldName, "WINDOWS")) { this.asm.emitImm64(0, 0); return; }
-            if (this.strEq(fieldName, "LINUX")) { this.asm.emitImm64(0, 1); return; }
-            if (this.strEq(fieldName, "DARWIN")) { this.asm.emitImm64(0, 2); return; }
-            if (this.strEq(fieldName, "MACOS")) { this.asm.emitImm64(0, 2); return; }
-            if (this.strEq(fieldName, "UNKNOWN")) { this.asm.emitImm64(0, 3); return; }
+        if (obj.kind == 6 && obj.name == "OSTypes") {
+            if (fieldName == "WINDOWS") { this.asm.emitImm64(0, 0); return; }
+            if (fieldName == "LINUX") { this.asm.emitImm64(0, 1); return; }
+            if (fieldName == "DARWIN") { this.asm.emitImm64(0, 2); return; }
+            if (fieldName == "MACOS") { this.asm.emitImm64(0, 2); return; }
+            if (fieldName == "UNKNOWN") { this.asm.emitImm64(0, 3); return; }
         }
         // os.name / os.version / os.build - builtin OS detection fields
-        if (obj.kind == 6 && this.strEq(obj.name, "console") && this.strEq(fieldName, "title")) {
+        if (obj.kind == 6 && obj.name == "console" && fieldName == "title") {
             // The self-hosted backend uses the documented empty fallback for
             // title reads on hosts where a native title query is unavailable.
             this.emitLlmaiStringLiteral("");
@@ -4568,28 +4517,28 @@ int strIdx = this.stringPatchIndices[i];
         // OVERHAUL.md threading module: `threads.length` is the effective
         // thread count used for this compilation (total - 2 by default or the
         // explicit --threads N), embedded as an immediate at compile time.
-        if (obj.kind == 6 && this.strEq(obj.name, "threads") && this.strEq(fieldName, "length")
+        if (obj.kind == 6 && obj.name == "threads" && fieldName == "length"
             && this.getLocalType("threads").length == 0 && this.findGlobal("threads") < 0) {
             this.asm.emitImm64(0, this.threadCount);
             return;
         }
-        if (obj.kind == 6 && this.strEq(obj.name, "os")) {
-            if (this.strEq(fieldName, "name")) {
+        if (obj.kind == 6 && obj.name == "os") {
+            if (fieldName == "name") {
                 this.emitLlmaiStringLiteral("windows");
                 return;
             }
-            if (this.strEq(fieldName, "version")) {
+            if (fieldName == "version") {
                 this.genOsVersionCall();
                 return;
             }
-            if (this.strEq(fieldName, "build")) {
+            if (fieldName == "build") {
                 this.genOsBuildCall();
                 return;
             }
         }
-        if (this.strEq(fieldName, "length")) {
+        if (fieldName == "length") {
             string objType = this.inferExprType(obj);
-            if (this.strEq(objType, "string")) {
+            if (objType == "string") {
                 // Use the same aligned imported strlen path as the explicit
                 // strlen() builtin.  Keeping this out of the hand-written
                 // byte loop avoids a stage-sensitive movzx lowering issue in
@@ -4609,7 +4558,7 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.movRMBase(0, 0, -8);
             return;
         }
-        if (obj.kind == 6 && this.strEq(obj.name, "this")) {
+        if (obj.kind == 6 && obj.name == "this") {
             int thisOff = this.findLocal("this");
             int fieldOff = this.findFieldOffset(this.currentClassName, fieldName);
             if (fieldOff < 0) { return; }
@@ -4618,7 +4567,7 @@ int strIdx = this.stringPatchIndices[i];
             return;
 
         }
-        if (obj.kind == 6 && this.strEq(obj.name, "this") && !this.strEq(this.currentClassName, "")) {
+        if (obj.kind == 6 && obj.name == "this" && this.currentClassName != "") {
             int thisOff = this.findLocal("this");
             int fieldOff = this.findFieldOffset(this.currentClassName, fieldName);
             if (fieldOff < 0) { return; }
@@ -4628,24 +4577,24 @@ int strIdx = this.stringPatchIndices[i];
         }
         if (obj.kind == 6) {
             string varType = this.getLocalType(obj.name);
-            if (this.strEq(varType, "tuple")) {
+            if (varType == "tuple") {
                 int tupleField = -1;
-                if (this.strEq(fieldName, "0")) { tupleField = 0; }
-                elif (this.strEq(fieldName, "1")) { tupleField = 1; }
-                elif (this.strEq(fieldName, "2")) { tupleField = 2; }
-                elif (this.strEq(fieldName, "3")) { tupleField = 3; }
-                elif (this.strEq(fieldName, "4")) { tupleField = 4; }
+                if (fieldName == "0") { tupleField = 0; }
+                elif (fieldName == "1") { tupleField = 1; }
+                elif (fieldName == "2") { tupleField = 2; }
+                elif (fieldName == "3") { tupleField = 3; }
+                elif (fieldName == "4") { tupleField = 4; }
                 if (tupleField >= 0) {
                     this.genExpr(obj);
                     this.asm.movRMBase(0, 0, tupleField * 8);
                     return;
                 }
             }
-            if (!this.strEq(varType, "")) {
+            if (varType != "") {
                 this.genExpr(obj);
                 string elemType = this.arrayElementType(varType);
                 string lookupType = varType;
-                if (!this.strEq(elemType, "")) { lookupType = elemType; }
+                if (elemType != "") { lookupType = elemType; }
                 int fieldOff = this.findFieldOffset(lookupType, fieldName);
                 if (fieldOff < 0) {
                     // A self-hosted compiler can temporarily lose the class
@@ -4665,8 +4614,8 @@ int strIdx = this.stringPatchIndices[i];
             string arrType = this.inferExprType(arrNode);
             this.genArrayIndex(obj);
             string elemType = this.inferExprType(obj);
-            if (this.strEq(elemType, "")) { elemType = this.arrayElementType(arrType); }
-            if (!this.strEq(elemType, "")) {
+            if (elemType == "") { elemType = this.arrayElementType(arrType); }
+            if (elemType != "") {
                 int fieldOff = this.findFieldOffset(elemType, fieldName);
                 if (fieldOff >= 0) {
                     this.asm.movRMBase(0, 0, fieldOff);
@@ -4770,9 +4719,9 @@ int strIdx = this.stringPatchIndices[i];
         }
 
         if (expr.kind == 6) {
-            if (this.strEq(expr.name, "this")) { return this.currentClassName; }
+            if (expr.name == "this") { return this.currentClassName; }
             for (int ci = 0; ci < this.constNames.length; ci++) {
-                if (this.strEq(this.constNames[ci], expr.name)) {
+                if (this.constNames[ci] == expr.name) {
                     if (ci < this.constIsString.length && this.constIsString[ci] == 1) {
                         return "string";
                     }
@@ -4780,24 +4729,24 @@ int strIdx = this.stringPatchIndices[i];
                 }
             }
             string localType = this.getLocalType(expr.name);
-            if (!this.strEq(localType, "")) { return localType; }
+            if (localType != "") { return localType; }
             // Bare class field: `field` inside a method resolves to
             // this.field (parity with silverc-rs infer_struct_type).
-            if (!this.strEq(this.currentClassName, "")) {
+            if (this.currentClassName != "") {
                 string fieldType = this.findFieldType(this.currentClassName, expr.name);
-                if (!this.strEq(fieldType, "")) { return fieldType; }
+                if (fieldType != "") { return fieldType; }
             }
             return "";
         }
         if (expr.kind == 13) {
-            if (this.strEq(expr.name, "length")) { return "int"; }
+            if (expr.name == "length") { return "int"; }
             return this.inferMemberAccessType(expr);
         }
         if (expr.kind == 24) {
             Node arrNode = expr.child(0);
             string arrType = this.inferExprType(arrNode);
             if (this.isDictType(arrType)) { return this.dictValueType(arrType); }
-            if (this.strEq(arrType, "string")) { return "char"; }
+            if (arrType == "string") { return "char"; }
             return this.arrayElementType(arrType);
         }
         // UNIFIED_CORE_LIBRARY.md §4 rule 6: a free CALL node whose name is
@@ -4825,12 +4774,12 @@ int strIdx = this.stringPatchIndices[i];
                 string dotted = this.dottedNewClassName(cname);
                 if (dotted.length > 0 && this.isClassName(dotted)) { return dotted; }
                 for (int ci = 0; ci < this.classNames.length; ci++) {
-                    if (this.strEq(this.classNames[ci], cname)) {
+                    if (this.classNames[ci] == cname) {
                         return cname;
                     }
                 }
             }
-            if (!expr.isMember && this.strEq(cname, "char")) { return "char"; }
+            if (!expr.isMember && cname == "char") { return "char"; }
             string recvType = "";
             if (expr.isMember && expr.childCount() > 0) {
                 recvType = this.inferExprType(expr.child(0));
@@ -4838,115 +4787,115 @@ int strIdx = this.stringPatchIndices[i];
                 // value as a string.  Without this, `env.get(k) == "v"`
                 // inferred an unknown type and lowered to pointer comparison
                 // instead of strcmp, so the comparison was always false.
-                if (this.strEq(expr.child(0).name, "env") && (this.strEq(cname, "get") || this.strEq(cname, "getenv") || this.strEq(cname, "getEnv"))) {
+                if (expr.child(0).name == "env" && (cname == "get" || cname == "getenv" || cname == "getEnv")) {
                     return "string";
                 }
-                if (this.strEq(expr.child(0).name, "url") && (this.strEq(cname, "isUrl") || this.strEq(cname, "isFtp") || this.strEq(cname, "isFtps"))) {
+                if (expr.child(0).name == "url" && (cname == "isUrl" || cname == "isFtp" || cname == "isFtps")) {
                     return "bool";
                 }
-                if ((this.strEq(expr.child(0).name, "fs") || this.strEq(expr.child(0).name, "file") || this.strEq(expr.child(0).name, "folder")) && (this.strEq(cname, "isDir") || this.strEq(cname, "isFile") || this.strEq(cname, "isDriveRoot") || this.strEq(cname, "exists"))) {
+                if ((expr.child(0).name == "fs" || expr.child(0).name == "file" || expr.child(0).name == "folder") && (cname == "isDir" || cname == "isFile" || cname == "isDriveRoot" || cname == "exists")) {
                     return "bool";
                 }
-                if ((this.strEq(expr.child(0).name, "fs") || this.strEq(expr.child(0).name, "file") || this.strEq(expr.child(0).name, "folder")) && this.strEq(cname, "getSize")) {
+                if ((expr.child(0).name == "fs" || expr.child(0).name == "file" || expr.child(0).name == "folder") && cname == "getSize") {
                     return "int64";
                 }
-                if ((this.strEq(expr.child(0).name, "fs") || this.strEq(expr.child(0).name, "folder")) && (this.strEq(cname, "getEntries") || this.strEq(cname, "entries") || this.strEq(cname, "list") || this.strEq(cname, "getFiles") || this.strEq(cname, "files") || this.strEq(cname, "getFolders") || this.strEq(cname, "folders"))) {
+                if ((expr.child(0).name == "fs" || expr.child(0).name == "folder") && (cname == "getEntries" || cname == "entries" || cname == "list" || cname == "getFiles" || cname == "files" || cname == "getFolders" || cname == "folders")) {
                     return "string[]";
                 }
-                if (this.strEq(cname, "toInt64") || this.strEq(cname, "toInt") || this.strEq(cname, "toNumber")) { return "int64"; }
-                if ((this.strEq(cname, "toFloat") || this.strEq(cname, "toFloat64")) && (this.strEq(recvType, "float") || this.strEq(recvType, "float64") || this.strEq(recvType, "double") || this.strEq(recvType, "int") || this.strEq(recvType, "int32") || this.strEq(recvType, "int64") || this.strEq(recvType, "uint") || this.strEq(recvType, "bool") || this.strEq(recvType, "char"))) { return "float64"; }
-                if (this.strEq(cname, "toString") && (this.strEq(recvType, "string") || this.strEq(recvType, "char") || this.strEq(recvType, "int") || this.strEq(recvType, "int32") || this.strEq(recvType, "int64") || this.strEq(recvType, "uint") || this.strEq(recvType, "bool") || this.strEq(recvType, "float64"))) {
+                if (cname == "toInt64" || cname == "toInt" || cname == "toNumber") { return "int64"; }
+                if ((cname == "toFloat" || cname == "toFloat64") && (recvType == "float" || recvType == "float64" || recvType == "double" || recvType == "int" || recvType == "int32" || recvType == "int64" || recvType == "uint" || recvType == "bool" || recvType == "char")) { return "float64"; }
+                if (cname == "toString" && (recvType == "string" || recvType == "char" || recvType == "int" || recvType == "int32" || recvType == "int64" || recvType == "uint" || recvType == "bool" || recvType == "float64")) {
                     return "string";
                 }
-                if ((this.strEq(cname, "trim") || this.strEq(cname, "trimEnd") || this.strEq(cname, "trimStart") || this.strEq(cname, "trimLeft") || this.strEq(cname, "trimRight")) && this.strEq(recvType, "string")) {
+                if ((cname == "trim" || cname == "trimEnd" || cname == "trimStart" || cname == "trimLeft" || cname == "trimRight") && recvType == "string") {
                     return "string";
                 }
-                if (this.strEq(cname, "startsWith") && this.strEq(recvType, "string")) {
+                if (cname == "startsWith" && recvType == "string") {
                     return "bool";
                 }
-                if ((this.strEq(cname, "split") || this.strEq(cname, "lines")) && this.strEq(recvType, "string")) {
+                if ((cname == "split" || cname == "lines") && recvType == "string") {
                     return "string[]";
                 }
-                if (this.strEq(cname, "isWhiteSpace") && this.strEq(recvType, "char")) {
+                if (cname == "isWhiteSpace" && recvType == "char") {
                     return "bool";
                 }
-                if (this.strEq(cname, "contains") && this.strEq(recvType, "string")) {
+                if (cname == "contains" && recvType == "string") {
                     return "bool";
                 }
-                if ((this.strEq(cname, "indexOf") || this.strEq(cname, "find")) && this.strEq(recvType, "string")) {
+                if ((cname == "indexOf" || cname == "find") && recvType == "string") {
                     return "int";
                 }
-                if ((this.strEq(cname, "toLower") || this.strEq(cname, "lower")) && this.strEq(recvType, "string")) {
+                if ((cname == "toLower" || cname == "lower") && recvType == "string") {
                     return "string";
                 }
-                if ((this.strEq(cname, "toUpper") || this.strEq(cname, "upper")) && this.strEq(recvType, "string")) {
+                if ((cname == "toUpper" || cname == "upper") && recvType == "string") {
                     return "string";
                 }
-                if ((this.strEq(cname, "substr") || this.strEq(cname, "substring")) && this.strEq(recvType, "string")) {
+                if ((cname == "substr" || cname == "substring") && recvType == "string") {
                     return "string";
                 }
-                if (this.strEq(cname, "length") && this.strEq(recvType, "string")) {
+                if (cname == "length" && recvType == "string") {
                     return "int";
                 }
-                if (this.strEq(cname, "toBytes") && this.strEq(recvType, "string")) {
+                if (cname == "toBytes" && recvType == "string") {
                     return "byte[]";
                 }
-                if (this.strEq(cname, "stringify") && expr.child(0).kind == 6 && this.strEq(expr.child(0).name, "json")) {
+                if (cname == "stringify" && expr.child(0).kind == 6 && expr.child(0).name == "json") {
                     return "string";
                 }
-                if (this.strEq(cname, "endsWith") && this.strEq(recvType, "string")) {
+                if (cname == "endsWith" && recvType == "string") {
                     return "bool";
                 }
-                if (this.strEq(cname, "replace") && this.strEq(recvType, "string")) { return "string"; }
-                if (this.strEq(cname, "join") && expr.childCount() > 0 && expr.child(0).kind == 6 && this.strEq(expr.child(0).name, "string")) { return "string"; }
-                if (this.strEq(cname, "any") || this.strEq(cname, "all")) {
+                if (cname == "replace" && recvType == "string") { return "string"; }
+                if (cname == "join" && expr.childCount() > 0 && expr.child(0).kind == 6 && expr.child(0).name == "string") { return "string"; }
+                if (cname == "any" || cname == "all") {
 
                     if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
                         return "bool";
                     }
                 }
-                if (this.strEq(cname, "some") || this.strEq(cname, "every")) {
+                if (cname == "some" || cname == "every") {
                     if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
                         return "bool";
                     }
                 }
-                if (this.strEq(cname, "map") || this.strEq(cname, "forEach") || this.strEq(cname, "filter")) {
+                if (cname == "map" || cname == "forEach" || cname == "filter") {
                     if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
                         return recvType;
                     }
                 }
-                if (this.strEq(cname, "reduce") || this.strEq(cname, "find")) {
+                if (cname == "reduce" || cname == "find") {
                     if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
                         return this.arrayElementType(recvType);
                     }
                 }
-                if (this.strEq(cname, "reverse")) {
+                if (cname == "reverse") {
                     if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
                         return recvType;
                     }
                 }
-                if (this.strEq(cname, "join")) {
+                if (cname == "join") {
                     if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
                         return "string";
                     }
                 }
-                if ((this.strEq(cname, "pad") || this.strEq(cname, "padLeft") || this.strEq(cname, "padRight") || this.strEq(cname, "slugify")) && this.strEq(recvType, "string")) {
+                if ((cname == "pad" || cname == "padLeft" || cname == "padRight" || cname == "slugify") && recvType == "string") {
 
                     return "string";
                 }
             }
             string cls = recvType;
-            if (expr.isMember && expr.childCount() > 0 && this.strEq(cls, "")) {
+            if (expr.isMember && expr.childCount() > 0 && cls == "") {
                 Node recv = expr.child(0);
                 cls = this.inferExprType(recv);
             }
             for (int i = 0; i < this.funcNames.length; i++) {
-                if (this.strEq(this.funcNames[i], cname) && this.typeNameEq(this.funcClasses[i], cls)) {
+                if (this.funcNames[i] == cname && (this.funcClasses[i] == cls || cls == this.funcClasses[i] + "?")) {
                     return this.funcRetTypes[i];
                 }
             }
             for (int i = 0; i < this.funcNames.length; i++) {
-                if (this.strEq(this.funcNames[i], cname)) {
+                if (this.funcNames[i] == cname) {
                     return this.funcRetTypes[i];
                 }
             }
@@ -4955,24 +4904,24 @@ int strIdx = this.stringPatchIndices[i];
             // the 32-bit DLL return is widened to int64 via movsxd, so the
             // caller must not treat the result as string-shaped.
             if (this.win32CallResolves(cname) || this.linuxCallResolves(cname) || this.macCallResolves(cname)) { return "int"; }
-            if (this.strEq(cname, "readString") || this.strEq(cname, "readFile") || this.strEq(cname, "input") || this.strEq(cname, "readLine")) { return "string"; }
-            if (this.strEq(cname, "strlen") || this.strEq(cname, "len")) { return "int"; }
-            if (this.strEq(cname, "getenv")) { return "string"; }
-            if (this.strEq(cname, "getExt") || this.strEq(cname, "getExtension")) { return "string"; }
-            if (this.strEq(cname, "cargs")) { return "string[]"; }
-            if (this.strEq(cname, "findFieldType")) { return "string"; }
-            if (this.strEq(cname, "findFieldOffset")) { return "int"; }
+            if (cname == "readString" || cname == "readFile" || cname == "input" || cname == "readLine") { return "string"; }
+            if (cname == "strlen" || cname == "len") { return "int"; }
+            if (cname == "getenv") { return "string"; }
+            if (cname == "getExt" || cname == "getExtension") { return "string"; }
+            if (cname == "cargs") { return "string[]"; }
+            if (cname == "findFieldType") { return "string"; }
+            if (cname == "findFieldOffset") { return "int"; }
             return "";
         }
         if (expr.kind == 7) {
             if (expr.op == 1) {
                 string lt = this.inferExprType(expr.child(0));
                 string rt = this.inferExprType(expr.child(1));
-                if (this.strEq(lt, "string") || this.strEq(rt, "string")) {
+                if (lt == "string" || rt == "string") {
                     return "string";
                 }
-                if (this.strEq(lt, "float") || this.strEq(lt, "float64") || this.strEq(lt, "double")
-                    || this.strEq(rt, "float") || this.strEq(rt, "float64") || this.strEq(rt, "double")) {
+                if (lt == "float" || lt == "float64" || lt == "double"
+                    || rt == "float" || rt == "float64" || rt == "double") {
                     return "float64";
                 }
                 return "int";
@@ -4980,8 +4929,8 @@ int strIdx = this.stringPatchIndices[i];
             if (expr.op >= 2 && expr.op <= 4) {
                 string lt = this.inferExprType(expr.child(0));
                 string rt = this.inferExprType(expr.child(1));
-                if (this.strEq(lt, "float") || this.strEq(lt, "float64") || this.strEq(lt, "double")
-                    || this.strEq(rt, "float") || this.strEq(rt, "float64") || this.strEq(rt, "double")) {
+                if (lt == "float" || lt == "float64" || lt == "double"
+                    || rt == "float" || rt == "float64" || rt == "double") {
                     return "float64";
                 }
             }
@@ -5001,7 +4950,7 @@ int strIdx = this.stringPatchIndices[i];
         Node obj = expr.child(0);
         string fieldName = expr.name;
         // os.name / os.version / os.build → string
-        if (obj.kind == 6 && this.strEq(obj.name, "os")) { return "string"; }
+        if (obj.kind == 6 && obj.name == "os") { return "string"; }
         string objType = this.inferExprType(obj);
         string fieldType = this.findFieldType(objType, fieldName);
         return fieldType;
@@ -5009,11 +4958,11 @@ int strIdx = this.stringPatchIndices[i];
 
     public int findFieldOffsetInAllClasses(string fieldName) {
         for (int i = 0; i < this.classFieldNames.length; i++) {
-            if (this.strEq(this.classFieldNames[i], fieldName)) {
+            if (this.classFieldNames[i] == fieldName) {
                 int off = this.classFieldOffsets[i];
                 int unique = 1;
                 for (int j = 0; j < this.classFieldNames.length; j++) {
-                    if (j != i && this.strEq(this.classFieldNames[j], fieldName)) {
+                    if (j != i && this.classFieldNames[j] == fieldName) {
                         unique = 0;
                     }
                 }
@@ -5037,7 +4986,7 @@ int strIdx = this.stringPatchIndices[i];
         // index expression and is not stable in later self-hosted stages.
         if (arrNode.kind == 13) {
             Node arrObj = arrNode.child(0);
-            if (arrObj.kind == 6 && this.strEq(arrObj.name, "this")) {
+            if (arrObj.kind == 6 && arrObj.name == "this") {
 
                 int thisOff = this.findLocal("this");
                 int fieldOff = this.findFieldOffset(this.currentClassName, arrNode.name);
@@ -5047,13 +4996,13 @@ int strIdx = this.stringPatchIndices[i];
                     this.asm.movRMBase(0, 0, fieldOff);
                     this.asm.pushR64(0);
                     this.genExpr(idxNode);
-                    if (!this.strEq(fieldType, "string")) {
+                    if (fieldType != "string") {
                         this.asm.shlR64Imm(0, 3);
                     }
                     this.asm.movRR64(11, 0);
                     this.asm.popR64(0);
                     this.asm.addRR64(0, 11);
-                    if (this.strEq(fieldType, "string")) {
+                    if (fieldType == "string") {
                         this.asm.movzxByteMBase(0, 0, 0);
                     } else {
                         this.asm.movRMBase(0, 0, 0);
@@ -5074,13 +5023,13 @@ int strIdx = this.stringPatchIndices[i];
                     this.asm.movRMBase(0, 0, fieldOff);
                     this.asm.pushR64(0);
                     this.genExpr(idxNode);
-                    if (!this.strEq(fieldType, "string")) {
+                    if (fieldType != "string") {
                         this.asm.shlR64Imm(0, 3);
                     }
                     this.asm.movRR64(11, 0);
                     this.asm.popR64(0);
                     this.asm.addRR64(0, 11);
-                    if (this.strEq(fieldType, "string")) {
+                    if (fieldType == "string") {
                         this.asm.movzxByteMBase(0, 0, 0);
                     } else {
                         this.asm.movRMBase(0, 0, 0);
@@ -5150,7 +5099,7 @@ int strIdx = this.stringPatchIndices[i];
         // [capacity, length, ...] allocation.  Returns the data pointer.
         Node baseNode = expr.child(0);
         string baseType = this.inferExprType(baseNode);
-        bool isStr = this.strEq(baseType, "string");
+        bool isStr = baseType == "string";
         bool isByteArr = false;
         if (!isStr) { isByteArr = this.isByteElemType(baseType); }
 
@@ -5333,7 +5282,7 @@ int strIdx = this.stringPatchIndices[i];
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
         string elemType = this.arrayElementType(arrType);
-        bool stringElements = this.strEq(elemType, "string");
+        bool stringElements = elemType == "string";
         int arrOff = this.allocLocal("__arr_all_arr");
         int targetOff = this.allocLocal("__arr_all_target");
         int lenOff = this.allocLocal("__arr_all_len");
@@ -5580,15 +5529,15 @@ int strIdx = this.stringPatchIndices[i];
     }
 
     public bool isHofMethod(string name) {
-        if (this.strEq(name, "map")) { return true; }
-        if (this.strEq(name, "filter")) { return true; }
-        if (this.strEq(name, "reduce")) { return true; }
-        if (this.strEq(name, "forEach")) { return true; }
-        if (this.strEq(name, "every")) { return true; }
-        if (this.strEq(name, "some")) { return true; }
-        if (this.strEq(name, "all")) { return true; }
-        if (this.strEq(name, "any")) { return true; }
-        if (this.strEq(name, "find")) { return true; }
+        if (name == "map") { return true; }
+        if (name == "filter") { return true; }
+        if (name == "reduce") { return true; }
+        if (name == "forEach") { return true; }
+        if (name == "every") { return true; }
+        if (name == "some") { return true; }
+        if (name == "all") { return true; }
+        if (name == "any") { return true; }
+        if (name == "find") { return true; }
         return false;
     }
 
@@ -5613,7 +5562,7 @@ int strIdx = this.stringPatchIndices[i];
             string pn = lam.child(pi).name;
             int po = this.allocLocal(pn);
             offs.add(po);
-            if (pi == 0 && !this.strEq(elemType, "")) {
+            if (pi == 0 && elemType != "") {
                 this.setLocalType(pn, elemType);
             }
         }
@@ -5833,7 +5782,7 @@ int strIdx = this.stringPatchIndices[i];
         int[] paramOffs = this.allocLambdaParams(lam, elemType);
         Node body = lam.child(lam.childCount() - 1);
         for (int pi = 0; pi < count; pi++) {
-            if (pi == 1 && !this.strEq(elemType, "")) {
+            if (pi == 1 && elemType != "") {
                 this.setLocalType(lam.child(pi).name, elemType);
             }
         }
@@ -6048,7 +5997,7 @@ int strIdx = this.stringPatchIndices[i];
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
         string elemType = this.arrayElementType(arrType);
-        bool stringElements = this.strEq(elemType, "string");
+        bool stringElements = elemType == "string";
         int arrOff = this.allocLocal("__index_arr");
         int needleOff = this.allocLocal("__index_needle");
         int lenOff = this.allocLocal("__index_len");
@@ -6107,7 +6056,7 @@ int strIdx = this.stringPatchIndices[i];
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
         string elemType = this.arrayElementType(arrType);
-        bool stringElements = this.strEq(elemType, "string");
+        bool stringElements = elemType == "string";
         int arrOff = this.allocLocal("__sort_arr");
         int lenOff = this.allocLocal("__sort_len");
         int iOff = this.allocLocal("__sort_i");
@@ -6211,7 +6160,7 @@ int strIdx = this.stringPatchIndices[i];
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
         string elemType = this.arrayElementType(arrType);
-        bool stringElements = this.strEq(elemType, "string");
+        bool stringElements = elemType == "string";
         int arrOff = this.allocLocal("__arr_unique_arr");
         int lenOff = this.allocLocal("__arr_unique_len");
         int outOff = this.allocLocal("__arr_unique_out");
@@ -6496,7 +6445,7 @@ int strIdx = this.stringPatchIndices[i];
             }
         } elif (arrNode.kind == 13) {
             Node arrObj = arrNode.child(0);
-            if (arrObj.kind == 6 && this.strEq(arrObj.name, "this")) {
+            if (arrObj.kind == 6 && arrObj.name == "this") {
                 int thisOff2 = this.findLocal("this");
                 int fieldOff2 = this.findFieldOffset(this.currentClassName, arrNode.name);
                 if (fieldOff2 >= 0 && thisOff2 != 0) {
@@ -6585,7 +6534,7 @@ int strIdx = this.stringPatchIndices[i];
             }
         } elif (arrNode.kind == 13) {
             Node arrObj2 = arrNode.child(0);
-            if (arrObj2.kind == 6 && this.strEq(arrObj2.name, "this")) {
+            if (arrObj2.kind == 6 && arrObj2.name == "this") {
                 int thisOff3 = this.findLocal("this");
                 int fieldOff3 = this.findFieldOffset(this.currentClassName, arrNode.name);
                 if (fieldOff3 >= 0 && thisOff3 != 0) {
@@ -6645,7 +6594,7 @@ int strIdx = this.stringPatchIndices[i];
         // member field slot so later field reads see the appended element.
         if (arrNode.kind == 13) {
             Node arrObj3 = arrNode.child(0);
-            if (arrObj3.kind == 6 && this.strEq(arrObj3.name, "this")) {
+            if (arrObj3.kind == 6 && arrObj3.name == "this") {
                 int thisOff4 = this.findLocal("this");
                 int fieldOff6 = this.findFieldOffset(this.currentClassName, arrNode.name);
                 if (fieldOff6 >= 0 && thisOff4 != 0) {
@@ -6678,7 +6627,7 @@ int strIdx = this.stringPatchIndices[i];
         if (this.findLocal(name) != 0) { return true; }
         if (this.findGlobal(name) >= 0) { return true; }
         for (int i = 0; i < this.classNames.length; i++) {
-            if (this.strEq(this.classNames[i], name)) { return true; }
+            if (this.classNames[i] == name) { return true; }
         }
         return false;
     }
@@ -6694,17 +6643,17 @@ int strIdx = this.stringPatchIndices[i];
         Node recv = call.child(0);
         if (recv.kind != 6) { return false; }
         if (this.isUserSymbol(recv.name)) { return false; }
-        if (this.strEq(recv.name, "fs")) { return true; }
-        if (this.strEq(recv.name, "env")) { return true; }
-        if (this.strEq(recv.name, "file")) { return true; }
-        if (this.strEq(recv.name, "folder")) { return true; }
-        if (this.strEq(recv.name, "json")) { return true; }
-        if (this.strEq(recv.name, "yaml")) { return true; }
-        if (this.strEq(recv.name, "llmai") || this.strEq(recv.name, "LLMAI")) { return true; }
-        if (this.strEq(recv.name, "Value")) { return true; }
+        if (recv.name == "fs") { return true; }
+        if (recv.name == "env") { return true; }
+        if (recv.name == "file") { return true; }
+        if (recv.name == "folder") { return true; }
+        if (recv.name == "json") { return true; }
+        if (recv.name == "yaml") { return true; }
+        if (recv.name == "llmai" || recv.name == "LLMAI") { return true; }
+        if (recv.name == "Value") { return true; }
 
-        if (this.strEq(recv.name, "os")) { return true; }
-        if (this.strEq(recv.name, "url")) { return true; }
+        if (recv.name == "os") { return true; }
+        if (recv.name == "url") { return true; }
         return false;
     }
 
@@ -6722,7 +6671,7 @@ int strIdx = this.stringPatchIndices[i];
         // DOCS/259 G2: invoking a fn-typed LOCAL (`void () cb; cb = ...; cb();`)
         // — same 8-byte address slot contract as fn-typed parameters.  The
         // local's declared type distinguishes it from an unknown bare call.
-        if (!call.isMember && call.childCount() == 0 && this.strEq(this.getLocalType(name), "void ()")) {
+        if (!call.isMember && call.childCount() == 0 && this.getLocalType(name) == "void ()") {
             this.genFnPtrCall(name);
             return;
         }
@@ -6743,7 +6692,7 @@ int strIdx = this.stringPatchIndices[i];
         }
         int isClass = 0;
         for (int i = 0; i < this.classNames.length; i++) {
-            if (this.strEq(this.classNames[i], name)) { isClass = 1; }
+            if (this.classNames[i] == name) { isClass = 1; }
         }
         bool builtinName = (!call.isMember || this.isBuiltinModuleReceiver(call));
         // A receiver that names a user-declared symbol is never a stdlib
@@ -6754,11 +6703,11 @@ int strIdx = this.stringPatchIndices[i];
         if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6) {
             recvIsUserSymbol = this.isUserSymbol(call.child(0).name);
         }
-        if ((this.strEq(name, "__binaryMetadataStatus") || this.strEq(name, "__binaryMetadataStatusNative")) && !call.isMember) {
+        if ((name == "__binaryMetadataStatus" || name == "__binaryMetadataStatusNative") && !call.isMember) {
             this.genBinaryMetadataStatus(call);
-        } elif ((this.strEq(name, "__binaryMetadataField") || this.strEq(name, "__binaryMetadataFieldNative")) && !call.isMember) {
+        } elif ((name == "__binaryMetadataField" || name == "__binaryMetadataFieldNative") && !call.isMember) {
             this.genBinaryMetadataField(call);
-        } elif (this.strEq(name, "byte") && !call.isMember) {
+        } elif (name == "byte" && !call.isMember) {
             // Explicit checked conversion to the unsigned byte range.
             if (call.childCount() > 0) {
                 this.genExpr(call.child(0));
@@ -6775,7 +6724,7 @@ int strIdx = this.stringPatchIndices[i];
             } else {
                 this.asm.xorRR64(0, 0);
             }
-        } elif (builtinName && (this.strEq(name, "int") || this.strEq(name, "int64") || this.strEq(name, "int32")) && !call.isMember) {
+        } elif (builtinName && (name == "int" || name == "int64" || name == "int32") && !call.isMember) {
             // int(...) / int64(...) / int32(...) conversion: strings parse via
             // strtoll, floats truncate toward zero (cvttsd2si), ints pass
             // through.
@@ -6785,7 +6734,7 @@ int strIdx = this.stringPatchIndices[i];
                 if (arg.kind == 2) { isStringArg = true; }
                 elif (arg.kind == 6) {
                     string lt = this.getLocalType(arg.name);
-                    if (this.strEq(lt, "string")) { isStringArg = true; }
+                    if (lt == "string") { isStringArg = true; }
                 }
                 if (isStringArg) {
                     this.genExpr(arg);
@@ -6832,7 +6781,7 @@ int strIdx = this.stringPatchIndices[i];
             } else {
                 this.asm.xorRR64(0, 0);
             }
-        } elif (builtinName && (this.strEq(name, "double") || this.strEq(name, "float") || this.strEq(name, "float64")) && !call.isMember) {
+        } elif (builtinName && (name == "double" || name == "float" || name == "float64") && !call.isMember) {
             // double(...) / float(...) / float64(...) conversion: integers widen
             // to an IEEE-754 double bit pattern via cvtsi2sd; float operands
             // pass through unchanged (mirrors silverc-rs gen_double_conversion).
@@ -6852,7 +6801,7 @@ int strIdx = this.stringPatchIndices[i];
             } else {
                 this.asm.xorRR64(0, 0);
             }
-        } elif (builtinName && this.strEq(name, "char") && !call.isMember) {
+        } elif (builtinName && name == "char" && !call.isMember) {
             // char(...) conversion: low byte of the argument.
             if (call.childCount() > 0) {
                 this.genExpr(call.child(0));
@@ -6868,102 +6817,102 @@ int strIdx = this.stringPatchIndices[i];
             // `class socket`). `new T(...)` nodes carry isStatic from the
             // parser and always construct.
             this.genNewCall(call);
-        } elif (builtinName && this.strEq(name, "printline")) {
+        } elif (builtinName && name == "printline") {
             this.genPrintCall(call, 1);
-        } elif (builtinName && this.strEq(name, "print")) {
+        } elif (builtinName && name == "print") {
             this.genPrintCall(call, 0);
-        } elif (builtinName && this.strEq(name, "eprintln")) {
+        } elif (builtinName && name == "eprintln") {
             // OVERHAUL.md CLI diagnostics: compiler error messages go to the
             // standard error stream, matching silverc-rs's eprintln!.
             this.genEprintCall(call, 1);
-        } elif (builtinName && this.strEq(name, "eprint")) {
+        } elif (builtinName && name == "eprint") {
             this.genEprintCall(call, 0);
-        } elif (builtinName && this.strEq(name, "readString")) {
+        } elif (builtinName && name == "readString") {
             this.genReadStringCall(call);
-        } elif (builtinName && this.strEq(name, "readFile")) {
+        } elif (builtinName && name == "readFile") {
             this.genReadStringCall(call);
-        } elif (builtinName && this.strEq(name, "input")) {
+        } elif (builtinName && name == "input") {
             this.genInputCall(call);
-        } elif (builtinName && this.strEq(name, "readLine")) {
+        } elif (builtinName && name == "readLine") {
             this.genInputCall(call);
-        } elif (builtinName && this.strEq(name, "writeBytes")) {
+        } elif (builtinName && name == "writeBytes") {
             this.genWriteBytesCall(call);
-        } elif (builtinName && this.strEq(name, "writeFile")) {
+        } elif (builtinName && name == "writeFile") {
             this.genWriteBytesCall(call);
-        } elif (builtinName && this.strEq(name, "writeString")) {
+        } elif (builtinName && name == "writeString") {
             this.genWriteBytesCall(call);
-        } elif (builtinName && this.strEq(name, "strlen")) {
+        } elif (builtinName && name == "strlen") {
             this.genStrlenCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && this.strEq(call.child(0).name, "json") && this.strEq(name, "stringify")) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && call.child(0).name == "json" && name == "stringify") {
             // json.stringify(value): native JSON text lowering matching
             // silverc-rs stdlib/json.rs (string/int/float/bool/array).
             this.genJsonStringify(call);
-        } elif (builtinName && this.strEq(name, "len")) {
+        } elif (builtinName && name == "len") {
             this.genLenCall(call);
-        } elif (builtinName && this.strEq(name, "exit")) {
+        } elif (builtinName && name == "exit") {
             this.genExitCall(call);
-        } elif (builtinName && this.strEq(name, "cargs")) {
+        } elif (builtinName && name == "cargs") {
             this.genCargsCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "llmai") || this.strEq(call.child(0).name, "LLMAI")) && this.strEq(call.name, "chat")) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "llmai" || call.child(0).name == "LLMAI") && call.name == "chat") {
             // Builtin LLM chat completion (DOCS/206): llmai.chat(url, headers, body)
             this.genLlmaiChatCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.strEq(call.child(0).name, "mouse") && (this.strEq(call.name, "cursorX") || this.strEq(call.name, "getCursorX"))) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && call.child(0).name == "mouse" && (call.name == "cursorX" || call.name == "getCursorX")) {
             // Win32 cursor X read. GetCursorPos(LPPOINT) needs a real Win32
             // pointer; the high-level caller can't supply one. We allocate a
             // 16-byte POINT struct on the stack, call GetCursorPos, and
             // sign-extend the X int32 into RAX.
             this.genCursorXCall();
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.strEq(call.child(0).name, "mouse") && (this.strEq(call.name, "cursorY") || this.strEq(call.name, "getCursorY"))) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && call.child(0).name == "mouse" && (call.name == "cursorY" || call.name == "getCursorY")) {
             // Win32 cursor Y read. Same dance as cursorX but reads +4.
             this.genCursorYCall();
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && this.strEq(call.child(0).name, "env") && (this.strEq(call.name, "get") || this.strEq(call.name, "getenv") || this.strEq(call.name, "getEnv"))) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && call.child(0).name == "env" && (call.name == "get" || call.name == "getenv" || call.name == "getEnv")) {
             // Environment variable lookup: env.get(name) / env.getenv(name)
             this.genGetEnvCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file") || this.strEq(call.child(0).name, "folder")) && (this.strEq(call.name, "getExt") || this.strEq(call.name, "getExtension"))) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file" || call.child(0).name == "folder") && (call.name == "getExt" || call.name == "getExtension")) {
             this.genGetExtCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file") || this.strEq(call.child(0).name, "folder")) && (this.strEq(call.name, "getenv") || this.strEq(call.name, "getEnv"))) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file" || call.child(0).name == "folder") && (call.name == "getenv" || call.name == "getEnv")) {
             // fs.getenv(name) alias for environment variable lookup
             this.genGetEnvCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && this.strEq(call.child(0).name, "url") && (this.strEq(call.name, "isUrl") || this.strEq(call.name, "isFtp") || this.strEq(call.name, "isFtps"))) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && call.child(0).name == "url" && (call.name == "isUrl" || call.name == "isFtp" || call.name == "isFtps")) {
             this.genUrlCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file") || this.strEq(call.child(0).name, "folder")) && this.strEq(call.name, "exists")) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file" || call.child(0).name == "folder") && call.name == "exists") {
             this.genFileExistsCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file")) && this.strEq(call.name, "delete")) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file") && call.name == "delete") {
             this.genFileDeleteCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && this.strEq(call.child(0).name, "folder") && this.strEq(call.name, "delete")) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && call.child(0).name == "folder" && call.name == "delete") {
             this.genFolderDeleteCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file") || this.strEq(call.child(0).name, "folder")) && this.strEq(call.name, "copy")) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file" || call.child(0).name == "folder") && call.name == "copy") {
             this.genFileCopyCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file")) && (this.strEq(call.name, "rename") || this.strEq(call.name, "move"))) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file") && (call.name == "rename" || call.name == "move")) {
             this.genFileRenameCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file")) && this.strEq(call.name, "getSize")) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file") && call.name == "getSize") {
             this.genFileSizeCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && this.strEq(call.child(0).name, "folder") && this.strEq(call.name, "getSize")) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && call.child(0).name == "folder" && call.name == "getSize") {
             this.genFolderSizeCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file") || this.strEq(call.child(0).name, "folder")) && this.strEq(call.name, "isDir")) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file" || call.child(0).name == "folder") && call.name == "isDir") {
 
             this.genIsDirCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file") || this.strEq(call.child(0).name, "folder")) && this.strEq(call.name, "isFile")) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file" || call.child(0).name == "folder") && call.name == "isFile") {
             this.genIsFileCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "file") || this.strEq(call.child(0).name, "folder")) && this.strEq(call.name, "isDriveRoot")) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file" || call.child(0).name == "folder") && call.name == "isDriveRoot") {
             this.genIsDriveRootCall(call);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (this.strEq(call.child(0).name, "fs") || this.strEq(call.child(0).name, "folder")) && (this.strEq(call.name, "getEntries") || this.strEq(call.name, "entries") || this.strEq(call.name, "list") || this.strEq(call.name, "getFiles") || this.strEq(call.name, "files") || this.strEq(call.name, "getFolders") || this.strEq(call.name, "folders"))) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "folder") && (call.name == "getEntries" || call.name == "entries" || call.name == "list" || call.name == "getFiles" || call.name == "files" || call.name == "getFolders" || call.name == "folders")) {
             int entFilter = 0;
-            if (this.strEq(call.name, "getFiles") || this.strEq(call.name, "files")) { entFilter = 1; }
-            elif (this.strEq(call.name, "getFolders") || this.strEq(call.name, "folders")) { entFilter = 2; }
+            if (call.name == "getFiles" || call.name == "files") { entFilter = 1; }
+            elif (call.name == "getFolders" || call.name == "folders") { entFilter = 2; }
             this.genFolderEntriesCall(call, entFilter);
-        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.strEq(call.child(0).name, "Value")) {
+        } elif (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && call.child(0).name == "Value") {
             // Static factory on the builtin Value tagged union (e.g. Value.makeInt).
             this.genValueFactoryCall(call);
-        } elif (call.isMember && call.childCount() > 1 && this.strEq(call.name, "contains") && this.isDictType(this.inferReceiverType(call.child(0)))) {
+        } elif (call.isMember && call.childCount() > 1 && call.name == "contains" && this.isDictType(this.inferReceiverType(call.child(0)))) {
             this.genDictContains(call);
-        } elif (call.isMember && call.childCount() > 0 && this.strEq(call.name, "count") && this.isDictType(this.inferReceiverType(call.child(0)))) {
+        } elif (call.isMember && call.childCount() > 0 && call.name == "count" && this.isDictType(this.inferReceiverType(call.child(0)))) {
             this.genDictCount(call);
-        } elif (call.isMember && call.childCount() > 0 && this.strEq(call.name, "remove") && this.isDictType(this.inferReceiverType(call.child(0)))) {
+        } elif (call.isMember && call.childCount() > 0 && call.name == "remove" && this.isDictType(this.inferReceiverType(call.child(0)))) {
             this.genDictRemove(call);
-        } elif (call.isMember && call.childCount() > 0 && this.strEq(call.name, "keys") && this.isDictType(this.inferReceiverType(call.child(0)))) {
+        } elif (call.isMember && call.childCount() > 0 && call.name == "keys" && this.isDictType(this.inferReceiverType(call.child(0)))) {
             this.genDictKeys(call);
-        } elif (call.isMember && call.childCount() > 0 && this.strEq(call.name, "values") && this.isDictType(this.inferReceiverType(call.child(0)))) {
+        } elif (call.isMember && call.childCount() > 0 && call.name == "values" && this.isDictType(this.inferReceiverType(call.child(0)))) {
             this.genDictValues(call);
         } elif (call.isMember && this.isThisAsmMember(call)) {
             // MiniAsm is a runtime object owned by MiniCg. Every this.asm
@@ -6975,32 +6924,32 @@ int strIdx = this.stringPatchIndices[i];
             this.genBuiltinMemberCall(call);
         } elif (call.isMember && !this.isThisAsmMember(call) && this.isUserClassMemberCall(call)) {
             this.genMemberCall(call);
-        } elif (this.strEq(name, "pushR64") || this.strEq(name, "popR64") || this.strEq(name, "movRR64") || this.strEq(name, "movRI64") || this.strEq(name, "movRMBase") || this.strEq(name, "movMBaseR") || this.strEq(name, "subRI32") || this.strEq(name, "addRI32") || this.strEq(name, "xorRR64") || this.strEq(name, "cmpRI32") || this.strEq(name, "cmpRR64") || this.strEq(name, "ret") || this.strEq(name, "callR64") || this.strEq(name, "leaRBase") || this.strEq(name, "emitU8") || this.strEq(name, "emitU32") || this.strEq(name, "emitImm64") || this.strEq(name, "emitCallSetup") || this.strEq(name, "emitCallTeardown") || this.strEq(name, "addRR64") || this.strEq(name, "subRR64") || this.strEq(name, "mulRR64") || this.strEq(name, "andRImm") || this.strEq(name, "shlR64Imm") || this.strEq(name, "incR64") || this.strEq(name, "decR64") || this.strEq(name, "movByteMBaseIdxR") || this.strEq(name, "movMBaseByteR") || this.strEq(name, "label") || this.strEq(name, "bindLabel") || this.strEq(name, "jeLabel") || this.strEq(name, "jneLabel") || this.strEq(name, "jmpLabel") || this.strEq(name, "jlLabel") || this.strEq(name, "jleLabel") || this.strEq(name, "jgLabel") || this.strEq(name, "jgeLabel") || this.strEq(name, "movzxByteMBase") || this.strEq(name, "callRel32")) {
+        } elif (name == "pushR64" || name == "popR64" || name == "movRR64" || name == "movRI64" || name == "movRMBase" || name == "movMBaseR" || name == "subRI32" || name == "addRI32" || name == "xorRR64" || name == "cmpRI32" || name == "cmpRR64" || name == "ret" || name == "callR64" || name == "leaRBase" || name == "emitU8" || name == "emitU32" || name == "emitImm64" || name == "emitCallSetup" || name == "emitCallTeardown" || name == "addRR64" || name == "subRR64" || name == "mulRR64" || name == "andRImm" || name == "shlR64Imm" || name == "incR64" || name == "decR64" || name == "movByteMBaseIdxR" || name == "movMBaseByteR" || name == "label" || name == "bindLabel" || name == "jeLabel" || name == "jneLabel" || name == "jmpLabel" || name == "jlLabel" || name == "jleLabel" || name == "jgLabel" || name == "jgeLabel" || name == "movzxByteMBase" || name == "callRel32") {
             this.genAsmCall(call);        } elif (call.isMember && call.childCount() > 1 && call.child(1).kind == 80 && this.isHofMethod(name) && this.isArrayLikeType(this.inferExprType(call.child(0)))) {
-            if (this.strEq(name, "map") || this.strEq(name, "forEach")) { this.genLambdaMap(call); }
-            elif (this.strEq(name, "filter")) { this.genLambdaFilter(call); }
-            elif (this.strEq(name, "reduce")) { this.genLambdaReduce(call); }
-            elif (this.strEq(name, "find")) { this.genLambdaFind(call); }
-            elif (this.strEq(name, "all") || this.strEq(name, "every")) { this.genLambdaQuantifier(call, 1); }
+            if (name == "map" || name == "forEach") { this.genLambdaMap(call); }
+            elif (name == "filter") { this.genLambdaFilter(call); }
+            elif (name == "reduce") { this.genLambdaReduce(call); }
+            elif (name == "find") { this.genLambdaFind(call); }
+            elif (name == "all" || name == "every") { this.genLambdaQuantifier(call, 1); }
             else { this.genLambdaQuantifier(call, 0); }
-        } elif (call.isMember && call.childCount() > 0 && (this.strEq(name, "any") || this.strEq(name, "all") || this.strEq(name, "reverse") || this.strEq(name, "map")) && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
-            if (this.strEq(name, "any")) { this.genArrayAny(call); }
-            elif (this.strEq(name, "all")) { this.genArrayAll(call); }
-            elif (this.strEq(name, "reverse")) { this.genArrayReverse(call); }
+        } elif (call.isMember && call.childCount() > 0 && (name == "any" || name == "all" || name == "reverse" || name == "map") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+            if (name == "any") { this.genArrayAny(call); }
+            elif (name == "all") { this.genArrayAll(call); }
+            elif (name == "reverse") { this.genArrayReverse(call); }
             else { this.genArrayMap(call); }
-        } elif (call.isMember && call.childCount() > 0 && this.strEq(name, "last") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+        } elif (call.isMember && call.childCount() > 0 && name == "last" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArrayLast(call);
-        } elif (call.isMember && call.childCount() > 0 && (this.strEq(name, "pop") || this.strEq(name, "outlast")) && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+        } elif (call.isMember && call.childCount() > 0 && (name == "pop" || name == "outlast") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArrayPop(call);
-        } elif (call.isMember && call.childCount() > 1 && (this.strEq(name, "indexOf") || this.strEq(name, "find")) && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+        } elif (call.isMember && call.childCount() > 1 && (name == "indexOf" || name == "find") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArrayIndexOf(call);
-        } elif (call.isMember && call.childCount() > 0 && this.strEq(name, "sort") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+        } elif (call.isMember && call.childCount() > 0 && name == "sort" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArraySort(call);
-        } elif (call.isMember && call.childCount() > 0 && this.strEq(name, "unique") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+        } elif (call.isMember && call.childCount() > 0 && name == "unique" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArrayUnique(call);
-        } elif (call.isMember && call.childCount() > 1 && this.strEq(name, "join") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+        } elif (call.isMember && call.childCount() > 1 && name == "join" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArrayJoin(call);
-        } elif (call.isMember && call.childCount() > 2 && this.strEq(name, "join") && call.child(0).kind == 6 && this.strEq(call.child(0).name, "string")) {
+        } elif (call.isMember && call.childCount() > 2 && name == "join" && call.child(0).kind == 6 && call.child(0).name == "string") {
             // Static string form `string.join(sep, parts)` (DOCS/88): reorder
             // the args into (array, sep) and reuse the member-join emitter.
             Node joinCall = new Node();
@@ -7009,7 +6958,7 @@ int strIdx = this.stringPatchIndices[i];
             joinCall.children.add(call.child(2));
             joinCall.children.add(call.child(1));
             this.genArrayJoin(joinCall);
-} elif ((call.isMember && this.strEq(name, "add") && call.childCount() > 0) || (call.isMember && this.strEq(name, "push") && call.childCount() > 0) || (call.isMember && this.strEq(name, "append") && call.childCount() > 0)) {
+} elif ((call.isMember && name == "add" && call.childCount() > 0) || (call.isMember && name == "push" && call.childCount() > 0) || (call.isMember && name == "append" && call.childCount() > 0)) {
               string addRecvType = this.inferExprType(call.child(0));
               if (addRecvType.length >= 2 && addRecvType[addRecvType.length - 2] == '[' && addRecvType[addRecvType.length - 1] == ']') {
                  this.genArrayAdd(call);
@@ -7018,7 +6967,7 @@ int strIdx = this.stringPatchIndices[i];
              } else {
                  this.genUserCall(call);
              }
-        } elif (this.strEq(name, "super")) {
+        } elif (name == "super") {
             // super(...) - parent constructor call
             this.genSuperCall(call);
         } else {
@@ -7332,7 +7281,7 @@ int strIdx = this.stringPatchIndices[i];
             slotOff = this.findLocal(dictNode.name);
         } elif (dictNode.kind == 13 && dictNode.childCount() > 0) {
             Node dobj = dictNode.child(0);
-            if (dobj.kind == 6 && this.strEq(dobj.name, "this")) {
+            if (dobj.kind == 6 && dobj.name == "this") {
                 slotKind = 2;
                 slotOff = this.findLocal("this");
                 slotOff2 = this.findFieldOffset(this.currentClassName, dictNode.name);
@@ -7583,20 +7532,20 @@ int strIdx = this.stringPatchIndices[i];
         }
         int tag = 0;
         int fOff = 8;
-        if (this.strEq(m, "makeInt")) { tag = 1; fOff = 8; }
-        elif (this.strEq(m, "makeFloat")) { tag = 2; fOff = 16; }
-        elif (this.strEq(m, "makeBool")) { tag = 3; fOff = 24; }
-        elif (this.strEq(m, "makeString")) { tag = 4; fOff = 32; }
-        elif (this.strEq(m, "makeChar")) { tag = 5; fOff = 40; }
-        elif (this.strEq(m, "makeArray")) { tag = 6; fOff = 48; }
-        elif (this.strEq(m, "makeTuple")) { tag = 7; fOff = 48; }
-        elif (this.strEq(m, "makeObject")) { tag = 8; fOff = 56; }
+        if (m == "makeInt") { tag = 1; fOff = 8; }
+        elif (m == "makeFloat") { tag = 2; fOff = 16; }
+        elif (m == "makeBool") { tag = 3; fOff = 24; }
+        elif (m == "makeString") { tag = 4; fOff = 32; }
+        elif (m == "makeChar") { tag = 5; fOff = 40; }
+        elif (m == "makeArray") { tag = 6; fOff = 48; }
+        elif (m == "makeTuple") { tag = 7; fOff = 48; }
+        elif (m == "makeObject") { tag = 8; fOff = 56; }
 
-        elif (this.strEq(m, "makeFunc")) { tag = 9; fOff = 72; }
-        elif (this.strEq(m, "makeBuiltin")) { tag = 10; fOff = 72; }
-        elif (this.strEq(m, "makeClassInst")) { tag = 12; fOff = 56; }
-        elif (this.strEq(m, "makeEnumVal")) { tag = 13; fOff = 64; }
-        elif (this.strEq(m, "makeDict")) { tag = 15; fOff = 56; }
+        elif (m == "makeFunc") { tag = 9; fOff = 72; }
+        elif (m == "makeBuiltin") { tag = 10; fOff = 72; }
+        elif (m == "makeClassInst") { tag = 12; fOff = 56; }
+        elif (m == "makeEnumVal") { tag = 13; fOff = 64; }
+        elif (m == "makeDict") { tag = 15; fOff = 56; }
         this.asm.movRMBase(0, 5, vP);
         this.asm.movRI64(1, tag);
         this.asm.movMBaseR(0, 1, 0);
@@ -7605,7 +7554,7 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.movRMBase(1, 5, vArgs[0]);
             this.asm.movMBaseR(0, 1, fOff);
         }
-        if (this.strEq(m, "makeEnumVal")) {
+        if (m == "makeEnumVal") {
             if (vArgs.length > 1) {
                 this.asm.movRMBase(0, 5, vP);
                 this.asm.movRMBase(1, 5, vArgs[1]);
@@ -7614,7 +7563,7 @@ int strIdx = this.stringPatchIndices[i];
         }
         // makeObject / makeClassInst carry a second argument: the type name
         // stored at the typeName offset (64).
-        if (this.strEq(m, "makeObject") || this.strEq(m, "makeClassInst")) {
+        if (m == "makeObject" || m == "makeClassInst") {
             if (vArgs.length > 1) {
                 this.asm.movRMBase(0, 5, vP);
                 this.asm.movRMBase(1, 5, vArgs[1]);
@@ -7625,7 +7574,7 @@ int strIdx = this.stringPatchIndices[i];
         // a string payload cannot dereference a null pointer. makeString and
         // makeEnumVal already store their string payload at the strVal offset
         // (32), so skip the default there to avoid overwriting it.
-        if (!this.strEq(m, "makeString") && !this.strEq(m, "makeEnumVal")) {
+        if (m != "makeString" && m != "makeEnumVal") {
             this.asm.movRMBase(0, 5, vP);
             this.asm.pushR64(0);
             Node es = new Node(); es.kind = 2; es.strVal = "";
@@ -7639,7 +7588,7 @@ int strIdx = this.stringPatchIndices[i];
 
     public string parentClassName(string className) {
         for (int i = 0; i < this.classNames.length; i++) {
-            if (this.strEq(this.classNames[i], className)) {
+            if (this.classNames[i] == className) {
                 return this.classParentClasses[i];
             }
         }
@@ -7652,7 +7601,7 @@ int strIdx = this.stringPatchIndices[i];
         // constructor, not a later overload (e.g. Env(Env? parent)) whose
         // garbage argument would leave fields non-null and recurse forever.
         for (int i = 0; i < this.funcNames.length; i++) {
-            if (this.strEq(this.funcNames[i], "construct") && this.strEq(this.funcClasses[i], className)) {
+            if (this.funcNames[i] == "construct" && this.funcClasses[i] == className) {
                 if (i < this.funcParamCounts.length && this.funcParamCounts[i] == nargs) {
                     ctorIdx = i;
                 }
@@ -7661,7 +7610,7 @@ int strIdx = this.stringPatchIndices[i];
         // Fall back to a constructor whose trailing parameters all have defaults.
         if (ctorIdx < 0) {
             for (int i = 0; i < this.funcNames.length; i++) {
-                if (this.strEq(this.funcNames[i], "construct") && this.strEq(this.funcClasses[i], className)) {
+                if (this.funcNames[i] == "construct" && this.funcClasses[i] == className) {
                     int pc = (i < this.funcParamCounts.length) ? this.funcParamCounts[i] : 0;
                     int ps = (i < this.funcParamStarts.length) ? this.funcParamStarts[i] : 0;
                     bool allDefault = true;
@@ -7677,7 +7626,7 @@ int strIdx = this.stringPatchIndices[i];
         // Last-resort fallback: any constructor of the class.
         if (ctorIdx < 0) {
             for (int i = 0; i < this.funcNames.length; i++) {
-                if (this.strEq(this.funcNames[i], "construct") && this.strEq(this.funcClasses[i], className)) {
+                if (this.funcNames[i] == "construct" && this.funcClasses[i] == className) {
                     ctorIdx = i;
                 }
             }
@@ -7688,7 +7637,7 @@ int strIdx = this.stringPatchIndices[i];
 public void genNewCall(Node call) {
     int size = 16;
     for (int i = 0; i < this.classNames.length; i++) {
-        if (this.strEq(this.classNames[i], call.name)) {
+        if (this.classNames[i] == call.name) {
             int cnt = this.classFieldCounts[i];
             size = cnt * 8;
             if (size < 16) { size = 16; }
@@ -7715,7 +7664,7 @@ public void genNewCall(Node call) {
         bool hasAnonymousMessage = false;                if (call.child(i).kind == 19 && call.child(i).childCount() > 0) {
             if (call.child(i).child(0).kind == 66 || call.child(i).child(0).kind == 74) { hasAnonymousMessage = true; }
         }
-        if (this.strEq(call.name, "ChatCompletionRequest") && i == 1 && hasAnonymousMessage) {
+        if (call.name == "ChatCompletionRequest" && i == 1 && hasAnonymousMessage) {
             int count = call.child(i).childCount();
             int capacity = 8;
             int allocSize = (capacity + 2) * 8;
@@ -7766,7 +7715,7 @@ public void genNewCall(Node call) {
         string current = call.name;
         for (int guard = 0; guard < this.classNames.length; guard++) {
             string parent = this.parentClassName(current);
-            if (this.strEq(parent, "")) { break; }
+            if (parent == "") { break; }
             ctorIdx = this.findConstructor(parent, nargs);
             if (ctorIdx >= 0) { break; }
             current = parent;
@@ -7850,21 +7799,21 @@ public void genNewCall(Node call) {
     public void genSuperCall(Node call) {
         // super(arg0, arg1, ...) - call parent class constructor with `this`.
         // Only valid inside a class constructor.
-        if (!this.strEq(this.currentFunctionName, "construct")) { return; }
+        if (this.currentFunctionName != "construct") { return; }
 
         // Find parent class of the current class.
         string parentClass = "";
         for (int i = 0; i < this.classNames.length; i++) {
-            if (this.strEq(this.classNames[i], this.currentClassName)) {
+            if (this.classNames[i] == this.currentClassName) {
                 parentClass = this.classParentClasses[i];
             }
         }
-        if (this.strEq(parentClass, "")) { return; }
+        if (parentClass == "") { return; }
 
         // Find parent's construct function.
         int ctorIdx = -1;
         for (int i = 0; i < this.funcNames.length; i++) {
-            if (this.strEq(this.funcNames[i], "construct") && this.strEq(this.funcClasses[i], parentClass)) {
+            if (this.funcNames[i] == "construct" && this.funcClasses[i] == parentClass) {
                 ctorIdx = i;
             }
         }
@@ -7943,11 +7892,11 @@ public void genNewCall(Node call) {
 
     public void genAsmCall(Node call) {
         string name = call.name;
-        if (this.strEq(name, "ret")) {
+        if (name == "ret") {
             this.asm.ret();
             return;
         }
-        if (this.strEq(name, "label")) {
+        if (name == "label") {
             string lbl = "";
             if (call.childCount() > 0 && call.child(0).kind == 2) {
                 lbl = call.child(0).strVal;
@@ -7955,7 +7904,7 @@ public void genNewCall(Node call) {
             this.asm.label(lbl);
             return;
         }
-        if (this.strEq(name, "bindLabel")) {
+        if (name == "bindLabel") {
             int id = 0;
             if (call.childCount() > 0) {
                 id = this.asmOperand(call.child(0));
@@ -7963,7 +7912,7 @@ public void genNewCall(Node call) {
             this.asm.bindLabel(id);
             return;
         }
-        if (this.strEq(name, "emitImm64")) {
+        if (name == "emitImm64") {
             int reg = 0;
             int64 imm = 0;
             if (call.childCount() > 1) {
@@ -7990,46 +7939,46 @@ public void genNewCall(Node call) {
                 args.add(this.asmOperand(c));
             }
         }
-        if (this.strEq(name, "pushR64")) { this.asm.pushR64(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "popR64")) { this.asm.popR64(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "movRR64")) { this.asm.movRR64(this.asmArg(args, 0), this.asmArg(args, 1)); }
-        elif (this.strEq(name, "movRI64")) {
+        if (name == "pushR64") { this.asm.pushR64(this.asmArg(args, 0)); }
+        elif (name == "popR64") { this.asm.popR64(this.asmArg(args, 0)); }
+        elif (name == "movRR64") { this.asm.movRR64(this.asmArg(args, 0), this.asmArg(args, 1)); }
+        elif (name == "movRI64") {
             int64 v = 0;
             if (call.childCount() > 1) { v = this.asmOperand(call.child(1)); }
             this.asm.movRI64(this.asmArg(args, 0), v);
         }
-        elif (this.strEq(name, "movRMBase")) { this.asm.movRMBase(this.asmArg(args, 0), this.asmArg(args, 1), this.asmArg(args, 2)); }
-        elif (this.strEq(name, "movMBaseR")) { this.asm.movMBaseR(this.asmArg(args, 0), this.asmArg(args, 1), this.asmArg(args, 2)); }
-        elif (this.strEq(name, "subRI32")) { this.asm.subRI32(this.asmArg(args, 0), this.asmArg(args, 1)); }
-        elif (this.strEq(name, "addRI32")) { this.asm.addRI32(this.asmArg(args, 0), this.asmArg(args, 1)); }
-        elif (this.strEq(name, "xorRR64")) { this.asm.xorRR64(this.asmArg(args, 0), this.asmArg(args, 1)); }
-        elif (this.strEq(name, "cmpRI32")) { this.asm.cmpRI32(this.asmArg(args, 0), this.asmArg(args, 1)); }
-        elif (this.strEq(name, "cmpRR64")) { this.asm.cmpRR64(this.asmArg(args, 0), this.asmArg(args, 1)); }
-        elif (this.strEq(name, "callR64")) { this.asm.callR64(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "leaRBase")) { this.asm.leaRBase(this.asmArg(args, 0), this.asmArg(args, 1), this.asmArg(args, 2)); }
-        elif (this.strEq(name, "emitU8")) { this.asm.emitU8(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "emitU32")) { this.asm.emitU32(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "emitImm64")) { this.asm.emitImm64(this.asmArg(args, 0), this.asmArg(args, 1)); }
-        elif (this.strEq(name, "emitCallSetup")) { this.asm.emitCallSetup(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "emitCallTeardown")) { this.asm.emitCallTeardown(); }
-        elif (this.strEq(name, "addRR64")) { this.asm.addRR64(this.asmArg(args, 0), this.asmArg(args, 1)); }
-        elif (this.strEq(name, "subRR64")) { this.asm.subRR64(this.asmArg(args, 0), this.asmArg(args, 1)); }
-        elif (this.strEq(name, "mulRR64")) { this.asm.mulRR64(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "andRImm")) { this.asm.andRImm(this.asmArg(args, 0), this.asmArg(args, 1)); }
-        elif (this.strEq(name, "shlR64Imm")) { this.asm.shlR64Imm(this.asmArg(args, 0), this.asmArg(args, 1)); }
-        elif (this.strEq(name, "incR64")) { this.asm.incR64(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "decR64")) { this.asm.decR64(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "movByteMBaseIdxR")) { this.asm.movByteMBaseIdxR(this.asmArg(args, 0), this.asmArg(args, 1), this.asmArg(args, 2)); }
-        elif (this.strEq(name, "movMBaseByteR")) { this.asm.movMBaseByteR(this.asmArg(args, 0), this.asmArg(args, 1), this.asmArg(args, 2)); }
-        elif (this.strEq(name, "jeLabel")) { this.asm.jeLabel(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "jneLabel")) { this.asm.jneLabel(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "jmpLabel")) { this.asm.jmpLabel(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "jlLabel")) { this.asm.jlLabel(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "jleLabel")) { this.asm.jleLabel(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "jgLabel")) { this.asm.jgLabel(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "jgeLabel")) { this.asm.jgeLabel(this.asmArg(args, 0)); }
-        elif (this.strEq(name, "movzxByteMBase")) { this.asm.movzxByteMBase(this.asmArg(args, 0), this.asmArg(args, 1), this.asmArg(args, 2)); }
-        elif (this.strEq(name, "callRel32")) { this.asm.callRel32(this.asmArg(args, 0)); }
+        elif (name == "movRMBase") { this.asm.movRMBase(this.asmArg(args, 0), this.asmArg(args, 1), this.asmArg(args, 2)); }
+        elif (name == "movMBaseR") { this.asm.movMBaseR(this.asmArg(args, 0), this.asmArg(args, 1), this.asmArg(args, 2)); }
+        elif (name == "subRI32") { this.asm.subRI32(this.asmArg(args, 0), this.asmArg(args, 1)); }
+        elif (name == "addRI32") { this.asm.addRI32(this.asmArg(args, 0), this.asmArg(args, 1)); }
+        elif (name == "xorRR64") { this.asm.xorRR64(this.asmArg(args, 0), this.asmArg(args, 1)); }
+        elif (name == "cmpRI32") { this.asm.cmpRI32(this.asmArg(args, 0), this.asmArg(args, 1)); }
+        elif (name == "cmpRR64") { this.asm.cmpRR64(this.asmArg(args, 0), this.asmArg(args, 1)); }
+        elif (name == "callR64") { this.asm.callR64(this.asmArg(args, 0)); }
+        elif (name == "leaRBase") { this.asm.leaRBase(this.asmArg(args, 0), this.asmArg(args, 1), this.asmArg(args, 2)); }
+        elif (name == "emitU8") { this.asm.emitU8(this.asmArg(args, 0)); }
+        elif (name == "emitU32") { this.asm.emitU32(this.asmArg(args, 0)); }
+        elif (name == "emitImm64") { this.asm.emitImm64(this.asmArg(args, 0), this.asmArg(args, 1)); }
+        elif (name == "emitCallSetup") { this.asm.emitCallSetup(this.asmArg(args, 0)); }
+        elif (name == "emitCallTeardown") { this.asm.emitCallTeardown(); }
+        elif (name == "addRR64") { this.asm.addRR64(this.asmArg(args, 0), this.asmArg(args, 1)); }
+        elif (name == "subRR64") { this.asm.subRR64(this.asmArg(args, 0), this.asmArg(args, 1)); }
+        elif (name == "mulRR64") { this.asm.mulRR64(this.asmArg(args, 0)); }
+        elif (name == "andRImm") { this.asm.andRImm(this.asmArg(args, 0), this.asmArg(args, 1)); }
+        elif (name == "shlR64Imm") { this.asm.shlR64Imm(this.asmArg(args, 0), this.asmArg(args, 1)); }
+        elif (name == "incR64") { this.asm.incR64(this.asmArg(args, 0)); }
+        elif (name == "decR64") { this.asm.decR64(this.asmArg(args, 0)); }
+        elif (name == "movByteMBaseIdxR") { this.asm.movByteMBaseIdxR(this.asmArg(args, 0), this.asmArg(args, 1), this.asmArg(args, 2)); }
+        elif (name == "movMBaseByteR") { this.asm.movMBaseByteR(this.asmArg(args, 0), this.asmArg(args, 1), this.asmArg(args, 2)); }
+        elif (name == "jeLabel") { this.asm.jeLabel(this.asmArg(args, 0)); }
+        elif (name == "jneLabel") { this.asm.jneLabel(this.asmArg(args, 0)); }
+        elif (name == "jmpLabel") { this.asm.jmpLabel(this.asmArg(args, 0)); }
+        elif (name == "jlLabel") { this.asm.jlLabel(this.asmArg(args, 0)); }
+        elif (name == "jleLabel") { this.asm.jleLabel(this.asmArg(args, 0)); }
+        elif (name == "jgLabel") { this.asm.jgLabel(this.asmArg(args, 0)); }
+        elif (name == "jgeLabel") { this.asm.jgeLabel(this.asmArg(args, 0)); }
+        elif (name == "movzxByteMBase") { this.asm.movzxByteMBase(this.asmArg(args, 0), this.asmArg(args, 1), this.asmArg(args, 2)); }
+        elif (name == "callRel32") { this.asm.callRel32(this.asmArg(args, 0)); }
     }
 
     // WINDOWS-TARGET: the PE VERSIONINFO bridge. The self-hosted backend uses
@@ -8116,7 +8065,7 @@ public void genNewCall(Node call) {
 
         // `language` is represented by the selected initial translation.
         // 0409/04B0 is the standard en-US VERSIONINFO table.
-        if (call.child(1).kind == 2 && this.strEq(call.child(1).strVal, "language")) {
+        if (call.child(1).kind == 2 && call.child(1).strVal == "language") {
             this.emitLlmaiStringLiteral("en-US");
             this.asm.jmpLabel(done);
         }
@@ -8204,7 +8153,7 @@ public void genNewCall(Node call) {
     public string win32CustomResolveDll(string name) {
         for (int g = 0; g < this.win32Grants.length; g++) {
             string grant = this.win32Grants[g];
-            if (grant.length > name.length + 1 && this.strEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') {
+            if (grant.length > name.length + 1 && projectSlice(grant, grant.length - name.length, grant.length) == name && grant[grant.length - name.length - 1] == '|') {
                 return projectSlice(grant, 0, grant.length - name.length - 1);
             }
         }
@@ -8218,7 +8167,7 @@ public void genNewCall(Node call) {
     public string linuxCustomResolveLibUngated(string name) {
         for (int g = 0; g < this.linuxGrants.length; g++) {
             string grant = this.linuxGrants[g];
-            if (grant.length > name.length + 1 && this.strEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') {
+            if (grant.length > name.length + 1 && projectSlice(grant, grant.length - name.length, grant.length) == name && grant[grant.length - name.length - 1] == '|') {
                 return projectSlice(grant, 0, grant.length - name.length - 1);
             }
         }
@@ -8233,7 +8182,7 @@ public void genNewCall(Node call) {
     public int selectOverloadIdx(string name, string cls, int nargs) {
         int best = -1;
         for (int i = 0; i < this.funcNames.length; i++) {
-            if (this.strEq(this.funcNames[i], name) && this.strEq(this.funcClasses[i], cls)) {
+            if (this.funcNames[i] == name && this.funcClasses[i] == cls) {
                 int pc = (i < this.funcParamCounts.length) ? this.funcParamCounts[i] : -1;
                 if (pc < 0) { continue; }
                 int pStart = this.funcParamStarts[i];
@@ -8304,14 +8253,14 @@ public void genNewCall(Node call) {
             string recvType = this.inferExprType(call.child(0));
             bool recvIsClass = false;
             for (int ci = 0; ci < this.classNames.length; ci++) {
-                if (this.typeNameEq(this.classNames[ci], recvType)) { recvIsClass = true; }
+                if ((this.classNames[ci] == recvType || recvType == this.classNames[ci] + "?")) { recvIsClass = true; }
             }
             // Any receiver that is not a class instance and not `this` names a
             // module: the call must resolve to the GLOBAL function (e.g.
             // json_runtime.get, fs.read). An unknown identifier has recvType
             // "" which is exactly the module case. Class methods of the
             // current class must NOT shadow global functions here.
-            if (!recvIsClass && !this.strEq(recvType, "this")) {
+            if (!recvIsClass && recvType != "this") {
                 isModuleCall = true;
             }
         }
@@ -8326,9 +8275,9 @@ public void genNewCall(Node call) {
             string rt0 = this.inferExprType(call.child(0));
             bool rt0IsClass = false;
             for (int ci2 = 0; ci2 < this.classNames.length; ci2++) {
-                if (this.typeNameEq(this.classNames[ci2], rt0)) { rt0IsClass = true; }
+                if ((this.classNames[ci2] == rt0 || rt0 == this.classNames[ci2] + "?")) { rt0IsClass = true; }
             }
-            if (!rt0IsClass && !this.strEq(rt0, "this")) {
+            if (!rt0IsClass && rt0 != "this") {
                 nargs = call.childCount() - 1;
             }
         }
@@ -8342,7 +8291,7 @@ public void genNewCall(Node call) {
         int s1Matched = -1;
         int s1Count = 0;
         for (int i = 0; i < this.funcNames.length; i++) {
-            if (!isModuleCall && this.strEq(this.funcNames[i], name) && this.strEq(this.funcClasses[i], this.currentClassName)) {
+            if (!isModuleCall && this.funcNames[i] == name && this.funcClasses[i] == this.currentClassName) {
                 s1Matched = i;
                 s1Count = s1Count + 1;
             }
@@ -8370,7 +8319,7 @@ public void genNewCall(Node call) {
             int s2Matched = -1;
             int s2Count = 0;
             for (int i = 0; i < this.funcNames.length; i++) {
-                if (this.strEq(this.funcNames[i], name) && this.strEq(this.funcClasses[i], "")) {
+                if (this.funcNames[i] == name && this.funcClasses[i] == "") {
                     s2Matched = i;
                     s2Count = s2Count + 1;
                 }
@@ -8396,13 +8345,13 @@ public void genNewCall(Node call) {
         }
         if (funcIdx < 0) {
             for (int i = 0; i < this.funcNames.length; i++) {
-                if (this.strEq(this.funcNames[i], name)) {
+                if (this.funcNames[i] == name) {
                     // A bare call that
                     // resolves as an imported win32 export must reach the
                     // DLL (silverc-rs checks win32::resolve before the bare
                     // static-method fallback), never a same-named class
                     // method from another module of the aggregate.
-                    if (!this.strEq(this.funcClasses[i], "") && (this.win32CallResolves(name) || this.linuxCallResolves(name) || this.macCallResolves(name))) { continue; }
+                    if (this.funcClasses[i] != "" && (this.win32CallResolves(name) || this.linuxCallResolves(name) || this.macCallResolves(name))) { continue; }
                     funcIdx = i;
                 }
             }
@@ -8416,7 +8365,7 @@ public void genNewCall(Node call) {
         // resolved function is a plain global function (no owning class), drop
         // that receiver so it isn't evaluated as argument 0.
         int argStart = 0;
-        if (isModuleCall || (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.strEq(lookupClass, ""))) {
+        if (isModuleCall || (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && lookupClass == "")) {
             argStart = 1;
         }
         // UNIFIED_CORE_LIBRARY.md §4 rule 6 -- a resolved GLOBAL whose
@@ -8426,7 +8375,7 @@ public void genNewCall(Node call) {
         // classification below (net.sr's bare connect/listen in module-
         // qualified form). argStart is known only here, so this is the
         // earliest point the check can use the module-qualified arg count.
-        if (funcIdx >= 0 && this.strEq(lookupClass, "") && (this.win32CallResolves(name) || this.linuxCallResolves(name) || this.macCallResolves(name))) {
+        if (funcIdx >= 0 && lookupClass == "" && (this.win32CallResolves(name) || this.linuxCallResolves(name) || this.macCallResolves(name))) {
             int callArgs = call.childCount() - argStart;
             if (callArgs < 0) { callArgs = 0; }
             int pc = (funcIdx < this.funcParamCounts.length) ? this.funcParamCounts[funcIdx] : -1;
@@ -8475,7 +8424,7 @@ public void genNewCall(Node call) {
             // `this` slot and the declared parameters follow in RDX/R8/R9.
             // Without the bias the arguments shift one register and corrupt
             // string/object parameters.
-            bool staticMethodCall = !this.strEq(lookupClass, "");
+            bool staticMethodCall = lookupClass != "";
             int slotBias = 0;
             if (staticMethodCall) { slotBias = 1; }
             int slotTotal = totalArgs + slotBias;
@@ -8542,15 +8491,15 @@ public void genNewCall(Node call) {
         // These helpers have an out-parameter internally and therefore cannot
         // use the ordinary four-register external-call path. Handle them
         // before argument marshalling so they pass a real POINT pointer.
-        if (this.strEq(name, "GetCursorX")) {
+        if (name == "GetCursorX") {
             this.genCursorXCall();
             this.emitExcCheck();
             return;
-        } elif (this.strEq(name, "GetCursorY")) {
+        } elif (name == "GetCursorY") {
             this.genCursorYCall();
             this.emitExcCheck();
             return;
-        } elif (this.strEq(name, "GetCursorPos")) {
+        } elif (name == "GetCursorPos") {
             // GetCursorPos writes an 8-byte POINT (two int32 coordinates),
             // while Silver's `int pos[2]` is an array of 8-byte slots.  Do not
             // pass the array pointer directly: Win32 would write packed int32
@@ -8604,7 +8553,7 @@ public void genNewCall(Node call) {
             string macLib = this.macResolveLib(name);
             string macFn = name;
             for (int ma = 0; ma < this.macAliasLocals.length; ma++) {
-                if (this.strEq(this.macAliasLocals[ma], name)) {
+                if (this.macAliasLocals[ma] == name) {
                     macLib = this.macAliasLibs[ma];
                     macFn = this.macAliasExports[ma];
                     break;
@@ -8674,7 +8623,7 @@ public void genNewCall(Node call) {
         // backend it is a no-op: notifications.sr `show` already printed the
         // canonical NOTIFY: parity line, so just return 0 and let the caller
         // continue.
-        if (this.strEq(name, "nativeToastShow")) {
+        if (name == "nativeToastShow") {
             this.asm.xorRR64(0, 0);
             this.asm.emitCallTeardown();
             return;
@@ -8684,7 +8633,7 @@ public void genNewCall(Node call) {
         // the self-hosted backend they are no-ops (return 0) so the
         // TrayIcon class in std/system_tray.sr links and runs without a
         // native tray shell.
-        if (this.strEq(name, "trayAdd") || this.strEq(name, "traySetTooltip") || this.strEq(name, "trayDelete") || this.strEq(name, "trayRemove") || this.strEq(name, "traySetMenu") || this.strEq(name, "trayRunLoop") || this.strEq(name, "trayPollMenu") || this.strEq(name, "trayPollClick")) {
+        if (name == "trayAdd" || name == "traySetTooltip" || name == "trayDelete" || name == "trayRemove" || name == "traySetMenu" || name == "trayRunLoop" || name == "trayPollMenu" || name == "trayPollClick") {
             this.asm.xorRR64(0, 0);
             this.asm.emitCallTeardown();
             return;
@@ -8694,7 +8643,7 @@ public void genNewCall(Node call) {
         // as no-ops so the RegistryKey class in std/registry.sr compiles and
         // runs anywhere. String-returning bridges yield the empty string;
         // everything else returns 0.
-        if (this.strEq(name, "regGetString") || this.strEq(name, "regEnumSubKeyName") || this.strEq(name, "regEnumValueName")) {
+        if (name == "regGetString" || name == "regEnumSubKeyName" || name == "regEnumValueName") {
             int strIdx = this.addString("");
             int sp = this.asm.buf.length;
             this.asm.emitImm64(0, 0);
@@ -8703,7 +8652,7 @@ public void genNewCall(Node call) {
             this.asm.emitCallTeardown();
             return;
         }
-        if (this.strEq(name, "regOpen") || this.strEq(name, "regCreate") || this.strEq(name, "regClose") || this.strEq(name, "regSubKey") || this.strEq(name, "regSetString") || this.strEq(name, "regGetInt") || this.strEq(name, "regSetInt") || this.strEq(name, "regGetInt64") || this.strEq(name, "regSetInt64") || this.strEq(name, "regDeleteValue") || this.strEq(name, "regDeleteKey") || this.strEq(name, "regValueExists") || this.strEq(name, "regSubKeyCount") || this.strEq(name, "regValueCount")) {
+        if (name == "regOpen" || name == "regCreate" || name == "regClose" || name == "regSubKey" || name == "regSetString" || name == "regGetInt" || name == "regSetInt" || name == "regGetInt64" || name == "regSetInt64" || name == "regDeleteValue" || name == "regDeleteKey" || name == "regValueExists" || name == "regSubKeyCount" || name == "regValueCount") {
             this.asm.xorRR64(0, 0);
             this.asm.emitCallTeardown();
             return;
@@ -8716,7 +8665,7 @@ public void genNewCall(Node call) {
         // path) so a program written against silverc-rs/std/gui.sr compiles
         // deterministically: every bridge yields 0, which the Window class
         // guards treat as "no window".
-        if (this.strEq(name, "guiCreateWindow") || this.strEq(name, "guiShow") || this.strEq(name, "guiHide") || this.strEq(name, "guiMaximize") || this.strEq(name, "guiMinimize") || this.strEq(name, "guiSetTitle") || this.strEq(name, "guiClose") || this.strEq(name, "guiRunLoop") || this.strEq(name, "guiSetIcon") || this.strEq(name, "loadIcon")) {
+        if (name == "guiCreateWindow" || name == "guiShow" || name == "guiHide" || name == "guiMaximize" || name == "guiMinimize" || name == "guiSetTitle" || name == "guiClose" || name == "guiRunLoop" || name == "guiSetIcon" || name == "loadIcon") {
             this.asm.xorRR64(0, 0);
             this.asm.emitCallTeardown();
             return;
@@ -8727,7 +8676,7 @@ public void genNewCall(Node call) {
         // backend has no consumer for that contract today; return the empty
         // string so the call site never lands on the unpatched forward-call
         // path with a garbage pointer.
-        if (this.strEq(name, "getFocusedProcessDataNative")) {
+        if (name == "getFocusedProcessDataNative") {
             int strIdx = this.addString("");
             int sp = this.asm.buf.length;
             this.asm.emitImm64(0, 0);
@@ -8741,7 +8690,7 @@ public void genNewCall(Node call) {
         // never collected; the backend provides the native os.type contract:
         // the compile-time constant OSTypes.WINDOWS (0) on this Windows-only
         // backend.
-        if (this.strEq(name, "osType")) {
+        if (name == "osType") {
             // LINUX SysV backend (additive): OSTypes.LINUX (1) on the Linux
             // target; OSTypes.WINDOWS (0) otherwise (unchanged).
             // MAC AAPCS64 backend (additive, code-only): OSTypes.DARWIN (2)
@@ -8758,10 +8707,10 @@ public void genNewCall(Node call) {
         }
         bool isWin32 = false;
         string win32Dll = "";
-        if (this.strEq(name, "FindFirstFileA") || this.strEq(name, "FindNextFileA") || this.strEq(name, "FindClose") || this.strEq(name, "GetFileTime") || this.strEq(name, "DeleteFileA") || this.strEq(name, "MoveFileA") || this.strEq(name, "GetFileAttributesA") || this.strEq(name, "CreateDirectoryA") || this.strEq(name, "RemoveDirectoryA") || this.strEq(name, "SetCurrentDirectoryA") || this.strEq(name, "CreateProcessA") || this.strEq(name, "WaitForSingleObject") || this.strEq(name, "GetStdHandle") || this.strEq(name, "SetConsoleTextAttribute") || this.strEq(name, "GetConsoleScreenBufferInfo") || this.strEq(name, "SetConsoleCursorPosition") || this.strEq(name, "GetModuleHandleA") || this.strEq(name, "LoadLibraryA") || this.strEq(name, "GetProcAddress") || this.strEq(name, "Sleep") || this.strEq(name, "GetTickCount") || this.strEq(name, "GetLastError") || this.strEq(name, "GetCurrentDirectoryA") || this.strEq(name, "WriteConsoleA") || this.strEq(name, "ReadConsoleA") || this.strEq(name, "GetConsoleMode") || this.strEq(name, "SetConsoleMode") || this.strEq(name, "CreatePipe") || this.strEq(name, "GetExitCodeProcess") || this.strEq(name, "CreateFileA") || this.strEq(name, "GetFileSize") || this.strEq(name, "ReadFile") || this.strEq(name, "WriteFile") || this.strEq(name, "CloseHandle") || this.strEq(name, "GetFileAttributesW") || this.strEq(name, "SetFilePointer") || this.strEq(name, "GetCurrentProcessId") || this.strEq(name, "GetCurrentProcess") || this.strEq(name, "GetCurrentThreadId") || this.strEq(name, "GetCurrentThread") || this.strEq(name, "GetEnvironmentVariableA") || this.strEq(name, "GetEnvironmentVariableW") || this.strEq(name, "SetEnvironmentVariableA") || this.strEq(name, "SetEnvironmentVariableW") || this.strEq(name, "ExpandEnvironmentStringsA") || this.strEq(name, "GetEnvironmentStringsA") || this.strEq(name, "FreeEnvironmentStringsA") || this.strEq(name, "GetTempPathA") || this.strEq(name, "GetComputerNameA") || this.strEq(name, "CopyFileA") || this.strEq(name, "SetFileAttributesA") || this.strEq(name, "GetFullPathNameA") || this.strEq(name, "GetModuleFileNameA") || this.strEq(name, "QueryPerformanceCounter") || this.strEq(name, "QueryPerformanceFrequency") || this.strEq(name, "GetTickCount64") || this.strEq(name, "TerminateProcess") || this.strEq(name, "OpenProcess") || this.strEq(name, "GetProcessId") || this.strEq(name, "FlushFileBuffers") || this.strEq(name, "GetFileSizeEx") || this.strEq(name, "CreateProcessW") || this.strEq(name, "CreateProcess") || this.strEq(name, "GetVersionExA") || this.strEq(name, "GetSystemDirectoryA") || this.strEq(name, "GetWindowsDirectoryA") || this.strEq(name, "GetLocalTime") || this.strEq(name, "GetSystemTime") || this.strEq(name, "OutputDebugStringA") || this.strEq(name, "IsDebuggerPresent") || this.strEq(name, "GetCommandLineA") || this.strEq(name, "GlobalAlloc") || this.strEq(name, "GlobalFree") || this.strEq(name, "VirtualAlloc") || this.strEq(name, "VirtualFree") || this.strEq(name, "HeapFree") || this.strEq(name, "GetProcessHeap") || this.strEq(name, "lstrlenA") || this.strEq(name, "lstrcpyA") || this.strEq(name, "lstrcatA") || this.strEq(name, "lstrcmpA") || this.strEq(name, "SetThreadPriority") || this.strEq(name, "QueryFullProcessImageNameA") || this.strEq(name, "GetSystemInfo") || this.strEq(name, "GlobalMemoryStatusEx") || this.strEq(name, "GetDiskFreeSpaceExA") || this.strEq(name, "GetUserDefaultUILanguage")) {
+        if (name == "FindFirstFileA" || name == "FindNextFileA" || name == "FindClose" || name == "GetFileTime" || name == "DeleteFileA" || name == "MoveFileA" || name == "GetFileAttributesA" || name == "CreateDirectoryA" || name == "RemoveDirectoryA" || name == "SetCurrentDirectoryA" || name == "CreateProcessA" || name == "WaitForSingleObject" || name == "GetStdHandle" || name == "SetConsoleTextAttribute" || name == "GetConsoleScreenBufferInfo" || name == "SetConsoleCursorPosition" || name == "GetModuleHandleA" || name == "LoadLibraryA" || name == "GetProcAddress" || name == "Sleep" || name == "GetTickCount" || name == "GetLastError" || name == "GetCurrentDirectoryA" || name == "WriteConsoleA" || name == "ReadConsoleA" || name == "GetConsoleMode" || name == "SetConsoleMode" || name == "CreatePipe" || name == "GetExitCodeProcess" || name == "CreateFileA" || name == "GetFileSize" || name == "ReadFile" || name == "WriteFile" || name == "CloseHandle" || name == "GetFileAttributesW" || name == "SetFilePointer" || name == "GetCurrentProcessId" || name == "GetCurrentProcess" || name == "GetCurrentThreadId" || name == "GetCurrentThread" || name == "GetEnvironmentVariableA" || name == "GetEnvironmentVariableW" || name == "SetEnvironmentVariableA" || name == "SetEnvironmentVariableW" || name == "ExpandEnvironmentStringsA" || name == "GetEnvironmentStringsA" || name == "FreeEnvironmentStringsA" || name == "GetTempPathA" || name == "GetComputerNameA" || name == "CopyFileA" || name == "SetFileAttributesA" || name == "GetFullPathNameA" || name == "GetModuleFileNameA" || name == "QueryPerformanceCounter" || name == "QueryPerformanceFrequency" || name == "GetTickCount64" || name == "TerminateProcess" || name == "OpenProcess" || name == "GetProcessId" || name == "FlushFileBuffers" || name == "GetFileSizeEx" || name == "CreateProcessW" || name == "CreateProcess" || name == "GetVersionExA" || name == "GetSystemDirectoryA" || name == "GetWindowsDirectoryA" || name == "GetLocalTime" || name == "GetSystemTime" || name == "OutputDebugStringA" || name == "IsDebuggerPresent" || name == "GetCommandLineA" || name == "GlobalAlloc" || name == "GlobalFree" || name == "VirtualAlloc" || name == "VirtualFree" || name == "HeapFree" || name == "GetProcessHeap" || name == "lstrlenA" || name == "lstrcpyA" || name == "lstrcatA" || name == "lstrcmpA" || name == "SetThreadPriority" || name == "QueryFullProcessImageNameA" || name == "GetSystemInfo" || name == "GlobalMemoryStatusEx" || name == "GetDiskFreeSpaceExA" || name == "GetUserDefaultUILanguage") {
             isWin32 = true;
             win32Dll = "kernel32.dll";
-        } elif (this.strEq(name, "RegOpenKeyExA") || this.strEq(name, "RegQueryValueExA") || this.strEq(name, "RegCloseKey") || this.strEq(name, "GetUserNameA")) {
+        } elif (name == "RegOpenKeyExA" || name == "RegQueryValueExA" || name == "RegCloseKey" || name == "GetUserNameA") {
             // advapi32 names the
             // std modules call as plain bare functions (the registry backend,
             // and sysinfo's cpuModel/username readers). GetUserNameA is
@@ -8770,44 +8719,44 @@ public void genNewCall(Node call) {
             // kernel32 dies at load with STATUS_ENTRYPOINT_NOT_FOUND.
             isWin32 = true;
             win32Dll = "advapi32.dll";
-        } elif (this.strEq(name, "GetFileVersionInfoSizeA") || this.strEq(name, "GetFileVersionInfoA") || this.strEq(name, "VerQueryValueA")) {
+        } elif (name == "GetFileVersionInfoSizeA" || name == "GetFileVersionInfoA" || name == "VerQueryValueA") {
             // DOCS/251 -- Windows VERSIONINFO APIs live in version.dll.
             isWin32 = true;
             win32Dll = "version.dll";
-        } elif (this.strEq(name, "memcpy") || this.strEq(name, "memset") || this.strEq(name, "memmove") || this.strEq(name, "memcmp") || this.strEq(name, "strlen") || this.strEq(name, "strcmp") || this.strEq(name, "strchr") || this.strEq(name, "strstr") || this.strEq(name, "strrchr") || this.strEq(name, "strcpy") || this.strEq(name, "strcat") || this.strEq(name, "strncmp") || this.strEq(name, "strncat") || this.strEq(name, "strncpy") || this.strEq(name, "strcat") || this.strEq(name, "strtok") || this.strEq(name, "strpbrk") || this.strEq(name, "strspn") || this.strEq(name, "strcspn") || this.strEq(name, "atoi") || this.strEq(name, "atol") || this.strEq(name, "atoll") || this.strEq(name, "strtol") || this.strEq(name, "strtoll") || this.strEq(name, "malloc") || this.strEq(name, "free") || this.strEq(name, "realloc") || this.strEq(name, "calloc") || this.strEq(name, "printf") || this.strEq(name, "fprintf") || this.strEq(name, "sprintf") || this.strEq(name, "sscanf") || this.strEq(name, "fopen") || this.strEq(name, "fclose") || this.strEq(name, "fread") || this.strEq(name, "fwrite") || this.strEq(name, "fflush") || this.strEq(name, "fgets") || this.strEq(name, "fputs") || this.strEq(name, "fseek") || this.strEq(name, "ftell") || this.strEq(name, "system") || this.strEq(name, "getenv") || this.strEq(name, "putenv") || this.strEq(name, "time") || this.strEq(name, "rand") || this.strEq(name, "srand") || this.strEq(name, "abs") || this.strEq(name, "labs") || this.strEq(name, "toupper") || this.strEq(name, "tolower") || this.strEq(name, "isalpha") || this.strEq(name, "isdigit") || this.strEq(name, "isspace") || this.strEq(name, "isprint") || this.strEq(name, "isalnum") || this.strEq(name, "isxdigit") || this.strEq(name, "isupper") || this.strEq(name, "islower")) {
+        } elif (name == "memcpy" || name == "memset" || name == "memmove" || name == "memcmp" || name == "strlen" || name == "strcmp" || name == "strchr" || name == "strstr" || name == "strrchr" || name == "strcpy" || name == "strcat" || name == "strncmp" || name == "strncat" || name == "strncpy" || name == "strcat" || name == "strtok" || name == "strpbrk" || name == "strspn" || name == "strcspn" || name == "atoi" || name == "atol" || name == "atoll" || name == "strtol" || name == "strtoll" || name == "malloc" || name == "free" || name == "realloc" || name == "calloc" || name == "printf" || name == "fprintf" || name == "sprintf" || name == "sscanf" || name == "fopen" || name == "fclose" || name == "fread" || name == "fwrite" || name == "fflush" || name == "fgets" || name == "fputs" || name == "fseek" || name == "ftell" || name == "system" || name == "getenv" || name == "putenv" || name == "time" || name == "rand" || name == "srand" || name == "abs" || name == "labs" || name == "toupper" || name == "tolower" || name == "isalpha" || name == "isdigit" || name == "isspace" || name == "isprint" || name == "isalnum" || name == "isxdigit" || name == "isupper" || name == "islower") {
             isWin32 = true;
             win32Dll = "msvcrt.dll";
-        } elif (this.strEq(name, "socket") || this.strEq(name, "bind") || this.strEq(name, "listen") || this.strEq(name, "accept") || this.strEq(name, "recv") || this.strEq(name, "send") || this.strEq(name, "closesocket") || this.strEq(name, "setsockopt") || this.strEq(name, "WSAStartup") || this.strEq(name, "WSACleanup") || this.strEq(name, "htons") || this.strEq(name, "inet_addr") || this.strEq(name, "getaddrinfo") || this.strEq(name, "freeaddrinfo") || this.strEq(name, "ioctlsocket") || this.strEq(name, "select") || this.strEq(name, "connect") || this.strEq(name, "shutdown") || this.strEq(name, "WSAGetLastError")) {
+        } elif (name == "socket" || name == "bind" || name == "listen" || name == "accept" || name == "recv" || name == "send" || name == "closesocket" || name == "setsockopt" || name == "WSAStartup" || name == "WSACleanup" || name == "htons" || name == "inet_addr" || name == "getaddrinfo" || name == "freeaddrinfo" || name == "ioctlsocket" || name == "select" || name == "connect" || name == "shutdown" || name == "WSAGetLastError") {
             isWin32 = true;
             win32Dll = "ws2_32.dll";
-        } elif (this.strEq(name, "InternetOpenA") || this.strEq(name, "InternetConnectA") || this.strEq(name, "InternetOpenUrlA") || this.strEq(name, "InternetReadFile") || this.strEq(name, "InternetReadFileExA") || this.strEq(name, "InternetCloseHandle") || this.strEq(name, "HttpSendRequestA") || this.strEq(name, "HttpSendRequestExA") || this.strEq(name, "InternetQueryDataAvailable") || this.strEq(name, "InternetSetOptionA") || this.strEq(name, "InternetQueryOptionA") || this.strEq(name, "HttpQueryInfoA") || this.strEq(name, "InternetWriteFile") || this.strEq(name, "InternetGetConnectedState") || this.strEq(name, "InternetCrackUrlA") || this.strEq(name, "InternetCanonicalizeUrlA") || this.strEq(name, "InternetSetStatusCallback")) {
+        } elif (name == "InternetOpenA" || name == "InternetConnectA" || name == "InternetOpenUrlA" || name == "InternetReadFile" || name == "InternetReadFileExA" || name == "InternetCloseHandle" || name == "HttpSendRequestA" || name == "HttpSendRequestExA" || name == "InternetQueryDataAvailable" || name == "InternetSetOptionA" || name == "InternetQueryOptionA" || name == "HttpQueryInfoA" || name == "InternetWriteFile" || name == "InternetGetConnectedState" || name == "InternetCrackUrlA" || name == "InternetCanonicalizeUrlA" || name == "InternetSetStatusCallback") {
             isWin32 = true;
             win32Dll = "wininet.dll";
-        } elif (this.strEq(name, "ShellExecuteA") || this.strEq(name, "ShellExecuteW") || this.strEq(name, "ShellExecuteExA") || this.strEq(name, "ShellExecuteExW")) {
+        } elif (name == "ShellExecuteA" || name == "ShellExecuteW" || name == "ShellExecuteExA" || name == "ShellExecuteExW") {
             isWin32 = true;
             win32Dll = "shell32.dll";
-        } elif (this.strEq(name, "WinHttpOpen") || this.strEq(name, "WinHttpConnect") || this.strEq(name, "WinHttpOpenRequest") || this.strEq(name, "WinHttpSendRequest") || this.strEq(name, "WinHttpReceiveResponse") || this.strEq(name, "WinHttpReadData") || this.strEq(name, "WinHttpCloseHandle") || this.strEq(name, "WinHttpQueryHeaders") || this.strEq(name, "WinHttpQueryDataAvailable") || this.strEq(name, "WinHttpSetOption")) {
+        } elif (name == "WinHttpOpen" || name == "WinHttpConnect" || name == "WinHttpOpenRequest" || name == "WinHttpSendRequest" || name == "WinHttpReceiveResponse" || name == "WinHttpReadData" || name == "WinHttpCloseHandle" || name == "WinHttpQueryHeaders" || name == "WinHttpQueryDataAvailable" || name == "WinHttpSetOption") {
             isWin32 = true;
             win32Dll = "winhttp.dll";
-        } elif (this.strEq(name, "keybd_event") || this.strEq(name, "VkKeyScanA") || this.strEq(name, "GetKeyState") || this.strEq(name, "GetAsyncKeyState") || this.strEq(name, "GetKeyboardState") || this.strEq(name, "SetKeyboardState") || this.strEq(name, "MapVirtualKeyA") || this.strEq(name, "SendInput")) {
+        } elif (name == "keybd_event" || name == "VkKeyScanA" || name == "GetKeyState" || name == "GetAsyncKeyState" || name == "GetKeyboardState" || name == "SetKeyboardState" || name == "MapVirtualKeyA" || name == "SendInput") {
             // Win32 keyboard - user32.dll (DOCS/229, mirrors silverc-rs
             // keyboard.rs + the user32 dispatcher added later).
             isWin32 = true;
             win32Dll = "user32.dll";
-        } elif (this.strEq(name, "mouse_event") || this.strEq(name, "GetCursorPos") || this.strEq(name, "GetCursorX") || this.strEq(name, "GetCursorY") || this.strEq(name, "SetCursorPos") || this.strEq(name, "SetCursor") || this.strEq(name, "ClipCursor") || this.strEq(name, "GetClipCursor") || this.strEq(name, "GetDoubleClickTime") || this.strEq(name, "SetDoubleClickTime") || this.strEq(name, "GetForegroundWindow") || this.strEq(name, "GetWindowTextA") || this.strEq(name, "GetWindowThreadProcessId")) {
+        } elif (name == "mouse_event" || name == "GetCursorPos" || name == "GetCursorX" || name == "GetCursorY" || name == "SetCursorPos" || name == "SetCursor" || name == "ClipCursor" || name == "GetClipCursor" || name == "GetDoubleClickTime" || name == "SetDoubleClickTime" || name == "GetForegroundWindow" || name == "GetWindowTextA" || name == "GetWindowThreadProcessId") {
             // Win32 mouse / cursor - same user32.dll but a distinct elif so
             // the keyboard importer above cannot silently absorb a typo, and
             // so mouse-specific extensions (SetCursor, ClipCursor) can be
             // added without touching the keyboard list.
             isWin32 = true;
             win32Dll = "user32.dll";
-        } elif (this.strEq(name, "RegisterHotKey") || this.strEq(name, "UnregisterHotKey") || this.strEq(name, "MessageBeep") || this.strEq(name, "RegisterRawInputDevices") || this.strEq(name, "GetRawInputData") || this.strEq(name, "GetRawInputDeviceList")) {
+        } elif (name == "RegisterHotKey" || name == "UnregisterHotKey" || name == "MessageBeep" || name == "RegisterRawInputDevices" || name == "GetRawInputData" || name == "GetRawInputDeviceList") {
             // Hotkeys + raw input on user32.dll. Kept separate from the
             // keyboard / mouse sections so future raw-input work can land in
             // its own block.
             isWin32 = true;
             win32Dll = "user32.dll";
-        } elif (this.strEq(name, "RegisterClassExA") || this.strEq(name, "CreateWindowExA") || this.strEq(name, "ShowWindow") || this.strEq(name, "UpdateWindow") || this.strEq(name, "SetWindowTextA") || this.strEq(name, "DestroyWindow") || this.strEq(name, "GetMessageA") || this.strEq(name, "TranslateMessage") || this.strEq(name, "DispatchMessageA") || this.strEq(name, "DefWindowProcA") || this.strEq(name, "PostQuitMessage") || this.strEq(name, "GetSystemMetrics") || this.strEq(name, "LoadIconA") || this.strEq(name, "LoadCursorA") || this.strEq(name, "LoadImageA") || this.strEq(name, "SendMessageA")) {
+        } elif (name == "RegisterClassExA" || name == "CreateWindowExA" || name == "ShowWindow" || name == "UpdateWindow" || name == "SetWindowTextA" || name == "DestroyWindow" || name == "GetMessageA" || name == "TranslateMessage" || name == "DispatchMessageA" || name == "DefWindowProcA" || name == "PostQuitMessage" || name == "GetSystemMetrics" || name == "LoadIconA" || name == "LoadCursorA" || name == "LoadImageA" || name == "SendMessageA") {
             // DOCS/248 -- window GUI on user32.dll. The Window class in
             // std/gui.sr calls these directly; the generic dispatcher emits
             // the IAT call with the arguments spilled in Win64 order.
@@ -8836,7 +8785,7 @@ public void genNewCall(Node call) {
         // CreateProcess (that spelling exists only as a C macro).  Map it to
         // the ANSI import so source like std/process.sr links and runs.
         string importName = name;
-        if (this.strEq(name, "CreateProcess")) { importName = "CreateProcessA"; }
+        if (name == "CreateProcess") { importName = "CreateProcessA"; }
         // Aliased win32 grants. Resolution
         // order mirrors silverc-rs win32::resolve: full-DLL tables and plain
         // single-export grants answer first, aliased grants second, matched
@@ -8858,14 +8807,14 @@ public void genNewCall(Node call) {
         string aliasExport = "";
         if (!plainWin32Allowed) {
             for (int g = 0; g < this.win32AliasLocals.length; g++) {
-                if (this.strEq(this.win32AliasLocals[g], name)) {
+                if (this.win32AliasLocals[g] == name) {
                     aliasDll = this.win32AliasDlls[g];
                     aliasExport = this.win32AliasExports[g];
                 }
             }
             if (aliasDll.length == 0) {
                 for (int a2 = 0; a2 < this.linuxAliasLocals.length; a2++) {
-                    if (this.strEq(this.linuxAliasLocals[a2], name)) {
+                    if (this.linuxAliasLocals[a2] == name) {
                         aliasDll = this.linuxAliasLibs[a2];
                         aliasExport = this.linuxAliasExports[a2];
                     }
@@ -8928,8 +8877,8 @@ public void genNewCall(Node call) {
         if (recv.kind != 13) { return false; }
         Node recvObj = recv.child(0);
         if (recvObj.kind != 6) { return false; }
-        if (!this.strEq(recvObj.name, "this")) { return false; }
-        if (!this.strEq(recv.name, "asm")) { return false; }
+        if (recvObj.name != "this") { return false; }
+        if (recv.name != "asm") { return false; }
         return true;
     }
 
@@ -8943,12 +8892,12 @@ public void genNewCall(Node call) {
         // register and corrupt string/object parameters.
         if (recv.kind == 6) {
             for (int i = 0; i < this.classNames.length; i++) {
-                if (this.strEq(this.classNames[i], recv.name)) { return true; }
+                if (this.classNames[i] == recv.name) { return true; }
             }
         }
         string recvClass = this.inferExprType(recv);
         for (int i = 0; i < this.classNames.length; i++) {
-            if (this.typeNameEq(this.classNames[i], recvClass)) { return true; }
+            if ((this.classNames[i] == recvClass || recvClass == this.classNames[i] + "?")) { return true; }
         }
         return false;
     }
@@ -8957,7 +8906,7 @@ public void genNewCall(Node call) {
         string name = call.name;
         int funcIdx = -1;
         for (int i = 0; i < this.funcNames.length; i = i + 1) {
-            if (this.strEq(this.funcNames[i], name) && this.strEq(this.funcClasses[i], "MiniAsm")) {
+            if (this.funcNames[i] == name && this.funcClasses[i] == "MiniAsm") {
                 funcIdx = i;
             }
         }
@@ -9021,8 +8970,8 @@ public void genNewCall(Node call) {
         if (!call.isMember || call.childCount() < 1) { return false; }
         string name = call.name;
         string recvType = this.inferExprType(call.child(0));
-        if (this.strEq(name, "toString")) {
-            if (this.strEq(recvType, "string") || this.strEq(recvType, "char") || this.strEq(recvType, "int") || this.strEq(recvType, "int32") || this.strEq(recvType, "int64") || this.strEq(recvType, "uint") || this.strEq(recvType, "bool") || this.strEq(recvType, "float64")) {
+        if (name == "toString") {
+            if (recvType == "string" || recvType == "char" || recvType == "int" || recvType == "int32" || recvType == "int64" || recvType == "uint" || recvType == "bool" || recvType == "float64") {
                 return true;
             }
         }
@@ -9032,25 +8981,25 @@ public void genNewCall(Node call) {
         // reload of the operand. Without this, `idx.toInt().toInt()` (common in
         // silveri) routed through genUserCall and corrupted RAX when the
         // receiver was itself a call expression.
-        if (this.strEq(name, "toInt") || this.strEq(name, "toInt64") || this.strEq(name, "toNumber")) {
-            if (this.strEq(recvType, "int") || this.strEq(recvType, "int32") || this.strEq(recvType, "int64") || this.strEq(recvType, "bool") || this.strEq(recvType, "char")) {
+        if (name == "toInt" || name == "toInt64" || name == "toNumber") {
+            if (recvType == "int" || recvType == "int32" || recvType == "int64" || recvType == "bool" || recvType == "char") {
                 return true;
             }
         }
-        if (this.strEq(name, "toFloat") || this.strEq(name, "toFloat64")) {
-            if (this.strEq(recvType, "float") || this.strEq(recvType, "float64")
-                || this.strEq(recvType, "int") || this.strEq(recvType, "int32") || this.strEq(recvType, "int64")
-                || this.strEq(recvType, "uint") || this.strEq(recvType, "bool") || this.strEq(recvType, "char")) {
+        if (name == "toFloat" || name == "toFloat64") {
+            if (recvType == "float" || recvType == "float64"
+                || recvType == "int" || recvType == "int32" || recvType == "int64"
+                || recvType == "uint" || recvType == "bool" || recvType == "char") {
                 return true;
             }
         }
-        if (this.strEq(recvType, "string")) {
-            if (this.strEq(name, "contains") || this.strEq(name, "trim") || this.strEq(name, "trimEnd") || this.strEq(name, "trimStart") || this.strEq(name, "trimLeft") || this.strEq(name, "trimRight") || this.strEq(name, "split") || this.strEq(name, "lines") || this.strEq(name, "startsWith") || this.strEq(name, "endsWith") || this.strEq(name, "indexOf") || this.strEq(name, "find") || this.strEq(name, "substr") || this.strEq(name, "substring") || this.strEq(name, "toLower") || this.strEq(name, "lower") || this.strEq(name, "toUpper") || this.strEq(name, "upper") || this.strEq(name, "replace") || this.strEq(name, "pad") || this.strEq(name, "padLeft") || this.strEq(name, "padRight") || this.strEq(name, "slugify") || this.strEq(name, "length") || this.strEq(name, "toInt64") || this.strEq(name, "toInt") || this.strEq(name, "toNumber") || this.strEq(name, "toBytes")) {
+        if (recvType == "string") {
+            if (name == "contains" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "substr" || name == "substring" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toBytes") {
                 return true;
             }
         }
-        if (this.strEq(recvType, "char")) {
-            if (this.strEq(name, "isDigit") || this.strEq(name, "isAlpha") || this.strEq(name, "isAlphaNum") || this.strEq(name, "isLower") || this.strEq(name, "isUpper") || this.strEq(name, "isWhiteSpace")) {
+        if (recvType == "char") {
+            if (name == "isDigit" || name == "isAlpha" || name == "isAlphaNum" || name == "isLower" || name == "isUpper" || name == "isWhiteSpace") {
                 return true;
             }
         }
@@ -9061,12 +9010,12 @@ public void genNewCall(Node call) {
         Node recv = call.child(0);
         string name = call.name;
         string recvType = this.inferExprType(recv);
-        if (this.strEq(name, "toString")) {
-            if (this.strEq(recvType, "string")) {
+        if (name == "toString") {
+            if (recvType == "string") {
                 this.genExpr(recv);
             } elif (this.isCharExpr(recv)) {
                 this.genCharToString(recv);
-            } elif (this.strEq(recvType, "float") || this.strEq(recvType, "float64") || this.strEq(recvType, "double")) {
+            } elif (recvType == "float" || recvType == "float64" || recvType == "double") {
                 this.genFloatToString(recv);
             } elif (call.childCount() >= 2 && call.child(1).kind == 2) {
                 this.genIntToStringRadix(recv, call.child(1).strVal);
@@ -9075,18 +9024,18 @@ public void genNewCall(Node call) {
             }
             return;
         }
-        if (this.strEq(name, "toInt") || this.strEq(name, "toInt64") || this.strEq(name, "toNumber")) {
-            if (this.strEq(recvType, "int") || this.strEq(recvType, "int32") || this.strEq(recvType, "int64") || this.strEq(recvType, "bool") || this.strEq(recvType, "char")) {
+        if (name == "toInt" || name == "toInt64" || name == "toNumber") {
+            if (recvType == "int" || recvType == "int32" || recvType == "int64" || recvType == "bool" || recvType == "char") {
                 this.genExpr(recv);
                 return;
             }
         }
-        if (this.strEq(name, "toFloat") || this.strEq(name, "toFloat64")) {
-            if (this.strEq(recvType, "float") || this.strEq(recvType, "float64")) {
+        if (name == "toFloat" || name == "toFloat64") {
+            if (recvType == "float" || recvType == "float64") {
                 this.genExpr(recv);
                 return;
             }
-            if (this.strEq(recvType, "int") || this.strEq(recvType, "int32") || this.strEq(recvType, "int64") || this.strEq(recvType, "uint") || this.strEq(recvType, "bool") || this.strEq(recvType, "char")) {
+            if (recvType == "int" || recvType == "int32" || recvType == "int64" || recvType == "uint" || recvType == "bool" || recvType == "char") {
                 // int -> double: 64-bit cvtsi2sd xmm0, rax (see
                 // emitCvtsi2sdRax) then movq rax, xmm0.
                 this.genExpr(recv);
@@ -9095,7 +9044,7 @@ public void genNewCall(Node call) {
                 return;
             }
         }
-        if (this.strEq(name, "length")) {
+        if (name == "length") {
             // string.length() - call form of the .length field access.
             this.genExpr(recv);
             this.asm.movRR64(1, 0);
@@ -9108,7 +9057,7 @@ public void genNewCall(Node call) {
             this.asm.emitCallTeardown();
             return;
         }
-        if (this.strEq(name, "toBytes")) {
+        if (name == "toBytes") {
             // string.toBytes(): one byte of the NUL-terminated source per
             // element. Mirrors the silverc-rs emitter's semantics, lowered to
             // the self-host's dynamic byte[] layout (capacity qword at +0,
@@ -9195,7 +9144,7 @@ public void genNewCall(Node call) {
             this.asm.addRI32(0, 16);
             return;
         }
-        if (this.strEq(name, "contains")) {
+        if (name == "contains") {
             if (call.childCount() < 2) { this.asm.xorRR64(0, 0); return; }
             int recvOff = this.allocLocal("__contains_recv");
             this.genExpr(recv);
@@ -9221,7 +9170,7 @@ public void genNewCall(Node call) {
             this.asm.bindLabel(containsDone);
             return;
         }
-        if (this.strEq(name, "toInt64") || this.strEq(name, "toInt") || this.strEq(name, "toNumber")) {
+        if (name == "toInt64" || name == "toInt" || name == "toNumber") {
             // Convert a string to an integer via strtoll().  When no digit is
             // consumed (endptr still points at the original string) the input
             // is not numeric and a FormatException is thrown.
@@ -9250,10 +9199,10 @@ public void genNewCall(Node call) {
             this.asm.bindLabel(toOk);
             return;
         }
-        if (this.strEq(name, "trim") || this.strEq(name, "trimEnd") || this.strEq(name, "trimRight") || this.strEq(name, "trimStart") || this.strEq(name, "trimLeft")) {
+        if (name == "trim" || name == "trimEnd" || name == "trimRight" || name == "trimStart" || name == "trimLeft") {
             int tMode = 0;
-            if (this.strEq(name, "trim")) { tMode = 2; }
-            elif (this.strEq(name, "trimStart") || this.strEq(name, "trimLeft")) { tMode = 1; }
+            if (name == "trim") { tMode = 2; }
+            elif (name == "trimStart" || name == "trimLeft") { tMode = 1; }
             if (call.childCount() >= 2) {
                 this.genTrimCore(recv, call.child(1), 1, tMode);
             } else {
@@ -9261,7 +9210,7 @@ public void genNewCall(Node call) {
             }
             return;
         }
-        if (this.strEq(name, "startsWith")) {
+        if (name == "startsWith") {
             if (call.childCount() < 2) { this.asm.xorRR64(0, 0); return; }
             int swRecv = this.allocLocal("__starts_recv");
             int swPrefix = this.allocLocal("__starts_prefix");
@@ -9331,7 +9280,7 @@ public void genNewCall(Node call) {
 
             return;
         }
-        if (this.strEq(name, "endsWith")) {
+        if (name == "endsWith") {
             if (call.childCount() < 2) { this.asm.xorRR64(0, 0); return; }
             int ewRecv = this.allocLocal("__ends_recv");
             int ewSuffix = this.allocLocal("__ends_suffix");
@@ -9411,7 +9360,7 @@ public void genNewCall(Node call) {
             this.asm.bindLabel(ewDone);
             return;
         }
-        if (this.strEq(name, "indexOf") || this.strEq(name, "find")) {
+        if (name == "indexOf" || name == "find") {
             if (call.childCount() < 2) { this.asm.movRI64(0, -1); return; }
             int ioRecv = this.allocLocal("__index_recv");
             int ioNeedle = this.allocLocal("__index_needle");
@@ -9453,7 +9402,7 @@ public void genNewCall(Node call) {
             this.asm.bindLabel(ioDone);
             return;
         }
-        if (this.strEq(name, "substr") || this.strEq(name, "substring")) {
+        if (name == "substr" || name == "substring") {
             // substr(start) / substr(start, len) - allocate a new NUL-terminated copy.
             int sbRecv = this.allocLocal("__sub_recv");
             int sbStart = this.allocLocal("__sub_start");
@@ -9558,7 +9507,7 @@ public void genNewCall(Node call) {
             this.asm.movRMBase(0, 5, sbDst);
             return;
         }
-        if (this.strEq(name, "toLower") || this.strEq(name, "lower")) {
+        if (name == "toLower" || name == "lower") {
             int tlRecv = this.allocLocal("__tl_recv");
             int tlLen = this.allocLocal("__tl_len");
             int tlDst = this.allocLocal("__tl_dst");
@@ -9627,7 +9576,7 @@ public void genNewCall(Node call) {
             this.asm.movRMBase(0, 5, tlDst);
             return;
         }
-        if (this.strEq(name, "toUpper") || this.strEq(name, "upper")) {
+        if (name == "toUpper" || name == "upper") {
             int tuRecv = this.allocLocal("__tu_recv");
             int tuLen = this.allocLocal("__tu_len");
             int tuDst = this.allocLocal("__tu_dst");
@@ -9697,7 +9646,7 @@ public void genNewCall(Node call) {
             this.asm.movRMBase(0, 5, tuDst);
             return;
         }
-        if (this.strEq(name, "replace")) {
+        if (name == "replace") {
             // replace(old, new) - simple implementation using strstr loops
             if (call.childCount() < 3) { this.genExpr(recv); return; }
             int rpR = this.allocLocal("__rep_r");
@@ -9871,9 +9820,9 @@ public void genNewCall(Node call) {
             this.asm.movRMBase(0, 5, rpDst);
             return;
         }
-        if (this.strEq(name, "split") || this.strEq(name, "lines")) {
+        if (name == "split" || name == "lines") {
             // split(delim) / lines() - returns string[] using strstr iteration
-            if (this.strEq(name, "split") && call.childCount() < 2) { this.genExpr(recv); return; }
+            if (name == "split" && call.childCount() < 2) { this.genExpr(recv); return; }
             int spR = this.allocLocal("__sp_r");
             int spD = this.allocLocal("__sp_d");
             int spRL = this.allocLocal("__sp_rl");
@@ -9887,7 +9836,7 @@ public void genNewCall(Node call) {
             int spIdx = this.allocLocal("__sp_ix");
             this.genExpr(recv);
             this.asm.movMBaseR(5, 0, spR);
-            if (this.strEq(name, "lines")) {
+            if (name == "lines") {
                 Node nl = new Node(); nl.kind = 2; nl.strVal = "\n";
                 this.genExpr(nl);
             } else {
@@ -10057,18 +10006,18 @@ public void genNewCall(Node call) {
             this.asm.addRI32(0, 16);
             return;
         }
-        if (this.strEq(name, "isAlpha") || this.strEq(name, "isAlphaNum") || this.strEq(name, "isDigit") || this.strEq(name, "isLower") || this.strEq(name, "isUpper") || this.strEq(name, "isWhiteSpace")) {
+        if (name == "isAlpha" || name == "isAlphaNum" || name == "isDigit" || name == "isLower" || name == "isUpper" || name == "isWhiteSpace") {
             this.genExpr(recv);
             this.asm.movRR64(1, 0);
             int cYes = this.newLabel();
             int cEnd = this.newLabel();
             int cNo = this.newLabel();
-            if (this.strEq(name, "isDigit")) {
+            if (name == "isDigit") {
                 this.asm.cmpRI32(1, 48);
                 this.asm.jlLabel(cNo);
                 this.asm.cmpRI32(1, 57);
                 this.asm.jleLabel(cYes);
-            } elif (this.strEq(name, "isWhiteSpace")) {
+            } elif (name == "isWhiteSpace") {
                 this.asm.cmpRI32(1, 32);
                 this.asm.jeLabel(cYes);
                 this.asm.cmpRI32(1, 9);
@@ -10077,17 +10026,17 @@ public void genNewCall(Node call) {
                 this.asm.jeLabel(cYes);
                 this.asm.cmpRI32(1, 13);
                 this.asm.jeLabel(cYes);
-            } elif (this.strEq(name, "isLower")) {
+            } elif (name == "isLower") {
                 this.asm.cmpRI32(1, 97);
                 this.asm.jlLabel(cNo);
                 this.asm.cmpRI32(1, 122);
                 this.asm.jleLabel(cYes);
-            } elif (this.strEq(name, "isUpper")) {
+            } elif (name == "isUpper") {
                 this.asm.cmpRI32(1, 65);
                 this.asm.jlLabel(cNo);
                 this.asm.cmpRI32(1, 90);
                 this.asm.jleLabel(cYes);
-            } elif (this.strEq(name, "isAlpha")) {
+            } elif (name == "isAlpha") {
                 int lo1 = this.newLabel();
                 this.asm.cmpRI32(1, 65);
                 this.asm.jlLabel(lo1);
@@ -10098,7 +10047,7 @@ public void genNewCall(Node call) {
                 this.asm.jlLabel(cNo);
                 this.asm.cmpRI32(1, 122);
                 this.asm.jleLabel(cYes);
-            } elif (this.strEq(name, "isAlphaNum")) {
+            } elif (name == "isAlphaNum") {
                 int midNo = this.newLabel();
                 this.asm.cmpRI32(1, 48);
                 this.asm.jlLabel(midNo);
@@ -10237,7 +10186,6 @@ public void genNewCall(Node call) {
         this.asm.movMBaseR(5, 0, startOff);
         this.asm.movRMBase(0, 5, lenOff);
         this.asm.movMBaseR(5, 0, endOff);
-
 
         if (mode == 1 || mode == 2) {
             int sLoop = this.newLabel();
@@ -10389,7 +10337,7 @@ public void genNewCall(Node call) {
         // function, corrupting every argument at the call site.
         if (recv.kind == 6) {
             for (int ci = 0; ci < this.classNames.length; ci++) {
-                if (this.strEq(this.classNames[ci], recv.name)) { recvClass = recv.name; }
+                if (this.classNames[ci] == recv.name) { recvClass = recv.name; }
             }
         }
         int funcIdx = -1;
@@ -10402,7 +10350,7 @@ public void genNewCall(Node call) {
         if (explicitUserArgs < 0) { explicitUserArgs = 0; }
         bool haveExactClass = false;
         for (int i = 0; i < this.funcNames.length; i++) {
-            if (this.strEq(this.funcNames[i], name) && this.typeNameEq(this.funcClasses[i], recvClass)) {
+            if (this.funcNames[i] == name && (this.funcClasses[i] == recvClass || recvClass == this.funcClasses[i] + "?")) {
                 haveExactClass = true;
             }
         }
@@ -10416,7 +10364,7 @@ public void genNewCall(Node call) {
         // inherited fields, so the parent chain is covered.
         if (funcIdx < 0 && call.childCount() == 1) {
             string fieldType = this.findFieldType(recvClass, name);
-            if (this.strEq(fieldType, "void ()")) {
+            if (fieldType == "void ()") {
                 int fnFieldOff = this.findFieldOffset(recvClass, name);
                 if (fnFieldOff >= 0) {
                     this.genExpr(call.child(0));
@@ -10432,7 +10380,7 @@ public void genNewCall(Node call) {
         }
         if (funcIdx < 0) {
             for (int i = 0; i < this.funcNames.length; i++) {
-                if (this.strEq(this.funcNames[i], name)) {
+                if (this.funcNames[i] == name) {
                     funcIdx = i;
                 }
             }
@@ -10673,7 +10621,7 @@ public void genNewCall(Node call) {
         }
         if (op == 26) {
             string rptLt = this.inferExprType(bin.child(0));
-            if (this.strEq(rptLt, "string")) {
+            if (rptLt == "string") {
                 this.genStringRepeat(bin);
                 return;
             }
@@ -10693,7 +10641,7 @@ public void genNewCall(Node call) {
             // A char operand alone (`'a' + 1`, `'a' + 'b'`) is integer
             // arithmetic on the code point; treating char as string there
             // silently produced garbage from the string-concat path.
-            if (this.strEq(lt, "string") || this.strEq(rt, "string")) {
+            if (lt == "string" || rt == "string") {
                 this.genStringConcat(bin);
                 return;
             }
@@ -10705,7 +10653,7 @@ public void genNewCall(Node call) {
 
             string eqLt = this.inferExprType(bin.child(0));
             string eqRt = this.inferExprType(bin.child(1));
-            if (this.strEq(eqLt, "string") && this.strEq(eqRt, "string")) {
+            if (eqLt == "string" && eqRt == "string") {
                 this.genExpr(bin.child(0));
                 this.asm.pushR64(0);
                 this.genExpr(bin.child(1));
@@ -10862,14 +10810,14 @@ public void genNewCall(Node call) {
             int off = this.findLocal(lhs.name);
             int gi = this.findGlobal(lhs.name);
             int fieldOff = -1;
-            if (off == 0 && gi < 0 && !this.strEq(this.currentClassName, "")) {
+            if (off == 0 && gi < 0 && this.currentClassName != "") {
                 // Bare class field compound assign: `field += x` resolves to
                 // `this.field += x` (parity with silverc-rs).
                 fieldOff = this.findFieldOffset(this.currentClassName, lhs.name);
             }
             if (op == 14 && fieldOff >= 0) {
                 string bfT = this.findFieldType(this.currentClassName, lhs.name);
-                if (this.strEq(bfT, "string")) {
+                if (bfT == "string") {
                     // Bare string field `s += x`: the getLocalType string
                     // check below only sees locals/globals, so the generic
                     // path would integer-add heap pointers and fault on the
@@ -10906,10 +10854,10 @@ public void genNewCall(Node call) {
             // XMM sequence as genFloatBinary (mirrors silverc-rs float
             // compound-assign dispatch).
             string lhsT = this.getLocalType(lhs.name);
-            bool lhsFloat = this.strEq(lhsT, "float") || this.strEq(lhsT, "float64") || this.strEq(lhsT, "double");
+            bool lhsFloat = lhsT == "float" || lhsT == "float64" || lhsT == "double";
             if (!lhsFloat && fieldOff >= 0) {
                 string ffT = this.findFieldType(this.currentClassName, lhs.name);
-                lhsFloat = this.strEq(ffT, "float") || this.strEq(ffT, "float64") || this.strEq(ffT, "double");
+                lhsFloat = ffT == "float" || ffT == "float64" || ffT == "double";
             }
             if (lhsFloat && (op == 14 || op == 15 || op == 16 || op == 17)) {
                 if (off != 0) { this.asm.movRMBase(0, 5, off); }
@@ -10967,7 +10915,7 @@ public void genNewCall(Node call) {
             }
             if (op == 14) {
                 string lt = this.getLocalType(lhs.name);
-                if (this.strEq(lt, "string")) {
+                if (lt == "string") {
                     this.genStringConcat(bin);
                     if (off != 0) {
                         if (this.isRefParam(lhs.name)) {
@@ -11089,7 +11037,7 @@ public void genNewCall(Node call) {
                 arrIsByte = this.isByteElemType(this.getLocalType(arrNode.name));
             } elif (arrNode.kind == 13) {
                 Node arrObj = arrNode.child(0);
-                if (arrObj.kind == 6 && this.strEq(arrObj.name, "this")) {
+                if (arrObj.kind == 6 && arrObj.name == "this") {
                     // Stable classification for self-hosted stages: resolve the
                     // field type from the class table instead of the recursive
                     // inferExprType path.
@@ -11216,12 +11164,12 @@ public void genNewCall(Node call) {
         if (lhs.kind == 13 && lhs.childCount() >= 1) {
             Node obj = lhs.child(0);
             string fieldName = lhs.name;
-            if (obj.kind == 6 && this.strEq(obj.name, "this")) {
+            if (obj.kind == 6 && obj.name == "this") {
                 int thisOff = this.findLocal("this");
                 int fieldOff = this.findFieldOffset(this.currentClassName, fieldName);
                 if (fieldOff < 0) { this.genExpr(rhs); return; }
                 string fT = this.findFieldType(this.currentClassName, fieldName);
-                if ((this.strEq(fT, "float") || this.strEq(fT, "float64") || this.strEq(fT, "double"))
+                if ((fT == "float" || fT == "float64" || fT == "double")
                     && (op == 14 || op == 15 || op == 16 || op == 17)) {
                     // Float field compound-assign: the field holds IEEE-754
                     // bits; the integer ops below corrupt them. Run the same
@@ -11250,7 +11198,7 @@ public void genNewCall(Node call) {
                     this.asm.movMBaseR(10, 0, 0);
                     return;
                 }
-                if (this.strEq(fT, "string") && op == 14) {
+                if (fT == "string" && op == 14) {
                     // String field compound-assign: integer-add would combine
                     // heap pointers and fault on next use. Run the concat
                     // machinery (fresh buffer in rax) with the this.field lhs
@@ -11298,13 +11246,13 @@ public void genNewCall(Node call) {
                 int gi = this.findGlobal(obj.name);
                 string lookupType = varType;
                 string elemType = this.arrayElementType(varType);
-                if (!this.strEq(elemType, "")) { lookupType = elemType; }
+                if (elemType != "") { lookupType = elemType; }
                 int fieldOff = this.findFieldOffset(lookupType, fieldName);
                 if (fieldOff < 0) {
                     fieldOff = this.findFieldOffsetInAllClasses(fieldName);
                 }
                 string varFieldT = this.findFieldType(lookupType, fieldName);
-                if ((this.strEq(varFieldT, "float") || this.strEq(varFieldT, "float64") || this.strEq(varFieldT, "double"))
+                if ((varFieldT == "float" || varFieldT == "float64" || varFieldT == "double")
                     && (op == 14 || op == 15 || op == 16 || op == 17)
                     && fieldOff >= 0 && (off != 0 || gi >= 0)) {
                     // Float field compound-assign through a variable
@@ -11343,7 +11291,7 @@ public void genNewCall(Node call) {
                     this.asm.movMBaseR(11, 0, 0);
                     return;
                 }
-                if (this.strEq(varFieldT, "string") && op == 14
+                if (varFieldT == "string" && op == 14
                     && fieldOff >= 0 && (off != 0 || gi >= 0)) {
                     // String field compound-assign through a variable
                     // receiver: integer-add would combine heap pointers and
@@ -11435,7 +11383,7 @@ public void genNewCall(Node call) {
         Node rhs = bin.child(1);
         if (lhs.kind == 13 && lhs.childCount() >= 1) {
             Node titleObj = lhs.child(0);
-            if (titleObj.kind == 6 && this.strEq(titleObj.name, "console") && this.strEq(lhs.name, "title")) {
+            if (titleObj.kind == 6 && titleObj.name == "console" && lhs.name == "title") {
                 Node titleCall = new Node();
                 titleCall.kind = 10;
                 titleCall.name = "setTitle";
@@ -11453,7 +11401,7 @@ public void genNewCall(Node call) {
                 // Struct literal assigned to an existing struct variable:
                 // build a fresh struct object with the variable's type.
                 string lhsType = this.getLocalType(lhs.name);
-                if (this.strEq(lhsType, "")) { lhsType = this.getLocalType(lhs.name); }
+                if (lhsType == "") { lhsType = this.getLocalType(lhs.name); }
                 this.genStructLiteral(rhs, lhsType);
             } else {
                 this.genExpr(rhs);
@@ -11482,7 +11430,7 @@ public void genNewCall(Node call) {
                 }
             } elif (off != 0 && !this.isClassName(assignCurT)) {
                 string rhsClass = this.findClassForExpr(rhs);
-                if (!this.strEq(rhsClass, "")) {
+                if (rhsClass != "") {
                     this.setLocalType(lhs.name, rhsClass);
                 }
             }
@@ -11498,7 +11446,7 @@ public void genNewCall(Node call) {
                 }
             } elif (gi >= 0) {
                 this.genGlobalStore(gi);
-            } else if (!this.strEq(this.currentClassName, "")) {
+            } else if (this.currentClassName != "") {
                 // Bare class field write: `field = value` inside a method
                 // resolves to `this.field = value` (parity with silverc-rs).
                 // The old fallback stored to [rbp+0], clobbering the saved
@@ -11526,7 +11474,7 @@ public void genNewCall(Node call) {
         if (lhs.kind == 13 && lhs.childCount() >= 1) {
             Node obj = lhs.child(0);
             string fieldName = lhs.name;
-            if (obj.kind == 6 && this.strEq(obj.name, "this")) {
+            if (obj.kind == 6 && obj.name == "this") {
                 int thisOff = this.findLocal("this");
                 int fieldOff = this.findFieldOffset(this.currentClassName, fieldName);
                 if (fieldOff < 0) {
@@ -11549,7 +11497,7 @@ public void genNewCall(Node call) {
                 int gi = this.findGlobal(obj.name);
                 string lookupType = varType;
                 string elemType = this.arrayElementType(varType);
-                if (!this.strEq(elemType, "")) { lookupType = elemType; }
+                if (elemType != "") { lookupType = elemType; }
                 int fieldOff = this.findFieldOffset(lookupType, fieldName);
                 if (fieldOff < 0) {
                     this.genExpr(rhs);
@@ -11608,7 +11556,7 @@ public void genNewCall(Node call) {
                 arrIsByte = this.isByteElemType(this.getLocalType(arrNode.name));
             } elif (arrNode.kind == 13) {
                 Node arrObj = arrNode.child(0);
-                if (arrObj.kind == 6 && this.strEq(arrObj.name, "this")) {
+                if (arrObj.kind == 6 && arrObj.name == "this") {
                     // Classify from the class field table directly.  The
                     // recursive inferExprType path is not stable in later
                     // self-hosted stages (see genArrayIndex), so `this.field`
@@ -11704,7 +11652,7 @@ public void genNewCall(Node call) {
                 this.asm.popR64(0);
                 return;
             }
-            if (!this.strEq(this.currentClassName, "")) {
+            if (this.currentClassName != "") {
                 int fieldOff = this.findFieldOffset(this.currentClassName, lhs.name);
                 int thisOff = this.findLocal("this");
                 if (fieldOff >= 0 && thisOff != 0) {
@@ -11728,7 +11676,7 @@ public void genNewCall(Node call) {
             int fieldOff = -1;
             int objOff = 0;
             int objGi = -1;
-            if (obj.kind == 6 && this.strEq(obj.name, "this")) {
+            if (obj.kind == 6 && obj.name == "this") {
                 int thisOff = this.findLocal("this");
                 fieldOff = this.findFieldOffset(this.currentClassName, lhs.name);
                 objOff = thisOff;
@@ -11736,7 +11684,7 @@ public void genNewCall(Node call) {
                 string varType = this.getLocalType(obj.name);
                 string lookupType = varType;
                 string elemType = this.arrayElementType(varType);
-                if (!this.strEq(elemType, "")) { lookupType = elemType; }
+                if (elemType != "") { lookupType = elemType; }
                 fieldOff = this.findFieldOffset(lookupType, lhs.name);
                 objOff = this.findLocal(obj.name);
                 objGi = this.findGlobal(obj.name);
@@ -11874,9 +11822,9 @@ public void genNewCall(Node call) {
         // char[], and the internal string representation).  Such arrays must
         // be indexed without the *8 scaling used for 64-bit element types and
         // accessed with byte loads/stores instead of full-width moves.
-        if (this.strEq(t, "byte[]")) { return true; }
-        if (this.strEq(t, "char[]")) { return true; }
-        if (this.strEq(t, "string")) { return true; }
+        if (t == "byte[]") { return true; }
+        if (t == "char[]") { return true; }
+        if (t == "string") { return true; }
         return false;
     }
 
@@ -11887,35 +11835,35 @@ public void genNewCall(Node call) {
         if (expr.kind == 2) { return true; }
         if (expr.kind == 6) {
             string t = this.getLocalType(expr.name);
-            if (this.strEq(t, "")) {
+            if (t == "") {
                 for (int ci = 0; ci < this.constNames.length; ci++) {
-                    if (this.strEq(this.constNames[ci], expr.name)) {
-                        if (ci < this.constStringValues.length && !this.strEq(this.constStringValues[ci], "")) {
+                    if (this.constNames[ci] == expr.name) {
+                        if (ci < this.constStringValues.length && this.constStringValues[ci] != "") {
                             return true;
                         }
                     }
                 }
             }
-            return this.strEq(t, "string");
+            return t == "string";
         }
         if (expr.kind == 13) {
             string t = this.inferMemberAccessType(expr);
-            return this.strEq(t, "string");
+            return t == "string";
         }
         if (expr.kind == 24) {
             string t = this.inferExprType(expr);
-            return this.strEq(t, "string");
+            return t == "string";
         }
         if (expr.kind == 67) {
             // A slice `s[a..b]` of a string is a string; its kind (67) is not
             // otherwise recognized here, so without this case printline fell
             // back to %lld and printed the raw slice pointer.
             string t = this.inferExprType(expr);
-            return this.strEq(t, "string");
+            return t == "string";
         }
         if (expr.kind == 10) {
             string t = this.inferExprType(expr);
-            return this.strEq(t, "string");
+            return t == "string";
         }
         if (expr.kind == 7) {
             int op = expr.op;
@@ -11934,10 +11882,10 @@ public void genNewCall(Node call) {
         if (expr.kind == 3) { return true; }
         if (expr.kind == 6) {
             string t = this.getLocalType(expr.name);
-            return this.strEq(t, "char") || this.strEq(t, "char?");
+            return t == "char" || t == "char?";
         }
         if (expr.kind == 24) {
-            if (expr.childCount() > 0) { return this.strEq(this.inferExprType(expr.child(0)), "string"); }
+            if (expr.childCount() > 0) { return this.inferExprType(expr.child(0)) == "string"; }
             return false;
         }
         if (expr.kind == 23) {
@@ -11945,8 +11893,8 @@ public void genNewCall(Node call) {
             return false;
         }
         if (expr.kind == 10) {
-            if (!expr.isMember && this.strEq(expr.name, "char")) { return true; }
-            return this.strEq(this.inferExprType(expr), "char");
+            if (!expr.isMember && expr.name == "char") { return true; }
+            return this.inferExprType(expr) == "char";
         }
         return false;
     }
@@ -11961,9 +11909,9 @@ public void genNewCall(Node call) {
         if (expr.kind == 1) { return true; }
         if (expr.kind == 6) {
             string t = this.getLocalType(expr.name);
-            if (this.strEq(t, "float") || this.strEq(t, "float64") || this.strEq(t, "double")) { return true; }
+            if (t == "float" || t == "float64" || t == "double") { return true; }
             for (int ci = 0; ci < this.constNames.length; ci++) {
-                if (this.strEq(this.constNames[ci], expr.name)) {
+                if (this.constNames[ci] == expr.name) {
                     if (ci < this.constIsString.length && this.constIsString[ci] == 1) { return false; }
                     return false;
                 }
@@ -11972,11 +11920,11 @@ public void genNewCall(Node call) {
         }
         if (expr.kind == 13) {
             string t = this.inferMemberAccessType(expr);
-            return this.strEq(t, "float") || this.strEq(t, "float64") || this.strEq(t, "double");
+            return t == "float" || t == "float64" || t == "double";
         }
         if (expr.kind == 24) {
             string t = this.inferExprType(expr);
-            if (this.strEq(t, "float") || this.strEq(t, "float64") || this.strEq(t, "double")) { return true; }
+            if (t == "float" || t == "float64" || t == "double") { return true; }
             // Element reads on arrays whose declared element type is float64
             // hold double bit patterns too (mirrors the rs is_float_expr
             // Index arm). inferExprType covers local/global declared types;
@@ -11988,18 +11936,18 @@ public void genNewCall(Node call) {
                 Node arrNode = expr.child(0);
                 string ft = "";
                 if (arrNode.kind == 6) {
-                    if (!this.strEq(this.currentClassName, "")) {
+                    if (this.currentClassName != "") {
                         ft = this.findFieldType(this.currentClassName, arrNode.name);
                     }
                 } elif (arrNode.kind == 13 && arrNode.childCount() > 0) {
                     string ownerT = this.inferReceiverType(arrNode.child(0));
-                    if (!this.strEq(ownerT, "")) {
+                    if (ownerT != "") {
                         ft = this.findFieldType(ownerT, arrNode.name);
                     }
                 }
                 if (ft.length >= 2 && ft[ft.length - 2] == '[' && ft[ft.length - 1] == ']') {
                     string inner = this.arrayElementType(ft);
-                    if (this.strEq(inner, "float") || this.strEq(inner, "float64") || this.strEq(inner, "double")) { return true; }
+                    if (inner == "float" || inner == "float64" || inner == "double") { return true; }
                 }
             }
         }
@@ -12023,12 +11971,12 @@ public void genNewCall(Node call) {
             // float(x) / float64(x) / double(x) free conversions produce an
             // IEEE-754 double bit pattern. silverc-rs's parser normalizes all
             // three spellings to double() and is_float_expr matches them here.
-            if (!expr.isMember && (this.strEq(cn, "float") || this.strEq(cn, "double") || this.strEq(cn, "float64"))) { return true; }
-            if ((this.strEq(cn, "toFloat") || this.strEq(cn, "toFloat64")) && expr.isMember && expr.childCount() > 0) {
+            if (!expr.isMember && (cn == "float" || cn == "double" || cn == "float64")) { return true; }
+            if ((cn == "toFloat" || cn == "toFloat64") && expr.isMember && expr.childCount() > 0) {
                 string crt = this.inferExprType(expr.child(0));
-                if (this.strEq(crt, "float") || this.strEq(crt, "float64") || this.strEq(crt, "double")
-                    || this.strEq(crt, "int") || this.strEq(crt, "int32") || this.strEq(crt, "int64")
-                    || this.strEq(crt, "uint") || this.strEq(crt, "bool") || this.strEq(crt, "char")) {
+                if (crt == "float" || crt == "float64" || crt == "double"
+                    || crt == "int" || crt == "int32" || crt == "int64"
+                    || crt == "uint" || crt == "bool" || crt == "char") {
                     return true;
                 }
             }
@@ -12036,9 +11984,9 @@ public void genNewCall(Node call) {
             // float (e.g. the interpreter's valueToFloat / floatStrToF64):
             // the result travels as IEEE-754 bits and must be printed with %g.
             for (int ri = 0; ri < this.funcNames.length; ri++) {
-                if (this.strEq(this.funcNames[ri], cn) && this.strEq(this.funcClasses[ri], "")) {
+                if (this.funcNames[ri] == cn && this.funcClasses[ri] == "") {
                     string frt = this.funcRetTypes[ri];
-                    if (this.strEq(frt, "float") || this.strEq(frt, "float64") || this.strEq(frt, "double")) {
+                    if (frt == "float" || frt == "float64" || frt == "double") {
                         return true;
                     }
                     break;
@@ -12056,8 +12004,8 @@ public void genNewCall(Node call) {
         if (this.isFloatLike(rhs)) { return false; }
         if (this.isStringLike(rhs)) { return false; }
         string rt = this.inferExprType(rhs);
-        if (this.strEq(rt, "string")) { return false; }
-        if (this.strEq(rt, "char")) { return false; }
+        if (rt == "string") { return false; }
+        if (rt == "char") { return false; }
         return true;
     }
 
@@ -12079,9 +12027,9 @@ public void genNewCall(Node call) {
     // the `double d = n;` declaration path knows its destination only from the
     // statement's type hint.
     public void coerceDeclToDouble(string declType, Node rhs) {
-        bool isFlt = this.strEq(declType, "float");
-        if (this.strEq(declType, "float64")) { isFlt = true; }
-        if (this.strEq(declType, "double")) { isFlt = true; }
+        bool isFlt = declType == "float";
+        if (declType == "float64") { isFlt = true; }
+        if (declType == "double") { isFlt = true; }
         if (!isFlt) { return; }
         if (!this.floatStoreNeedsWiden(rhs)) { return; }
         this.emitCvtsi2sdRax();
@@ -12496,12 +12444,12 @@ public void genNewCall(Node call) {
         Node arg = call.child(1);
         string t = this.inferExprType(arg);
         bool isArr = t.length >= 2 && t[t.length - 2] == '[' && t[t.length - 1] == ']';
-        if (arg.kind == 2 || this.strEq(t, "string")) {
+        if (arg.kind == 2 || t == "string") {
             this.genExpr(arg);
             this.genJsonQuote();
             return;
         }
-        if (this.strEq(t, "float") || this.strEq(t, "float64") || this.strEq(t, "double")) {
+        if (t == "float" || t == "float64" || t == "double") {
             this.genFloatToString(arg);
             return;
         }
@@ -12547,7 +12495,7 @@ public void genNewCall(Node call) {
             this.genJsonLit("null");
             return;
         }
-        if (this.strEq(t, "int") || this.strEq(t, "int32") || this.strEq(t, "int64") || this.strEq(t, "uint") || this.strEq(t, "bool") || this.strEq(t, "char")) {
+        if (t == "int" || t == "int32" || t == "int64" || t == "uint" || t == "bool" || t == "char") {
             // Integer-ish (and bool variables): decimal text, matching rs's
             // integer fallback path.
             this.genIntToString(arg);
@@ -12562,10 +12510,10 @@ public void genNewCall(Node call) {
     // byte-packed on the self-host (elements at ptr+i), all other arrays use
     // 8-byte element slots.
     public void genJsonArray(string elemType) {
-        bool strElem = this.strEq(elemType, "string");
-        bool fltElem = this.strEq(elemType, "float") || this.strEq(elemType, "float64") || this.strEq(elemType, "double");
-        bool intElem = this.strEq(elemType, "int") || this.strEq(elemType, "int32") || this.strEq(elemType, "int64") || this.strEq(elemType, "uint") || this.strEq(elemType, "byte");
-        bool byteElem = this.strEq(elemType, "byte");
+        bool strElem = elemType == "string";
+        bool fltElem = elemType == "float" || elemType == "float64" || elemType == "double";
+        bool intElem = elemType == "int" || elemType == "int32" || elemType == "int64" || elemType == "uint" || elemType == "byte";
+        bool byteElem = elemType == "byte";
         int arrOff = this.allocLocal("__jsa_arr");
         this.asm.movMBaseR(5, 0, arrOff);
         // scratch = malloc(40) for per-element number text
@@ -12847,8 +12795,8 @@ public void genNewCall(Node call) {
         int bufOff = this.allocLocal("__i2s_radix_buf");
         this.asm.movMBaseR(5, 0, bufOff);
         string fmt = "%lld";
-        if (this.strEq(selector, "x")) { fmt = "%llx"; }
-        if (this.strEq(selector, "X")) { fmt = "%llX"; }
+        if (selector == "x") { fmt = "%llx"; }
+        if (selector == "X") { fmt = "%llX"; }
         this.addFormatStr(fmt);
         this.asm.movRMBase(8, 5, valOff);
         this.asm.movRR64(2, 1);
@@ -13010,7 +12958,7 @@ public void genNewCall(Node call) {
 
         if (rtNullableChar) {
             this.genCharToString(bin.child(1));
-        } elif (this.strEq(rt, "string")) {
+        } elif (rt == "string") {
             this.genExpr(bin.child(1));
         } elif (this.isFloatLike(bin.child(1))) {
             // Float operands stringify with %g via sprintf (silverc-rs
@@ -13026,7 +12974,7 @@ public void genNewCall(Node call) {
         bool ltNullableChar = this.isCharExpr(bin.child(0));
         if (ltNullableChar) {
             this.genCharToString(bin.child(0));
-        } elif (this.strEq(lt, "string")) {
+        } elif (lt == "string") {
             this.genExpr(bin.child(0));
         } elif (this.isFloatLike(bin.child(0))) {
             this.genFloatToString(bin.child(0));
@@ -13501,7 +13449,6 @@ public void genNewCall(Node call) {
         int sizeOff = this.allocLocal("__env_size");
         this.asm.movMBaseR(5, 0, sizeOff);
 
-
         int notFound = this.asm.createLabel();
         int done = this.asm.createLabel();
         this.asm.cmpRI32(0, 0);
@@ -13579,7 +13526,7 @@ public void genNewCall(Node call) {
         this.genExpr(call.child(1));
         int urlOff = this.allocLocal("__url_s");
         this.asm.movMBaseR(5, 0, urlOff);
-        if (this.strEq(name, "isUrl")) {
+        if (name == "isUrl") {
             this.emitPrefixCheck(urlOff, "http://", 7);
             int uYes = this.newLabel();
             int uDone = this.newLabel();
@@ -13593,7 +13540,7 @@ public void genNewCall(Node call) {
             this.asm.bindLabel(uYes);
             this.asm.movRI64(0, 1);
             this.asm.bindLabel(uDone);
-        } elif (this.strEq(name, "isFtp")) {
+        } elif (name == "isFtp") {
             // ftp:// but not ftps://
             this.emitPrefixCheck(urlOff, "ftps://", 7);
             int fNo = this.newLabel();
@@ -13736,7 +13683,6 @@ public void genNewCall(Node call) {
     public void genLinuxFileRenameCall(Node call) {
         this.linuxBackend.genLinuxFileRenameCall(this, call);
     }
-
 
     public void genFileCopyCall(Node call) {
         // LINUX SysV backend (additive): open/read/write loop via libc. The
@@ -14180,7 +14126,6 @@ public void genNewCall(Node call) {
         int bufOff = this.allocLocal("__fd_buf");
         this.asm.movMBaseR(5, 0, bufOff);
 
-
         // memcpy(buf, fd+44, nlen); buf[nlen] = 0
         this.asm.emitCallSetup(0);
         this.asm.movRMBase(1, 5, bufOff);
@@ -14434,7 +14379,6 @@ public void genNewCall(Node call) {
         this.emitGetProcessHeapCall();
         this.asm.emitCallTeardown();
 
-
         this.asm.emitCallSetup(0);
         this.asm.movRR64(1, 0);
         this.asm.xorRR64(2, 2);
@@ -14544,7 +14488,6 @@ public void genNewCall(Node call) {
         this.asm.movRI64(0, 0);
         this.asm.movMBaseR(5, 0, breadOff);
 
-
         // ReadFile(stdin, buf, 4096, &read, 0)
         this.asm.emitCallSetup(8);
         this.asm.xorRR64(0, 0);
@@ -14652,12 +14595,12 @@ public void genNewCall(Node call) {
     }
 
     public bool isLiveHeapType(string t) {
-        if (this.strEq(t, "string") || this.strEq(t, "string?")) { return true; }
+        if (t == "string" || t == "string?") { return true; }
         if (t.length >= 2) {
             if (t[t.length - 2] == '[' && t[t.length - 1] == ']') { return true; }
         }
         for (int ci = 0; ci < this.classNames.length; ci++) {
-            if (this.strEq(this.classNames[ci], t)) { return true; }
+            if (this.classNames[ci] == t) { return true; }
         }
         return false;
     }
@@ -15242,7 +15185,7 @@ public void genNewCall(Node call) {
 
         string dataType = this.inferExprType(call.child(dataIdx));
         int isString = 0;
-        if (this.strEq(dataType, "string")) { isString = 1; }
+        if (dataType == "string") { isString = 1; }
 
         int sizeOff = this.allocLocal("__wb_size");
         int bufOff = dataOff;

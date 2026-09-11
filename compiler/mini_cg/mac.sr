@@ -13,8 +13,8 @@ mod export mini_cg.mac;
 // macResolveExport / macResolveAliasLib / macKnownExport / macBareLib) and
 // the Mach-O addressing layer (machoHeaderLen / machoCodeVaddr /
 // machoDataVaddr / computeMacGotAddresses). Of these, 21 are verbatim moves
-// of the 7dfd7c8 slots from the core (same bodies, `this.strEq` -> `cgStrEq`,
-// core state via `cg`); 7 are new mirrors of linux.sr shapes with Apple
+// of the 7dfd7c8 slots from the core (same bodies, string comparisons use
+// the unified `==`, core state via `cg`); 7 are new mirrors of linux.sr shapes with Apple
 // values (aapcsRegAt, the four macho* helpers, checkMacModuleGrant,
 // macResolveAliasLib).
 //
@@ -72,66 +72,66 @@ class MiniCgMac {
     }
 
     public string macImportLib(string dll) {
-        if (cgStrEq(dll, "kernel32.dll")) { return "/usr/lib/libSystem.B.dylib"; }
-        if (cgStrEq(dll, "msvcrt.dll")) { return "/usr/lib/libSystem.B.dylib"; }
-        if (cgStrEq(dll, "ucrtbase.dll")) { return "/usr/lib/libSystem.B.dylib"; }
-        if (cgStrEq(dll, "ws2_32.dll")) { return "/usr/lib/libSystem.B.dylib"; }
+        if (dll == "kernel32.dll") { return "/usr/lib/libSystem.B.dylib"; }
+        if (dll == "msvcrt.dll") { return "/usr/lib/libSystem.B.dylib"; }
+        if (dll == "ucrtbase.dll") { return "/usr/lib/libSystem.B.dylib"; }
+        if (dll == "ws2_32.dll") { return "/usr/lib/libSystem.B.dylib"; }
         return "";
     }
 
     public string macImportName(string dll, string name) {
-        if (cgStrEq(dll, "kernel32.dll")) {
-            if (cgStrEq(name, "ExitProcess")) { return "exit"; }
-            if (cgStrEq(name, "VirtualAlloc")) { return "mmap"; }
-            if (cgStrEq(name, "CloseHandle")) { return "close"; }
-            if (cgStrEq(name, "CreateFileA")) { return "open"; }
-            if (cgStrEq(name, "ReadFile")) { return "read"; }
-            if (cgStrEq(name, "WriteFile")) { return "write"; }
-            if (cgStrEq(name, "DeleteFileA")) { return "unlink"; }
-            if (cgStrEq(name, "MoveFileA")) { return "rename"; }
-            if (cgStrEq(name, "RemoveDirectoryA")) { return "rmdir"; }
-            if (cgStrEq(name, "GetFileAttributesA")) { return "stat"; }
-            if (cgStrEq(name, "FindFirstFileA")) { return "opendir"; }
-            if (cgStrEq(name, "FindNextFileA")) { return "readdir"; }
-            if (cgStrEq(name, "FindClose")) { return "closedir"; }
-            if (cgStrEq(name, "GetEnvironmentVariableA")) { return "getenv"; }
-            if (cgStrEq(name, "SetEnvironmentVariableA")) { return "setenv"; }
-            if (cgStrEq(name, "GetComputerNameA")) { return "gethostname"; }
-            if (cgStrEq(name, "GetCurrentProcessId")) { return "getpid"; }
-            if (cgStrEq(name, "Sleep")) { return "nanosleep"; }
-            if (cgStrEq(name, "GetTickCount") || cgStrEq(name, "GetTickCount64")) { return "clock_gettime"; }
-            if (cgStrEq(name, "QueryPerformanceCounter") || cgStrEq(name, "QueryPerformanceFrequency")) { return "clock_gettime"; }
-            if (cgStrEq(name, "GetLocalTime") || cgStrEq(name, "GetSystemTime")) { return "clock_gettime"; }
-            if (cgStrEq(name, "SetFilePointer") || cgStrEq(name, "GetFileSize")) { return "lseek"; }
-            if (cgStrEq(name, "lstrlenA")) { return "strlen"; }
+        if (dll == "kernel32.dll") {
+            if (name == "ExitProcess") { return "exit"; }
+            if (name == "VirtualAlloc") { return "mmap"; }
+            if (name == "CloseHandle") { return "close"; }
+            if (name == "CreateFileA") { return "open"; }
+            if (name == "ReadFile") { return "read"; }
+            if (name == "WriteFile") { return "write"; }
+            if (name == "DeleteFileA") { return "unlink"; }
+            if (name == "MoveFileA") { return "rename"; }
+            if (name == "RemoveDirectoryA") { return "rmdir"; }
+            if (name == "GetFileAttributesA") { return "stat"; }
+            if (name == "FindFirstFileA") { return "opendir"; }
+            if (name == "FindNextFileA") { return "readdir"; }
+            if (name == "FindClose") { return "closedir"; }
+            if (name == "GetEnvironmentVariableA") { return "getenv"; }
+            if (name == "SetEnvironmentVariableA") { return "setenv"; }
+            if (name == "GetComputerNameA") { return "gethostname"; }
+            if (name == "GetCurrentProcessId") { return "getpid"; }
+            if (name == "Sleep") { return "nanosleep"; }
+            if (name == "GetTickCount" || name == "GetTickCount64") { return "clock_gettime"; }
+            if (name == "QueryPerformanceCounter" || name == "QueryPerformanceFrequency") { return "clock_gettime"; }
+            if (name == "GetLocalTime" || name == "GetSystemTime") { return "clock_gettime"; }
+            if (name == "SetFilePointer" || name == "GetFileSize") { return "lseek"; }
+            if (name == "lstrlenA") { return "strlen"; }
             return "";
         }
         // msvcrt/ucrtbase overlap on the same C library: libSystem carries
         // every name both DLLs export except the Windows-only underscore
         // helpers.
-        if (cgStrEq(dll, "msvcrt.dll") || cgStrEq(dll, "ucrtbase.dll")) {
-            if (cgStrEq(name, "_atoi64")) { return "atoll"; }
+        if (dll == "msvcrt.dll" || dll == "ucrtbase.dll") {
+            if (name == "_atoi64") { return "atoll"; }
             return name;
         }
-        if (cgStrEq(dll, "ws2_32.dll")) {
-            if (cgStrEq(name, "closesocket")) { return "close"; }
-            if (cgStrEq(name, "socket") || cgStrEq(name, "bind") || cgStrEq(name, "listen") || cgStrEq(name, "accept") || cgStrEq(name, "recv") || cgStrEq(name, "send") || cgStrEq(name, "shutdown") || cgStrEq(name, "connect") || cgStrEq(name, "setsockopt") || cgStrEq(name, "getaddrinfo") || cgStrEq(name, "freeaddrinfo")) { return name; }
+        if (dll == "ws2_32.dll") {
+            if (name == "closesocket") { return "close"; }
+            if (name == "socket" || name == "bind" || name == "listen" || name == "accept" || name == "recv" || name == "send" || name == "shutdown" || name == "connect" || name == "setsockopt" || name == "getaddrinfo" || name == "freeaddrinfo") { return name; }
             return "";
         }
         return "";
     }
 
     public string macModuleLib(string module) {
-        if (cgStrEq(module, "libsystem")) { return "/usr/lib/libSystem.B.dylib"; }
-        if (cgStrEq(module, "objc")) { return "/usr/lib/libobjc.A.dylib"; }
-        if (cgStrEq(module, "appkit")) { return "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit"; }
-        if (cgStrEq(module, "quartz")) { return "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore"; }
+        if (module == "libsystem") { return "/usr/lib/libSystem.B.dylib"; }
+        if (module == "objc") { return "/usr/lib/libobjc.A.dylib"; }
+        if (module == "appkit") { return "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit"; }
+        if (module == "quartz") { return "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore"; }
         return "";
     }
 
     public string macExportTable(string lib) {
-        if (cgStrEq(lib, "/usr/lib/libSystem.B.dylib")) { return "exit _exit mmap munmap malloc free read write open close lseek stat fstat unlink rename mkdir rmdir opendir readdir closedir getenv setenv clock_gettime nanosleep localtime_r gmtime_r posix_spawn posix_spawnp posix_spawn_file_actions_init posix_spawn_file_actions_adddup2 posix_spawn_file_actions_destroy waitpid kill pipe dup2 getpid pthread_create pthread_join pthread_mach_thread_np sysconf sysctlbyname uname gethostname getlogin_r statvfs getentropy arc4random_buf dlopen dlsym rand srand getuid printf strlen strcmp strcpy memcpy memset socket connect bind listen accept send recv setsockopt getaddrinfo freeaddrinfo"; }
-        if (cgStrEq(lib, "/usr/lib/libobjc.A.dylib")) { return "objc_getClass sel_registerName objc_msgSend"; }
+        if (lib == "/usr/lib/libSystem.B.dylib") { return "exit _exit mmap munmap malloc free read write open close lseek stat fstat unlink rename mkdir rmdir opendir readdir closedir getenv setenv clock_gettime nanosleep localtime_r gmtime_r posix_spawn posix_spawnp posix_spawn_file_actions_init posix_spawn_file_actions_adddup2 posix_spawn_file_actions_destroy waitpid kill pipe dup2 getpid pthread_create pthread_join pthread_mach_thread_np sysconf sysctlbyname uname gethostname getlogin_r statvfs getentropy arc4random_buf dlopen dlsym rand srand getuid printf strlen strcmp strcpy memcpy memset socket connect bind listen accept send recv setsockopt getaddrinfo freeaddrinfo"; }
+        if (lib == "/usr/lib/libobjc.A.dylib") { return "objc_getClass sel_registerName objc_msgSend"; }
         return "";
     }
 
@@ -142,7 +142,7 @@ class MiniCgMac {
             while (i < table.length && table[i] == ' ') { i++; }
             int start = i;
             while (i < table.length && table[i] != ' ') { i++; }
-            if (i > start && cgStrEq(fn, projectSlice(table, start, i))) { return true; }
+            if (i > start && fn == projectSlice(table, start, i)) { return true; }
         }
         return false;
     }
@@ -150,7 +150,7 @@ class MiniCgMac {
     public void macAddLib(MiniCg cg, string lib) {
         if (lib.length == 0) { return; }
         for (int i = 0; i < cg.macLibs.length; i++) {
-            if (cgStrEq(cg.macLibs[i], lib)) { return; }
+            if (cg.macLibs[i] == lib) { return; }
         }
         cg.macLibs.add(lib);
     }
@@ -159,16 +159,16 @@ class MiniCgMac {
         if (lib.length == 0 || fn.length == 0) { return; }
         string grant = lib + "|" + fn;
         for (int i = 0; i < cg.macGrants.length; i++) {
-            if (cgStrEq(cg.macGrants[i], grant)) { return; }
+            if (cg.macGrants[i] == grant) { return; }
         }
         cg.macGrants.add(grant);
     }
 
     public void macAddGrantAlias(MiniCg cg, string lib, string exportName, string localName) {
         if (lib.length == 0 || exportName.length == 0 || localName.length == 0) { return; }
-        if (cgStrEq(exportName, localName)) { this.macAddGrant(cg, lib, exportName); return; }
+        if (exportName == localName) { this.macAddGrant(cg, lib, exportName); return; }
         for (int i = 0; i < cg.macAliasLocals.length; i++) {
-            if (cgStrEq(cg.macAliasLocals[i], localName) && cgStrEq(cg.macAliasExports[i], exportName) && cgStrEq(cg.macAliasLibs[i], lib)) { return; }
+            if (cg.macAliasLocals[i] == localName && cg.macAliasExports[i] == exportName && cg.macAliasLibs[i] == lib) { return; }
         }
         cg.macAliasLocals.add(localName);
         cg.macAliasExports.add(exportName);
@@ -185,13 +185,13 @@ class MiniCgMac {
 
     public bool macAllowed(MiniCg cg, string lib, string fn) {
         for (int i = 0; i < cg.macLibs.length; i++) {
-            if (cgStrEq(cg.macLibs[i], lib)) {
+            if (cg.macLibs[i] == lib) {
                 if (this.macTableHas(lib, fn)) { return true; }
             }
         }
         string grant = lib + "|" + fn;
         for (int i = 0; i < cg.macGrants.length; i++) {
-            if (cgStrEq(cg.macGrants[i], grant)) { return true; }
+            if (cg.macGrants[i] == grant) { return true; }
         }
         return false;
     }
@@ -199,13 +199,13 @@ class MiniCgMac {
     public void registerMacImport(MiniCg cg, Node node) {
         string source = node.typeHint;
         bool all = node.isStatic;
-        if (!cgStrEq(source, "mac") && source.length > 4) {
+        if (source != "mac" && source.length > 4) {
             string prefix = projectSlice(source, 0, 4);
-            if (!cgStrEq(prefix, "mac.")) { return; }
-        } elif (!cgStrEq(source, "mac")) {
+            if (prefix != "mac.") { return; }
+        } elif (source != "mac") {
             return;
         }
-        if (cgStrEq(source, "mac")) {
+        if (source == "mac") {
             if (all) {
                 this.macAddLib(cg, this.macModuleLib("libsystem"));
                 this.macAddLib(cg, this.macModuleLib("objc"));
@@ -250,10 +250,10 @@ class MiniCgMac {
     }
 
     public string macModuleOf(string lib) {
-        if (cgStrEq(lib, "/usr/lib/libSystem.B.dylib")) { return "libsystem"; }
-        if (cgStrEq(lib, "/usr/lib/libobjc.A.dylib")) { return "objc"; }
-        if (cgStrEq(lib, "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit")) { return "appkit"; }
-        if (cgStrEq(lib, "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore")) { return "quartz"; }
+        if (lib == "/usr/lib/libSystem.B.dylib") { return "libsystem"; }
+        if (lib == "/usr/lib/libobjc.A.dylib") { return "objc"; }
+        if (lib == "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit") { return "appkit"; }
+        if (lib == "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore") { return "quartz"; }
         return lib;
     }
 
@@ -264,10 +264,10 @@ class MiniCgMac {
         }
         for (int g = 0; g < cg.macGrants.length; g++) {
             string grant = cg.macGrants[g];
-            if (grant.length > name.length + 1 && cgStrEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') { return true; }
+            if (grant.length > name.length + 1 && projectSlice(grant, grant.length - name.length, grant.length) == name && grant[grant.length - name.length - 1] == '|') { return true; }
         }
         for (int a = 0; a < cg.macAliasLocals.length; a++) {
-            if (cgStrEq(cg.macAliasLocals[a], name)) { return true; }
+            if (cg.macAliasLocals[a] == name) { return true; }
         }
         return false;
     }
@@ -278,7 +278,7 @@ class MiniCgMac {
         }
         for (int g = 0; g < cg.macGrants.length; g++) {
             string grant = cg.macGrants[g];
-            if (grant.length > name.length + 1 && cgStrEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') {
+            if (grant.length > name.length + 1 && projectSlice(grant, grant.length - name.length, grant.length) == name && grant[grant.length - name.length - 1] == '|') {
                 int bar = -1;
                 for (int k = 0; k < grant.length; k++) {
                     if (grant[k] == '|') { bar = k; break; }
@@ -295,10 +295,10 @@ class MiniCgMac {
         }
         for (int g = 0; g < cg.macGrants.length; g++) {
             string grant = cg.macGrants[g];
-            if (grant.length > name.length + 1 && cgStrEq(projectSlice(grant, grant.length - name.length, grant.length), name) && grant[grant.length - name.length - 1] == '|') { return name; }
+            if (grant.length > name.length + 1 && projectSlice(grant, grant.length - name.length, grant.length) == name && grant[grant.length - name.length - 1] == '|') { return name; }
         }
         for (int a = 0; a < cg.macAliasLocals.length; a++) {
-            if (cgStrEq(cg.macAliasLocals[a], name)) { return cg.macAliasExports[a]; }
+            if (cg.macAliasLocals[a] == name) { return cg.macAliasExports[a]; }
         }
         return "";
     }
@@ -306,7 +306,7 @@ class MiniCgMac {
     // Mirror of linuxResolveAliasLib: owning lib of an aliased local name.
     public string macResolveAliasLib(MiniCg cg, string name) {
         for (int a = 0; a < cg.macAliasLocals.length; a++) {
-            if (cgStrEq(cg.macAliasLocals[a], name)) { return cg.macAliasLibs[a]; }
+            if (cg.macAliasLocals[a] == name) { return cg.macAliasLibs[a]; }
         }
         return "";
     }

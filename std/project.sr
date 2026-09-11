@@ -6,7 +6,7 @@ mod export project;
 //
 // - The file imports only fs/string/progress/preprocess modules and never
 //   calls a DLL export (the bodies use only the string module helpers
-//   projectFind/projectSlice/projectTrim/cliArgEq, fs builtins,
+//   projectFind/projectSlice/projectTrim, fs builtins,
 //   ProgressReporter, and the printline/exit builtins), so importing it
 //   forces no DLL into a user PE's import table. In the self-hosted
 //   aggregate the only CRT caller in the whole compile set is
@@ -103,7 +103,7 @@ string projectDirname(string path) {
 }
 
 string projectJoin(string root, string path) {
-    if (cliArgEq(root, ".")) { return path; }
+    if (root == ".") { return path; }
     if (path.length > 0 && (path[0] == '/' || path[0] == '\\')) {
         return root + path;
     }
@@ -301,7 +301,7 @@ string projectSourcePath(string root, string[] sourceDirs, string moduleName) {
         string sourceDir = sourceDirs[i];
         string candidate = "";
         if (projectHasSuffix(sourceDir, ".sr")) {
-            if (cliArgEq(sourceDir, moduleName + ".sr")) {
+            if (sourceDir == moduleName + ".sr") {
                 candidate = projectJoin(root, sourceDir);
             }
         } else {
@@ -311,7 +311,7 @@ string projectSourcePath(string root, string[] sourceDirs, string moduleName) {
             candidate = projectJoin(root, sourceDir + "/" + moduleName + ".sr");
             #off
         }
-        if (!cliArgEq(candidate, "") && file.exists(candidate)) {
+        if (candidate != "" && file.exists(candidate)) {
             return candidate;
         }
         if (!projectHasSuffix(sourceDir, ".sr")) {
@@ -325,7 +325,7 @@ string projectSourcePath(string root, string[] sourceDirs, string moduleName) {
                 #else
                 dotted = projectJoin(root, sourceDir + "/" + projectDottedPath(moduleName, "/") + ".sr");
                 #off
-                if (!cliArgEq(dotted, "") && file.exists(dotted)) {
+                if (dotted != "" && file.exists(dotted)) {
                     return dotted;
                 }
             }
@@ -336,7 +336,7 @@ string projectSourcePath(string root, string[] sourceDirs, string moduleName) {
             #else
             packaged = projectJoin(root, sourceDir + "/" + moduleName + "/" + moduleName + ".sr");
             #off
-            if (!cliArgEq(packaged, "") && file.exists(packaged)) {
+            if (packaged != "" && file.exists(packaged)) {
                 return packaged;
             }
         }
@@ -345,9 +345,9 @@ string projectSourcePath(string root, string[] sourceDirs, string moduleName) {
 }
 
 bool projectBuiltin(string name) {
-    return cliArgEq(name, "fs") || cliArgEq(name, "json") || cliArgEq(name, "yaml")
-        || cliArgEq(name, "llmai") || cliArgEq(name, "LLMAI")
-        || cliArgEq(name, "os");
+    return name == "fs" || name == "json" || name == "yaml"
+        || name == "llmai" || name == "LLMAI"
+        || name == "os";
 }
 
 string projectImportModule(string statement) {
@@ -372,7 +372,7 @@ string projectImportModule(string statement) {
 
 bool projectVisited(string[] visited, string path) {
     for (int i = 0; i < visited.length; i = i + 1) {
-        if (cliArgEq(visited[i], path)) { return true; }
+        if (visited[i] == path) { return true; }
     }
     return false;
 }
@@ -567,7 +567,7 @@ class NativeModules {
 
     public int find(string name) {
         for (int i = 0; i < this.names.length; i++) {
-            if (cliArgEq(this.names[i], name)) { return i; }
+            if (this.names[i] == name) { return i; }
         }
         return -1;
     }
@@ -626,14 +626,14 @@ class NativeModules {
     public string fileFor(string name, string targetOs) {
         int idx = this.find(name);
         if (idx < 0) { return ""; }
-        if (cliArgEq(targetOs, "LINUX")) { return this.linFiles[idx]; }
+        if (targetOs == "LINUX") { return this.linFiles[idx]; }
         return this.winFiles[idx];
     }
 
     public string exportsFor(string name, string targetOs) {
         int idx = this.find(name);
         if (idx < 0) { return ""; }
-        if (cliArgEq(targetOs, "LINUX")) {
+        if (targetOs == "LINUX") {
             if (this.hasLinExp[idx]) { return this.linExpJoined[idx]; }
         } else {
             if (this.hasWinExp[idx]) { return this.winExpJoined[idx]; }
@@ -745,16 +745,16 @@ NativeModules projectParseNativeModules(string manifest) {
                 val = projectTrim(vacc2);
             }
             string lkey = nativeLower(key);
-            if (cliArgEq(lkey, "module")) {
+            if (lkey == "module") {
                 if (!isArr) {
                     string m = projectTrim(val);
                     if (m.length > 0) { modName = m; }
                 }
-            } elif (cliArgEq(lkey, "windows")) {
+            } elif (lkey == "windows") {
                 if (!isArr && val.length > 0) { winFile = val; }
-            } elif (cliArgEq(lkey, "linux")) {
+            } elif (lkey == "linux") {
                 if (!isArr && val.length > 0) { linFile = val; }
-            } elif (cliArgEq(lkey, "exports")) {
+            } elif (lkey == "exports") {
                 hasExps = true;
                 if (isArr) {
                     string[] lst = nativeSplitExports(arrInner);
@@ -762,7 +762,7 @@ NativeModules projectParseNativeModules(string manifest) {
                 } else {
                     expsJoined = projectTrim(val);
                 }
-            } elif (cliArgEq(lkey, "windowsexports")) {
+            } elif (lkey == "windowsexports") {
                 hasWin = true;
                 if (isArr) {
                     string[] lst2 = nativeSplitExports(arrInner);
@@ -770,7 +770,7 @@ NativeModules projectParseNativeModules(string manifest) {
                 } else {
                     winExpsJoined = projectTrim(val);
                 }
-            } elif (cliArgEq(lkey, "linuxexports")) {
+            } elif (lkey == "linuxexports") {
                 hasLin = true;
                 if (isArr) {
                     string[] lst3 = nativeSplitExports(arrInner);
@@ -805,14 +805,14 @@ string nativeStarMsg(string source) {
 }
 
 string nativeSideError(NativeModules nm, string module, string targetOs) {
-    if (cliArgEq(targetOs, "LINUX")) {
+    if (targetOs == "LINUX") {
         string have = nm.winFile(module);
         string extra = "";
         if (have.length > 0) { extra = " (entry declares \"windows\": \"" + have + "\" only)"; }
         return "custom native module \"" + module + "\" has no library for LINUX targets" + extra + "; add \"linux\": \"<lib>\" to its \"nativeModules\" entry";
     }
     string side = "WINDOWS";
-    if (cliArgEq(targetOs, "MAC")) { side = "MAC (which use the \"windows\" file)"; }
+    if (targetOs == "MAC") { side = "MAC (which use the \"windows\" file)"; }
     string have2 = nm.linFile(module);
     string extra2 = "";
     if (have2.length > 0) { extra2 = " (entry declares \"linux\": \"" + have2 + "\" only)"; }
@@ -820,27 +820,27 @@ string nativeSideError(NativeModules nm, string module, string targetOs) {
 }
 
 bool projectIsStdModule(string name) {
-    if (cliArgEq(name, "math")) { return true; }
-    if (cliArgEq(name, "fs")) { return true; }
-    if (cliArgEq(name, "file")) { return true; }
-    if (cliArgEq(name, "folder")) { return true; }
-    if (cliArgEq(name, "json")) { return true; }
-    if (cliArgEq(name, "http")) { return true; }
-    if (cliArgEq(name, "llmai")) { return true; }
-    if (cliArgEq(name, "LLMAI")) { return true; }
-    if (cliArgEq(name, "env")) { return true; }
-    if (cliArgEq(name, "url")) { return true; }
-    if (cliArgEq(name, "hash")) { return true; }
-    if (cliArgEq(name, "path")) { return true; }
-    if (cliArgEq(name, "keyboard")) { return true; }
-    if (cliArgEq(name, "mouse")) { return true; }
-    if (cliArgEq(name, "bom")) { return true; }
-    if (cliArgEq(name, "binary_metadata")) { return true; }
-    if (cliArgEq(name, "process")) { return true; }
-    if (cliArgEq(name, "console")) { return true; }
-    if (cliArgEq(name, "gui")) { return true; }
-    if (cliArgEq(name, "registry")) { return true; }
-    if (cliArgEq(name, "os")) { return true; }
+    if (name == "math") { return true; }
+    if (name == "fs") { return true; }
+    if (name == "file") { return true; }
+    if (name == "folder") { return true; }
+    if (name == "json") { return true; }
+    if (name == "http") { return true; }
+    if (name == "llmai") { return true; }
+    if (name == "LLMAI") { return true; }
+    if (name == "env") { return true; }
+    if (name == "url") { return true; }
+    if (name == "hash") { return true; }
+    if (name == "path") { return true; }
+    if (name == "keyboard") { return true; }
+    if (name == "mouse") { return true; }
+    if (name == "bom") { return true; }
+    if (name == "binary_metadata") { return true; }
+    if (name == "process") { return true; }
+    if (name == "console") { return true; }
+    if (name == "gui") { return true; }
+    if (name == "registry") { return true; }
+    if (name == "os") { return true; }
     return false;
 }
 
@@ -1065,7 +1065,7 @@ string projectMinify(string source) {
 
 // `root\src\Auth.sr` -> `src/Auth.sr` (forward slashes, no root prefix).
 string projectRelativePath(string root, string path) {
-    if (cliArgEq(root, ".")) { return path; }
+    if (root == ".") { return path; }
     string prefix = root + "\\";
     if (path.length > prefix.length) {
         bool matched = true;
@@ -1185,7 +1185,7 @@ class ProjectVisited {
 
     public bool contains(string p) {
         for (int i = 0; i < this.paths.length; i = i + 1) {
-            if (cliArgEq(this.paths[i], p)) { return true; }
+            if (this.paths[i] == p) { return true; }
         }
         return false;
     }
@@ -1210,7 +1210,7 @@ string projectCollect(string path, string root, string[] sourceDirs, ProjectVisi
         string moduleName = projectImportModule(statement);
         if (moduleName.length > 0 && !projectBuiltin(moduleName)) {
             string importPath = projectSourcePath(root, sourceDirs, moduleName);
-            if (!cliArgEq(importPath, "")) {
+            if (importPath != "") {
                 result = result + projectCollect(importPath, root, sourceDirs, visited, emitMarkers, progress) + "\n";
             }
         }
@@ -1243,7 +1243,7 @@ int projectCountCollect(string path, string root, string[] sourceDirs, ProjectVi
         string moduleName = projectImportModule(statement);
         if (moduleName.length > 0 && !projectBuiltin(moduleName)) {
             string importPath = projectSourcePath(root, sourceDirs, moduleName);
-            if (!cliArgEq(importPath, "")) {
+            if (importPath != "") {
                 sub = sub + projectCountCollect(importPath, root, sourceDirs, visited);
             }
         }
@@ -1439,10 +1439,10 @@ string projectBuildSource(string projectPath, bool emitMarkers) {
                         if (!isPref && projectFind(stmt, "from", 0) >= 0) {
                             string ipath = projectSourcePath(root, sources, mod);
                             bool silver = false;
-                            if (!cliArgEq(ipath, "")) { silver = true; }
+                            if (ipath != "") { silver = true; }
                             if (!silver) {
                                 for (int bi = 0; bi < allBundleStems.length; bi++) {
-                                    if (cliArgEq(allBundleStems[bi], mod)) { silver = true; break; }
+                                    if (allBundleStems[bi] == mod) { silver = true; break; }
                                 }
                             }
                             if (!silver && (projectIsStdModule(mod) || projectBuiltin(mod))) { silver = true; }
@@ -1466,15 +1466,15 @@ string projectBuildSource(string projectPath, bool emitMarkers) {
     string name = projectManifestValue(manifest, "name");
     string version = projectManifestValue(manifest, "version");
     string license = projectManifestValue(manifest, "license");
-    if (!cliArgEq(name, "")) { metadata = metadata + "const string APP_NAME = \"" + name + "\";\n"; }
-    if (!cliArgEq(version, "")) { metadata = metadata + "const string APP_VERSION = \"" + version + "\";\n"; }
-    if (!cliArgEq(license, "")) { metadata = metadata + "const string APP_LICENSE = \"" + license + "\";\n"; }
-    metadata = metadata + "const string LANG_VERSION = \"0.6.0\";\n";
+    if (name != "") { metadata = metadata + "const string APP_NAME = \"" + name + "\";\n"; }
+    if (version != "") { metadata = metadata + "const string APP_VERSION = \"" + version + "\";\n"; }
+    if (license != "") { metadata = metadata + "const string APP_LICENSE = \"" + license + "\";\n"; }
+    metadata = metadata + "const string LANG_VERSION = \"0.7.1\";\n";
     metadata = metadata + "const string APP_COPYRIGHT = \"Edan M. © 2025\";\n";
     // DOCS/253 -- expose the project type so Silver code can branch on it.
     // A missing `type` (or the legacy `exe` spelling) means `console`.
     string ptype = projectManifestValue(manifest, "type");
-    if (cliArgEq(ptype, "") || cliArgEq(ptype, "exe")) { ptype = "console"; }
+    if (ptype == "" || ptype == "exe") { ptype = "console"; }
     metadata = metadata + "const string APP_TYPE = \"" + ptype + "\";\n";
     return metadata + body;
 }
@@ -1543,7 +1543,7 @@ int[] projectBuildBundle(string projectPath) {
     bundle.add('B' - 'a' + 97);
     bundle.add('2' - 'a' + 97);
     bundle.add(1); bundle.add(1); bundle.add(1); bundle.add(1);  // flags (reserved)
-    string metaText = version + "\n" + description + "\n" + author + "\n0.6.0\n" + copyright;
+    string metaText = version + "\n" + description + "\n" + author + "\n0.7.1\n" + copyright;
     bundle.add((metaText.length / 16581375) + 1);
     bundle.add(((metaText.length / 65025) % 255) + 1);
     bundle.add(((metaText.length / 255) % 255) + 1);
