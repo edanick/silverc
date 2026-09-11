@@ -392,8 +392,8 @@ class Parser {
         while (i2 < len) {
             char c = t[i2];
             if (c >= '0' && c <= '9') { sawDigit = true; }
-            elif (c == '.' && !wantInt && !sawDot && !sawExp) { sawDot = true; }
-            elif ((c == 'e' || c == 'E') && !wantInt && sawDigit && !sawExp) {
+            else if (c == '.' && !wantInt && !sawDot && !sawExp) { sawDot = true; }
+            else if ((c == 'e' || c == 'E') && !wantInt && sawDigit && !sawExp) {
                 sawExp = true;
                 if (i2 + 1 < len && (t[i2 + 1] == '+' || t[i2 + 1] == '-')) { i2++; }
                 if (i2 + 1 >= len) { return false; }
@@ -1207,7 +1207,7 @@ class Parser {
                             items.add(inner);
                         }
                     }
-                } elif (item.kind == 61 || item.kind == 50 || item.kind == 73 || item.kind == 16 || item.kind == 53 || item.kind == 54 || item.kind == 55 || item.kind == 59 || item.kind == 68) {
+                } else if (item.kind == 61 || item.kind == 50 || item.kind == 73 || item.kind == 16 || item.kind == 53 || item.kind == 54 || item.kind == 55 || item.kind == 59 || item.kind == 68) {
                     mainBody.children.add(item);
                 } else {
                     items.add(item);
@@ -1357,7 +1357,7 @@ class Parser {
                     // the function name.
                     while (scan < this.tokens.length && this.tokens[scan].kind != 121) { scan++; }
                     scan++;
-                } elif (this.tokens[scan].kind == 120) {
+                } else if (this.tokens[scan].kind == 120) {
                     scan++;
                     while (scan < this.tokens.length && this.tokens[scan].kind != 121) { scan++; }
                     scan++;
@@ -1391,7 +1391,7 @@ class Parser {
         if (this.check(113)) {
             this.advance();
             node.isStatic = true;
-        } elif (this.check(102)) {
+        } else if (this.check(102)) {
             this.advance();
             Node first = this.parseImportNameNode();
             node.name = first.name;
@@ -2061,7 +2061,7 @@ class Parser {
                 retType = retType + this.advance().text;
             }
             if (this.check(121)) { retType += ">"; this.advance(); }
-        } elif (retType == "<") {
+        } else if (retType == "<") {
             // Union/result return type `<A | B>` (DOCS/29).
             while (!this.check(121) && !this.check(106) && !this.check(103)) {
                 retType = retType + this.advance().text;
@@ -2081,7 +2081,7 @@ class Parser {
             // (`int add(int x int y)`).
             if (this.check(107)) {
                 this.advance();
-            } elif (sawParam) {
+            } else if (sawParam) {
                 Token prevT = this.tokens[this.pos - 1];
                 this.recordError("you forgot a comma \",\" at line " + prevT.line.toString() + ", column " + (prevT.col + this.tokenSrcLen(prevT)).toString());
             }
@@ -2178,9 +2178,9 @@ class Parser {
         if (this.check(140)) {
             this.advance();
             node.children.add(this.parseExpr(0));
-        } elif (this.check(102)) {
+        } else if (this.check(102)) {
             node.children.add(this.parseBlock());
-        } elif (this.check(103) || this.check(0)) {
+        } else if (this.check(103) || this.check(0)) {
             // `void main()` followed by `}` on the next line: the opening
             // curly bracket is missing; point just past the signature's
             // end-of-line.
@@ -2313,9 +2313,14 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             return n;
         }
         if (this.check(10)) { return this.parseIf(); }
-        // A leading `elif` continues an if-chain begun by a previous
-        // statement (`if (...) { } else { }\n elif (...) { }`).
-        if (this.check(56)) { return this.parseIf(); }
+        // A leading `elif` is not Silver; write `else if` (merged into
+        // the previous chain) or `if` (standalone). Parsed as `if` so
+        // later passes see a valid tree; the driver still fails on this.
+        if (this.check(56)) {
+            Token leadTok = this.peek();
+            this.recordError(leadTok.line.toString() + ":" + leadTok.col.toString() + ": `elif` is not Silver; write `else if` instead");
+            return this.parseIf();
+        }
         if (this.check(12)) { return this.parseWhile(); }
         if (this.check(13)) { return this.parseFor(); }
         if (this.check(166)) { return this.parseLoop(); }
@@ -2493,7 +2498,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             }
             this.expect(121);
             if (isTupleType) { typeName = "tuple"; }
-        } elif (typeName == "<") {
+        } else if (typeName == "<") {
             // Union/result type `<A | B>` (DOCS/29) or nullable `<T>`: collect
             // the member tokens into the type hint string.
             while (!this.check(121) && !this.check(106) && !this.check(103)) {
@@ -2528,7 +2533,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         if (this.check(110)) {
             this.advance();
             n.children.add(this.parseExpr(0));
-        } elif (this.check(140)) {
+        } else if (this.check(140)) {
             this.advance();
             Node rhs = this.parseExpr(0);
             Node moveBin = new Node(); moveBin.kind = 7; moveBin.op = 28;
@@ -2548,6 +2553,9 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
     private Node parseIf() {
         Node n = new Node(); n.kind = 53;
         if (this.check(56)) {
+            // Reached only after the caller already recorded the `elif`
+            // error (statement dispatch, `else` and trailing positions
+            // below): swallow the keyword and parse the clause as `if`.
             this.advance();
         } else {
             this.expect(10);
@@ -2558,14 +2566,18 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         n.children.add(this.parseBlockOrStmt());
         if (this.check(11)) {
             this.advance();
-            if (this.check(10)) {
-                n.children.add(this.parseIf());
-            } elif (this.check(56)) {
+            if (this.check(56)) {
+                Token chainTok = this.peek();
+                this.recordError(chainTok.line.toString() + ":" + chainTok.col.toString() + ": `elif` is not Silver; write `else if` instead");
+            }
+            if (this.check(10) || this.check(56)) {
                 n.children.add(this.parseIf());
             } else {
                 n.children.add(this.parseBlockOrStmt());
             }
-        } elif (this.check(56)) {
+        } else if (this.check(56)) {
+            Token tailTok = this.peek();
+            this.recordError(tailTok.line.toString() + ":" + tailTok.col.toString() + ": `elif` is not Silver; write `else if` instead");
             n.children.add(this.parseIf());
         }
         return n;
@@ -2604,7 +2616,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     n.children.add(this.parseExpr(0));
                 }
                 n.children.add(this.parseBlock());
-            } elif (this.check(11) || (this.check(7) && this.peek().text == "default")) {
+            } else if (this.check(11) || (this.check(7) && this.peek().text == "default")) {
                 this.advance();
                 n.children.add(this.parseBlock());
             } else {
@@ -2833,7 +2845,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     // (`add (1 2)`).
                     if (this.check(107)) {
                         this.advance();
-                    } elif (argc > 0) {
+                    } else if (argc > 0) {
                         Token prevT = this.tokens[this.pos - 1];
                         this.recordError("you forgot a comma \",\" at line " + prevT.line.toString() + ", column " + (prevT.col + this.tokenSrcLen(prevT)).toString());
                     }
@@ -2919,7 +2931,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     while (!this.check(101) && !this.check(0)) {
                         if (this.check(107)) {
                             this.advance();
-                        } elif (mArgc > 0) {
+                        } else if (mArgc > 0) {
                             Token prevT2 = this.tokens[this.pos - 1];
                             this.recordError("you forgot a comma \",\" at line " + prevT2.line.toString() + ", column " + (prevT2.col + this.tokenSrcLen(prevT2)).toString());
                         }
@@ -3490,7 +3502,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 string exprSrc = "";
                 while (i < s.length && depth > 0) {
                     if (s[i] == '{') { depth++; }
-                    elif (s[i] == '}') {
+                    else if (s[i] == '}') {
                         depth--;
                         if (depth == 0) { break; }
                     }
@@ -3540,7 +3552,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             if (this.check(100)) {
                 depth++;
                 this.advance();
-            } elif (this.check(101)) {
+            } else if (this.check(101)) {
                 depth--;
                 this.advance();
                 if (depth == 0) { break; }
@@ -3556,7 +3568,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             this.advance();
             while (!this.check(0) && !this.check(106) && !this.check(103)) { this.advance(); }
             if (this.check(106)) { this.advance(); }
-        } elif (this.check(102)) {
+        } else if (this.check(102)) {
             this.skipBalancedBraces();
             if (this.check(106)) { this.advance(); }
         }
@@ -3596,11 +3608,11 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             if (k == 100) {
                 depth++;
                 i++;
-            } elif (k == 101) {
+            } else if (k == 101) {
                 depth--;
                 i++;
                 if (depth == 0) { break; }
-            } elif (k == 0) {
+            } else if (k == 0) {
                 return false;
             } else {
                 i++;
@@ -3630,7 +3642,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 depth++;
                 started = true;
                 this.advance();
-            } elif (this.check(101)) {
+            } else if (this.check(101)) {
                 if (!started) { return; }
                 depth--;
                 this.advance();
@@ -3649,7 +3661,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             if (this.check(102)) {
                 depth++;
                 this.advance();
-            } elif (this.check(103)) {
+            } else if (this.check(103)) {
                 depth--;
                 this.advance();
                 if (depth == 0) { return; }
@@ -3745,7 +3757,7 @@ string diagClosestMatch(string needle, string[] candidates) {
         int d = diagLevenshtein(needleLc, candLc);
         bool acceptable = false;
         if (d == 1) { acceptable = true; }
-        elif (d == 2 && needleLc.length >= 3) {
+        else if (d == 2 && needleLc.length >= 3) {
             if (needleLc[0] == candLc[0] && needleLc[1] == candLc[1]) { acceptable = true; }
         }
         if (acceptable) {
