@@ -19,15 +19,27 @@ one language for many possibilities.
 
 #### Windows
 
-1. Create the folder `C:\bin`.
-2. Download or copy `silverc.exe` into it.
-3. Add it to your user `PATH` (reopen the terminal afterwards):
+Pick either a global binaries directory or a per-user one under AppData.
+
+Option 1 — global `C:\bin` (needs admin to create):
 
 ```powershell
+mkdir C:\bin
 setx PATH "$env:PATH;C:\bin"
 ```
 
-4. Verify with `silverc --version`.
+Download or copy `silverc.exe` into `C:\bin`.
+
+Option 2 — per-user `%appdata%\silver\bin` (no admin needed):
+
+```powershell
+mkdir "$env:APPDATA\silver\bin"
+setx PATH "$env:PATH;$env:APPDATA\silver\bin"
+```
+
+Download or copy `silverc.exe` into `%appdata%\silver\bin`.
+
+Reopen the terminal afterwards, then verify with `silverc --version`.
 
 #### Linux and macOS
 
