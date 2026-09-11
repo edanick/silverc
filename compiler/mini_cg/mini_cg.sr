@@ -8223,21 +8223,32 @@ public void genNewCall(Node call) {
         if (nargs2 > nreg) { nargs2 = nreg; }
         // Spill every argument to the outgoing slots before loading the
         // argument registers (nested calls clobber volatile regs).
+        // Register arguments spill ABOVE the stack-argument area: stack
+        // args live at [RSP+0..], so spilling regs at [RSP+8i] would let
+        // the 7th+ argument overwrite args 0-2 (segfaulted >6-arg native
+        // calls: RDI got the 7th arg instead of the 1st).
+        int stackCount = 0;
+        if (extArgCount > nreg) { stackCount = extArgCount - nreg; }
         for (int i = 0; i < extArgCount; i++) {
             this.genExpr(call.child(i + argStart));
             if (i < nreg) {
-                this.asm.movMBaseR(4, 0, i * 8);
+                this.asm.movMBaseR(4, 0, stackCount * 8 + i * 8);
             } else {
                 this.asm.movMBaseR(4, 0, stackBase + (i - nreg) * 8);
             }
         }
         for (int i = 0; i < nargs2; i++) {
-            this.asm.movRMBase(this.sysvRegAt(i), 4, i * 8);
+            this.asm.movRMBase(this.sysvRegAt(i), 4, stackCount * 8 + i * 8);
         }
+        // The call target travels in R10 (mirroring emitLinuxVariadicTail)
+        // so RAX can carry AL = 0: SysV variadic calls read AL as the
+        // vector-register count, and every argument here travels in GP
+        // registers. RAX is dead at this point (regs already loaded).
         this.addImportPatchDirect(lib, libFn);
         this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
+        this.asm.movRMBase(10, 0, 0);
+        this.asm.movRI64(0, 0);
+        this.asm.callR64(10);
         this.emitAbiCallTeardown();
     }
 
