@@ -15,6 +15,43 @@ one language for many possibilities.
 
 ## Quick start
 
+### Put `silverc` on your `PATH`
+
+#### Windows
+
+1. Create the folder `%LocalAppData%\Silver\bin`.
+2. Copy `silverc.exe` into it.
+3. Add it to your user `PATH` (reopen the terminal afterwards):
+
+```powershell
+setx PATH "$env:PATH;$env:LocalAppData\Silver\bin"
+```
+
+4. Verify with `silverc --version`.
+
+#### Linux and macOS
+
+Both use the same location, `~/.local/bin`:
+
+```bash
+mkdir -p ~/.local/bin
+cp silverc ~/.local/bin/silverc
+chmod +x ~/.local/bin/silverc
+```
+
+Make sure `~/.local/bin` is on your `PATH`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Add that line to `~/.bashrc` (Linux) or `~/.zshrc` (macOS, the default
+shell) so it persists. Most Linux distributions pick up `~/.local/bin`
+automatically once it exists (re-login to apply); macOS always needs the
+export line above, then `source ~/.zshrc`.
+
+Verify with `silverc --version`.
+
 ### Build a Silver program
 
 Run these commands from the workspace root. Place the compiler on your `PATH` under the command name `silverc`, then compile a program:
