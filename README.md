@@ -21,7 +21,7 @@ one language for many possibilities.
 
 Pick either a global binaries directory or a per-user one under AppData.
 
-Option 1 — global `C:\bin` (needs admin to create):
+Option 1 - global `C:\bin` (needs admin to create):
 
 ```powershell
 mkdir C:\bin
@@ -30,7 +30,7 @@ setx PATH "$env:PATH;C:\bin"
 
 Download or copy `silverc.exe` into `C:\bin`.
 
-Option 2 — per-user `%appdata%\silver\bin` (no admin needed):
+Option 2 - per-user `%appdata%\silver\bin` (no admin needed):
 
 ```powershell
 mkdir "$env:APPDATA\silver\bin"
