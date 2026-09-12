@@ -3209,6 +3209,15 @@ int strIdx = this.stringPatchIndices[i];
                     this.genByteArrayLiteral(initNode);
                 } else if (initNode.kind == 74) {
                     this.genStructLiteral(initNode, stmt.typeHint);
+                } else if ((stmt.typeHint == "string" || stmt.typeHint == "string?") && !this.isStringLike(initNode) && this.isCharExpr(initNode)) {
+                    // `string s = char(65);` / `char c = 'x'; string s = c;`:
+                    // char-to-string conversion (2-byte [char, NUL] heap
+                    // buffer). Storing the raw char value as the string
+                    // pointer made strlen() fault. Mirrors silverc-rs
+                    // gen_char_to_string in the decl-init arm (a
+                    // `c.toString()` call stays on the plain path via
+                    // isStringLike, so its pointer is never masked).
+                    this.genCharToString(initNode);
                 } else {
                     this.genExpr(initNode);
                     // `double d = n;` widens the integer to a real double
