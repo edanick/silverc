@@ -6757,6 +6757,17 @@ int strIdx = this.stringPatchIndices[i];
         if (recv.name == "url") { return true; }
         return false;
     }
+    public bool isFileOpsReceiver(Node recv) {
+        // True when the receiver is a FileOps/FolderOps-typed value (e.g. a
+        // `FileOps file;` local). fs.sr sources are builtin-reserved so these
+        // classes have no collected methods; instance calls on them route to
+        // the native fs lowerings instead of the (missing) user methods.
+        if (recv.kind != 6) { return false; }
+        string t = this.inferExprType(recv);
+        if (t == "FileOps" || t == "FileOps?" || t == "FolderOps" || t == "FolderOps?") { return true; }
+        return false;
+    }
+
 
     public void genCall(Node call) {
         string name = call.name;
@@ -7021,6 +7032,46 @@ int strIdx = this.stringPatchIndices[i];
             if (call.name == "getFiles" || call.name == "files") { entFilter = 1; }
             else if (call.name == "getFolders" || call.name == "folders") { entFilter = 2; }
             this.genFolderEntriesCall(call, entFilter);
+        } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.isFileOpsReceiver(call.child(0)) && (call.name == "readString" || call.name == "readFile" || call.name == "writeString" || call.name == "writeBytes" || call.name == "writeFile" || call.name == "exists" || call.name == "delete" || call.name == "rename" || call.name == "move" || call.name == "copy" || call.name == "getSize" || call.name == "isDir" || call.name == "isFile" || call.name == "isDriveRoot" || call.name == "getExt" || call.name == "getExtension" || call.name == "getEntries" || call.name == "entries" || call.name == "list" || call.name == "getFiles" || call.name == "files" || call.name == "getFolders" || call.name == "folders")) {
+            // Instance call on a FileOps/FolderOps-typed value (e.g.
+            // `FileOps file; file.readString(p)`). fs.sr sources are
+            // builtin-reserved so these classes have no collected methods;
+            // route the known method names to the native fs lowerings (which
+            // ignore the receiver, like the module forms). Anything else
+            // (including other user objects) falls through to the normal
+            // member dispatch below.
+            string recvT = this.inferExprType(call.child(0));
+            bool isFolderOps = recvT == "FolderOps" || recvT == "FolderOps?";
+            if (call.name == "readString" || call.name == "readFile") {
+                this.genReadStringCall(call);
+            } else if (call.name == "writeString" || call.name == "writeBytes" || call.name == "writeFile") {
+                this.genWriteBytesCall(call);
+            } else if (call.name == "exists") {
+                this.genFileExistsCall(call);
+            } else if (call.name == "delete") {
+                if (isFolderOps) { this.genFolderDeleteCall(call); }
+                else { this.genFileDeleteCall(call); }
+            } else if (call.name == "rename" || call.name == "move") {
+                this.genFileRenameCall(call);
+            } else if (call.name == "copy") {
+                this.genFileCopyCall(call);
+            } else if (call.name == "getSize") {
+                if (isFolderOps) { this.genFolderSizeCall(call); }
+                else { this.genFileSizeCall(call); }
+            } else if (call.name == "isDir") {
+                this.genIsDirCall(call);
+            } else if (call.name == "isFile") {
+                this.genIsFileCall(call);
+            } else if (call.name == "isDriveRoot") {
+                this.genIsDriveRootCall(call);
+            } else if (call.name == "getExt" || call.name == "getExtension") {
+                this.genGetExtCall(call);
+            } else {
+                int entFilter2 = 0;
+                if (call.name == "getFiles" || call.name == "files") { entFilter2 = 1; }
+                else if (call.name == "getFolders" || call.name == "folders") { entFilter2 = 2; }
+                this.genFolderEntriesCall(call, entFilter2);
+            }
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && call.child(0).name == "Value") {
             // Static factory on the builtin Value tagged union (e.g. Value.makeInt).
             this.genValueFactoryCall(call);
