@@ -7012,6 +7012,16 @@ int strIdx = this.stringPatchIndices[i];
             this.genLenCall(call);
         } else if (builtinName && name == "exit") {
             this.genExitCall(call);
+        } else if (builtinName && name == "sleep" && !call.isMember && !this.sleepUserDeclared()) {
+            // Bare sleep(ms) with no collected user function of that name:
+            // native builtin lowering (mirrors silverc-rs `name == "sleep"`
+            // SENTINEL_SLEEP). User-declared globals (std/time.sr,
+            // std/thread.sr, std/async.sr star imports) keep resolving
+            // through genUserCall below, exactly like the Rust dispatcher
+            // which consults func_labels before the builtin. Without this,
+            // the call fell into the unresolvable path and yielded null,
+            // so sleep() was a silent no-op in native executables.
+            this.genSleepCall(call);
         } else if (builtinName && name == "cargs") {
             this.genCargsCall(call);
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "llmai" || call.child(0).name == "LLMAI") && call.name == "chat") {
@@ -13390,6 +13400,31 @@ public void genNewCall(Node call) {
 
     public void genExitCall(Node call) {
         this.windowsBackend.genExitCall(this, call);
+    }
+
+    // True when any collected module declares a function named `sleep`
+    // (std/time.sr, std/thread.sr, std/async.sr globals). The genCall
+    // builtin branch above must yield to those declarations, mirroring
+    // silverc-rs where func_labels is consulted before the sleep builtin.
+    public bool sleepUserDeclared() {
+        for (int i = 0; i < this.funcNames.length; i++) {
+            if (this.funcNames[i] == "sleep") { return true; }
+        }
+        return false;
+    }
+
+    // Bare sleep(ms) builtin: kernel32!Sleep on WINDOWS (one millisecond
+    // argument in RCX, no import grant required -- like genExitCall the
+    // import is recorded unconditionally), nanosleep timespec on LINUX.
+    // MAC falls through to the WINDOWS helper: the import remaps to
+    // nanosleep via macImportName and the v1 Mach-O emitter discards
+    // bodies, the same precedent as genExitCall/genInputCall.
+    public void genSleepCall(Node call) {
+        if (this.isLinuxTarget()) {
+            this.linuxBackend.genLinuxSleepCall(this, call);
+            return;
+        }
+        this.windowsBackend.genSleepCall(this, call);
     }
 
     public void genCargsCall(Node call) {

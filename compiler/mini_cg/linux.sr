@@ -1326,6 +1326,42 @@ class MiniCgLinux {
         cg.asm.movRMBase(0, 5, bufOff);
     }
 
+    public void genLinuxSleepCall(MiniCg cg, Node call) {
+        // LINUX SysV backend: bare sleep(ms) via nanosleep(&timespec,
+        // NULL), mirroring silverc-rs gen_sleep_linux. The millisecond
+        // count in RAX is split into whole seconds + nanoseconds in a
+        // two-slot timespec whose base is the lower slot (nsec allocated
+        // first, like the Rust shape). Negative counts fail harmlessly
+        // inside nanosleep with EINVAL. The void result yields null.
+        if (call.childCount() > 0) {
+            cg.genExpr(call.child(0));
+        } else {
+            cg.asm.xorRR64(0, 0);
+        }
+        int msOff = cg.allocLocal("__sleep_ms");
+        cg.asm.movMBaseR(5, 0, msOff);
+        int nsecOff = cg.allocLocal("__sleep_nsec");
+        int secOff = cg.allocLocal("__sleep_sec");
+        cg.asm.movRMBase(0, 5, msOff);
+        cg.asm.movRI64(1, 1000);
+        cg.asm.cqo();
+        cg.asm.idivR64(1);
+        cg.asm.movMBaseR(5, 0, secOff);
+        cg.asm.movRR64(0, 2);
+        cg.asm.movRI64(1, 1000000);
+        cg.asm.imulRR64(0, 1);
+        cg.asm.movMBaseR(5, 0, nsecOff);
+        cg.asm.leaRBase(7, 5, secOff);
+        cg.asm.xorRR64(6, 6);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "nanosleep");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(10, 0, 0);
+        cg.asm.callR64(10);
+        cg.emitAbiCallTeardown();
+        cg.asm.xorRR64(0, 0);
+    }
+
     public void emitLinuxHeapAllocFromR8(MiniCg cg) {
         cg.asm.pushR64(8);
         cg.asm.movRR64(7, 8);

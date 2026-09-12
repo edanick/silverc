@@ -238,6 +238,28 @@ class MiniCgWindows {
         cg.asm.emitCallTeardown();
     }
 
+    public void genSleepCall(MiniCg cg, Node call) {
+        // Bare sleep(ms) builtin (mirrors silverc-rs SENTINEL_SLEEP
+        // lowering): the millisecond count travels in RCX straight into
+        // kernel32!Sleep. No import grant is required -- the import is
+        // recorded unconditionally, like genExitCall above. A missing
+        // argument sleeps zero (returns at once); the void result yields
+        // null so expression contexts keep the old value shape.
+        if (call.childCount() > 0) {
+            cg.genExpr(call.child(0));
+            cg.asm.movRR64(1, 0);
+        } else {
+            cg.asm.xorRR64(1, 1);
+        }
+        cg.addImportPatch("kernel32.dll", "Sleep");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.emitCallSetup(0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        cg.asm.xorRR64(0, 0);
+    }
+
     public void genCursorXCall(MiniCg cg) {
         cg.allocLocal("__cursor_padding");
         int pointOff = cg.allocLocal("__cursor_point");
