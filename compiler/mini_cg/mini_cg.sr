@@ -9089,11 +9089,11 @@ public void genNewCall(Node call) {
             return;
         }
         if (name == "toBytes") {
-            // string.toBytes(): one byte of the NUL-terminated source per
-            // element. Mirrors the silverc-rs emitter's semantics, lowered to
-            // the self-host's dynamic byte[] layout (capacity qword at +0,
-            // length qword at +8, element bytes from +16, array value =
-            // alloc+16, bounds check reads length at ptr[-8]).
+            // string.toBytes(): a proper Silver int[] (8-byte slots, length
+            // at ptr[-8]): header capacity=len at +0, length=len at +8, data
+            // from +16. Mirrors silverc-rs emit_string_to_bytes. (The old
+            // byte-packed layout read back 8 bytes per int element, so every
+            // value came back corrupted.)
             this.genExpr(recv);
             int tbRecv = this.allocLocal("__tb_recv");
             this.asm.movMBaseR(5, 0, tbRecv);
@@ -9108,42 +9108,23 @@ public void genNewCall(Node call) {
             this.asm.emitCallTeardown();
             int tbLen = this.allocLocal("__tb_len");
             this.asm.movMBaseR(5, 0, tbLen);
-            // capacity = max(len, 8), mirroring the dynamic new-array lowering
-            int tbCap = this.allocLocal("__tb_cap");
-            int tbGe8 = this.newLabel();
-            int tbCapDone = this.newLabel();
+            // size = (len + 2) * 8; hdr = HeapAlloc(GetProcessHeap(), 0, size)
             this.asm.movRMBase(0, 5, tbLen);
-            this.asm.cmpRI32(0, 8);
-            this.asm.jgeLabel(tbGe8);
-            this.asm.movRI64(0, 8);
-            this.asm.jmpLabel(tbCapDone);
-            this.asm.bindLabel(tbGe8);
-            this.asm.movRMBase(0, 5, tbLen);
-            this.asm.bindLabel(tbCapDone);
-            this.asm.movMBaseR(5, 0, tbCap);
-            // size = (cap + 2) * 8 in RCX; alloc via malloc (same import path
-            // as the substr/string-repeat lowerings).
-            this.asm.movRMBase(0, 5, tbCap);
             this.asm.addRI32(0, 2);
             this.asm.shlR64Imm(0, 3);
-            this.asm.movRR64(1, 0);
-            this.addImportPatch("msvcrt.dll", "malloc");
-            int tbMA = 0xDEADBEEFCAFEBADE;
-            this.asm.emitImm64(0, tbMA);
-            this.asm.movRMBase(0, 0, 0);
-            this.asm.emitCallSetup(0);
-            this.asm.callR64(0);
-            this.asm.emitCallTeardown();
+            int tbSize = this.allocLocal("__tb_size");
+            this.asm.movMBaseR(5, 0, tbSize);
+            this.emitLlmaiHeapAlloc(tbSize);
             int tbHdr = this.allocLocal("__tb_hdr");
             this.asm.movMBaseR(5, 0, tbHdr);
             // header: capacity at +0, length at +8
-            this.asm.movRMBase(1, 5, tbCap);
+            this.asm.movRMBase(1, 5, tbLen);
             this.asm.movRMBase(0, 5, tbHdr);
             this.asm.movMBaseR(0, 1, 0);
             this.asm.movRMBase(1, 5, tbLen);
             this.asm.movRMBase(0, 5, tbHdr);
             this.asm.movMBaseR(0, 1, 8);
-            // fill loop: byte [hdr + 16 + i] = src[i] for i < len
+            // fill: slot[i] (qword at hdr+16+i*8) = movzx byte src[i]
             int tbI = this.allocLocal("__tb_i");
             this.asm.xorRR64(0, 0);
             this.asm.movMBaseR(5, 0, tbI);
@@ -9159,12 +9140,13 @@ public void genNewCall(Node call) {
             this.asm.movRMBase(0, 5, tbI);
             this.asm.addRR64(1, 0);
             this.asm.movzxByteMBase(1, 1, 0);
-            // byte [hdr + 16 + i] = CL
+            // RAX = hdr + 16 + i * 8; [RAX] = RCX
             this.asm.movRMBase(0, 5, tbHdr);
             this.asm.addRI32(0, 16);
             this.asm.movRMBase(2, 5, tbI);
+            this.asm.shlR64Imm(2, 3);
             this.asm.addRR64(0, 2);
-            this.asm.movMBaseByteR(0, 1, 0);
+            this.asm.movMBaseR(0, 1, 0);
             this.asm.movRMBase(0, 5, tbI);
             this.asm.incR64(0);
             this.asm.movMBaseR(5, 0, tbI);
