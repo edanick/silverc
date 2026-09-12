@@ -1789,6 +1789,13 @@ int strIdx = this.stringPatchIndices[i];
                     this.userModuleNames.add(src);
                 }
             } else if (pi.kind == 105) {
+                // Real enum declarations carry their members as children. A
+                // bare source import (`import math;`) is also kind 105 but
+                // has no children and no typeHint: registering its module
+                // name as an enum poisoned enum checks (and member-const
+                // fallback guards) for that name, so module-qualified
+                // global consts like math.PI read back 0.
+                if (pi.childCount() == 0) { continue; }
                 this.enumNames.add(pi.name);
                 for (int j = 0; j < pi.childCount(); j++) {
                     Node member = pi.child(j);
@@ -4558,6 +4565,37 @@ int strIdx = this.stringPatchIndices[i];
                 return;
             }
         }
+        if (obj.kind == 6) {
+            // Module-qualified global const (e.g. math.PI): the module name
+            // is neither a local, a class, nor an enum, so the field is a
+            // global const collected under its bare name. Without this the
+            // access emitted nothing and read back 0.
+            bool objIsLocal = this.getLocalType(obj.name) != "";
+            bool objIsClass = false;
+            for (int ci = 0; ci < this.classNames.length; ci++) {
+                if (this.classNames[ci] == obj.name) { objIsClass = true; }
+            }
+            bool objIsEnum = false;
+            for (int ei = 0; ei < this.enumNames.length; ei++) {
+                if (this.enumNames[ei] == obj.name) { objIsEnum = true; }
+            }
+            if (!objIsLocal && !objIsClass && !objIsEnum) {
+                for (int ci = 0; ci < this.constNames.length; ci++) {
+                    if (this.constNames[ci] == fieldName) {
+                        if (ci < this.constIsString.length && this.constIsString[ci] == 1) {
+                            int strIdx = this.addString(this.constStringValues[ci]);
+                            int sp = this.asm.buf.length;
+                            this.asm.emitImm64(0, 0);
+                            this.stringPatchOffsets.add(sp + 2);
+                            this.stringPatchIndices.add(strIdx);
+                        } else {
+                            this.asm.emitImm64(0, this.constValues[ci]);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         if (fieldName == "length") {
             string objType = this.inferExprType(obj);
             if (objType == "string") {
@@ -4993,6 +5031,27 @@ int strIdx = this.stringPatchIndices[i];
         string fieldName = expr.name;
         // os.name / os.version / os.build → string
         if (obj.kind == 6 && obj.name == "os") { return "string"; }
+        // Module-qualified global const (e.g. math.PI): report its declared
+        // type so float consts skip the int-to-double store coercion and
+        // format via %g. Mirrors the genMemberAccess fallback guards.
+        if (obj.kind == 6) {
+            bool objIsLocal = this.getLocalType(obj.name) != "";
+            bool objIsClass = false;
+            for (int ci = 0; ci < this.classNames.length; ci++) {
+                if (this.classNames[ci] == obj.name) { objIsClass = true; }
+            }
+            bool objIsEnum = false;
+            for (int ei = 0; ei < this.enumNames.length; ei++) {
+                if (this.enumNames[ei] == obj.name) { objIsEnum = true; }
+            }
+            if (!objIsLocal && !objIsClass && !objIsEnum) {
+                for (int ci = 0; ci < this.constNames.length; ci++) {
+                    if (this.constNames[ci] == fieldName) {
+                        if (ci < this.constTypes.length && this.constTypes[ci] != "") { return this.constTypes[ci]; }
+                    }
+                }
+            }
+        }
         string objType = this.inferExprType(obj);
         string fieldType = this.findFieldType(objType, fieldName);
         return fieldType;
