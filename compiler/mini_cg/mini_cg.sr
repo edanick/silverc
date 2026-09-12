@@ -6533,6 +6533,27 @@ int strIdx = this.stringPatchIndices[i];
     public void genArrayAdd(Node call) {
         Node arrNode = call.child(0);
         Node valNode = call.child(1);
+        // byte[]/char[] elements are byte-packed on self-host (see
+        // genByteArrayLiteral and isByteElemType): index reads, stores,
+        // and slices all use stride 1 with byte loads/stores. The growth
+        // and store paths below must match that layout; the old code
+        // always wrote 8-byte slots, so the second .add on a packed
+        // array stored a qword past the malloc'd payload and corrupted
+        // the heap (0xC0000374). Mirrors the classification idiom used
+        // by the index-store path.
+        bool arrIsByte = false;
+        if (arrNode.kind == 6) {
+            arrIsByte = this.isByteElemType(this.getLocalType(arrNode.name));
+        } else if (arrNode.kind == 13) {
+            Node addArrObj = arrNode.child(0);
+            if (addArrObj.kind == 6 && addArrObj.name == "this") {
+                arrIsByte = this.isByteElemType(this.findFieldType(this.currentClassName, arrNode.name));
+            } else {
+                arrIsByte = this.isByteElemType(this.inferExprType(arrNode));
+            }
+        } else {
+            arrIsByte = this.isByteElemType(this.inferExprType(arrNode));
+        }
         this.genExpr(arrNode);
         int arrOff = this.allocLocal("__arr_add_arr");
         this.asm.movMBaseR(5, 0, arrOff);
@@ -6573,8 +6594,12 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.shlR64Imm(1, 1);
         this.asm.movMBaseR(5, 1, newCapOff);
         this.asm.movRMBase(0, 5, newCapOff);
-        this.asm.addRI32(0, 2);
-        this.asm.shlR64Imm(0, 3);
+        if (arrIsByte) {
+            this.asm.addRI32(0, 16);
+        } else {
+            this.asm.addRI32(0, 2);
+            this.asm.shlR64Imm(0, 3);
+        }
         this.asm.movRR64(1, 0);
         this.addImportPatch("msvcrt.dll", "malloc");
         this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB0);
@@ -6593,7 +6618,7 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movMBaseR(0, 1, 8);
         this.asm.movRMBase(0, 5, arrOff);
         this.asm.movRMBase(1, 0, -8);
-        this.asm.shlR64Imm(1, 3);
+        if (!arrIsByte) { this.asm.shlR64Imm(1, 3); }
         int copySzOff = this.allocLocal("__arr_copy_sz");
         this.asm.movMBaseR(5, 1, copySzOff);
         // Copy existing elements with scalar loads/stores instead of
@@ -6613,15 +6638,35 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.cmpRI32(0, 0);
         this.asm.jleLabel(copyDone);
         this.asm.movRMBase(10, 5, copySrcOff);
-        this.asm.movRMBase(8, 10, 0);
+        if (arrIsByte) {
+            this.asm.movzxByteMBase(8, 10, 0);
+        } else {
+            this.asm.movRMBase(8, 10, 0);
+        }
         this.asm.movRMBase(11, 5, copyDstOff);
-        this.asm.movMBaseR(11, 8, 0);
-        this.asm.addRI32(10, 8);
+        if (arrIsByte) {
+            this.asm.movMBaseByteR(11, 8, 0);
+        } else {
+            this.asm.movMBaseR(11, 8, 0);
+        }
+        if (arrIsByte) {
+            this.asm.addRI32(10, 1);
+        } else {
+            this.asm.addRI32(10, 8);
+        }
         this.asm.movMBaseR(5, 10, copySrcOff);
-        this.asm.addRI32(11, 8);
+        if (arrIsByte) {
+            this.asm.addRI32(11, 1);
+        } else {
+            this.asm.addRI32(11, 8);
+        }
         this.asm.movMBaseR(5, 11, copyDstOff);
         this.asm.movRMBase(0, 5, copySzOff);
-        this.asm.subRI32(0, 8);
+        if (arrIsByte) {
+            this.asm.subRI32(0, 1);
+        } else {
+            this.asm.subRI32(0, 8);
+        }
         this.asm.movMBaseR(5, 0, copySzOff);
         this.asm.jmpLabel(copyLoop);
         this.asm.bindLabel(copyDone);
@@ -6683,10 +6728,14 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.bindLabel(doneGrow);
         this.asm.movRMBase(0, 5, arrOff);
         this.asm.movRMBase(1, 0, -8);
-        this.asm.shlR64Imm(1, 3);
+        if (!arrIsByte) { this.asm.shlR64Imm(1, 3); }
         this.asm.addRR64(0, 1);
         this.asm.movRMBase(8, 5, valOff);
-        this.asm.movMBaseR(0, 8, 0);
+        if (arrIsByte) {
+            this.asm.movMBaseByteR(0, 8, 0);
+        } else {
+            this.asm.movMBaseR(0, 8, 0);
+        }
         this.asm.movRMBase(0, 5, arrOff);
         this.asm.movRMBase(1, 0, -8);
         this.asm.addRI32(1, 1);
