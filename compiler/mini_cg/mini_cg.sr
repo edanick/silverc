@@ -4899,6 +4899,26 @@ int strIdx = this.stringPatchIndices[i];
                 Node recv = expr.child(0);
                 cls = this.inferExprType(recv);
             }
+            // Overload-aware return type for module/plain calls: resolve via
+            // the same overload dispatch the call binds, so math.max(3, 7)
+            // types as int (not the float overload's float64). Class-instance
+            // calls keep the legacy first-match behavior below.
+            bool clsIsClass = false;
+            for (int ci = 0; ci < this.classNames.length; ci++) {
+                if (this.classNames[ci] == cls) { clsIsClass = true; }
+            }
+            if (!clsIsClass) {
+                int nargs = expr.childCount();
+                Node probe = null;
+                if (expr.isMember && expr.childCount() > 0) {
+                    nargs = expr.childCount() - 1;
+                    if (expr.childCount() > 1) { probe = expr.child(1); }
+                } else if (expr.childCount() > 0) {
+                    probe = expr.child(0);
+                }
+                int wi = this.selectOverloadIdx(cname, cls, nargs, probe);
+                if (wi >= 0 && wi < this.funcRetTypes.length) { return this.funcRetTypes[wi]; }
+            }
             for (int i = 0; i < this.funcNames.length; i++) {
                 if (this.funcNames[i] == cname && (this.funcClasses[i] == cls || cls == this.funcClasses[i] + "?")) {
                     return this.funcRetTypes[i];
@@ -8208,8 +8228,27 @@ public void genNewCall(Node call) {
     // whose parameter list accepts `nargs` arguments. The variadic tail is
     // itself optional (required = non-default count among the fixed prefix);
     // same-arity ties keep the last declaration. -1 when nothing matches.
-    public int selectOverloadIdx(string name, string cls, int nargs) {
+    public int selectOverloadIdx(string name, string cls, int nargs, Node probe) {
+        // Overload dispatch by argument count, with a type tie-break on the
+        // first explicit argument (probe, null when unavailable): a float
+        // argument prefers a float-typed first parameter, an array argument
+        // prefers the same array type, otherwise an int-typed one. This
+        // routes math.abs(-1.5)/max/min/sum to the matching math.sr overload
+        // instead of always taking the last declaration. Without a probe (or
+        // on score ties) the legacy last-match behavior is preserved exactly.
         int best = -1;
+        int bestScore = -1;
+        bool haveProbe = probe != null;
+        bool probeFloat = false;
+        bool probeArr = false;
+        string probeType = "";
+        if (haveProbe) {
+            probeFloat = this.isFloatLike(probe);
+            probeType = this.inferExprType(probe);
+            if (probeType.length >= 2) {
+                if (probeType[probeType.length - 2] == '[' && probeType[probeType.length - 1] == ']') { probeArr = true; }
+            }
+        }
         for (int i = 0; i < this.funcNames.length; i++) {
             if (this.funcNames[i] == name && this.funcClasses[i] == cls) {
                 int pc = (i < this.funcParamCounts.length) ? this.funcParamCounts[i] : -1;
@@ -8228,7 +8267,21 @@ public void genNewCall(Node call) {
                 } else {
                     accepts = nargs >= minArgs && nargs <= pc;
                 }
-                if (accepts) { best = i; }
+                if (accepts) {
+                    int score = 0;
+                    if (haveProbe && nargs > 0) {
+                        string p0 = "";
+                        if (pStart < this.funcParamTypes.length) { p0 = this.funcParamTypes[pStart]; }
+                        if (probeFloat) {
+                            if (p0 == "float" || p0 == "float64" || p0 == "double") { score = 2; }
+                        } else if (probeArr) {
+                            if (p0 == probeType) { score = 2; }
+                        } else {
+                            if (p0 == "int" || p0 == "int32" || p0 == "int64" || p0 == "uint") { score = 2; }
+                        }
+                    }
+                    if (score > bestScore || score == bestScore) { best = i; bestScore = score; }
+                }
             }
         }
         return best;
@@ -8337,7 +8390,7 @@ public void genNewCall(Node call) {
             }
         }
         if (s1Count > 1) {
-            funcIdx = this.selectOverloadIdx(name, this.currentClassName, nargs);
+            funcIdx = this.selectOverloadIdx(name, this.currentClassName, nargs, null);
             if (funcIdx < 0) {
                 // UNIFIED_CORE_LIBRARY.md §4 rule 6: when no class-method
                 // overload accepts the argument count but the name resolves
@@ -8365,7 +8418,15 @@ public void genNewCall(Node call) {
                 }
             }
             if (s2Count > 1) {
-                funcIdx = this.selectOverloadIdx(name, "", nargs);
+                // Type-aware tie-break on the first explicit argument
+                // (module calls like math.abs(-1.5) need the float overload).
+                Node probe2 = null;
+                if (nargs > 0) {
+                    int ai = 0;
+                    if (call.isMember) { ai = 1; }
+                    if (ai < call.childCount()) { probe2 = call.child(ai); }
+                }
+                funcIdx = this.selectOverloadIdx(name, "", nargs, probe2);
                 if (funcIdx < 0) {
                     // UNIFIED_CORE_LIBRARY.md §4 rule 6 -- resolution prefers
                     // the DLL export inside regions: when NO user overload of
@@ -10377,7 +10438,7 @@ public void genNewCall(Node call) {
             }
         }
         if (haveExactClass) {
-            funcIdx = this.selectOverloadIdx(name, recvClass, explicitUserArgs);
+            funcIdx = this.selectOverloadIdx(name, recvClass, explicitUserArgs, null);
         }
         // DOCS/259 G2: a zero-arg member call on a receiver whose class
         // declares a fn-typed field of that name (`this.cb()` / `obj.cb()`)
@@ -12005,6 +12066,22 @@ public void genNewCall(Node call) {
             // Free function / member call whose declared return type is a
             // float (e.g. the interpreter's valueToFloat / floatStrToF64):
             // the result travels as IEEE-754 bits and must be printed with %g.
+            // Overload-aware: resolve the same overload dispatch binds, so
+            // math.max(3, 7) (int overload) is not treated as float.
+            int nargs = expr.childCount();
+            Node fprobe = null;
+            if (expr.isMember && expr.childCount() > 0) {
+                nargs = expr.childCount() - 1;
+                if (expr.childCount() > 1) { fprobe = expr.child(1); }
+            } else if (expr.childCount() > 0) {
+                fprobe = expr.child(0);
+            }
+            int wi = this.selectOverloadIdx(cn, "", nargs, fprobe);
+            if (wi >= 0 && wi < this.funcRetTypes.length) {
+                string wrt = this.funcRetTypes[wi];
+                if (wrt == "float" || wrt == "float64" || wrt == "double") { return true; }
+                return false;
+            }
             for (int ri = 0; ri < this.funcNames.length; ri++) {
                 if (this.funcNames[ri] == cn && this.funcClasses[ri] == "") {
                     string frt = this.funcRetTypes[ri];
