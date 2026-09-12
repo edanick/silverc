@@ -1167,9 +1167,17 @@ string projectStripDirectivesCustom(string source, NativeModules nm) {
         string trimmed = projectTrim(line);
         bool skip = false;
         if (trimmed.length >= 10 && projectSlice(trimmed, 0, 10) == "mod export") { skip = true; }
-        bool isWin32Import = trimmed.length >= 6 && projectSlice(trimmed, 0, 6) == "import" && projectFind(trimmed, "win32", 0) >= 0;
-        bool isLinuxImport = trimmed.length >= 6 && projectSlice(trimmed, 0, 6) == "import" && projectFind(trimmed, "linux", 0) >= 0;
-        if (trimmed.length >= 6 && projectSlice(trimmed, 0, 6) == "import" && !isWin32Import && !isLinuxImport) {
+        // Whole-word `import`: a trimmed line starting with the identifier
+        // characters (e.g. `importGroupIdx.add(...);`) is code, not an
+        // import statement, and must survive stripping.
+        bool isImportLine = trimmed.length >= 6 && projectSlice(trimmed, 0, 6) == "import";
+        if (isImportLine && trimmed.length > 6) {
+            char c6 = trimmed[6];
+            if (c6 != ' ' && c6 != '\t' && c6 != '\r' && c6 != '\n' && c6 != '{' && c6 != '*') { isImportLine = false; }
+        }
+        bool isWin32Import = isImportLine && projectFind(trimmed, "win32", 0) >= 0;
+        bool isLinuxImport = isImportLine && projectFind(trimmed, "linux", 0) >= 0;
+        if (isImportLine && !isWin32Import && !isLinuxImport) {
             bool keepCustom = false;
             int impPos = projectFind(trimmed, "import", 0);
             int semiPos = projectFind(trimmed, ";", 0);
@@ -1205,13 +1213,20 @@ string projectStripDirectives(string source) {
         string trimmed = projectTrim(line);
         bool skip = false;
         if (trimmed.length >= 10 && projectSlice(trimmed, 0, 10) == "mod export") { skip = true; }
+        // Whole-word `import` (same guard as projectStripDirectivesCustom):
+        // identifier-led lines such as `importGroupIdx.add(...);` are code.
+        bool isImportLine = trimmed.length >= 6 && projectSlice(trimmed, 0, 6) == "import";
+        if (isImportLine && trimmed.length > 6) {
+            char c6 = trimmed[6];
+            if (c6 != ' ' && c6 != '\t' && c6 != '\r' && c6 != '\n' && c6 != '{' && c6 != '*') { isImportLine = false; }
+        }
         // DOCS/213 -- keep `import ... from win32...;` lines: they carry the
         // native DLL module grants the codegen must see. LINUX.md Phase B:
         // keep `import ... from linux...;` lines beside them: they carry
         // the native Linux lib grants (linux.libc/x11/xtst) the same way.
-        bool isWin32Import = trimmed.length >= 6 && projectSlice(trimmed, 0, 6) == "import" && projectFind(trimmed, "win32", 0) >= 0;
-        bool isLinuxImport = trimmed.length >= 6 && projectSlice(trimmed, 0, 6) == "import" && projectFind(trimmed, "linux", 0) >= 0;
-        if (trimmed.length >= 6 && projectSlice(trimmed, 0, 6) == "import" && !isWin32Import && !isLinuxImport) { skip = true; }
+        bool isWin32Import = isImportLine && projectFind(trimmed, "win32", 0) >= 0;
+        bool isLinuxImport = isImportLine && projectFind(trimmed, "linux", 0) >= 0;
+        if (isImportLine && !isWin32Import && !isLinuxImport) { skip = true; }
         if (!skip) { parts.add(line); }
         if (end < source.length) { parts.add("\n"); }
         cursor = end + 1;
