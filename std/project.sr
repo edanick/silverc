@@ -1241,6 +1241,25 @@ string projectCollect(string path, string root, string[] sourceDirs, ProjectVisi
     while (cursor < source.length) {
         int importPos = projectFind(source, "import", cursor);
         if (importPos < 0) { break; }
+        // Same line-leading + whole-word guard as projectCollect so the
+        // count stays in lockstep with the real collection.
+        bool lineLeading = true;
+        for (int bi = importPos - 1; bi >= 0; bi--) {
+            char bc = source[bi];
+            if (bc == '\n') { break; }
+            if (bc != ' ' && bc != '\t' && bc != '\r') { lineLeading = false; break; }
+        }
+        if (!lineLeading) {
+            cursor = importPos + 6;
+            continue;
+        }
+        if (importPos + 6 < source.length) {
+            char ic = source[importPos + 6];
+            if (ic != ' ' && ic != '\t' && ic != '\r' && ic != '\n' && ic != '{' && ic != '*') {
+                cursor = importPos + 6;
+                continue;
+            }
+        }
         int semi = projectFind(source, ";", importPos + 6);
         if (semi < 0) { break; }
         string statement = projectSlice(source, importPos + 6, semi);
@@ -1274,6 +1293,31 @@ int projectCountCollect(string path, string root, string[] sourceDirs, ProjectVi
     while (cursor < source.length) {
         int importPos = projectFind(source, "import", cursor);
         if (importPos < 0) { break; }
+        // Only a line-leading `import` starts an import statement: the
+        // aggregate sources contain the literal word "import" in comments,
+        // string literals and identifiers (e.g. `importPath`), and scanning
+        // those resolves bogus modules (a driver comment names `math`, the
+        // `importPath` local below reads as `Path` on case-insensitive
+        // filesystems, duplicating path.sr). Mirrors collectImports.
+        bool lineLeading = true;
+        for (int bi = importPos - 1; bi >= 0; bi--) {
+            char bc = source[bi];
+            if (bc == '\n') { break; }
+            if (bc != ' ' && bc != '\t' && bc != '\r') { lineLeading = false; break; }
+        }
+        if (!lineLeading) {
+            cursor = importPos + 6;
+            continue;
+        }
+        // Whole-word check: reject matches glued to identifier characters
+        // (e.g. `importPath`, `importGroupIdx`).
+        if (importPos + 6 < source.length) {
+            char ic = source[importPos + 6];
+            if (ic != ' ' && ic != '\t' && ic != '\r' && ic != '\n' && ic != '{' && ic != '*') {
+                cursor = importPos + 6;
+                continue;
+            }
+        }
         int semi = projectFind(source, ";", importPos + 6);
         if (semi < 0) { break; }
         string statement = projectSlice(source, importPos + 6, semi);

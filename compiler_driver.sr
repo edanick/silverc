@@ -380,6 +380,27 @@ string collectModule(string name, string inputFile, string[] visited, bool emitM
     while (cursor < modSrc.length) {
         int importPos = projectFind(modSrc, "import", cursor);
         if (importPos < 0) { break; }
+        // Line-leading + whole-word guard: module sources contain the word
+        // "import" in comments, strings and identifiers (e.g. `importPath`);
+        // only a real statement may resolve a dependency. Mirrors
+        // collectImports below.
+        bool lineLeading = true;
+        for (int bi = importPos - 1; bi >= 0; bi--) {
+            char bc = modSrc[bi];
+            if (bc == '\n') { break; }
+            if (bc != ' ' && bc != '\t' && bc != '\r') { lineLeading = false; break; }
+        }
+        if (!lineLeading) {
+            cursor = importPos + 6;
+            continue;
+        }
+        if (importPos + 6 < modSrc.length) {
+            char ic = modSrc[importPos + 6];
+            if (ic != ' ' && ic != '\t' && ic != '\r' && ic != '\n' && ic != '{' && ic != '*') {
+                cursor = importPos + 6;
+                continue;
+            }
+        }
         int semi = projectFind(modSrc, ";", importPos + 6);
         if (semi < 0) { break; }
         string statement = projectSlice(modSrc, importPos + 6, semi);
@@ -416,6 +437,25 @@ int countModule(string name, string inputFile, string[] visited) {
     while (cursor < modSrc.length) {
         int importPos = projectFind(modSrc, "import", cursor);
         if (importPos < 0) { break; }
+        // Same line-leading + whole-word guard as collectModule so the
+        // count stays in lockstep with the real collection.
+        bool lineLeading = true;
+        for (int bi = importPos - 1; bi >= 0; bi--) {
+            char bc = modSrc[bi];
+            if (bc == '\n') { break; }
+            if (bc != ' ' && bc != '\t' && bc != '\r') { lineLeading = false; break; }
+        }
+        if (!lineLeading) {
+            cursor = importPos + 6;
+            continue;
+        }
+        if (importPos + 6 < modSrc.length) {
+            char ic = modSrc[importPos + 6];
+            if (ic != ' ' && ic != '\t' && ic != '\r' && ic != '\n' && ic != '{' && ic != '*') {
+                cursor = importPos + 6;
+                continue;
+            }
+        }
         int semi = projectFind(modSrc, ";", importPos + 6);
         if (semi < 0) { break; }
         string statement = projectSlice(modSrc, importPos + 6, semi);
