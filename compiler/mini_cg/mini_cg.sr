@@ -9033,12 +9033,26 @@ public void genNewCall(Node call) {
             this.asm.movRMBase(0, 0, 0);
             this.asm.callR64(0);
         } else {
-            this.asm.callRel32(0);
+            // Unresolvable call name (e.g. a member call like json.stringify
+            // whose receiver is shadowed by a local, matching no user
+            // function): yield null like the bootstrap instead of emitting a
+            // forward call no definition will ever patch (rel32=0 faults at
+            // runtime). Names declared anywhere still take the forward path
+            // so later-defined functions link normally.
+            bool knownName = false;
+            for (int fi = 0; fi < this.funcNames.length; fi++) {
+                if (this.funcNames[fi] == name) { knownName = true; break; }
+            }
+            if (!knownName) {
+                this.asm.xorRR64(0, 0);
+            } else {
+                this.asm.callRel32(0);
 
-            this.forwardCalls.add(this.asm.buf.length - 4);
-            this.forwardCallFuncIdxs.add(-1);
-            this.forwardCallNames.add(name);
-            this.forwardCallClasses.add("");
+                this.forwardCalls.add(this.asm.buf.length - 4);
+                this.forwardCallFuncIdxs.add(-1);
+                this.forwardCallNames.add(name);
+                this.forwardCallClasses.add("");
+            }
         }
         this.emitAbiCallTeardown();
     }
@@ -10538,6 +10552,14 @@ public void genNewCall(Node call) {
                     funcIdx = i;
                 }
             }
+        }
+        if (funcIdx < 0) {
+            // Unresolvable member call (e.g. a stdlib-namespace call like
+            // json.stringify whose receiver is shadowed by a local): yield
+            // null like the bootstrap instead of emitting a forward call no
+            // function will ever patch (rel32=0 faults at runtime).
+            this.asm.xorRR64(0, 0);
+            return;
         }
         string lookupClass = "";
         if (funcIdx >= 0) {
