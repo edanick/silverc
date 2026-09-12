@@ -60,6 +60,7 @@ class MiniCg {
     public prop int[] constValues;
     public prop string[] constStringValues;
     public prop int[] constIsString;
+    public prop string[] constTypes;
     public prop string[] funcRetTypes;
     public prop int[] funcOffsets;
     public prop int[] funcParamStarts;
@@ -247,6 +248,7 @@ class MiniCg {
         this.constValues = [];
         this.constStringValues = [];
         this.constIsString = [];
+        this.constTypes = [];
         this.funcRetTypes = [];
         this.funcOffsets = [];
         this.funcParamStarts = [];
@@ -1731,7 +1733,15 @@ int strIdx = this.stringPatchIndices[i];
             Node pi = program[i];
             if (pi.kind == 104) {
                 this.constNames.add(pi.name);
+                this.constTypes.add(pi.typeHint);
                 if (pi.childCount() > 0 && pi.child(0).kind == 0) {
+                    this.constValues.add(pi.child(0).intVal);
+                    this.constStringValues.add("");
+                    this.constIsString.add(0);
+                } else if (pi.childCount() > 0 && pi.child(0).kind == 1) {
+                    // Float const: intVal already holds the IEEE-754 double
+                    // bit pattern (same convention as float-literal codegen),
+                    // so the const read materializes the exact double.
                     this.constValues.add(pi.child(0).intVal);
                     this.constStringValues.add("");
                     this.constIsString.add(0);
@@ -1787,6 +1797,7 @@ int strIdx = this.stringPatchIndices[i];
                     this.constValues.add(member.intVal);
                     this.constStringValues.add("");
                     this.constIsString.add(0);
+                    this.constTypes.add("");
                 }
             }
             // Legacy `def Name = enum { A, B, ... };` (kind 103, rejected
@@ -1804,6 +1815,7 @@ int strIdx = this.stringPatchIndices[i];
                     this.constValues.add(j);
                     this.constStringValues.add("");
                     this.constIsString.add(0);
+                    this.constTypes.add("");
                 }
             }
 
@@ -11996,6 +12008,10 @@ public void genNewCall(Node call) {
             for (int ci = 0; ci < this.constNames.length; ci++) {
                 if (this.constNames[ci] == expr.name) {
                     if (ci < this.constIsString.length && this.constIsString[ci] == 1) { return false; }
+                    if (ci < this.constTypes.length) {
+                        string ct = this.constTypes[ci];
+                        if (ct == "float" || ct == "float64" || ct == "double") { return true; }
+                    }
                     return false;
                 }
             }
