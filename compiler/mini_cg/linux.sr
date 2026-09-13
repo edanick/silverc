@@ -1288,6 +1288,76 @@ class MiniCgLinux {
         cg.asm.bindLabel(rsDone);
     }
 
+    public void genLinuxReadBytesFile(MiniCg cg, int pathOff) {
+        cg.asm.movRI64(8, 144);
+        this.emitLinuxHeapAllocFromR8(cg);
+        int stOff = cg.allocLocal("__rb_linux_st");
+        cg.asm.movMBaseR(5, 0, stOff);
+        cg.asm.movRMBase(7, 5, pathOff);
+        cg.asm.movRMBase(6, 5, stOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "stat");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int rbErr = cg.newLabel();
+        int rbDone = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jneLabel(rbErr);
+        cg.asm.movRMBase(0, 5, stOff);
+        cg.asm.movRMBase(0, 0, 48);
+        int sizeOff = cg.allocLocal("__rb_linux_size");
+        cg.asm.movMBaseR(5, 0, sizeOff);
+        cg.asm.movRMBase(8, 5, sizeOff);
+        cg.asm.addRI32(8, 16);
+        this.emitLinuxHeapAllocFromR8(cg);
+        int bufOff = cg.allocLocal("__rb_linux_buf");
+        cg.asm.movMBaseR(5, 0, bufOff);
+        cg.asm.movRMBase(1, 5, sizeOff);
+        cg.asm.movRMBase(0, 5, bufOff);
+        cg.asm.movMBaseR(0, 1, 0);
+        cg.asm.movRMBase(1, 5, sizeOff);
+        cg.asm.movRMBase(0, 5, bufOff);
+        cg.asm.movMBaseR(0, 1, 8);
+        cg.asm.movRMBase(7, 5, pathOff);
+        cg.asm.xorRR64(6, 6);
+        cg.asm.xorRR64(2, 2);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "open");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int hfileOff = cg.allocLocal("__rb_linux_hfile");
+        cg.asm.movMBaseR(5, 0, hfileOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jlLabel(rbErr);
+        cg.asm.movRMBase(7, 5, hfileOff);
+        cg.asm.movRMBase(6, 5, bufOff);
+        cg.asm.addRI32(6, 16);
+        cg.asm.movRMBase(2, 5, sizeOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "read");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movRMBase(7, 5, hfileOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "close");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movRMBase(0, 5, bufOff);
+        cg.asm.addRI32(0, 16);
+        cg.asm.jmpLabel(rbDone);
+        cg.asm.bindLabel(rbErr);
+        cg.emitThrowException("file not found");
+        cg.asm.bindLabel(rbDone);
+    }
+
     public void genLinuxInputCall(MiniCg cg) {
         int bufSize = 4096;
         int sizeOff = cg.allocLocal("__in_size");

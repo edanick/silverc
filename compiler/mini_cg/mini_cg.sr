@@ -7084,6 +7084,12 @@ int strIdx = this.stringPatchIndices[i];
             this.genIsDirCall(call);
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file" || call.child(0).name == "folder") && call.name == "isFile") {
             this.genIsFileCall(call);
+        } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file" || call.child(0).name == "folder") && call.name == "read") {
+            // fs.read(path) / file.read(path): whole-file bytes. Bare
+            // read(fd, buf, n) (POSIX, fs.sr LINUX bodies) keeps resolving
+            // through genUserCall below, exactly like silverc-rs where only
+            // the fs-dispatched form reaches gen_read.
+            this.genReadBytesCall(call);
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file" || call.child(0).name == "folder") && call.name == "isDriveRoot") {
             this.genIsDriveRootCall(call);
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "folder") && (call.name == "getEntries" || call.name == "entries" || call.name == "list" || call.name == "getFiles" || call.name == "files" || call.name == "getFolders" || call.name == "folders")) {
@@ -7103,6 +7109,8 @@ int strIdx = this.stringPatchIndices[i];
             bool isFolderOps = recvT == "FolderOps" || recvT == "FolderOps?";
             if (call.name == "readString" || call.name == "readFile") {
                 this.genReadStringCall(call);
+            } else if (call.name == "read") {
+                this.genReadBytesCall(call);
             } else if (call.name == "writeString" || call.name == "writeBytes" || call.name == "writeFile") {
                 this.genWriteBytesCall(call);
             } else if (call.name == "exists") {
@@ -14781,6 +14789,159 @@ public void genNewCall(Node call) {
     // emitAbiCallSetup/teardown, beside the unchanged WINDOWS block.
     public void genLinuxReadStringFile(int pathOff) {
         this.linuxBackend.genLinuxReadStringFile(this, pathOff);
+    }
+
+    // fs.read(path) / file.read(path): whole-file bytes as a Silver byte[]
+    // (parity with silverc-rs gen_fs_call "read" -> gen_read, which the
+    // self-host dispatcher was missing: the call fell through to the
+    // unresolvable path and yielded null, so every .length/index use
+    // faulted). Same CreateFileA shape as genReadStringCall, but the
+    // payload is a Silver array, not a string: HeapAlloc(size + 16) with
+    // header [0] = size, [8] = size, ReadFile fills buf + 16, and buf + 16
+    // is returned -- the raw-buffer shape the Rust backend emits, never a
+    // Silver array handed to Win32 (the DELEGATION QUIRK in std/fs.sr).
+    // Missing files throw "file not found" like readString and Rust
+    // (std/fs.sr's `return []` documents the S6 surface only). No
+    // readBytes alias exists in S6; bare POSIX read(fd, buf, n) never
+    // reaches here (member dispatch only).
+    public void genReadBytesCall(Node call) {
+        int pathIdx = 0;
+        if (call.isMember) { pathIdx = 1; }
+        if (call.childCount() <= pathIdx) {
+            // No-arg form: zeroed 16-byte header, data pointer back
+            // (mirrors the Rust no-arg arm).
+            this.asm.emitCallSetup(0);
+            this.emitGetProcessHeapCall();
+            this.asm.emitCallTeardown();
+            this.asm.emitCallSetup(0);
+            this.asm.movRR64(1, 0);
+            this.asm.movRI64(2, 8);
+            this.asm.movRI64(8, 16);
+            this.emitHeapAllocCall();
+            this.asm.emitCallTeardown();
+            this.asm.movRI64(1, 0);
+            this.asm.movMBaseR(0, 1, 0);
+            this.asm.movMBaseR(0, 1, 8);
+            this.asm.addRI32(0, 16);
+            return;
+        }
+        this.genExpr(call.child(pathIdx));
+        int pathOff = this.allocLocal("__rb_path");
+        this.asm.movMBaseR(5, 0, pathOff);
+        // LINUX SysV backend (additive): stat-sized open/read/close via
+        // libc, header [0] = [8] = size, payload at buf + 16 (mirrors
+        // silverc-rs gen_read_linux beside the unchanged WINDOWS block).
+        if (this.isLinuxTarget()) {
+            this.genLinuxReadBytesFile(pathOff);
+            return;
+        }
+        this.asm.emitCallSetup(24);
+        this.asm.movRI64(0, 3);
+        this.asm.movMBaseR(4, 0, 32);
+        this.asm.movRI64(0, 0x80);
+        this.asm.movMBaseR(4, 0, 40);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(4, 0, 48);
+        this.asm.movRMBase(1, 5, pathOff);
+        this.asm.movRI64(2, 0x80000000);
+        this.asm.movRI64(8, 1);
+        this.asm.xorRR64(9, 9);
+        this.addImportPatch("kernel32.dll", "CreateFileA");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+
+        int hfileOff = this.allocLocal("__rb_hfile");
+        this.asm.movMBaseR(5, 0, hfileOff);
+
+        // CreateFileA returns INVALID_HANDLE_VALUE (-1) for a missing
+        // path: throw FileNotFoundException ("file not found"), matching
+        // silverc-rs gen_read and the readString lowering above.
+        int rbEmpty = this.newLabel();
+        int rbDone = this.newLabel();
+        int rbCont = this.newLabel();
+        this.asm.movRI64(1, 0xFFFFFFFFFFFFFFFF);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jneLabel(rbCont);
+        this.asm.jmpLabel(rbEmpty);
+        this.asm.bindLabel(rbCont);
+
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, hfileOff);
+        this.asm.xorRR64(2, 2);
+        this.addImportPatch("kernel32.dll", "GetFileSize");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+
+        int sizeOff = this.allocLocal("__rb_size");
+        this.asm.movMBaseR(5, 0, sizeOff);
+
+        this.asm.emitCallSetup(0);
+        this.emitGetProcessHeapCall();
+        this.asm.emitCallTeardown();
+
+        this.asm.emitCallSetup(0);
+        this.asm.movRR64(1, 0);
+        this.asm.movRI64(2, 8);
+        this.asm.movRMBase(8, 5, sizeOff);
+        this.asm.addRI32(8, 16);
+        this.emitHeapAllocCall();
+        this.asm.emitCallTeardown();
+
+        int bufOff = this.allocLocal("__rb_buf");
+        this.asm.movMBaseR(5, 0, bufOff);
+        this.asm.movRMBase(1, 5, sizeOff);
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(1, 5, sizeOff);
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.movMBaseR(0, 1, 8);
+
+        int breadOff = this.allocLocal("__rb_bread");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, breadOff);
+
+        this.asm.emitCallSetup(8);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(4, 0, 32);
+        this.asm.movRMBase(1, 5, hfileOff);
+        this.asm.movRMBase(2, 5, bufOff);
+        this.asm.addRI32(2, 16);
+        this.asm.movRMBase(8, 5, sizeOff);
+        this.asm.leaRBase(9, 5, breadOff);
+        this.addImportPatch("kernel32.dll", "ReadFile");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, hfileOff);
+        this.addImportPatch("kernel32.dll", "CloseHandle");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.addRI32(0, 16);
+        this.asm.jmpLabel(rbDone);
+        this.asm.bindLabel(rbEmpty);
+        this.emitThrowException("file not found");
+        this.asm.bindLabel(rbDone);
+    }
+
+    // LINUX SysV backend (additive): read bytes via libc stat + open +
+    // read + close (stat st_size at offset 48 sizes a heap buffer with
+    // header [0] = [8] = size, payload at buf + 16, mirroring silverc-rs
+    // gen_read_linux and the WINDOWS block above). Missing files throw
+    // "file not found" like the WINDOWS path. SysV regs +
+    // addImportPatchDirect + emitAbiCallSetup/teardown.
+    public void genLinuxReadBytesFile(int pathOff) {
+        this.linuxBackend.genLinuxReadBytesFile(this, pathOff);
     }
 
     // input() builtin: reads a line from stdin via GetStdHandle + ReadFile.
