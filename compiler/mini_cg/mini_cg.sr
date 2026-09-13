@@ -9299,7 +9299,7 @@ public void genNewCall(Node call) {
             }
         }
         if (recvType == "string") {
-            if (name == "contains" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "substr" || name == "substring" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toBytes") {
+            if (name == "contains" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "substr" || name == "substring" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toBytes" || name == "repeat") {
                 return true;
             }
         }
@@ -9361,6 +9361,18 @@ public void genNewCall(Node call) {
             this.asm.callR64(0);
             this.asm.emitCallTeardown();
             return;
+        }
+        if (name == "repeat") {
+            // s.repeat(n): same lowering as the `...` operator (which
+            // shares this node shape: child(0) is the string, child(1) the
+            // count). Parity with silverc-rs, which routes the method form
+            // to emit_string_repeat. Without this the call fell through to
+            // genUserCall, resolved to nothing, and yielded null -- every
+            // consumer of the mask (e.g. password fields) faulted.
+            if (call.childCount() >= 2) {
+                this.genStringRepeat(call);
+                return;
+            }
         }
         if (name == "toBytes") {
             // string.toBytes(): a proper Silver int[] (8-byte slots, length
@@ -13240,6 +13252,16 @@ public void genNewCall(Node call) {
         this.asm.movMBaseR(5, 0, iOff);
         this.asm.jmpLabel(loop);
         this.asm.bindLabel(done);
+        // NUL-terminate at dst + len * count (parity with silverc-rs
+        // emit_string_repeat: without it strlen walks into heap garbage
+        // and every consumer of the repeated string misbehaves).
+        this.asm.movRMBase(0, 5, lenOff);
+        this.asm.movRMBase(1, 5, cntOff);
+        this.asm.mulRR64(1);
+        this.asm.movRMBase(1, 5, dstOff);
+        this.asm.addRR64(1, 0);
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseByteR(1, 0, 0);
         this.asm.movRMBase(0, 5, dstOff);
         this.asm.jmpLabel(zeroDone);
         this.asm.bindLabel(zeroCnt);
