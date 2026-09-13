@@ -3667,11 +3667,18 @@ int strIdx = this.stringPatchIndices[i];
     }
 
     public void genByteArrayLiteral(Node expr) {
+        // byte[]/char[] literals use the same qword-cell layout as every
+        // other array (parity with silverc-rs: elements are 8-byte cells,
+        // b[i] reads the i-th cell). The old packed form (16 + capacity
+        // bytes, stride-1) disagreed with the bootstrap on indexing, so
+        // shared code like the TTF parser (slot formula over dense file
+        // bytes) faulted. Capacity/length header plus per-element qword
+        // stores mirror the generic literal path below.
         int count = expr.childCount();
         if (expr.op == 1 && expr.intVal >= 0) { count = expr.intVal; }
         int capacity = 8;
         if (count > 8) { capacity = count; }
-        int allocSize = 16 + capacity;
+        int allocSize = (capacity + 2) * 8;
         this.asm.emitImm64(1, allocSize);
         this.addImportPatch("msvcrt.dll", "malloc");
         int sByteArr = 0xDEADBEEFCAFEBAB0;
@@ -3688,13 +3695,10 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRMBase(0, 5, arrOff);
         this.asm.emitImm64(1, count);
         this.asm.movMBaseR(0, 1, 8);
-        // Explicit literals and small constant allocations carry zero-valued
-        // children. Large allocations intentionally leave the payload alone;
-        // native read APIs fill those buffers before they are consumed.
         for (int i = 0; i < expr.childCount(); i++) {
             this.genExpr(expr.child(i));
             this.asm.movRMBase(1, 5, arrOff);
-            this.asm.movMBaseByteR(1, 0, 16 + i);
+            this.asm.movMBaseR(1, 0, 16 + i * 8);
         }
         this.asm.movRMBase(0, 5, arrOff);
         this.asm.addRI32(0, 16);
@@ -5141,22 +5145,22 @@ int strIdx = this.stringPatchIndices[i];
         }
         int isString = 0;
         if (arrNode.kind == 6) {
-            if (this.isByteElemType(this.getLocalType(arrNode.name))) { isString = 1; }
+            if (this.isStrideOneType(this.getLocalType(arrNode.name))) { isString = 1; }
         } else if (arrNode.kind == 13) {
-            if (this.isByteElemType(this.inferExprType(arrNode))) { isString = 1; }
+            if (this.isStrideOneType(this.inferExprType(arrNode))) { isString = 1; }
         } else if (arrNode.kind == 24) {
             // Nested index (m[i][j]): the inner expression's inferred type is
-            // the row element type, so byte-backed rows (char[][], string[]
-            // vs. byte elements) are classified the same way as a member
-            // access row.  Without this, char[][] reads used full-width loads.
-            if (this.isByteElemType(this.inferExprType(arrNode))) { isString = 1; }
+            // the row element type; rows classify by their own stride, so
+            // string rows keep byte loads while byte[]/char[] rows use the
+            // qword path like every other array (parity with silverc-rs).
+            if (this.isStrideOneType(this.inferExprType(arrNode))) { isString = 1; }
         } else if (arrNode.kind == 9 || arrNode.kind == 10) {
             // Indexing a call result (e.g. `f(x)[i]`, `this.inferExprType(...)[i]`):
             // classify by the call's inferred return type so string results use
             // byte loads.  Without this, `str[expr]` on a call result was
             // treated as a 64-bit-element array (bounds check against the heap
             // bytes before the string, *8 scaling) and crashed in later stages.
-            if (this.isByteElemType(this.inferExprType(arrNode))) { isString = 1; }
+            if (this.isStrideOneType(this.inferExprType(arrNode))) { isString = 1; }
         }
         if (arrNode.kind == 6 && this.findLocal(arrNode.name) != 0) {
             int arrOff = this.findLocal(arrNode.name);
@@ -5195,14 +5199,14 @@ int strIdx = this.stringPatchIndices[i];
     public void genSlice(Node expr) {
         // Slice expr: [0]=base, [1]=start, [2]=end (end-exclusive).
         // Strings copy bytes into a fresh NUL-terminated buffer; arrays copy
-        // elements (8 bytes each, or 1 byte for byte[]/char[]) into a new
+        // elements (8 bytes each) into a new
 
         // [capacity, length, ...] allocation.  Returns the data pointer.
         Node baseNode = expr.child(0);
         string baseType = this.inferExprType(baseNode);
         bool isStr = baseType == "string";
         bool isByteArr = false;
-        if (!isStr) { isByteArr = this.isByteElemType(baseType); }
+        if (!isStr) { isByteArr = this.isStrideOneType(baseType); }
 
         int baseOff = this.allocLocal("__sl_base");
         int startOff = this.allocLocal("__sl_start");
@@ -5416,9 +5420,9 @@ int strIdx = this.stringPatchIndices[i];
 
         this.asm.movRMBase(1, 5, arrOff);
         this.asm.movRMBase(0, 5, iOff);
-        if (!this.isByteElemType(arrType)) { this.asm.shlR64Imm(0, 3); }
+        if (!this.isStrideOneType(arrType)) { this.asm.shlR64Imm(0, 3); }
         this.asm.addRR64(1, 0);
-        if (this.isByteElemType(arrType)) {
+        if (this.isStrideOneType(arrType)) {
             this.asm.movzxByteMBase(0, 1, 0);
         } else {
             this.asm.movRMBase(0, 1, 0);
@@ -5454,7 +5458,7 @@ int strIdx = this.stringPatchIndices[i];
     public void genArrayReverse(Node call) {
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
-        bool byteElements = this.isByteElemType(arrType);
+        bool strideOneElements = this.isStrideOneType(arrType);
         int arrOff = this.allocLocal("__arr_reverse_arr");
         int lenOff = this.allocLocal("__arr_reverse_len");
         int capOff = this.allocLocal("__arr_reverse_cap");
@@ -5509,11 +5513,11 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.subRI32(0, 1);
         this.asm.movRMBase(1, 5, iOff);
         this.asm.subRR64(0, 1);
-        if (!byteElements) { this.asm.shlR64Imm(0, 3); }
+        if (!strideOneElements) { this.asm.shlR64Imm(0, 3); }
         this.asm.movRR64(11, 0);
         this.asm.movRMBase(0, 5, arrOff);
         this.asm.addRR64(0, 11);
-        if (byteElements) {
+        if (strideOneElements) {
             this.asm.movzxByteMBase(0, 0, 0);
         } else {
             this.asm.movRMBase(0, 0, 0);
@@ -5522,10 +5526,10 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRMBase(0, 5, outOff);
         this.asm.addRI32(0, 16);
         this.asm.movRMBase(1, 5, iOff);
-        if (!byteElements) { this.asm.shlR64Imm(1, 3); }
+        if (!strideOneElements) { this.asm.shlR64Imm(1, 3); }
         this.asm.addRR64(0, 1);
         this.asm.popR64(1);
-        if (byteElements) {
+        if (strideOneElements) {
             this.asm.movMBaseByteR(0, 1, 0);
         } else {
             this.asm.movMBaseR(0, 1, 0);
@@ -5546,7 +5550,7 @@ int strIdx = this.stringPatchIndices[i];
         // ptr-8.
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
-        bool byteElements = this.isByteElemType(arrType);
+        bool strideOneElements = this.isStrideOneType(arrType);
         int arrOff = this.allocLocal("__arr_map_arr");
         int lenOff = this.allocLocal("__arr_map_len");
         int capOff = this.allocLocal("__arr_map_cap");
@@ -5598,9 +5602,9 @@ int strIdx = this.stringPatchIndices[i];
         // value = src[i]; out[i] = value + value.
         this.asm.movRMBase(0, 5, arrOff);
         this.asm.movRMBase(1, 5, iOff);
-        if (!byteElements) { this.asm.shlR64Imm(1, 3); }
+        if (!strideOneElements) { this.asm.shlR64Imm(1, 3); }
         this.asm.addRR64(0, 1);
-        if (byteElements) {
+        if (strideOneElements) {
             this.asm.movzxByteMBase(0, 0, 0);
         } else {
             this.asm.movRMBase(0, 0, 0);
@@ -5610,7 +5614,7 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRMBase(0, 5, outOff);
         this.asm.addRI32(0, 16);
         this.asm.movRMBase(1, 5, iOff);
-        if (!byteElements) { this.asm.shlR64Imm(1, 3); }
+        if (!strideOneElements) { this.asm.shlR64Imm(1, 3); }
         this.asm.addRR64(0, 1);
         this.asm.movMBaseR(0, 12, 0);
         this.asm.movRMBase(0, 5, iOff);
@@ -5671,12 +5675,12 @@ int strIdx = this.stringPatchIndices[i];
     }
 
     // Load source[i] into RAX (byte or 8-byte element).
-    public void genArrayElemLoad(int srcOff, int iOff, bool byteElements) {
+    public void genArrayElemLoad(int srcOff, int iOff, bool strideOneElements) {
         this.asm.movRMBase(0, 5, srcOff);
         this.asm.movRMBase(1, 5, iOff);
-        if (!byteElements) { this.asm.shlR64Imm(1, 3); }
+        if (!strideOneElements) { this.asm.shlR64Imm(1, 3); }
         this.asm.addRR64(0, 1);
-        if (byteElements) {
+        if (strideOneElements) {
             this.asm.movzxByteMBase(0, 0, 0);
         } else {
             this.asm.movRMBase(0, 0, 0);
@@ -5691,7 +5695,7 @@ int strIdx = this.stringPatchIndices[i];
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
         string elemType = this.arrayElementType(arrType);
-        bool byteElements = this.isByteElemType(arrType);
+        bool strideOneElements = this.isStrideOneType(arrType);
         int srcOff = this.allocLocal("__lmap_src");
         int lenOff = this.allocLocal("__lmap_len");
         int dstOff = this.allocLocal("__lmap_dst");
@@ -5735,7 +5739,7 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRMBase(1, 5, lenOff);
         this.asm.cmpRR64(0, 1);
         this.asm.jgeLabel(done);
-        this.genArrayElemLoad(srcOff, iOff, byteElements);
+        this.genArrayElemLoad(srcOff, iOff, strideOneElements);
         this.asm.movMBaseR(5, 0, elemOff);
         for (int bi = 0; bi < paramOffs.length; bi++) {
             this.asm.movRMBase(0, 5, elemOff);
@@ -5745,9 +5749,9 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRMBase(1, 5, dstOff);
         this.asm.addRI32(1, 16);
         this.asm.movRMBase(2, 5, iOff);
-        if (!byteElements) { this.asm.shlR64Imm(2, 3); }
+        if (!strideOneElements) { this.asm.shlR64Imm(2, 3); }
         this.asm.addRR64(1, 2);
-        if (byteElements) {
+        if (strideOneElements) {
             this.asm.movMBaseByteR(1, 0, 0);
         } else {
             this.asm.movMBaseR(1, 0, 0);
@@ -5767,7 +5771,7 @@ int strIdx = this.stringPatchIndices[i];
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
         string elemType = this.arrayElementType(arrType);
-        bool byteElements = this.isByteElemType(arrType);
+        bool strideOneElements = this.isStrideOneType(arrType);
         int srcOff = this.allocLocal("__lflt_src");
         int lenOff = this.allocLocal("__lflt_len");
         int dstOff = this.allocLocal("__lflt_dst");
@@ -5815,7 +5819,7 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRMBase(1, 5, lenOff);
         this.asm.cmpRR64(0, 1);
         this.asm.jgeLabel(done);
-        this.genArrayElemLoad(srcOff, iOff, byteElements);
+        this.genArrayElemLoad(srcOff, iOff, strideOneElements);
         this.asm.movMBaseR(5, 0, elemOff);
         for (int bi = 0; bi < paramOffs.length; bi++) {
             this.asm.movRMBase(0, 5, elemOff);
@@ -5829,10 +5833,10 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRMBase(0, 5, dstOff);
         this.asm.addRI32(0, 16);
         this.asm.movRMBase(1, 5, countOff);
-        if (!byteElements) { this.asm.shlR64Imm(1, 3); }
+        if (!strideOneElements) { this.asm.shlR64Imm(1, 3); }
         this.asm.addRR64(0, 1);
         this.asm.movRMBase(2, 5, elemOff);
-        if (byteElements) {
+        if (strideOneElements) {
             this.asm.movMBaseByteR(0, 2, 0);
         } else {
             this.asm.movMBaseR(0, 2, 0);
@@ -5859,7 +5863,7 @@ int strIdx = this.stringPatchIndices[i];
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
         string elemType = this.arrayElementType(arrType);
-        bool byteElements = this.isByteElemType(arrType);
+        bool strideOneElements = this.isStrideOneType(arrType);
         int srcOff = this.allocLocal("__lred_src");
         int lenOff = this.allocLocal("__lred_len");
         int accOff = this.allocLocal("__lred_acc");
@@ -5897,7 +5901,7 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRMBase(1, 5, lenOff);
         this.asm.cmpRR64(0, 1);
         this.asm.jgeLabel(done);
-        this.genArrayElemLoad(srcOff, iOff, byteElements);
+        this.genArrayElemLoad(srcOff, iOff, strideOneElements);
         this.asm.movMBaseR(5, 0, elemOff);
         for (int bi = 0; bi < paramOffs.length; bi++) {
             if (bi == 0) {
@@ -5925,7 +5929,7 @@ int strIdx = this.stringPatchIndices[i];
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
         string elemType = this.arrayElementType(arrType);
-        bool byteElements = this.isByteElemType(arrType);
+        bool strideOneElements = this.isStrideOneType(arrType);
         int srcOff = this.allocLocal("__lfnd_src");
         int lenOff = this.allocLocal("__lfnd_len");
         int elemOff = this.allocLocal("__lfnd_elem");
@@ -5953,7 +5957,7 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRMBase(1, 5, lenOff);
         this.asm.cmpRR64(0, 1);
         this.asm.jgeLabel(done);
-        this.genArrayElemLoad(srcOff, iOff, byteElements);
+        this.genArrayElemLoad(srcOff, iOff, strideOneElements);
         this.asm.movMBaseR(5, 0, elemOff);
         for (int bi = 0; bi < paramOffs.length; bi++) {
             this.asm.movRMBase(0, 5, elemOff);
@@ -5979,7 +5983,7 @@ int strIdx = this.stringPatchIndices[i];
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
         string elemType = this.arrayElementType(arrType);
-        bool byteElements = this.isByteElemType(arrType);
+        bool strideOneElements = this.isStrideOneType(arrType);
         int srcOff = this.allocLocal("__lqnt_src");
         int lenOff = this.allocLocal("__lqnt_len");
         int elemOff = this.allocLocal("__lqnt_elem");
@@ -6006,7 +6010,7 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRMBase(1, 5, lenOff);
         this.asm.cmpRR64(0, 1);
         this.asm.jgeLabel(exhausted);
-        this.genArrayElemLoad(srcOff, iOff, byteElements);
+        this.genArrayElemLoad(srcOff, iOff, strideOneElements);
         this.asm.movMBaseR(5, 0, elemOff);
         for (int bi = 0; bi < paramOffs.length; bi++) {
             this.asm.movRMBase(0, 5, elemOff);
@@ -6533,26 +6537,23 @@ int strIdx = this.stringPatchIndices[i];
     public void genArrayAdd(Node call) {
         Node arrNode = call.child(0);
         Node valNode = call.child(1);
-        // byte[]/char[] elements are byte-packed on self-host (see
-        // genByteArrayLiteral and isByteElemType): index reads, stores,
-        // and slices all use stride 1 with byte loads/stores. The growth
-        // and store paths below must match that layout; the old code
-        // always wrote 8-byte slots, so the second .add on a packed
-        // array stored a qword past the malloc'd payload and corrupted
-        // the heap (0xC0000374). Mirrors the classification idiom used
-        // by the index-store path.
-        bool arrIsByte = false;
+        // Growth keeps the uniform qword-cell layout (parity with
+        // silverc-rs): capacity counts cells, payload is (cap + 2) * 8
+        // bytes, element copies are full-width. byte[]/char[] grow exactly
+        // like int[] now that indexing agrees across backends; strings
+        // keep the bytewise path below via isStrideOneType.
+        bool arrIsStrideOne = false;
         if (arrNode.kind == 6) {
-            arrIsByte = this.isByteElemType(this.getLocalType(arrNode.name));
+            arrIsStrideOne = this.isStrideOneType(this.getLocalType(arrNode.name));
         } else if (arrNode.kind == 13) {
             Node addArrObj = arrNode.child(0);
             if (addArrObj.kind == 6 && addArrObj.name == "this") {
-                arrIsByte = this.isByteElemType(this.findFieldType(this.currentClassName, arrNode.name));
+                arrIsStrideOne = this.isStrideOneType(this.findFieldType(this.currentClassName, arrNode.name));
             } else {
-                arrIsByte = this.isByteElemType(this.inferExprType(arrNode));
+                arrIsStrideOne = this.isStrideOneType(this.inferExprType(arrNode));
             }
         } else {
-            arrIsByte = this.isByteElemType(this.inferExprType(arrNode));
+            arrIsStrideOne = this.isStrideOneType(this.inferExprType(arrNode));
         }
         this.genExpr(arrNode);
         int arrOff = this.allocLocal("__arr_add_arr");
@@ -6594,7 +6595,7 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.shlR64Imm(1, 1);
         this.asm.movMBaseR(5, 1, newCapOff);
         this.asm.movRMBase(0, 5, newCapOff);
-        if (arrIsByte) {
+        if (arrIsStrideOne) {
             this.asm.addRI32(0, 16);
         } else {
             this.asm.addRI32(0, 2);
@@ -6618,7 +6619,7 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movMBaseR(0, 1, 8);
         this.asm.movRMBase(0, 5, arrOff);
         this.asm.movRMBase(1, 0, -8);
-        if (!arrIsByte) { this.asm.shlR64Imm(1, 3); }
+        if (!arrIsStrideOne) { this.asm.shlR64Imm(1, 3); }
         int copySzOff = this.allocLocal("__arr_copy_sz");
         this.asm.movMBaseR(5, 1, copySzOff);
         // Copy existing elements with scalar loads/stores instead of
@@ -6638,31 +6639,31 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.cmpRI32(0, 0);
         this.asm.jleLabel(copyDone);
         this.asm.movRMBase(10, 5, copySrcOff);
-        if (arrIsByte) {
+        if (arrIsStrideOne) {
             this.asm.movzxByteMBase(8, 10, 0);
         } else {
             this.asm.movRMBase(8, 10, 0);
         }
         this.asm.movRMBase(11, 5, copyDstOff);
-        if (arrIsByte) {
+        if (arrIsStrideOne) {
             this.asm.movMBaseByteR(11, 8, 0);
         } else {
             this.asm.movMBaseR(11, 8, 0);
         }
-        if (arrIsByte) {
+        if (arrIsStrideOne) {
             this.asm.addRI32(10, 1);
         } else {
             this.asm.addRI32(10, 8);
         }
         this.asm.movMBaseR(5, 10, copySrcOff);
-        if (arrIsByte) {
+        if (arrIsStrideOne) {
             this.asm.addRI32(11, 1);
         } else {
             this.asm.addRI32(11, 8);
         }
         this.asm.movMBaseR(5, 11, copyDstOff);
         this.asm.movRMBase(0, 5, copySzOff);
-        if (arrIsByte) {
+        if (arrIsStrideOne) {
             this.asm.subRI32(0, 1);
         } else {
             this.asm.subRI32(0, 8);
@@ -6728,10 +6729,10 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.bindLabel(doneGrow);
         this.asm.movRMBase(0, 5, arrOff);
         this.asm.movRMBase(1, 0, -8);
-        if (!arrIsByte) { this.asm.shlR64Imm(1, 3); }
+        if (!arrIsStrideOne) { this.asm.shlR64Imm(1, 3); }
         this.asm.addRR64(0, 1);
         this.asm.movRMBase(8, 5, valOff);
-        if (arrIsByte) {
+        if (arrIsStrideOne) {
             this.asm.movMBaseByteR(0, 8, 0);
         } else {
             this.asm.movMBaseR(0, 8, 0);
@@ -11326,28 +11327,30 @@ public void genNewCall(Node call) {
                 this.genBinary(assignBin);
                 return;
             }
-            bool arrIsByte = false;
+            bool arrIsStrideOne = false;
             if (arrNode.kind == 6) {
-                arrIsByte = this.isByteElemType(this.getLocalType(arrNode.name));
+                arrIsStrideOne = this.isStrideOneType(this.getLocalType(arrNode.name));
             } else if (arrNode.kind == 13) {
                 Node arrObj = arrNode.child(0);
                 if (arrObj.kind == 6 && arrObj.name == "this") {
                     // Stable classification for self-hosted stages: resolve the
                     // field type from the class table instead of the recursive
                     // inferExprType path.
-                    arrIsByte = this.isByteElemType(this.findFieldType(this.currentClassName, arrNode.name));
+                    arrIsStrideOne = this.isStrideOneType(this.findFieldType(this.currentClassName, arrNode.name));
                 } else {
-                    arrIsByte = this.isByteElemType(this.inferExprType(arrNode));
+                    arrIsStrideOne = this.isStrideOneType(this.inferExprType(arrNode));
                 }
             } else if (arrNode.kind == 24) {
-                arrIsByte = this.isByteElemType(this.inferExprType(arrNode));
+                arrIsStrideOne = this.isStrideOneType(this.inferExprType(arrNode));
             }
-            if (arrIsByte) {
-                // byte[]/char[] elements are byte-packed on self-host: keep
-                // the byte RMW, but resolve the array base through genExpr so
-                // GLOBAL arrays load through their storage slot too
-                // (findLocal returns 0 for globals and [rbp+0] is the saved
-                // frame pointer - mirroring the rs genExpr(arr) base rule).
+            if (arrIsStrideOne) {
+                // String elements read as characters (byte loads); every
+                // array type (byte[]/char[] included, parity with
+                // silverc-rs) uses the qword RMW below. Resolve the array
+                // base through genExpr so GLOBAL arrays load through their
+                // storage slot too (findLocal returns 0 for globals and
+                // [rbp+0] is the saved frame pointer - mirroring the rs
+                // genExpr(arr) base rule).
                 this.genExpr(arrNode);
                 this.asm.pushR64(0);
                 this.genExpr(idxNode);
@@ -11845,9 +11848,9 @@ public void genNewCall(Node call) {
                 this.genDictIndexSet(bin);
                 return;
             }
-            bool arrIsByte = false;
+            bool arrIsStrideOne = false;
             if (arrNode.kind == 6) {
-                arrIsByte = this.isByteElemType(this.getLocalType(arrNode.name));
+                arrIsStrideOne = this.isStrideOneType(this.getLocalType(arrNode.name));
             } else if (arrNode.kind == 13) {
                 Node arrObj = arrNode.child(0);
                 if (arrObj.kind == 6 && arrObj.name == "this") {
@@ -11855,9 +11858,9 @@ public void genNewCall(Node call) {
                     // recursive inferExprType path is not stable in later
                     // self-hosted stages (see genArrayIndex), so `this.field`
                     // array stores must resolve the element size here.
-                    arrIsByte = this.isByteElemType(this.findFieldType(this.currentClassName, arrNode.name));
+                    arrIsStrideOne = this.isStrideOneType(this.findFieldType(this.currentClassName, arrNode.name));
                 } else {
-                    arrIsByte = this.isByteElemType(this.inferExprType(arrNode));
+                    arrIsStrideOne = this.isStrideOneType(this.inferExprType(arrNode));
                 }
             }
             if (arrNode.kind == 6 && this.findLocal(arrNode.name) != 0) {
@@ -11870,9 +11873,9 @@ public void genNewCall(Node call) {
                 this.asm.movRMBase(11, 5, arrOff);
                 this.asm.popR64(12);
                 this.asm.popR64(0);
-                if (!arrIsByte) { this.asm.shlR64Imm(0, 3); }
+                if (!arrIsStrideOne) { this.asm.shlR64Imm(0, 3); }
                 this.asm.addRR64(11, 0);
-                if (arrIsByte) {
+                if (arrIsStrideOne) {
                     this.asm.movMBaseByteR(11, 12, 0);
                 } else {
                     this.asm.movMBaseR(11, 12, 0);
@@ -11888,7 +11891,7 @@ public void genNewCall(Node call) {
                 this.genExpr(arrNode);
                 this.asm.pushR64(0);
                 this.genExpr(idxNode);
-                if (!arrIsByte) { this.asm.shlR64Imm(0, 3); }
+                if (!arrIsStrideOne) { this.asm.shlR64Imm(0, 3); }
                 this.asm.movRR64(11, 0);
                 this.asm.popR64(0);
                 this.asm.addRR64(0, 11);
@@ -11897,7 +11900,7 @@ public void genNewCall(Node call) {
                 this.coerceStoreToDouble(lhs, rhs);
                 this.asm.movRR64(12, 0);
                 this.asm.popR64(0);
-                if (arrIsByte) {
+                if (arrIsStrideOne) {
                     this.asm.movMBaseByteR(0, 12, 0);
                 } else {
                     this.asm.movMBaseR(0, 12, 0);
@@ -12111,13 +12114,14 @@ public void genNewCall(Node call) {
         this.asm.movRR64(1, 0);
     }
 
-    public bool isByteElemType(string t) {
-        // True when an array type stores single bytes per element (byte[],
-        // char[], and the internal string representation).  Such arrays must
-        // be indexed without the *8 scaling used for 64-bit element types and
-        // accessed with byte loads/stores instead of full-width moves.
-        if (t == "byte[]") { return true; }
-        if (t == "char[]") { return true; }
+    public bool isStrideOneType(string t) {
+        // True only for strings, the one element type addressed without
+        // the *8 scaling used for 64-bit array elements (byte loads/stores
+        // instead of full-width moves). byte[]/char[] are 8-byte cells on
+        // both backends (parity with silverc-rs, whose index lowering is
+        // unconditionally shl-3 + qword load): they take the scaled path
+        // like every other array type, so shared code (e.g. the TTF parser
+        // slot formula over dense file bytes) agrees across compilers.
         if (t == "string") { return true; }
         return false;
     }
@@ -12829,14 +12833,12 @@ public void genNewCall(Node call) {
 
     // RAX holds an array data pointer; replace it with the JSON array text
     // "[elem,elem,...]".  Element rendering mirrors rs: string -> quoted
-    // copy, float-ish -> %g, integer-ish -> %lld decimal.  byte[] arrays are
-    // byte-packed on the self-host (elements at ptr+i), all other arrays use
-    // 8-byte element slots.
+    // copy, float-ish -> %g, integer-ish -> %lld decimal.  Every element
+    // type (byte included) lives in 8-byte cells, so all loads scale by 8.
     public void genJsonArray(string elemType) {
         bool strElem = elemType == "string";
         bool fltElem = elemType == "float" || elemType == "float64" || elemType == "double";
         bool intElem = elemType == "int" || elemType == "int32" || elemType == "int64" || elemType == "uint" || elemType == "byte";
-        bool byteElem = elemType == "byte";
         int arrOff = this.allocLocal("__jsa_arr");
         this.asm.movMBaseR(5, 0, arrOff);
         // scratch = malloc(40) for per-element number text
@@ -12872,18 +12874,12 @@ public void genNewCall(Node call) {
         this.asm.movRMBase(1, 5, lenOff);
         this.asm.cmpRR64(0, 1);
         this.asm.jgeLabel(sumEnd);
-        // rcx = elem = [arr + i*8]; byte[] arrays are byte-packed
-        // (elements at arr+i) so they load with movzx instead.
+        // rcx = elem = [arr + i*8] for every element type.
         this.asm.movRMBase(1, 5, arrOff);
         this.asm.movRMBase(2, 5, iOff);
-        if (byteElem) {
-            this.asm.addRR64(1, 2);
-            this.asm.movzxByteMBase(1, 1, 0);
-        } else {
-            this.asm.shlR64Imm(2, 3);
-            this.asm.addRR64(1, 2);
-            this.asm.movRMBase(1, 1, 0);
-        }
+        this.asm.shlR64Imm(2, 3);
+        this.asm.addRR64(1, 2);
+        this.asm.movRMBase(1, 1, 0);
         if (strElem) {
             this.addImportPatch("ucrtbase.dll", "strlen");
             this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
@@ -12979,18 +12975,12 @@ public void genNewCall(Node call) {
         this.asm.incR64(0);
         this.asm.movMBaseR(5, 0, posOff);
         this.asm.bindLabel(noComma2);
-        // rcx = elem = [arr + i*8]; byte[] arrays are byte-packed
-        // (elements at arr+i) so they load with movzx instead.
+        // rcx = elem = [arr + i*8] for every element type.
         this.asm.movRMBase(1, 5, arrOff);
         this.asm.movRMBase(2, 5, iOff);
-        if (byteElem) {
-            this.asm.addRR64(1, 2);
-            this.asm.movzxByteMBase(1, 1, 0);
-        } else {
-            this.asm.shlR64Imm(2, 3);
-            this.asm.addRR64(1, 2);
-            this.asm.movRMBase(1, 1, 0);
-        }
+        this.asm.shlR64Imm(2, 3);
+        this.asm.addRR64(1, 2);
+        this.asm.movRMBase(1, 1, 0);
         if (strElem) {
             // elen = strlen(elem) -> [elenOff]
             this.addImportPatch("ucrtbase.dll", "strlen");
@@ -13034,18 +13024,11 @@ public void genNewCall(Node call) {
             this.asm.movMBaseR(5, 0, posOff);
         } else {
             // sprintf(scratch, fmt, elem); elen = strlen(scratch)
-            if (byteElem) {
-                this.asm.movRMBase(9, 5, arrOff);
-                this.asm.movRMBase(2, 5, iOff);
-                this.asm.addRR64(9, 2);
-                this.asm.movzxByteMBase(9, 9, 0);
-            } else {
-                this.asm.movRMBase(9, 5, arrOff);
-                this.asm.movRMBase(2, 5, iOff);
-                this.asm.shlR64Imm(2, 3);
-                this.asm.addRR64(9, 2);
-                this.asm.movRMBase(9, 9, 0);
-            }
+            this.asm.movRMBase(9, 5, arrOff);
+            this.asm.movRMBase(2, 5, iOff);
+            this.asm.shlR64Imm(2, 3);
+            this.asm.addRR64(9, 2);
+            this.asm.movRMBase(9, 9, 0);
             this.asm.movRMBase(1, 5, scratchOff);
             int sp2 = this.asm.buf.length;
             this.asm.emitImm64(0, 0);
