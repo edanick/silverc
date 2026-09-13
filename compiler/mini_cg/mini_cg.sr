@@ -10656,6 +10656,29 @@ public void genNewCall(Node call) {
         if (haveExactClass) {
             funcIdx = this.selectOverloadIdx(name, recvClass, explicitUserArgs, null);
         }
+        // Inheritance: an inherited method must resolve to the ancestor
+        // that declares it, not to the any-class fallback below (which
+        // binds the LAST same-named method of ANY class -- e.g.
+        // ScrollBar.markDirty() bound GalleryHost.markDirty(), whose
+        // foreign field layout faulted on first access). Walk the parent
+        // chain nearest-first (parity with silverc-rs resolve_method
+        // parent walk); the nullable "?" suffix reads through to the base
+        // class exactly like the exact-class check above.
+        if (funcIdx < 0) {
+            string ancestor = recvClass;
+            if (ancestor.length >= 1) {
+                if (ancestor[ancestor.length - 1] == '?') {
+                    ancestor = ancestor.substring(0, ancestor.length - 1);
+                }
+            }
+            ancestor = this.parentClassName(ancestor);
+            for (int depth = 0; depth < 64; depth++) {
+                if (ancestor == "") { break; }
+                funcIdx = this.selectOverloadIdx(name, ancestor, explicitUserArgs, null);
+                if (funcIdx >= 0) { break; }
+                ancestor = this.parentClassName(ancestor);
+            }
+        }
         // DOCS/259 G2: a zero-arg member call on a receiver whose class
         // declares a fn-typed field of that name (`this.cb()` / `obj.cb()`)
         // is an indirect call through the stored function address. Method
