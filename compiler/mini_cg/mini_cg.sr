@@ -3848,9 +3848,17 @@ int strIdx = this.stringPatchIndices[i];
                 this.asm.addRI32(0, 2);
                 this.asm.shlR64Imm(0, 3);
                 this.asm.movRR64(8, 0);
+                // The size argument is held in R8 (caller-saved) here, but the
+                // GetProcessHeap call below clobbers it, so HeapAlloc would
+                // receive a garbage size and hand back an undersized buffer --
+                // heap corruption that only bites once large builds run enough
+                // dynamic `new T[n]`. Preserve R8 across the call, mirroring
+                // the __silver_rt_alloc HeapAlloc fallback fix above.
+                this.asm.pushR64(8);
                 this.asm.emitCallSetup(0);
                 this.emitGetProcessHeapCall();
                 this.asm.emitCallTeardown();
+                this.asm.popR64(8);
                 this.asm.movRR64(1, 0);
                 this.asm.movRI64(2, 8);
                 this.asm.emitCallSetup(0);
