@@ -2193,12 +2193,19 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.addRR64(0, 11);
         this.asm.jmpLabel(doneLbl);
         this.asm.bindLabel(fbLbl);
+        // The size argument arrives in R8 (caller-saved). The GetProcessHeap
+        // call below clobbers it, so HeapAlloc would receive a garbage size
+        // and hand back an undersized buffer -- heap corruption that only
+        // triggers once the 16 MiB bump reserve is exhausted (large builds).
+        // Preserve R8 across the call.
+        this.asm.pushR64(8);
         this.asm.emitCallSetup(0);
         this.addImportPatch("kernel32.dll", "GetProcessHeap");
         this.asm.emitImm64(0, 0);
         this.asm.movRMBase(0, 0, 0);
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
+        this.asm.popR64(8);
         this.asm.emitCallSetup(0);
         this.asm.movRR64(1, 0);
         this.asm.movRI64(2, 8);
