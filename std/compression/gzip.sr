@@ -1,6 +1,6 @@
 mod export gzip;
 
-import deflate from compression.deflate;
+import DeflateEngine from compression.deflate;
 
 // DOCS -- GZIP codec (RFC 1952, DOCS/260): the DEFLATE payload plus a fixed
 // 10-byte header (ID1/ID2/CM/FLG=0/MTIME/EXTRA/OS=3) and an 8-byte trailer
@@ -28,13 +28,13 @@ int gzCrc(int[] data, int len) {
     return (crc ^ 4294967295) & 4294967295;
 }
 
-class gzip {
+class GzipEngine {
     public byte[] compress(byte[] data) {
         return this.compress(data, 6);
     }
 
     public byte[] compress(byte[] data, int level) {
-        var d = new deflate();
+        var d = new DeflateEngine();
         byte[] payload = d.compress(data, level);
         int[] cells = new int[data.length];
         for (int i = 0; i < data.length; i++) { cells[i] = data[i] & 255; }
@@ -85,7 +85,7 @@ class gzip {
         int bodyLen = n - p - 8;
         byte[] payload = [];
         for (int i = 0; i < bodyLen; i++) { payload.add(data[p + i]); }
-        var d = new deflate();
+        var d = new DeflateEngine();
         byte[] out = d.decompress(payload);
         int crc = (data[n - 8] & 255) | ((data[n - 7] & 255) << 8) | ((data[n - 6] & 255) << 16) | ((data[n - 5] & 255) << 24);
         int isize = (data[n - 4] & 255) | ((data[n - 3] & 255) << 8) | ((data[n - 2] & 255) << 16) | ((data[n - 1] & 255) << 24);
@@ -109,32 +109,29 @@ class gzip {
     }
 }
 
-// Module-level free functions: after importing this module call
-// `gzipCompress(bytes)` / `gzipDecompress(bytes)` directly -- no `new`. The
-// names are algorithm-qualified so several compression modules coexist
-// without a bare `compress`/`decompress` clash.
+// Public surface: `class gzip` with STATIC compress/decompress. After
+// `import gzip from compression.gzip;` (or the facade) call
+// `gzip.compress(bytes)` / `gzip.decompress(bytes)` -- no `new`. Engine is
+// `GzipEngine`. Single statics (no overload / no default arg: silverc-rs gaps).
 
-public byte[] gzipCompress(byte[] data) {
-    var g = new gzip();
-    return g.compress(data);
-}
+class gzip {
+    public static byte[] compress(byte[] data) {
+        var e = new GzipEngine();
+        return e.compress(data);
+    }
 
-public byte[] gzipCompress(byte[] data, int level) {
-    var g = new gzip();
-    return g.compress(data, level);
-}
+    public static byte[] decompress(byte[] data) {
+        var e = new GzipEngine();
+        return e.decompress(data);
+    }
 
-public byte[] gzipDecompress(byte[] data) {
-    var g = new gzip();
-    return g.decompress(data);
-}
+    public static void compressFile(string input, string output) {
+        var e = new GzipEngine();
+        e.compressFile(input, output);
+    }
 
-public void gzipCompressFile(string input, string output) {
-    var g = new gzip();
-    g.compressFile(input, output);
-}
-
-public void gzipDecompressFile(string input, string output) {
-    var g = new gzip();
-    g.decompressFile(input, output);
+    public static void decompressFile(string input, string output) {
+        var e = new GzipEngine();
+        e.decompressFile(input, output);
+    }
 }
