@@ -1,9 +1,10 @@
 // Compression levels (DOCS/260): deflate/gzip are zlib-style 0..9 (0 = stored,
-// 1..9 = increasing match-search effort, clamped), zstd is 1..22 (clamped).
-// Asserts every level round-trips, higher level is never worse (non-increasing
-// output), level 0 (stored) is strictly larger than level 1, and out-of-range
-// levels clamp and still round-trip. Runs on the compilers (they execute the
-// codecs; the interpreter cannot run these engines).
+// 1..9 = increasing match-search effort), zstd is 1..22. Every in-range level
+// round-trips, higher level is never worse (non-increasing output), and level 0
+// (stored) is strictly larger than level 1. Out-of-range levels throw a
+// ValueException (they never clamp) -- that abort path is verified outside the
+// suite (a passing suite run must exit 0, so it only exercises in-range
+// levels). Runs on the compilers (they execute the codecs).
 import { gzip, zstd, deflate } from compression;
 
 bool eq(byte[] a, byte[] e) {
@@ -34,15 +35,11 @@ void main() {
         gprev = c.length;
     }
     if (!(gzip.compressWithLevel(r, 0).length > gzip.compressWithLevel(r, 1).length)) { printline("FAIL gz stored>l1"); exit(1); }
-    if (!eq(gzip.decompress(gzip.compressWithLevel(r, -5)), r)) { printline("FAIL gz clamp neg"); exit(1); }
-    if (!eq(gzip.decompress(gzip.compressWithLevel(r, 99)), r)) { printline("FAIL gz clamp hi"); exit(1); }
 
     for (int level = 1; level <= 22; level++) {
         byte[] c = zstd.compressWithLevel(r, level);
         if (!eq(zstd.decompress(c), r)) { printline("FAIL zs rt"); exit(1); }
     }
-    if (!eq(zstd.decompress(zstd.compressWithLevel(r, 0)), r)) { printline("FAIL zs clamp lo"); exit(1); }
-    if (!eq(zstd.decompress(zstd.compressWithLevel(r, 100)), r)) { printline("FAIL zs clamp hi"); exit(1); }
 
     if (!eq(deflate.decompress(deflate.compress(r)), r)) { printline("FAIL dfl def"); exit(1); }
     if (!eq(gzip.decompress(gzip.compress(r)), r)) { printline("FAIL gz def"); exit(1); }

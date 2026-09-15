@@ -1,5 +1,7 @@
 mod export zstd;
 
+import * from exception;
+
 // DOCS -- Zstandard frame codec (RFC 8878, DOCS/260). Pure Silver, no OS
 // calls.
 //
@@ -8,8 +10,9 @@ mod export zstd;
 // reference CLI, Python `zstandard`, etc.) reads back exactly; and a decoder
 // that reads Raw_Block and RLE_Block frames (what the reference encoder emits
 // for incompressible data, and what `ZstdCompressor(level=1)` produces on
-// random input). The level argument is accepted for API parity and does not
-// change output (stores only).
+// random input). The level argument (1..22) is validated: in-range levels all
+// emit a valid store frame; an out-of-range level is printed and thrown as a
+// ValueException (never clamped).
 //
 // WHAT IS NOT (documented limitation, NOT a silent stub): Compressed_Block
 // decoding (Huffman-coded literals + FSE-coded sequences). A frame using a
@@ -28,14 +31,22 @@ mod export zstd;
 
 class ZstdEngine {
     // Zstandard levels are 1..22 (reference CLI range: 1 fast, 19 default-ish,
-    // 22 ultra). This build emits valid STORE frames at every level, so the
-    // level is clamped into range and accepted, but the output is the
-    // ratio-carrying sequence coder's job (not yet implemented -- see header):
-    // every level still produces a frame any zstd decoder (and this decoder)
-    // reads back byte-exact.
-    public int clampLevel(int level) {
-        if (level < 1) { return 1; }
-        if (level > 22) { return 22; }
+    // 22 ultra). This build emits valid STORE frames at every level in range
+    // (the ratio-carrying sequence coder is not yet implemented -- see the
+    // module header): every level produces a frame any zstd decoder (and this
+    // decoder) reads back byte-exact. An out-of-range level is reported and
+    // thrown, never clamped.
+    public int checkedLevel(int level) {
+        if (level < 1) {
+            string msg = "zstd compression level too little: " + level.toString() + " is below the minimum 1";
+            eprintln(msg);
+            throw new ValueException(msg);
+        }
+        if (level > 22) {
+            string msg = "zstd compression level too much: " + level.toString() + " is above the maximum 22";
+            eprintln(msg);
+            throw new ValueException(msg);
+        }
         return level;
     }
 
@@ -45,7 +56,7 @@ class ZstdEngine {
 
     public byte[] compress(byte[] data, int level) {
         int n = data.length;
-        int lvl = this.clampLevel(level);
+        int lvl = this.checkedLevel(level);
         byte[] out = [];
         out.add(40); out.add(181); out.add(47); out.add(253); // magic (LE FD2FB528)
         // FHD: Single_Segment=1 (bit5), FCS_flag=2 (bits3-4 -> 4 bytes), no
@@ -151,7 +162,7 @@ class ZstdEngine {
 // Public surface: `class zstd` with STATIC compress/decompress. After
 // `import zstd from compression.zstd;` (or the facade) call
 // `zstd.compress(bytes)` / `zstd.decompress(bytes)` -- no `new`. Engine is
-// `ZstdEngine`. Levels 1..22 (clamped; distinct `compressWithLevel` name, not
+// `ZstdEngine`. Levels 1..22 (validated; distinct `compressWithLevel` name, not
 // an overload -- see the header for what the levels do here).
 
 class zstd {
@@ -161,7 +172,7 @@ class zstd {
         return e.compress(data);
     }
 
-    // Explicit level, 1..22 (clamped).
+    // Explicit level, 1..22 (validated).
     public static byte[] compressWithLevel(byte[] data, int level) {
         var e = new ZstdEngine();
         return e.compress(data, level);
