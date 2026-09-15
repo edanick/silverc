@@ -105,6 +105,136 @@ private bool ppNameMatches(string name, string targetOs, bool debugBuild) {
     return name == targetOs;
 }
 
+// Index of a `*` immediately followed by `"`, or -1.
+private int ppFindStarQuote(string s, int start) {
+    int i = ppFindChar(s, '*', start);
+    while (i >= 0) {
+        if (i + 1 < s.length && s[i + 1] == '"') { return i; }
+        i = ppFindChar(s, '*', i + 1);
+    }
+    return -1;
+}
+
+// Normalize one path literal body (source[start..end], without quotes) for
+// the target OS and wrap it as an ordinary quoted literal: `/` becomes `\`
+// on WINDOWS, `\` becomes `/` elsewhere, and backslashes are doubled so the
+// normal string lexer reads them back singly (mirrors silverc-rs).
+private string ppNormalizeOne(string source, int start, int end, string targetOs) {
+    string lit = "\"";
+    for (int q = start; q < end; q++) {
+        char s = source[q];
+        if (s == '/' && targetOs == "WINDOWS") { lit += "\\\\"; }
+        else if (s == '\\' && targetOs != "WINDOWS") { lit += "/"; }
+        else if (s == '\\') { lit += "\\\\"; }
+        else { lit += ppSlice(source, q, q + 1); }
+    }
+    lit += "\"";
+    return lit;
+}
+
+// DOCS/257 — rewrite `*"..."` path literals for the target OS. A `*`
+// immediately followed by `"` outside strings/chars/comments opens a
+// compile-time path literal: separators normalize to the target, backslashes
+// stay literal (no escape processing), and the result re-emits as an ordinary
+// literal for the lexer. Strings (including `$"..."` text — interpolation
+// braces never nest quotes at lex level), char literals (with `\X` pairs
+// skipped) and `//` / `/* ... */` comments pass through untouched; `*` not
+// immediately followed by `"` is untouched. Single-line only: an unclosed
+// literal errors at its opening line. Pieces splice through pieces.join so a
+// directive-heavy aggregate costs a handful of concatenations, mirroring the
+// pass-2 splice below.
+public string ppNormalizePaths(string source, string targetOs, string[] errs) {
+    if (ppFindStarQuote(source, 0) < 0) { return source; }
+    string[] pieces = [];
+    int runStart = 0;
+    int i = 0;
+    int lineNo = 1;
+    bool inBlock = false;
+    while (i < source.length) {
+        char c = source[i];
+        if (inBlock) {
+            if (c == '*' && i + 1 < source.length && source[i + 1] == '/') {
+                pieces.add(ppSlice(source, runStart, i + 2));
+                runStart = i + 2;
+                i += 2;
+                inBlock = false;
+                continue;
+            }
+            if (c == '\n') { lineNo++; }
+            i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < source.length && source[i + 1] == '/') {
+            int e = i;
+            while (e < source.length && source[e] != '\n') { e++; }
+            pieces.add(ppSlice(source, runStart, e));
+            runStart = e;
+            i = e;
+            continue;
+        }
+        if (c == '/' && i + 1 < source.length && source[i + 1] == '*') {
+            pieces.add(ppSlice(source, runStart, i + 2));
+            runStart = i + 2;
+            i += 2;
+            inBlock = true;
+            continue;
+        }
+        if (c == '"') {
+            int j = i + 1;
+            while (j < source.length) {
+                char d = source[j];
+                if (d == '\n') { lineNo++; j++; continue; }
+                if (d == '"') { j++; break; }
+                if (d == '\\' && j + 1 < source.length) {
+                    if (source[j + 1] == '\n') { lineNo++; }
+                    j += 2;
+                    continue;
+                }
+                j++;
+            }
+            pieces.add(ppSlice(source, runStart, j));
+            runStart = j;
+            i = j;
+            continue;
+        }
+        if (c == '\'') {
+            int j = i + 1;
+            if (j < source.length && source[j] == '\\') {
+                j++;
+                if (j < source.length) {
+                    if (source[j] == '\n') { lineNo++; }
+                    j++;
+                }
+            } else if (j < source.length) {
+                if (source[j] == '\n') { lineNo++; }
+                j++;
+            }
+            if (j < source.length && source[j] == '\'') { j++; }
+            pieces.add(ppSlice(source, runStart, j));
+            runStart = j;
+            i = j;
+            continue;
+        }
+        if (c == '*' && i + 1 < source.length && source[i + 1] == '"') {
+            int k = i + 2;
+            while (k < source.length && source[k] != '"' && source[k] != '\n') { k++; }
+            if (k >= source.length || source[k] != '"') {
+                errs.add("preprocessor: '\"*\"' path literal opened at line " + lineNo.toString() + " is never closed on the same line");
+                return source;
+            }
+            pieces.add(ppSlice(source, runStart, i));
+            pieces.add(ppNormalizeOne(source, i + 2, k, targetOs));
+            runStart = k + 1;
+            i = k + 1;
+            continue;
+        }
+        if (c == '\n') { lineNo++; }
+        i++;
+    }
+    pieces.add(ppSlice(source, runStart, source.length));
+    return pieces.join("");
+}
+
 private string ppSlice(string s, int start, int end) {
     int a = start;
     if (a < 0) { a = 0; }
@@ -296,7 +426,10 @@ public string ppPreprocess(string source, string targetOs, bool debugBuild, stri
         return source;
     }
 
-    if (dropAt.length == 0) { return source; }
+    if (dropAt.length == 0) {
+        // DOCS/257 — no regions to blank, but path literals still rewrite.
+        return ppNormalizePaths(source, targetOs, errs);
+    }
 
     // Pass 2: splice — one slice per kept run, one terminator per blanked
     // line, so a directive-heavy file costs a handful of concatenations.
@@ -315,5 +448,7 @@ public string ppPreprocess(string source, string targetOs, bool debugBuild, stri
     if (copyStart < source.length) {
         result += ppSlice(source, copyStart, source.length);
     }
-    return result;
+    // DOCS/257 — path literals rewrite on the kept text, after region
+    // filtering, so stripped regions never see the scan.
+    return ppNormalizePaths(result, targetOs, errs);
 }
