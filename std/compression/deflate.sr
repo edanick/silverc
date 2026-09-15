@@ -5,10 +5,12 @@ mod export deflate;
 // backends, and buffers are int[] cells (0..255 per slot) converted to byte[]
 // only at the API boundary. Decoder handles stored, fixed-Huffman, and
 // dynamic-Huffman blocks; encoder emits stored blocks (level 0) or single
-// fixed-Huffman blocks with real LZ77 matches (levels accepted for API
-// compatibility; output identical). Raw DEFLATE carries no integrity check,
-// so truncated streams decode best-effort; the gzip/zstd wrappers verify.
-// Output is capped (32 MB) so corrupt streams always terminate.
+// fixed-Huffman blocks with real LZ77 matches. Levels are zlib-style 0..9:
+// level tunes the hash-chain depth (higher = deeper search = smaller output,
+// never worse); out-of-range levels clamp (negative -> 1, >9 -> 9). Raw
+// DEFLATE carries no integrity check, so truncated streams decode
+// best-effort; the gzip/zstd wrappers verify. Output is capped (32 MB) so
+// corrupt streams always terminate.
 
 // Length base table for symbols 257..285 (RFC 1951 3.2.5).
 int[] dflLenBase() {
@@ -286,8 +288,37 @@ class DeflateEngine {
     // parameters) so encoder state never crosses a helper boundary.
     private int[] matchHead;
     private int[] matchPrev;
+    // Probe-chain cap for the current compress() call (set from the level).
+    private int chainLimit;
     public HuffTable dynLitTable;
     public HuffTable dynDistTable;
+
+    construct() {
+        this.chainLimit = 64;
+    }
+
+    // DEFLATE levels are zlib-style: 0 = stored, 1..9 = increasing match-search
+    // effort. The fixed-Huffman encoder is level-independent in output format,
+    // so a level tunes the hash-chain depth (and thus how long a match it can
+    // find): low levels stop early (fast, larger), level 9 probes deepest
+    // (slowest, smallest). Higher level is therefore never worse.
+    public int clampLevel(int level) {
+        if (level < 0) { return 1; }
+        if (level > 9) { return 9; }
+        return level;
+    }
+
+    public int chainFor(int level) {
+        if (level <= 1) { return 4; }
+        if (level == 2) { return 8; }
+        if (level == 3) { return 16; }
+        if (level == 4) { return 32; }
+        if (level == 5) { return 48; }
+        if (level == 6) { return 64; }
+        if (level == 7) { return 96; }
+        if (level == 8) { return 160; }
+        return 256;
+    }
 
     public int[] findMatch(int[] data, int pos, int[] info) {
         int n = data.length;
@@ -301,7 +332,8 @@ class DeflateEngine {
         int h = ((data[pos] << 10) ^ (data[pos + 1] << 5) ^ data[pos + 2]) & 2047;
         int cand = this.matchHead[h];
         int chain = 0;
-        while (cand >= 0 && chain < 64) {
+        int cap = this.chainLimit;
+        while (cand >= 0 && chain < cap) {
             chain++;
             int dist = pos - cand;
             if (dist <= 0 || dist > 32768) { break; }
@@ -312,7 +344,7 @@ class DeflateEngine {
             if (len > bestLen) {
                 bestLen = len;
                 bestDist = dist;
-                if (len >= 128) { break; }
+                if (len >= 258) { break; }
             }
             cand = this.matchPrev[cand & 32767];
         }
@@ -456,9 +488,11 @@ class DeflateEngine {
     public byte[] compress(byte[] data, int level) {
         int[] cells = new int[data.length];
         for (int i = 0; i < data.length; i++) { cells[i] = data[i] & 255; }
-        if (level == 0 || data.length == 0) {
+        int lvl = this.clampLevel(level);
+        if (lvl == 0 || data.length == 0) {
             return this.compressStored(cells);
         }
+        this.chainLimit = this.chainFor(lvl);
         BitWriter bw = new BitWriter();
         this.emitFixedBlock(cells, bw, true);
         bw.alignFlush();
@@ -622,14 +656,22 @@ class DeflateEngine {
 // Public surface: `class deflate` with STATIC compress/decompress. After
 // `import compression.deflate;` / `import { deflate } from compression;` call
 // `deflate.compress(bytes)` / `deflate.decompress(bytes)` -- no `new`, no var.
-// The engine is `DeflateEngine`; `deflate` is the static facade. `level` lives
-// on the engine (`DeflateEngine().compress(data, level)`); the facade uses the
-// default match path. No static overloads / no default args (silverc-rs gaps).
+// The engine is `DeflateEngine`; `deflate` is the static facade. Levels are
+// 0..9: `deflate.compress(data)` uses the default (6);
+// `deflate.compressWithLevel(data, level)` picks one explicitly. Distinct
+// method names, not overloads / defaults (silverc-rs gaps).
 
 class deflate {
+    // Default level (6): `deflate.compress(data)` -- no `new`.
     public static byte[] compress(byte[] data) {
         var e = new DeflateEngine();
         return e.compress(data);
+    }
+
+    // Explicit level, 0..9 (clamped): a distinct name (no static overload).
+    public static byte[] compressWithLevel(byte[] data, int level) {
+        var e = new DeflateEngine();
+        return e.compress(data, level);
     }
 
     public static byte[] decompress(byte[] data) {
