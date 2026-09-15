@@ -42,10 +42,12 @@ import * from preprocess;
 // DOCS/260 — filter one source file through the `#on`/`#else`/`#off`
 // preprocessor. A region error prints to stderr and aborts with status 1
 // (matching silverc-rs), so malformed regions can never reach the parser.
-string preprocessOrProjectFail(string src) {
+// `debugBuild` selects the build-mode axis (`#on DEBUG` vs `#on RELEASE`);
+// callers forward the driver's --debug flag so every file filters alike.
+string preprocessOrProjectFail(string src, bool debugBuild) {
     string[] ppErrs = [];
     string target = ppTargetOs();
-    string out = ppPreprocess(src, target, ppErrs);
+    string out = ppPreprocess(src, target, debugBuild, ppErrs);
     if (ppErrs.length > 0) {
         for (int peI = 0; peI < ppErrs.length; peI++) {
             eprintln(ppErrs[peI]);
@@ -1273,14 +1275,14 @@ class ProjectVisited {
     }
 }
 
-string projectCollect(string path, string root, string[] sourceDirs, ProjectVisited visited, bool emitMarkers, ProgressReporter progress) {
+string projectCollect(string path, string root, string[] sourceDirs, ProjectVisited visited, bool emitMarkers, ProgressReporter progress, bool debugBuild) {
     if (visited.contains(path)) { return ""; }
     visited.add(path);
     // DOCS/260 — filter each project source BEFORE its imports are scanned
     // and its text joins the aggregate, so every file's `#on` regions resolve
     // independently and non-matching regions never reach the parser.
     string rawSource = file.readString(path);
-    string source = preprocessOrProjectFail(rawSource);
+    string source = preprocessOrProjectFail(rawSource, debugBuild);
     string result = "";
     int cursor = 0;
     while (cursor < source.length) {
@@ -1312,7 +1314,7 @@ string projectCollect(string path, string root, string[] sourceDirs, ProjectVisi
         if (moduleName.length > 0 && !projectBuiltin(moduleName)) {
             string importPath = projectSourcePath(root, sourceDirs, moduleName);
             if (importPath != "") {
-                result += projectCollect(importPath, root, sourceDirs, visited, emitMarkers, progress) + "\n";
+                result += projectCollect(importPath, root, sourceDirs, visited, emitMarkers, progress, debugBuild) + "\n";
             }
         }
         cursor = semi + 1;
@@ -1326,13 +1328,13 @@ string projectCollect(string path, string root, string[] sourceDirs, ProjectVisi
 // Count how many project source files `projectCollect` would collect for the
 // given entry (1 for the entry plus its transitive imports). Mirrors
 // `projectCollect`'s resolution logic exactly so the total is precise.
-int projectCountCollect(string path, string root, string[] sourceDirs, ProjectVisited visited) {
+int projectCountCollect(string path, string root, string[] sourceDirs, ProjectVisited visited, bool debugBuild) {
     if (visited.contains(path)) { return 0; }
     visited.add(path);
     // DOCS/260 — mirror projectCollect's filter so counts stay in lockstep
     // (a region error aborts during collection, before the aggregate builds).
     string rawSource = file.readString(path);
-    string source = preprocessOrProjectFail(rawSource);
+    string source = preprocessOrProjectFail(rawSource, debugBuild);
     int sub = 0;
     int cursor = 0;
     while (cursor < source.length) {
@@ -1370,7 +1372,7 @@ int projectCountCollect(string path, string root, string[] sourceDirs, ProjectVi
         if (moduleName.length > 0 && !projectBuiltin(moduleName)) {
             string importPath = projectSourcePath(root, sourceDirs, moduleName);
             if (importPath != "") {
-                sub += projectCountCollect(importPath, root, sourceDirs, visited);
+                sub += projectCountCollect(importPath, root, sourceDirs, visited, debugBuild);
             }
         }
         cursor = semi + 1;
@@ -1502,7 +1504,7 @@ string projectExpandCollections(string source, string root, string collections) 
     return result;
 }
 
-string projectBuildSource(string projectPath, bool emitMarkers) {
+string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild) {
     string manifest = file.readString(projectPath);
     string root = projectDirname(projectPath);
     string entry = projectManifestValue(manifest, "entry");
@@ -1514,13 +1516,15 @@ string projectBuildSource(string projectPath, bool emitMarkers) {
     // Progress (STDERR): pre-count the module files (entry + transitive
     // imports) so the lines show an exact `[processed/total]` and a real ETA.
     ProjectVisited countVisited = new ProjectVisited();
-    int moduleCount = projectCountCollect(entryPath, root, sources, countVisited);
+    int moduleCount = projectCountCollect(entryPath, root, sources, countVisited, debugBuild);
     ProgressReporter progress = new ProgressReporter(moduleCount);
     ProjectVisited visited = new ProjectVisited();
-    string collected = projectCollect(entryPath, root, sources, visited, emitMarkers, progress);
+    string collected = projectCollect(entryPath, root, sources, visited, emitMarkers, progress, debugBuild);
     progress.finish();
+    eprintln("TRC nm begin");
     NativeModules nmBuild = projectParseNativeModules(manifest);
     string body = projectStripDirectivesCustom(collected, nmBuild);
+    eprintln("TRC strip done " + body.length.toString());
 
     // `.qs` libraries listed under `imports` are not auto-imported; declaring
     // one only makes it available. Extract each module's source from the
@@ -1528,6 +1532,7 @@ string projectBuildSource(string projectPath, bool emitMarkers) {
     // `import * from X;` statements in the code resolve to the library.
     string[] imports = projectManifestImports(manifest);
     string[] allBundleStems = [];
+    eprintln("TRC stems begin " + imports.length.toString());
     // Shipped std SOURCE modules already collected for consumed bundles
     // (keyed by module name, so every spelling dedups): two libraries
     // needing `net` inline it once.
@@ -1545,9 +1550,12 @@ string projectBuildSource(string projectPath, bool emitMarkers) {
     for (int ki = 0; ki < imports.length; ki++) {
         string qsPath = projectJoin(root, imports[ki]);
         string qsContent = file.readString(qsPath);
+        eprintln("TRC libsrc begin " + ki.toString() + " " + qsContent.length.toString());
         if (qsContent.length > 0) {
             string[] libSources = projectQsSources(qsContent);
+            eprintln("TRC libsrc extracted " + libSources.length.toString());
             for (int si = 0; si < libSources.length; si++) {
+                eprintln("TRC scan " + ki.toString() + "." + si.toString() + " len " + libSources[si].length.toString() + " body " + body.length.toString());
                 // DOCS/261 v1: a bundle needing an undeclared custom module
                 // fails naming the declaration. Bare sources naming project
                 // files, sibling bundle modules, or std modules are Silver
@@ -1598,7 +1606,7 @@ string projectBuildSource(string projectPath, bool emitMarkers) {
                                         string stdRoot = projectDirname(stdPath);
                                         string[] stdDirs = [];
                                         stdDirs.add("");
-                                        string stdText = projectCollect(stdPath, stdRoot, stdDirs, visited, emitMarkers, progress);
+                                        string stdText = projectCollect(stdPath, stdRoot, stdDirs, visited, emitMarkers, progress, debugBuild);
                                         body += stdText + "\n";
                                     }
                                 }

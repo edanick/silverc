@@ -7,7 +7,12 @@ import * from sysinfo;
 //
 // Parses and validates the overhaul flag set:
 //   execution modes  --aot / --jit / --runtime   (mutually exclusive)
-//   independent      --optimize --cache-bytecode --watch --threads N
+//   independent      --optimize --cache-bytecode --watch --threads N --debug
+//
+// `--release` is not a real flag: passing it stores the releaseNotice text
+// in `error` and the driver prints it and exits without compiling (release
+// is the default build mode; mirrors silverc-rs RELEASE_NOTICE byte for
+// byte).
 //
 // The default invocation (only basic I/O flags) stays pure AOT. Error
 // messages mirror silverc-rs src/cli.rs byte for byte.
@@ -35,6 +40,11 @@ class CliFlags {
     // Additive: not part of activeFlagNames, so forbidden_flags behavior is
     // unchanged; WINDOWS builds with no --os behave byte-identically.
     public prop string targetOs;
+    // Preprocessor build mode (DOCS/253). False by default (no flag): feeds
+    // `#on RELEASE` regions; --debug sets it true and feeds `#on DEBUG`
+    // regions instead. Like targetOs, additive: not part of
+    // activeFlagNames, so forbidden_flags behavior is unchanged.
+    public prop bool debugBuild;
 
     construct {
         this.input = "";
@@ -49,6 +59,7 @@ class CliFlags {
         this.threadCount = 1;
         this.warnAllThreads = false;
         this.targetOs = "";
+        this.debugBuild = false;
     }
 
     public bool failed() {
@@ -206,6 +217,13 @@ class CliFlags {
         if (msg.length == 0) { return; }
         eprint(msg);
     }
+}
+
+// Printed when `--release` is passed. Release is the default build mode,
+// so there is nothing to opt into: the driver prints this notice and exits
+// without compiling. Mirrors silverc-rs RELEASE_NOTICE byte for byte.
+public string releaseNotice() {
+    return "default mode is release — just omit --release (no flag needed)";
 }
 
 // Logical processor count via the universal sysinfo module
@@ -373,6 +391,15 @@ public CliFlags parseCliArgs(string[] args) {
             o.watch = true;
         } else if (arg == "--threads") {
             want = 2;
+        } else if (arg == "--debug") {
+            o.debugBuild = true;
+        } else if (arg == "--release") {
+            // Release is the default build mode — there is nothing to opt
+            // into. The driver prints the notice and exits without compiling;
+            // parseCliArgs surfaces it as the error so the message stays
+            // identical in every entry path (mirrors silverc-rs).
+            o.error = releaseNotice();
+            return o;
         } else if (arg == "--os") {
             want = 4;
         } else if (arg == "-o" || arg == "--output") {

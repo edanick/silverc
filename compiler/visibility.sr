@@ -9,11 +9,13 @@ import * from preprocess;
 
 // DOCS/260 — every file the visibility pass reads must go through the
 // preprocessor first: non-matching `#on` regions are never tokenized, so the
-// re-read + re-lex here must not see them either.
-string visPreprocess(string path, string src) {
+// re-read + re-lex here must not see them either. `debugBuild` selects the
+// build-mode axis (`#on DEBUG` vs `#on RELEASE`); the driver forwards its
+// --debug flag so this pass filters exactly like the main pipeline.
+string visPreprocess(string path, string src, bool debugBuild) {
     string[] ppErrs = [];
     string target = ppTargetOs();
-    string filtered = ppPreprocess(src, target, ppErrs);
+    string filtered = ppPreprocess(src, target, debugBuild, ppErrs);
     if (ppErrs.length > 0) {
         for (int vpI = 0; vpI < ppErrs.length; vpI++) {
             printline(ppErrs[vpI]);
@@ -120,10 +122,14 @@ class VisibilityChecker {
 
     private prop string[] visitedPaths;
     private prop VisFile[] loadedFiles;
+    // Preprocessor build mode (--debug): forwarded so file filtering matches
+    // the main pipeline exactly.
+    private prop bool debugBuild;
 
-    construct (string entry) {
+    construct (string entry, bool debugBuild) {
         this.errors = [];
         this.entryPath = entry;
+        this.debugBuild = debugBuild;
         this.declNames = [];
         this.declKinds = [];
         this.declInternal = [];
@@ -165,7 +171,7 @@ class VisibilityChecker {
         }
         string rawSrc = visTryReadFile(path);
         if (rawSrc.length == 0) { return null; }
-        string src = visPreprocess(path, rawSrc);
+        string src = visPreprocess(path, rawSrc, this.debugBuild);
         this.visitedPaths.add(path);
         Lexer lexer = new Lexer(src + "\n");
         Token[] toks = lexer.tokenize();

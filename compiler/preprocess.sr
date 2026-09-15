@@ -10,13 +10,17 @@ mod export preprocess;
 //
 // Semantics:
 //   #on WINDOWS   open a region fed only on WINDOWS builds
+//   #on DEBUG     open a region fed only under `--debug`
+//   #on RELEASE   open a region fed by default (no flag; release is default)
 //   #on LINUX or MAC
 //                 open (or chain) a single branch fed on LINUX *or* MAC
-//                 builds: one branch listing several OS names separated by
-//                 the lowercase word `or` (OS names stay UPPERCASE-only,
+//                 builds: one branch listing several names separated by
+//                 the lowercase word `or` (names stay UPPERCASE-only,
 //                 order is irrelevant — `#on MAC or LINUX` means the same).
-//                 The branch matches when the target equals ANY listed OS
-//                 and keeps the usual first-match-wins / `#else`-last rules.
+//                 Each name is tested against its own axis (OS names test
+//                 the target, DEBUG/RELEASE test the `--debug` flag); the
+//                 branch matches when ANY listed name matches and keeps the
+//                 usual first-match-wins / `#else`-last rules.
 //   #on LINUX     inside an open region: close the previous branch and open
 //                 the next branch of the SAME region (first match wins)
 //   #else         fed only when no preceding `#on` of the region matched;
@@ -47,6 +51,14 @@ mod export preprocess;
 // directive names stay UPPERCASE-only (see ppIsOsName) — unchanged.
 // WINDOWS builds with no override return WINDOWS byte-identically;
 // LINUX builds return LINUX.
+//
+// The build mode rides a second, independent axis: `debugBuild` is true only
+// under `--debug`. Release is the default (no flag); `--release` is not a
+// real flag — the driver prints a notice and exits without compiling.
+// `#on DEBUG` feeds only when debugBuild is true, `#on RELEASE` only when it
+// is false (see ppNameMatches). Each `#on` name is tested against its own
+// axis, so one branch may mix axes (`#on LINUX or DEBUG`), though
+// single-axis regions stay the most readable.
 public string ppTargetOsFor(string overrideOs) {
     if (string.equals(overrideOs, "WINDOWS", StringCase.INSENSITIVE)) {
         return "WINDOWS";
@@ -72,6 +84,25 @@ public string ppTargetOs() {
 
 private bool ppIsOsName(string name) {
     return name == "WINDOWS" || name == "LINUX" || name == "MAC";
+}
+
+// True when `name` is a build-mode `#on` name (`DEBUG` / `RELEASE`,
+// case-sensitive). Build-mode names test the `--debug` flag, not the target
+// OS (mirrors silverc-rs is_build_mode_name).
+private bool ppIsBuildModeName(string name) {
+    return name == "DEBUG" || name == "RELEASE";
+}
+
+// True when a single `#on` name feeds for the given target OS and build
+// mode. OS names test `targetOs`; build-mode names test `debugBuild`
+// (`DEBUG` iff debug, `RELEASE` iff not debug). A branch feeds when ANY of
+// its names matches (mirrors silverc-rs name_matches).
+private bool ppNameMatches(string name, string targetOs, bool debugBuild) {
+    if (ppIsBuildModeName(name)) {
+        if (name == "DEBUG") { return debugBuild; }
+        return !debugBuild;
+    }
+    return name == targetOs;
 }
 
 private string ppSlice(string s, int start, int end) {
@@ -105,7 +136,7 @@ private int ppSkipBlanks(string s, int start, int end) {
     return p;
 }
 
-public string ppPreprocess(string source, string targetOs, string[] errs) {
+public string ppPreprocess(string source, string targetOs, bool debugBuild, string[] errs) {
     // Pass 1: pure scan. Parallel arrays describe each line to blank:
     // start offset, newline offset (-1 = last line without terminator),
     // and 1 when the line ends with a CRLF terminator.
@@ -155,18 +186,19 @@ public string ppPreprocess(string source, string targetOs, string[] errs) {
                 }
                 string osName = ppSlice(source, nameStart, nameEnd);
                 if (osName.length == 0) {
-                    errs.add("preprocessor: '#on' requires an OS name (WINDOWS, LINUX, MAC), at line " + lineNo.toString());
+                    errs.add("preprocessor: '#on' requires an OS or build-mode name (WINDOWS, LINUX, MAC, DEBUG, RELEASE), at line " + lineNo.toString());
                     return source;
                 }
-                if (!ppIsOsName(osName)) {
-                    errs.add("preprocessor: unknown OS name '" + osName + "' after '#on' (valid OS names are WINDOWS, LINUX, MAC), at line " + lineNo.toString());
+                if (!ppIsOsName(osName) && !ppIsBuildModeName(osName)) {
+                    errs.add("preprocessor: unknown OS or build-mode name '" + osName + "' after '#on' (valid names are WINDOWS, LINUX, MAC, DEBUG, RELEASE), at line " + lineNo.toString());
                     return source;
                 }
-                // OR-list: `#on LINUX or MAC` — one branch fed when the
-                // target equals ANY listed OS (names UPPERCASE-only,
-                // separator lowercase `or`, order irrelevant). The branch
-                // keeps the usual first-match-wins / `#else`-last rules.
-                bool matchesTarget = osName == targetOs;
+                // OR-list: `#on LINUX or MAC` — one branch fed when ANY listed
+                // name matches its own axis (OS names test the target,
+                // DEBUG/RELEASE test the `--debug` flag; order irrelevant).
+                // The branch keeps the usual first-match-wins / `#else`-last
+                // rules.
+                bool matchesTarget = ppNameMatches(osName, targetOs, debugBuild);
                 int listEnd = nameEnd;
                 int cursor = nameEnd;
                 while (cursor < contentEnd) {
@@ -192,14 +224,14 @@ public string ppPreprocess(string source, string targetOs, string[] errs) {
                     }
                     string nextOs = ppSlice(source, nextSkip, nextEnd);
                     if (nextOs.length == 0) {
-                        errs.add("preprocessor: '#on' requires an OS name (WINDOWS, LINUX, MAC) after 'or', at line " + lineNo.toString());
+                        errs.add("preprocessor: '#on' requires an OS or build-mode name (WINDOWS, LINUX, MAC, DEBUG, RELEASE) after 'or', at line " + lineNo.toString());
                         return source;
                     }
-                    if (!ppIsOsName(nextOs)) {
-                        errs.add("preprocessor: unknown OS name '" + nextOs + "' after '#on' (valid OS names are WINDOWS, LINUX, MAC), at line " + lineNo.toString());
+                    if (!ppIsOsName(nextOs) && !ppIsBuildModeName(nextOs)) {
+                        errs.add("preprocessor: unknown OS or build-mode name '" + nextOs + "' after '#on' (valid names are WINDOWS, LINUX, MAC, DEBUG, RELEASE), at line " + lineNo.toString());
                         return source;
                     }
-                    if (nextOs == targetOs) { matchesTarget = true; }
+                    if (ppNameMatches(nextOs, targetOs, debugBuild)) { matchesTarget = true; }
                     listEnd = nextEnd;
                     cursor = nextEnd;
                 }

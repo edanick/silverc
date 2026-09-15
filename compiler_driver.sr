@@ -98,6 +98,8 @@ void printHelp() {
     printline("  --watch           Predictive precompilation watcher");
     printline("  --threads <N>     Explicit worker count (default: 90% of system threads)");
     printline("  --os windows|linux|mac  Target OS (default: host; WINDOWS, LINUX, MAC also accepted)");
+    printline("  --debug           Debug build-mode: feeds `#on DEBUG` regions (default is release)");
+    printline("  --release         Not a flag: prints a notice (default mode is release) and exits");
     printline("");
     printline("Examples:");
     printline("  silverc --help");
@@ -130,10 +132,12 @@ string tryReadFile(string path) {
 // DOCS/260 — run the `#on`/`#else`/`#off` preprocessor over one file's text.
 // On a region error the messages print to stderr and the compile aborts with
 // status 1 (matching silverc-rs). Empty input passes through unchanged.
-string drvPreprocessOrDie(string src) {
+// `debugBuild` selects the build-mode axis (`#on DEBUG` vs `#on RELEASE`);
+// callers forward the --debug flag so every file filters alike.
+string drvPreprocessOrDie(string src, bool debugBuild) {
     string[] ppErrs = [];
     string target = ppTargetOs();
-    string out = ppPreprocess(src, target, ppErrs);
+    string out = ppPreprocess(src, target, debugBuild, ppErrs);
     if (ppErrs.length > 0) {
         for (int peI = 0; peI < ppErrs.length; peI++) {
             eprintln(ppErrs[peI]);
@@ -362,7 +366,7 @@ string cacheMarkerLine(string path) {
 // With emitMarkers set, one cache-marker comment line precedes each file's
 // content so the aggregate can be split per file again (--cache-bytecode).
 // When progress is non-null, one progress line is printed per module.
-string collectModule(string name, string inputFile, string[] visited, bool emitMarkers, ProgressReporter progress) {
+string collectModule(string name, string inputFile, string[] visited, bool emitMarkers, ProgressReporter progress, bool debugBuild) {
     for (int i = 0; i < visited.length; i++) {
         if (visited[i] == name) { return ""; }
     }
@@ -373,7 +377,7 @@ string collectModule(string name, string inputFile, string[] visited, bool emitM
     if (modSrc.length == 0) { return ""; }
     // DOCS/260 — filter the module BEFORE its imports are scanned so imports
     // inside non-matching regions are never resolved.
-    string modFiltered = drvPreprocessOrDie(modSrc);
+    string modFiltered = drvPreprocessOrDie(modSrc, debugBuild);
     modSrc = modFiltered;
     string result = "";
     int cursor = 0;
@@ -408,7 +412,7 @@ string collectModule(string name, string inputFile, string[] visited, bool emitM
         if (depName.length > 0) {
             string depPath = findModulePath(depName, inputFile);
             if (depPath.length > 0) {
-                result += collectModule(depName, inputFile, visited, emitMarkers, progress);
+                result += collectModule(depName, inputFile, visited, emitMarkers, progress, debugBuild);
             }
         }
         cursor = semi + 1;
@@ -422,7 +426,7 @@ string collectModule(string name, string inputFile, string[] visited, bool emitM
 // Count how many non-builtin modules `collectModule` would collect for a given
 // module name (1 for the module itself plus its transitive imports). Mirrors
 // `collectModule`'s resolution logic exactly so the total is precise.
-int countModule(string name, string inputFile, string[] visited) {
+int countModule(string name, string inputFile, string[] visited, bool debugBuild) {
     for (int i = 0; i < visited.length; i++) {
         if (visited[i] == name) { return 0; }
     }
@@ -430,7 +434,7 @@ int countModule(string name, string inputFile, string[] visited) {
     string modPath = findModulePath(name, inputFile);
     if (modPath.length == 0) { return 0; }
     string countRaw = tryReadFile(modPath);
-    string modSrc = drvPreprocessOrDie(countRaw);
+    string modSrc = drvPreprocessOrDie(countRaw, debugBuild);
     if (modSrc.length == 0) { return 0; }
     int sub = 0;
     int cursor = 0;
@@ -463,7 +467,7 @@ int countModule(string name, string inputFile, string[] visited) {
         if (depName.length > 0) {
             string depPath = findModulePath(depName, inputFile);
             if (depPath.length > 0) {
-                sub += countModule(depName, inputFile, visited);
+                sub += countModule(depName, inputFile, visited, debugBuild);
             }
         }
         cursor = semi + 1;
@@ -516,7 +520,7 @@ bool importIsMac(string name) {
     return name[0] == 'm' && name[1] == 'a' && name[2] == 'c';
 }
 
-string collectImports(string source, string inputFile, string ignored, string[] errs, bool emitMarkers, ProgressReporter progress) {
+string collectImports(string source, string inputFile, string ignored, string[] errs, bool emitMarkers, ProgressReporter progress, bool debugBuild) {
     string[] visited = [];
     string result = "";
     int cursor = 0;
@@ -579,7 +583,7 @@ string collectImports(string source, string inputFile, string ignored, string[] 
                     errs.add("unknown module \"" + moduleName + "\" was found at line " + loc[0].toString() + ", column " + loc[1].toString() + ". module either doesn't exist or not installed.");
                 }
             } else {
-                result += collectModule(moduleName, inputFile, visited, emitMarkers, progress);
+                result += collectModule(moduleName, inputFile, visited, emitMarkers, progress, debugBuild);
             }
         }
         cursor = semi + 1;
@@ -596,7 +600,7 @@ string collectImports(string source, string inputFile, string ignored, string[] 
 // `collectImports` would collect, using the same resolution logic so the
 // total is exact. The counting pass never builds source strings; it only
 // walks the import graph.
-int countModuleImports(string source, string inputFile, string ignored) {
+int countModuleImports(string source, string inputFile, string ignored, bool debugBuild) {
     string[] visited = [];
     int count = 1;
     int cursor = 0;
@@ -641,7 +645,7 @@ int countModuleImports(string source, string inputFile, string ignored) {
                 // Unknown module: the real collectImports pass reports it and
                 // aborts; the count is irrelevant when the compile fails.
             } else {
-                count += countModule(moduleName, inputFile, visited);
+                count += countModule(moduleName, inputFile, visited, debugBuild);
             }
         }
         cursor = semi + 1;
@@ -843,6 +847,13 @@ void main() {
     // OVERHAUL.md flag parsing: modes, independent flags, validation.
     CliFlags flags = parseCliArgs(args);
     if (flags.failed()) {
+        // `--release` is not a real flag: release is the default build mode,
+        // so print the notice and exit without compiling (mirrors
+        // silverc-rs, which exits 0 on the same notice).
+        if (flags.error == releaseNotice()) {
+            printline(flags.error);
+            exit(0);
+        }
         flags.errLine(flags.error);
         exit(1);
     }
@@ -941,7 +952,7 @@ int compileOnce(CliFlags flags, string outputFile) {
             string qEntry = projectManifestValue(manifest, "entry");
             string[] qSources = projectManifestSources(manifest);
             ProjectVisited qVisited = new ProjectVisited();
-            moduleCount = projectCountCollect(projectJoin(root, qEntry), root, qSources, qVisited);
+            moduleCount = projectCountCollect(projectJoin(root, qEntry), root, qSources, qVisited, flags.debugBuild);
             int[] bundle = projectBuildBundle(inputFile);
             file.writeBytes(outputFile, bundle);
             drvReportSuccess(outputFile, moduleCount, startTick);
@@ -957,13 +968,13 @@ int compileOnce(CliFlags flags, string outputFile) {
         string pEntry = projectManifestValue(manifest, "entry");
         string[] pSources = projectManifestSources(manifest);
         ProjectVisited pVisited = new ProjectVisited();
-        moduleCount = projectCountCollect(projectJoin(pRoot, pEntry), pRoot, pSources, pVisited);
+        moduleCount = projectCountCollect(projectJoin(pRoot, pEntry), pRoot, pSources, pVisited, flags.debugBuild);
         progress = new ProgressReporter(moduleCount);
         // DOCS/260 — the .srp aggregate (markers + per-file sources) was
         // already filtered per file inside projectCollect; this pass is a
         // no-op safety net (files with no directives return unchanged).
-        string builtSource = projectBuildSource(inputFile, flags.cacheBytecode);
-        source = drvPreprocessOrDie(builtSource);
+        string builtSource = projectBuildSource(inputFile, flags.cacheBytecode, flags.debugBuild);
+        source = drvPreprocessOrDie(builtSource, flags.debugBuild);
     } else {
         // `.col` declarations require a project manifest with a configured
         // collection directory. Standalone source compilation reports the
@@ -972,7 +983,7 @@ int compileOnce(CliFlags flags, string outputFile) {
 
         // DOCS/260 — the preprocessor runs before anything else scans the
         // entry source (import probes, module collection, the lexer).
-        source = drvPreprocessOrDie(source);
+        source = drvPreprocessOrDie(source, flags.debugBuild);
 
         // The universal llmai client is a source-level standard library. Keep
         // the low-level WinInet builtin available, but include the shared
@@ -1016,7 +1027,7 @@ int compileOnce(CliFlags flags, string outputFile) {
                 llmaiSource = tryReadFile("../../std/llmai.sr");
             }
             #off
-            source = drvPreprocessOrDie(llmaiSource) + "\n" + source;
+            source = drvPreprocessOrDie(llmaiSource, flags.debugBuild) + "\n" + source;
         }
 
         // The exception hierarchy is a source-level standard library. When a
@@ -1055,7 +1066,7 @@ int compileOnce(CliFlags flags, string outputFile) {
                 excSource = tryReadFile("../../std/exception.sr");
             }
             #off
-            source = drvPreprocessOrDie(excSource) + "\n" + source;
+            source = drvPreprocessOrDie(excSource, flags.debugBuild) + "\n" + source;
         }
 
         // BOM and focused-process APIs are source-level standard libraries.
@@ -1075,7 +1086,7 @@ int compileOnce(CliFlags flags, string outputFile) {
             if (bomSource.length == 0) { bomSource = tryReadFile("../silverc/std/bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile("../../std/bom.sr"); }
             #off
-            source = drvPreprocessOrDie(bomSource) + "\n" + source;
+            source = drvPreprocessOrDie(bomSource, flags.debugBuild) + "\n" + source;
         }
         int processImport = projectFind(source, "from " + "process", 0);
         if (processImport >= 0) {
@@ -1091,7 +1102,7 @@ int compileOnce(CliFlags flags, string outputFile) {
             if (processSource.length == 0) { processSource = tryReadFile("../silverc/std/process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile("../../std/process.sr"); }
             #off
-            source = drvPreprocessOrDie(processSource) + "\n" + source;
+            source = drvPreprocessOrDie(processSource, flags.debugBuild) + "\n" + source;
         }
         // Notifications (Windows toast / tray-balloon) is a source-level
         // standard library.  Prepend its definitions when a standalone source
@@ -1110,7 +1121,7 @@ int compileOnce(CliFlags flags, string outputFile) {
             if (notifSource.length == 0) { notifSource = tryReadFile("../silverc/std/notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile("../../std/notifications.sr"); }
             #off
-            source = drvPreprocessOrDie(notifSource) + "\n" + source;
+            source = drvPreprocessOrDie(notifSource, flags.debugBuild) + "\n" + source;
         }
 
         // Generic source-level imports (`import * from helper;`, `import
@@ -1121,11 +1132,11 @@ int compileOnce(CliFlags flags, string outputFile) {
         // Progress (STDERR): pre-count the modules (entry + imports) so the
         // lines show an exact `[processed/total]` and a real ETA.
         string[] moduleErrors = [];
-        int moduleCountImports = countModuleImports(source, inputFile, "");
+        int moduleCountImports = countModuleImports(source, inputFile, "", flags.debugBuild);
         moduleCount = moduleCountImports;
         progress = new ProgressReporter(moduleCountImports);
         progress.moduleDone(inputFile);
-        source = collectImports(source, inputFile, "", moduleErrors, flags.cacheBytecode, progress);
+        source = collectImports(source, inputFile, "", moduleErrors, flags.cacheBytecode, progress, flags.debugBuild);
         if (moduleErrors.length > 0) {
             for (int meI = 0; meI < moduleErrors.length; meI++) {
                 printline(moduleErrors[meI]);
@@ -1246,7 +1257,7 @@ int compileOnce(CliFlags flags, string outputFile) {
     // project, so nothing external exists there and the pass is skipped
     // (mirrors silverc-rs, which enforces on the single-file path).
     if (!inputIsProject) {
-        VisibilityChecker vis = new VisibilityChecker(inputFile);
+        VisibilityChecker vis = new VisibilityChecker(inputFile, flags.debugBuild);
         vis.run();
         if (vis.errors.length > 0) {
             for (int veI = 0; veI < vis.errors.length; veI++) {
