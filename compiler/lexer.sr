@@ -262,7 +262,18 @@ class Lexer {
             return new Token(123, "?", ln, cl);
         }
         if (c == '#') { return new Token(125, "#", ln, cl); }
-        if (c == '$') { return new Token(149, "$", ln, cl); }
+        if (c == '$') {
+            // SPEC 12.2 / DOCS 102: an adjacent `$"..."` lexes as ONE
+            // brace/quote-aware interpolation-string token (kind 168), so a
+            // nested string literal inside a `{...}` hole never ends the outer
+            // string. A lone `$` (or `$ ` not followed by a quote) stays a
+            // Dollar token, exactly like the Rust bootstrap.
+            if (this.peek() == '"') {
+                this.advance();
+                return this.readInterpStringToken(ln, cl);
+            }
+            return new Token(149, "$", ln, cl);
+        }
         if (c == '@') { return new Token(156, "@", ln, cl); }
 
         }
@@ -324,6 +335,127 @@ class Lexer {
         Token tok = new Token(3, s, ln, cl);
         tok.strVal = s;
         return tok;
+    }
+
+    // SPEC 12.2 / DOCS 102: brace/quote-aware scan of a `$"..."` interpolation
+    // string (the opening `"` has already been consumed). Literal runs decode
+    // escapes exactly like readStringToken; each `{...}` hole is captured
+    // verbatim -- its nested string/char literals, nested `$"..."` and `//` /
+    // `/* */` comments copied raw -- so an inner quote never ends the outer
+    // string and the parser can re-lex the hole text and apply the value-vs-
+    // parenthesized-expression rule. `{{` and `}}` are literal braces. The
+    // outer string terminates only at a `"` seen at brace-depth zero.
+    private Token readInterpStringToken(int ln, int cl) {
+        Token tok = new Token(168, "$", ln, cl);
+        string text = "";
+        bool closed = false;
+        while (this.pos < this.srcLen) {
+            char ch = this.src[this.pos]; this.advance();
+            if (ch == '"') { closed = true; break; }
+            if (ch == '\\') {
+                if (this.pos < this.srcLen) {
+                    char esc = this.src[this.pos]; this.advance();
+                    if (esc == 'n') { text += "\n"; }
+                    else if (esc == 't') { text += "\t"; }
+                    else if (esc == '0') { text += "\0"; }
+                    else if (esc == 'r') { text += "\r"; }
+                    else if (esc == '\\') { text += "\\"; }
+                    else if (esc == '\"') { text += "\""; }
+                    else if (esc == 'x') {
+                        int hv = 0;
+                        int nd = 0;
+                        while (nd < 2 && this.pos < this.srcLen) {
+                            char hc = this.src[this.pos];
+                            int dv = -1;
+                            if (hc >= '0' && hc <= '9') { dv = hc - '0'; }
+                            else if (hc >= 'a' && hc <= 'f') { dv = hc - 'a' + 10; }
+                            else if (hc >= 'A' && hc <= 'F') { dv = hc - 'A' + 10; }
+                            if (dv < 0) { break; }
+                            this.advance();
+                            hv = hv * 16 + dv;
+                            nd++;
+                        }
+                        if (nd > 0) { char xc = hv; text += charToString(xc); }
+                        else { text += "\\x"; }
+                    }
+                    else { text += "\\" + esc; }
+                }
+                continue;
+            }
+            if (ch == '{') {
+                if (this.peek() == '{') { this.advance(); text += "{"; continue; }
+                if (text.length > 0) {
+                    tok.ipKinds.add(0); tok.ipTexts.add(text); tok.ipLines.add(0); tok.ipCols.add(0);
+                    text = "";
+                }
+                int hLine = this.line;
+                int hCol = this.col - 1;
+                string hole = "";
+                int depth = 1;
+                bool holeClosed = false;
+                while (this.pos < this.srcLen) {
+                    char c2 = this.src[this.pos]; this.advance();
+                    if (c2 == '}') {
+                        if (depth == 1) { holeClosed = true; break; }
+                        depth--;
+                        hole += "}";
+                    } else if (c2 == '{') {
+                        depth++;
+                        hole += "{";
+                    } else if (c2 == '"' || c2 == '\'') {
+                        hole += charToString(c2);
+                        hole = this.ipCopyQuoted(c2, hole);
+                    } else if (c2 == '$' && this.peek() == '"') {
+                        hole += "$";
+                        this.advance();
+                        hole += "\"";
+                        hole = this.ipCopyQuoted('"', hole);
+                    } else if (c2 == '\\' && this.pos < this.srcLen) {
+                        hole += "\\";
+                        hole += charToString(this.src[this.pos]);
+                        this.advance();
+                    } else {
+                        hole += charToString(c2);
+                    }
+                }
+                if (!holeClosed) { closed = false; break; }
+                tok.ipKinds.add(1); tok.ipTexts.add(hole); tok.ipLines.add(hLine); tok.ipCols.add(hCol);
+                continue;
+            }
+            if (ch == '}') {
+                if (this.peek() == '}') { this.advance(); text += "}"; continue; }
+                text += "}";
+                continue;
+            }
+            text += charToString(ch);
+        }
+        if (text.length > 0) {
+            tok.ipKinds.add(0); tok.ipTexts.add(text); tok.ipLines.add(0); tok.ipCols.add(0);
+        }
+        if (!closed) {
+            int endCol = this.lineCharLen(ln);
+            if (endCol <= 0) { endCol = cl; }
+            this.recordLexError("you forgot to close your string quotes at line " + ln.toString() + ", column " + endCol.toString());
+        }
+        return tok;
+    }
+
+    // Copy a nested string/char literal from inside an interpolation hole into
+    // `acc` verbatim (the opening quote is already appended): consume until the
+    // matching unescaped `q`, treating `\\X` pairs as opaque so an escaped quote
+    // never closes the literal. Mirrors silverc-rs Lexer::copy_quoted_raw.
+    private string ipCopyQuoted(char q, string acc) {
+        while (this.pos < this.srcLen) {
+            char c = this.src[this.pos]; this.advance();
+            if (c == '\\') {
+                acc += "\\";
+                if (this.pos < this.srcLen) { acc += charToString(this.src[this.pos]); this.advance(); }
+                continue;
+            }
+            acc += charToString(c);
+            if (c == q) { return acc; }
+        }
+        return acc;
     }
 
     private Token readChar() {

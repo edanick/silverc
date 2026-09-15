@@ -1169,6 +1169,7 @@ class Parser {
         if (kind == 166) { return "loop"; }
         if (kind == 167) { return "internal"; }
         if (kind == 149) { return "$"; }
+        if (kind == 168) { return "$"; }
         if (kind == 150) { return "local"; }
         if (kind == 151) { return "alias"; }
         if (kind == 152) { return "fixed"; }
@@ -3467,6 +3468,14 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             a.children.add(this.parseExpr(10));
             return a;
         }
+        if (kind == 168) {
+            // SPEC 12.2 / DOCS 102: the lexer produced a brace/quote-aware
+            // interpolation string (adjacent `$"..."`); build the node from its
+            // segments, classifying each hole.
+            Node ip = this.buildInterpFromToken(t);
+            ip.line = t.line; ip.col = t.col;
+            return ip;
+        }
         if (kind == 149) {
             if (this.check(3)) {
                 Token st = this.advance();
@@ -3497,6 +3506,142 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         return ident;
     }
 
+    // Build the kind-69 interpolation node from a lexer InterpString token's
+    // segments (SPEC 12.2 / DOCS 102). Text segments become literal kind-2
+    // children; hole segments are classified value-vs-parenthesized-expression.
+    private Node buildInterpFromToken(Token t) {
+        Node n = new Node();
+        n.kind = 69;
+        n.name = "interp";
+        for (int i = 0; i < t.ipKinds.length; i++) {
+            if (t.ipKinds[i] == 0) {
+                string txt = t.ipTexts[i];
+                if (txt.length > 0) {
+                    Node tn = new Node(); tn.kind = 2; tn.strVal = txt;
+                    n.children.add(tn);
+                }
+            } else {
+                n.children.add(this.classifyHole(t.ipTexts[i], t.ipLines[i], t.ipCols[i]));
+            }
+        }
+        return n;
+    }
+
+    // Classify one interpolation hole (SPEC 12.2 / DOCS 102): a hole fully
+    // wrapped in parentheses is an arbitrary expression; anything else must be
+    // a plain value reference (identifier with `.member` / `[index]` postfixes),
+    // or it is a compile error telling the user to parenthesize. Mirrors
+    // silverc-rs Parser::parse_interp_hole.
+    private Node classifyHole(string raw, int hLine, int hCol) {
+        string h = this.ipTrim(raw);
+        if (h.length == 0) {
+            this.recordError("Expected expression in interpolation hole at line " + hLine.toString() + ", column " + hCol.toString());
+            Node empty = new Node(); empty.kind = 2; empty.strVal = "";
+            return empty;
+        }
+        if (this.holeFullyParenthesized(h)) {
+            string inner = this.ipTrim(this.ipSlice(h, 1, h.length - 2));
+            if (inner.length == 0) {
+                this.recordError("Expected expression in interpolation hole at line " + hLine.toString() + ", column " + hCol.toString());
+                Node empty = new Node(); empty.kind = 2; empty.strVal = "";
+                return empty;
+            }
+            return this.parseHoleExpr(inner, hLine, hCol);
+        }
+        Node en = this.parseHoleExpr(h, hLine, hCol);
+        if (!this.isValueRefNode(en)) {
+            this.recordError("expression interpolation must be wrapped in parentheses: use {(" + h + ")} for \"" + h + "\" at line " + hLine.toString() + ", column " + hCol.toString());
+            Node empty = new Node(); empty.kind = 2; empty.strVal = "";
+            return empty;
+        }
+        return en;
+    }
+
+    // Re-lex and parse one hole body as a single complete expression, forwarding
+    // any diagnostics the sub-parser records and rejecting trailing tokens
+    // (mirrors silverc-rs Parser::parse_hole_expr).
+    private Node parseHoleExpr(string text, int hLine, int hCol) {
+        Lexer lx = new Lexer(text);
+        Token[] toks = lx.tokenize();
+        Parser pp = new Parser(toks);
+        Node en = pp.parseExpr(0);
+        for (int e = 0; e < pp.diagErrors.length; e++) { this.recordError(pp.diagErrors[e]); }
+        if (!pp.check(0)) {
+            this.recordError("Expected end of interpolation hole at line " + hLine.toString() + ", column " + hCol.toString());
+        }
+        return en;
+    }
+
+    // True when the trimmed hole body `h` is entirely wrapped in one matching
+    // pair of parentheses: it starts with `(` whose partner `)` is the final
+    // character. Nested string/char literals are skipped so parens inside
+    // literals never count (mirrors silverc-rs hole_is_fully_parenthesized).
+    private bool holeFullyParenthesized(string h) {
+        int n = h.length;
+        if (n < 2) { return false; }
+        if (h[0] != '(' || h[n - 1] != ')') { return false; }
+        int depth = 0;
+        int i = 0;
+        while (i < n) {
+            char c = h[i];
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+                if (depth == 0) { return i == n - 1; }
+                if (depth < 0) { return false; }
+            } else if (c == '"' || c == '\'') {
+                char q = c;
+                int j = i + 1;
+                while (j < n) {
+                    if (h[j] == '\\') { j += 2; continue; }
+                    if (h[j] == q) { break; }
+                    j++;
+                }
+                i = j;
+            }
+            i++;
+        }
+        return false;
+    }
+
+    // Value-form interpolation check (SPEC 12.2): an identifier optionally
+    // followed by `.member` and/or `[index]` postfixes -- no operators, calls
+    // or literals. The bracket contents of an index may be any expression
+    // (mirrors silverc-rs is_value_ref_expr; kind 6 = identifier, 13 = member
+    // access, 24 = index).
+    private bool isValueRefNode(Node e) {
+        if (e.kind == 6) { return true; }
+        if (e.kind == 13 && e.childCount() > 0) { return this.isValueRefNode(e.child(0)); }
+        if (e.kind == 24 && e.childCount() > 0) { return this.isValueRefNode(e.child(0)); }
+        return false;
+    }
+
+    private bool ipIsSpace(char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    }
+
+    private string ipTrim(string s) {
+        int a = 0;
+        int b = s.length - 1;
+        while (a <= b && this.ipIsSpace(s[a])) { a++; }
+        while (b >= a && this.ipIsSpace(s[b])) { b--; }
+        return this.ipSlice(s, a, b);
+    }
+
+    // Characters s[a]..s[b] inclusive, clamped to the string bounds.
+    private string ipSlice(string s, int a, int b) {
+        string r = "";
+        if (a < 0) { a = 0; }
+        int i = a;
+        while (i <= b && i < s.length) { r += charToString(s[i]); i++; }
+        return r;
+    }
+
+    // Legacy `$ "..."` splitter for a non-adjacent Dollar token followed by a
+    // string literal (SPEC 12.2). Holes are split on balanced braces and routed
+    // through classifyHole so the value-vs-parenthesized rule matches the main
+    // interpolation path.
     private Node parseInterpString(string s) {
         Node n = new Node();
         n.kind = 69;
@@ -3505,6 +3650,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         int i = 0;
         while (i < s.length) {
             if (s[i] == '{') {
+                if (i + 1 < s.length && s[i + 1] == '{') { text += "{"; i += 2; continue; }
                 if (text.length > 0) {
                     Node tn = new Node(); tn.kind = 2; tn.strVal = text;
                     n.children.add(tn);
@@ -3523,12 +3669,12 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     i++;
                 }
                 if (depth == 0) {
-                    Lexer lx = new Lexer(exprSrc);
-                    Token[] toks = lx.tokenize();
-                    Parser pp = new Parser(toks);
-                    Node en = pp.parseExpr(0);
-                    n.children.add(en);
+                    n.children.add(this.classifyHole(exprSrc, n.line, n.col));
                 }
+                i++;
+            } else if (s[i] == '}') {
+                if (i + 1 < s.length && s[i + 1] == '}') { text += "}"; i += 2; continue; }
+                text += "}";
                 i++;
             } else {
                 text += charToString(s[i]);
