@@ -1,0 +1,141 @@
+mod export msgbox;
+
+// DOCS -- public `msgbox` module (DOCS/258). A modal message dialog mirroring
+// C# MessageBox with Silver casing: `msgbox.show()` overloads plus the
+// buttons/icon/default/options enums, returning a `dialogResult`. The call
+// blocks until the user dismisses the dialog. Windows-only (user32
+// MessageBoxA, ANSI text like the tray-balloon path); no #else and no
+// LINUX/MAC placeholders -- the other-OS regions get filled on their own
+// machines later. Off-target builds fall through to `dialogResult.None`.
+//
+// One module, one OS layer (msgbox -> win32.user32): every MessageBoxA call
+// lives INSIDE its show() body behind a `#on WINDOWS` region. OS selection
+// is compile-time via the preprocessor; the module does not use the runtime
+// `os` check.
+//
+// DISPATCH (per compiler): `msgbox` is NOT builtin-reserved anywhere, so it
+// resolves as an ORDINARY SOURCE module from disk (silverc/std/msgbox.sr)
+// on silverc-rs, the self-hosted compiler, and the interpreter alike. The
+// `win32.user32` grant inside is a std-library source grant (same posture as
+// std/sysinfo.sr, std/gui.sr): user programs only ever see `msgbox.*`.
+
+enum dialogResult { None, Ok, Cancel, Abort, Retry, Ignore, Yes, No }
+
+enum msgboxButtons { Ok, OkCancel, AbortRetryIgnore, YesNoCancel, YesNo, RetryCancel }
+
+enum msgboxIcon { None, Error, Question, Warning, Info }
+
+enum msgboxDefaultButton { Button1, Button2, Button3 }
+
+enum msgboxOptions { None, RightAlign, RtlReading, ServiceNotification, DefaultDesktopOnly }
+
+#on WINDOWS
+import * from win32.user32;
+#off
+
+// Win32 MB_* flag values (see DOCS/258): declaration order does NOT match
+// for icons, default buttons, or options, so every axis maps explicitly.
+int buttonFlags(msgboxButtons b) {
+    return match b {
+        msgboxButtons.Ok => 0;
+        msgboxButtons.OkCancel => 1;
+        msgboxButtons.AbortRetryIgnore => 2;
+        msgboxButtons.YesNoCancel => 3;
+        msgboxButtons.YesNo => 4;
+        msgboxButtons.RetryCancel => 5;
+        _ => 0;
+    };
+}
+
+int iconFlags(msgboxIcon i) {
+    return match i {
+        msgboxIcon.None => 0;
+        msgboxIcon.Error => 16;
+        msgboxIcon.Question => 32;
+        msgboxIcon.Warning => 48;
+        msgboxIcon.Info => 64;
+        _ => 0;
+    };
+}
+
+int defFlags(msgboxDefaultButton d) {
+    return match d {
+        msgboxDefaultButton.Button1 => 0;
+        msgboxDefaultButton.Button2 => 256;
+        msgboxDefaultButton.Button3 => 512;
+        _ => 0;
+    };
+}
+
+int optFlags(msgboxOptions o) {
+    return match o {
+        msgboxOptions.None => 0;
+        msgboxOptions.RightAlign => 524288;
+        msgboxOptions.RtlReading => 1048576;
+        msgboxOptions.ServiceNotification => 2097152;
+        msgboxOptions.DefaultDesktopOnly => 131072;
+        _ => 0;
+    };
+}
+
+// Win32 ID* result codes to dialogResult (0 / unknown => None).
+dialogResult resultFor(int code) {
+    return match code {
+        1 => dialogResult.Ok;
+        2 => dialogResult.Cancel;
+        3 => dialogResult.Abort;
+        4 => dialogResult.Retry;
+        5 => dialogResult.Ignore;
+        6 => dialogResult.Yes;
+        7 => dialogResult.No;
+        _ => dialogResult.None;
+    };
+}
+
+public dialogResult show(string text) {
+    #on WINDOWS
+    int code = MessageBoxA(null, text, "", 0);
+    return resultFor(code);
+    #off
+    return dialogResult.None;
+}
+
+public dialogResult show(string text, string caption) {
+    #on WINDOWS
+    int code = MessageBoxA(null, text, caption, 0);
+    return resultFor(code);
+    #off
+    return dialogResult.None;
+}
+
+public dialogResult show(string text, string caption, msgboxButtons buttons) {
+    #on WINDOWS
+    int code = MessageBoxA(null, text, caption, buttonFlags(buttons));
+    return resultFor(code);
+    #off
+    return dialogResult.None;
+}
+
+public dialogResult show(string text, string caption, msgboxButtons buttons, msgboxIcon icon) {
+    #on WINDOWS
+    int code = MessageBoxA(null, text, caption, buttonFlags(buttons) | iconFlags(icon));
+    return resultFor(code);
+    #off
+    return dialogResult.None;
+}
+
+public dialogResult show(string text, string caption, msgboxButtons buttons, msgboxIcon icon, msgboxDefaultButton defaultButton) {
+    #on WINDOWS
+    int code = MessageBoxA(null, text, caption, buttonFlags(buttons) | iconFlags(icon) | defFlags(defaultButton));
+    return resultFor(code);
+    #off
+    return dialogResult.None;
+}
+
+public dialogResult show(string text, string caption, msgboxButtons buttons, msgboxIcon icon, msgboxDefaultButton defaultButton, msgboxOptions opts) {
+    #on WINDOWS
+    int code = MessageBoxA(null, text, caption, buttonFlags(buttons) | iconFlags(icon) | defFlags(defaultButton) | optFlags(opts));
+    return resultFor(code);
+    #off
+    return dialogResult.None;
+}
