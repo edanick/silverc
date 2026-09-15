@@ -681,6 +681,21 @@ bool visIsDottedChild(string name, string root) {
     return projectFind(name, root + ".", 0) == 0;
 }
 
+// Directory holding this compiler binary (from cargs[0]), or "" when the
+// executable name carries no path. The visibility pass must resolve the same
+// files as the driver, so it probes the exe-relative tree before any
+// cwd-relative tree exactly like findModulePath does (see drvExeDir).
+string visExeDir() {
+    if (cargs.length == 0) { return ""; }
+    string exe = cargs[0];
+    int last = -1;
+    for (int i = 0; i < exe.length; i++) {
+        if (exe[i] == '\\' || exe[i] == '/') { last = i; }
+    }
+    if (last < 0) { return ""; }
+    return projectSlice(exe, 0, last);
+}
+
 string visFindModulePath(string name, string inputFile) {
     if (visBuiltinModule(name)) { return ""; }
     // Dotted children of the compiler baked-ins resolve to internals on
@@ -716,6 +731,18 @@ string visFindModulePath(string name, string inputFile) {
     }
     candidates.add(name + "\\" + name + ".sr");
     candidates.add(name + "/" + name + ".sr");
+    // The compiler's own tree (exe-relative) beats every cwd-relative tree
+    // below, mirroring findModulePath: a foreign cwd std/ must never shadow
+    // the shipped library.
+    string visExe = visExeDir();
+    if (visExe.length > 0) {
+        candidates.add(visExe + "\\std\\" + name + ".sr");
+        if (visHasDot) { candidates.add(visExe + "\\std\\" + visDottedBack + ".sr"); }
+        candidates.add(visExe + "\\std\\" + name + "\\" + name + ".sr");
+        candidates.add(visExe + "\\compiler\\" + name + ".sr");
+        if (visHasDot) { candidates.add(visExe + "\\compiler\\" + visDottedBack + ".sr"); }
+        candidates.add(visExe + "\\compiler\\" + name + "\\" + name + ".sr");
+    }
     candidates.add("std\\" + name + ".sr");
     if (visHasDot) { candidates.add("std\\" + visDottedBack + ".sr"); }
     candidates.add("std\\" + name + "\\" + name + ".sr");
@@ -762,6 +789,14 @@ string visFindModulePath(string name, string inputFile) {
     if (visHasDot) { candidates.add("..\\..\\silveri\\src\\" + visDottedBack + ".sr"); }
     candidates.add("..\\..\\silveri\\src\\" + name + "\\" + name + ".sr");
     #on LINUX
+    if (visExe.length > 0) {
+        candidates.add(visExe + "/std/" + name + ".sr");
+        if (visHasDot) { candidates.add(visExe + "/std/" + visDottedSlash + ".sr"); }
+        candidates.add(visExe + "/std/" + name + "/" + name + ".sr");
+        candidates.add(visExe + "/compiler/" + name + ".sr");
+        if (visHasDot) { candidates.add(visExe + "/compiler/" + visDottedSlash + ".sr"); }
+        candidates.add(visExe + "/compiler/" + name + "/" + name + ".sr");
+    }
     candidates.add("std/" + name + ".sr");
     if (visHasDot) { candidates.add("std/" + visDottedSlash + ".sr"); }
     candidates.add("std/" + name + "/" + name + ".sr");

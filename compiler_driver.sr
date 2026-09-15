@@ -191,6 +191,34 @@ bool drvIsDottedChild(string name, string root) {
     return projectFind(name, root + ".", 0) == 0;
 }
 
+// Directory holding this compiler binary (from cargs[0]), or "" when the
+// executable name carries no path (bare name on PATH). Module resolution
+// probes `<exeDir>\std\` and `<exeDir>\compiler\` before any cwd-relative
+// tree so a foreign cwd can never shadow the library the compiler shipped
+// with (mirrors silverc-rs exe-ancestor probing): e.g. running the test
+// suites from silverc-rs/ must not pick up its stale std stubs instead of
+// silverc/std. User files still win — input siblings and cwd-bare names are
+// probed before this tree.
+string drvExeDir() {
+    if (cargs.length == 0) { return ""; }
+    string exe = cargs[0];
+    int last = -1;
+    for (int i = 0; i < exe.length; i++) {
+        if (exe[i] == '\\' || exe[i] == '/') { last = i; }
+    }
+    if (last < 0) { return ""; }
+    return projectSlice(exe, 0, last);
+}
+
+// Read `rel` (a compiler-tree-relative path like "std\\llmai.sr") from the
+// compiler's own directory; "" when unavailable so callers fall through to
+// the historical cwd-relative ladder.
+string drvTryExeTree(string rel) {
+    string exeDir = drvExeDir();
+    if (exeDir.length == 0) { return ""; }
+    return tryReadFile(exeDir + "\\" + rel);
+}
+
 string findModulePath(string name, string inputFile) {
     if (projectBuiltin(name)) { return ""; }
     // Modules the driver already prepends above (llmai/exception/bom/process/
@@ -243,6 +271,18 @@ string findModulePath(string name, string inputFile) {
     }
     candidates.add(name + "\\" + name + ".sr");
     candidates.add(name + "/" + name + ".sr");
+    // The compiler's own tree (exe-relative, see drvExeDir) beats every
+    // cwd-relative tree below: a foreign cwd std/ (e.g. silverc-rs/std when
+    // the suites run from there) must never shadow silverc/std.
+    string exeDir = drvExeDir();
+    if (exeDir.length > 0) {
+        candidates.add(exeDir + "\\std\\" + name + ".sr");
+        if (drvHasDot) { candidates.add(exeDir + "\\std\\" + drvDottedBack + ".sr"); }
+        candidates.add(exeDir + "\\std\\" + name + "\\" + name + ".sr");
+        candidates.add(exeDir + "\\compiler\\" + name + ".sr");
+        if (drvHasDot) { candidates.add(exeDir + "\\compiler\\" + drvDottedBack + ".sr"); }
+        candidates.add(exeDir + "\\compiler\\" + name + "\\" + name + ".sr");
+    }
     candidates.add("std\\" + name + ".sr");
     if (drvHasDot) { candidates.add("std\\" + drvDottedBack + ".sr"); }
     candidates.add("std\\" + name + "\\" + name + ".sr");
@@ -293,6 +333,14 @@ string findModulePath(string name, string inputFile) {
     if (drvHasDot) { candidates.add("..\\..\\silveri\\src\\" + drvDottedBack + ".sr"); }
     candidates.add("..\\..\\silveri\\src\\" + name + "\\" + name + ".sr");
     #on LINUX
+    if (exeDir.length > 0) {
+        candidates.add(exeDir + "/std/" + name + ".sr");
+        if (drvHasDot) { candidates.add(exeDir + "/std/" + drvDottedSlash + ".sr"); }
+        candidates.add(exeDir + "/std/" + name + "/" + name + ".sr");
+        candidates.add(exeDir + "/compiler/" + name + ".sr");
+        if (drvHasDot) { candidates.add(exeDir + "/compiler/" + drvDottedSlash + ".sr"); }
+        candidates.add(exeDir + "/compiler/" + name + "/" + name + ".sr");
+    }
     candidates.add("std/" + name + ".sr");
     if (drvHasDot) { candidates.add("std/" + drvDottedSlash + ".sr"); }
     candidates.add("std/" + name + "/" + name + ".sr");
@@ -995,9 +1043,14 @@ int compileOnce(CliFlags flags, string outputFile) {
         if (llmaiImport >= 0) {
             // Load the wrapper by content instead of probing with
             // file.exists(): the self-hosted exists lowering is not reliable
-            // for paths containing `..` on every bootstrap stage. Try paths
-            // relative to the process cwd and the test-suite directories.
-            string llmaiSource = tryReadFile("std\\llmai.sr");
+            // for paths containing `..` on every bootstrap stage. The
+            // compiler's own tree (exe-relative) goes first so a foreign cwd
+            // std/ can never shadow the shipped wrapper; then paths relative
+            // to the process cwd and the test-suite directories.
+            string llmaiSource = drvTryExeTree("std\\llmai.sr");
+            if (llmaiSource.length == 0) {
+                llmaiSource = tryReadFile("std\\llmai.sr");
+            }
             if (llmaiSource.length == 0) {
                 llmaiSource = tryReadFile("silverc\\std\\llmai.sr");
             }
@@ -1036,7 +1089,10 @@ int compileOnce(CliFlags flags, string outputFile) {
         // the shared fields to strings. Mirrors the llmai handling above.
         int excImport = projectFind(source, "from " + "exception", 0);
         if (excImport >= 0) {
-            string excSource = tryReadFile("std\\exception.sr");
+            string excSource = drvTryExeTree("std\\exception.sr");
+            if (excSource.length == 0) {
+                excSource = tryReadFile("std\\exception.sr");
+            }
             if (excSource.length == 0) {
                 excSource = tryReadFile("silverc\\std\\exception.sr");
             }
@@ -1074,7 +1130,8 @@ int compileOnce(CliFlags flags, string outputFile) {
         // self-hosted import behavior used by llmai and exception.
         int bomImport = projectFind(source, "from " + "bom", 0);
         if (bomImport >= 0) {
-            string bomSource = tryReadFile("std\\bom.sr");
+            string bomSource = drvTryExeTree("std\\bom.sr");
+            if (bomSource.length == 0) { bomSource = tryReadFile("std\\bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile("silverc\\std\\bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile("..\\std\\bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile("..\\silverc\\std\\bom.sr"); }
@@ -1090,7 +1147,8 @@ int compileOnce(CliFlags flags, string outputFile) {
         }
         int processImport = projectFind(source, "from " + "process", 0);
         if (processImport >= 0) {
-            string processSource = tryReadFile("std\\process.sr");
+            string processSource = drvTryExeTree("std\\process.sr");
+            if (processSource.length == 0) { processSource = tryReadFile("std\\process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile("silverc\\std\\process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile("..\\std\\process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile("..\\silverc\\std\\process.sr"); }
@@ -1109,7 +1167,8 @@ int compileOnce(CliFlags flags, string outputFile) {
         // imports it, matching the self-hosted import behavior above.
         int notifImport = projectFind(source, "from " + "notifications", 0);
         if (notifImport >= 0) {
-            string notifSource = tryReadFile("std\\notifications.sr");
+            string notifSource = drvTryExeTree("std\\notifications.sr");
+            if (notifSource.length == 0) { notifSource = tryReadFile("std\\notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile("silverc\\std\\notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile("..\\std\\notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile("..\\silverc\\std\\notifications.sr"); }
