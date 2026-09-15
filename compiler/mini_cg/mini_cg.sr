@@ -8822,6 +8822,16 @@ public void genNewCall(Node call) {
             this.emitExcCheck();
             return;
         }
+        // DOCS/259 -- file dialog bridges carry six args plus struct/loop
+        // lowering that cannot ride the ordinary four-register
+        // external-call path, so they intercept here beside GetCursorPos
+        // (which needs a real POINT pointer for the same reason) instead
+        // of the post-spill bridge arms below.
+        if (name == "nativeOpenFile" || name == "nativeSaveFile" || name == "nativeFolder") {
+            this.genDialogCall(call, argStart, name);
+            this.emitExcCheck();
+            return;
+        }
         // LINUX SysV backend (additive): a free-function call into a granted
         // linux module (linux.libc/libX11/libXtst) emits a self-contained
         // SysV import call through the ELF GOT here and returns (mirrors
@@ -13813,6 +13823,14 @@ public void genNewCall(Node call) {
 
     public void genCursorPosCall(Node call, int argStart) {
         this.windowsBackend.genCursorPosCall(this, call, argStart);
+    }
+
+    // DOCS/259 -- file dialog bridges (real comdlg32/shell32 sequences in
+    // MiniCgWindows; the intercept sits beside GetCursorPos above).
+    public void genDialogCall(Node call, int argStart, string name) {
+        if (name == "nativeOpenFile") { this.windowsBackend.genDialogOpenCall(this, call, argStart); return; }
+        if (name == "nativeSaveFile") { this.windowsBackend.genDialogSaveCall(this, call, argStart); return; }
+        this.windowsBackend.genDialogFolderCall(this, call, argStart);
     }
 
     public void genGetEnvCall(Node call) {

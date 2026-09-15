@@ -429,4 +429,467 @@ class MiniCgWindows {
         // Return buffer
         cg.asm.movRMBase(0, 5, bufOff);
     }
+
+    // DOCS/259 -- file dialog bridges (nativeOpenFile / nativeSaveFile /
+    // nativeFolder, called from silverc/std/dialogs.sr `#on WINDOWS`
+    // regions). silverc-rs lowers the same three names to real
+    // comdlg32/shell32 sequences (src/stdlib/dialogs.rs); this backend
+    // emits the identical shapes: heap OPENFILENAMEA (152 bytes) /
+    // BROWSEINFOA (64 bytes) + NUL-doubled filter copy + file buffers +
+    // IAT call via addImportPatch (comdlg32.dll/shell32.dll record like
+    // any other DLL -- nothing to grant, bridges dispatch by name).
+    //
+    // Struct ground truth (python ctypes, x64): OPENFILENAMEA lStructSize:0,
+    // hwndOwner:8, lpstrFilter:24, nFilterIndex:44, lpstrFile:48, nMaxFile:56,
+    // lpstrInitialDir:80, lpstrTitle:88, Flags:96, lpstrDefExt:104 (size
+    // 152); BROWSEINFOA hwndOwner:0, pszDisplayName:16, lpszTitle:24,
+    // ulFlags:32, lpfn:40, lParam:48 (size 64). DWORD stores use 8-byte
+    // movMBaseR with the silverc-rs overlap discipline (zeroed heap +
+    // neighbours that are padding or written later). The
+    // SHBrowseForFolderA PIDL is leaked on purpose (no ole32
+    // CoTaskMemFree -- COM-adjacent, out of scope).
+
+    public void dlgHeapAllocFromR8(MiniCg cg) {
+        // R8 = size on entry; RAX = zero-filled heap block on exit.
+        cg.asm.pushR64(8);
+        cg.asm.emitCallSetup(0);
+        cg.emitGetProcessHeapCall();
+        cg.asm.emitCallTeardown();
+        cg.asm.popR64(8);
+        cg.asm.movRR64(1, 0);
+        cg.asm.movRI64(2, 8);
+        cg.asm.emitCallSetup(0);
+        cg.emitHeapAllocCall();
+        cg.asm.emitCallTeardown();
+    }
+
+    public void dlgStrlen(MiniCg cg, int ptrOff) {
+        // RAX = strlen([ptrOff]).
+        cg.asm.movRMBase(1, 5, ptrOff);
+        cg.addImportPatch("ucrtbase.dll", "strlen");
+        cg.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.emitCallSetup(0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+    }
+
+    public void dlgCopyBytes(MiniCg cg, int srcOff, int dstOff, int lenOff) {
+        // Copies [lenOff] bytes [srcOff] -> [dstOff]; byte loop, ptr bumps.
+        int remOff = cg.allocLocal("__dlg_rem");
+        cg.asm.movRMBase(0, 5, lenOff);
+        cg.asm.movMBaseR(5, 0, remOff);
+        int sOff = cg.allocLocal("__dlg_cs");
+        int dOff = cg.allocLocal("__dlg_cd");
+        cg.asm.movRMBase(0, 5, srcOff);
+        cg.asm.movMBaseR(5, 0, sOff);
+        cg.asm.movRMBase(0, 5, dstOff);
+        cg.asm.movMBaseR(5, 0, dOff);
+        int top = cg.newLabel();
+        int tend = cg.newLabel();
+        cg.asm.bindLabel(top);
+        cg.asm.movRMBase(0, 5, remOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jleLabel(tend);
+        cg.asm.movRMBase(11, 5, sOff);
+        cg.asm.movzxByteMBase(0, 11, 0);
+        cg.asm.movRMBase(11, 5, dOff);
+        cg.asm.movMBaseByteR(11, 0, 0);
+        cg.asm.movRMBase(0, 5, sOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, sOff);
+        cg.asm.movRMBase(0, 5, dOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, dOff);
+        cg.asm.movRMBase(0, 5, remOff);
+        cg.asm.subRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, remOff);
+        cg.asm.jmpLabel(top);
+        cg.asm.bindLabel(tend);
+    }
+
+    public void dlgFilterCopy(MiniCg cg, int srcOff, int dstOff) {
+        // `a|b` -> `a\0b\0\0`; [dstOff] = converted pointer, or 0 when the
+        // Silver filter is empty (=> NULL lpstrFilter).
+        this.dlgStrlen(cg, srcOff);
+        int lenOff = cg.allocLocal("__dlg_flen");
+        cg.asm.movMBaseR(5, 0, lenOff);
+        int build = cg.newLabel();
+        int fdone = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jneLabel(build);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.movMBaseR(5, 0, dstOff);
+        cg.asm.jmpLabel(fdone);
+        cg.asm.bindLabel(build);
+        cg.asm.movRMBase(8, 5, lenOff);
+        cg.asm.addRI32(8, 2);
+        this.dlgHeapAllocFromR8(cg);
+        int bufOff = cg.allocLocal("__dlg_fbuf");
+        cg.asm.movMBaseR(5, 0, bufOff);
+        // Byte loop over len+1 input bytes (copies the NUL too); 124 is '|'.
+        int remOff = cg.allocLocal("__dlg_frem");
+        cg.asm.movRMBase(0, 5, lenOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, remOff);
+        int sOff = cg.allocLocal("__dlg_fs");
+        int dOff = cg.allocLocal("__dlg_fd");
+        cg.asm.movRMBase(0, 5, srcOff);
+        cg.asm.movMBaseR(5, 0, sOff);
+        cg.asm.movRMBase(0, 5, bufOff);
+        cg.asm.movMBaseR(5, 0, dOff);
+        int top = cg.newLabel();
+        int tend = cg.newLabel();
+        cg.asm.bindLabel(top);
+        cg.asm.movRMBase(0, 5, remOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jleLabel(tend);
+        cg.asm.movRMBase(11, 5, sOff);
+        cg.asm.movzxByteMBase(0, 11, 0);
+        cg.asm.cmpRI32(0, 124);
+        int keep = cg.newLabel();
+        cg.asm.jneLabel(keep);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.bindLabel(keep);
+        cg.asm.movRMBase(11, 5, dOff);
+        cg.asm.movMBaseByteR(11, 0, 0);
+        cg.asm.movRMBase(0, 5, sOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, sOff);
+        cg.asm.movRMBase(0, 5, dOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, dOff);
+        cg.asm.movRMBase(0, 5, remOff);
+        cg.asm.subRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, remOff);
+        cg.asm.jmpLabel(top);
+        cg.asm.bindLabel(tend);
+        // Second trailing NUL at buf[len+1].
+        cg.asm.movRMBase(11, 5, bufOff);
+        cg.asm.movRMBase(0, 5, lenOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.addRR64(11, 0);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.movMBaseByteR(11, 0, 0);
+        cg.asm.movRMBase(0, 5, bufOff);
+        cg.asm.movMBaseR(5, 0, dstOff);
+        cg.asm.bindLabel(fdone);
+    }
+
+    public void dlgNullIfEmpty(MiniCg cg, int srcOff, int dstOff) {
+        // [dstOff] = NULL when [srcOff] is empty, else the same pointer.
+        this.dlgStrlen(cg, srcOff);
+        int nn = cg.newLabel();
+        int ndone = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jneLabel(nn);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.jmpLabel(ndone);
+        cg.asm.bindLabel(nn);
+        cg.asm.movRMBase(0, 5, srcOff);
+        cg.asm.bindLabel(ndone);
+        cg.asm.movMBaseR(5, 0, dstOff);
+    }
+
+    public void dlgStoreByteAt(MiniCg cg, int baseOff, int idxOff, int val) {
+        // [baseOff]+[idxOff] = val (single byte).
+        cg.asm.movRMBase(11, 5, baseOff);
+        cg.asm.movRMBase(0, 5, idxOff);
+        cg.asm.addRR64(11, 0);
+        cg.asm.movRI64(0, val);
+        cg.asm.movMBaseByteR(11, 0, 0);
+    }
+
+    public void genDialogOpenCall(MiniCg cg, Node call, int argStart) {
+        if (call.childCount() <= argStart + 5) { cg.emitLlmaiStringLiteral(""); return; }
+        int filterOff = cg.allocLocal("__dlg_filter");
+        cg.genExpr(call.child(argStart));
+        cg.asm.movMBaseR(5, 0, filterOff);
+        int dirOff = cg.allocLocal("__dlg_dir");
+        cg.genExpr(call.child(argStart + 1));
+        cg.asm.movMBaseR(5, 0, dirOff);
+        int titleOff = cg.allocLocal("__dlg_title");
+        cg.genExpr(call.child(argStart + 2));
+        cg.asm.movMBaseR(5, 0, titleOff);
+        int extOff = cg.allocLocal("__dlg_ext");
+        cg.genExpr(call.child(argStart + 3));
+        cg.asm.movMBaseR(5, 0, extOff);
+        int idxOff = cg.allocLocal("__dlg_idx");
+        cg.genExpr(call.child(argStart + 4));
+        cg.asm.movMBaseR(5, 0, idxOff);
+        int flagsOff = cg.allocLocal("__dlg_flags");
+        cg.genExpr(call.child(argStart + 5));
+        cg.asm.movMBaseR(5, 0, flagsOff);
+        int filtPtrOff = cg.allocLocal("__dlg_filter_ptr");
+        this.dlgFilterCopy(cg, filterOff, filtPtrOff);
+        cg.asm.movRI64(8, 32768);
+        this.dlgHeapAllocFromR8(cg);
+        int fileOff = cg.allocLocal("__dlg_file");
+        cg.asm.movMBaseR(5, 0, fileOff);
+        int extPtrOff = cg.allocLocal("__dlg_ext_ptr");
+        this.dlgNullIfEmpty(cg, extOff, extPtrOff);
+        int dirPtrOff = cg.allocLocal("__dlg_dir_ptr");
+        this.dlgNullIfEmpty(cg, dirOff, dirPtrOff);
+        cg.asm.movRMBase(0, 5, idxOff);
+        int idxOk = cg.newLabel();
+        cg.asm.cmpRI32(0, 1);
+        cg.asm.jgeLabel(idxOk);
+        cg.asm.movRI64(0, 1);
+        cg.asm.movMBaseR(5, 0, idxOff);
+        cg.asm.bindLabel(idxOk);
+        cg.asm.movRI64(8, 152);
+        this.dlgHeapAllocFromR8(cg);
+        int stOff = cg.allocLocal("__dlg_struct");
+        cg.asm.movMBaseR(5, 0, stOff);
+        cg.asm.movRMBase(10, 5, stOff);
+        cg.asm.movRI64(0, 152);
+        cg.asm.movMBaseR(10, 0, 0);
+        cg.asm.movRMBase(0, 5, filtPtrOff);
+        cg.asm.movMBaseR(10, 0, 24);
+        cg.asm.movRMBase(0, 5, idxOff);
+        cg.asm.movMBaseR(10, 0, 44);
+        cg.asm.movRMBase(0, 5, fileOff);
+        cg.asm.movMBaseR(10, 0, 48);
+        cg.asm.movRI64(0, 32768);
+        cg.asm.movMBaseR(10, 0, 56);
+        cg.asm.movRMBase(0, 5, dirPtrOff);
+        cg.asm.movMBaseR(10, 0, 80);
+        cg.asm.movRMBase(0, 5, titleOff);
+        cg.asm.movMBaseR(10, 0, 88);
+        cg.asm.movRMBase(0, 5, flagsOff);
+        cg.asm.movMBaseR(10, 0, 96);
+        cg.asm.movRMBase(0, 5, extPtrOff);
+        cg.asm.movMBaseR(10, 0, 104);
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRMBase(1, 5, stOff);
+        cg.addImportPatch("comdlg32.dll", "GetOpenFileNameA");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        int done = cg.newLabel();
+        int cancelled = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(cancelled);
+        this.dlgStrlen(cg, fileOff);
+        int len1Off = cg.allocLocal("__dlg_len1");
+        cg.asm.movMBaseR(5, 0, len1Off);
+        cg.asm.movRMBase(11, 5, fileOff);
+        cg.asm.movRMBase(0, 5, len1Off);
+        cg.asm.addRR64(11, 0);
+        cg.asm.addRI32(11, 1);
+        cg.asm.movzxByteMBase(0, 11, 0);
+        cg.asm.cmpRI32(0, 0);
+        int multi = cg.newLabel();
+        cg.asm.jneLabel(multi);
+        cg.asm.movRMBase(0, 5, fileOff);
+        cg.asm.jmpLabel(done);
+        cg.asm.bindLabel(multi);
+        cg.asm.movRI64(8, 32768);
+        this.dlgHeapAllocFromR8(cg);
+        int outOff = cg.allocLocal("__dlg_out");
+        cg.asm.movMBaseR(5, 0, outOff);
+        int outIdxOff = cg.allocLocal("__dlg_out_idx");
+        cg.asm.movRI64(0, 0);
+        cg.asm.movMBaseR(5, 0, outIdxOff);
+        cg.asm.movRMBase(0, 5, fileOff);
+        cg.asm.movRMBase(1, 5, len1Off);
+        cg.asm.addRR64(0, 1);
+        cg.asm.addRI32(0, 1);
+        int entryOff = cg.allocLocal("__dlg_entry");
+        cg.asm.movMBaseR(5, 0, entryOff);
+        int firstOff = cg.allocLocal("__dlg_first");
+        cg.asm.movRI64(0, 1);
+        cg.asm.movMBaseR(5, 0, firstOff);
+        int mtop = cg.newLabel();
+        int mnext = cg.newLabel();
+        int msep = cg.newLabel();
+        int mterm = cg.newLabel();
+        cg.asm.bindLabel(mtop);
+        this.dlgStrlen(cg, entryOff);
+        int elenOff = cg.allocLocal("__dlg_elen");
+        cg.asm.movMBaseR(5, 0, elenOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(mterm);
+        cg.asm.movRMBase(0, 5, firstOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(msep);
+        cg.asm.movRI64(0, 0);
+        cg.asm.movMBaseR(5, 0, firstOff);
+        cg.asm.jmpLabel(mnext);
+        cg.asm.bindLabel(msep);
+        this.dlgStoreByteAt(cg, outOff, outIdxOff, 10);
+        cg.asm.movRMBase(0, 5, outIdxOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, outIdxOff);
+        cg.asm.bindLabel(mnext);
+        int tmpOff = cg.allocLocal("__dlg_tmp");
+        cg.asm.movRMBase(0, 5, outOff);
+        cg.asm.movRMBase(1, 5, outIdxOff);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movMBaseR(5, 0, tmpOff);
+        this.dlgCopyBytes(cg, fileOff, tmpOff, len1Off);
+        cg.asm.movRMBase(0, 5, outIdxOff);
+        cg.asm.movRMBase(1, 5, len1Off);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movMBaseR(5, 0, outIdxOff);
+        this.dlgStoreByteAt(cg, outOff, outIdxOff, 92);
+        cg.asm.movRMBase(0, 5, outIdxOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, outIdxOff);
+        cg.asm.movRMBase(0, 5, outOff);
+        cg.asm.movRMBase(1, 5, outIdxOff);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movMBaseR(5, 0, tmpOff);
+        this.dlgCopyBytes(cg, entryOff, tmpOff, elenOff);
+        cg.asm.movRMBase(0, 5, outIdxOff);
+        cg.asm.movRMBase(1, 5, elenOff);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movMBaseR(5, 0, outIdxOff);
+        cg.asm.movRMBase(0, 5, entryOff);
+        cg.asm.movRMBase(1, 5, elenOff);
+        cg.asm.addRR64(0, 1);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, entryOff);
+        cg.asm.jmpLabel(mtop);
+        cg.asm.bindLabel(cancelled);
+        cg.emitLlmaiStringLiteral("");
+        cg.asm.jmpLabel(done);
+        cg.asm.bindLabel(mterm);
+        this.dlgStoreByteAt(cg, outOff, outIdxOff, 0);
+        cg.asm.movRMBase(0, 5, outOff);
+        cg.asm.bindLabel(done);
+    }
+
+    public void genDialogSaveCall(MiniCg cg, Node call, int argStart) {
+        if (call.childCount() <= argStart + 5) { cg.emitLlmaiStringLiteral(""); return; }
+        int filterOff = cg.allocLocal("__dlg_filter");
+        cg.genExpr(call.child(argStart));
+        cg.asm.movMBaseR(5, 0, filterOff);
+        int dirOff = cg.allocLocal("__dlg_dir");
+        cg.genExpr(call.child(argStart + 1));
+        cg.asm.movMBaseR(5, 0, dirOff);
+        int titleOff = cg.allocLocal("__dlg_title");
+        cg.genExpr(call.child(argStart + 2));
+        cg.asm.movMBaseR(5, 0, titleOff);
+        int extOff = cg.allocLocal("__dlg_ext");
+        cg.genExpr(call.child(argStart + 3));
+        cg.asm.movMBaseR(5, 0, extOff);
+        int idxOff = cg.allocLocal("__dlg_idx");
+        cg.genExpr(call.child(argStart + 4));
+        cg.asm.movMBaseR(5, 0, idxOff);
+        int flagsOff = cg.allocLocal("__dlg_flags");
+        cg.genExpr(call.child(argStart + 5));
+        cg.asm.movMBaseR(5, 0, flagsOff);
+        int filtPtrOff = cg.allocLocal("__dlg_filter_ptr");
+        this.dlgFilterCopy(cg, filterOff, filtPtrOff);
+        cg.asm.movRI64(8, 4096);
+        this.dlgHeapAllocFromR8(cg);
+        int fileOff = cg.allocLocal("__dlg_file");
+        cg.asm.movMBaseR(5, 0, fileOff);
+        int extPtrOff = cg.allocLocal("__dlg_ext_ptr");
+        this.dlgNullIfEmpty(cg, extOff, extPtrOff);
+        int dirPtrOff = cg.allocLocal("__dlg_dir_ptr");
+        this.dlgNullIfEmpty(cg, dirOff, dirPtrOff);
+        cg.asm.movRMBase(0, 5, idxOff);
+        int idxOk = cg.newLabel();
+        cg.asm.cmpRI32(0, 1);
+        cg.asm.jgeLabel(idxOk);
+        cg.asm.movRI64(0, 1);
+        cg.asm.movMBaseR(5, 0, idxOff);
+        cg.asm.bindLabel(idxOk);
+        cg.asm.movRI64(8, 152);
+        this.dlgHeapAllocFromR8(cg);
+        int stOff = cg.allocLocal("__dlg_struct");
+        cg.asm.movMBaseR(5, 0, stOff);
+        cg.asm.movRMBase(10, 5, stOff);
+        cg.asm.movRI64(0, 152);
+        cg.asm.movMBaseR(10, 0, 0);
+        cg.asm.movRMBase(0, 5, filtPtrOff);
+        cg.asm.movMBaseR(10, 0, 24);
+        cg.asm.movRMBase(0, 5, idxOff);
+        cg.asm.movMBaseR(10, 0, 44);
+        cg.asm.movRMBase(0, 5, fileOff);
+        cg.asm.movMBaseR(10, 0, 48);
+        cg.asm.movRI64(0, 4096);
+        cg.asm.movMBaseR(10, 0, 56);
+        cg.asm.movRMBase(0, 5, dirPtrOff);
+        cg.asm.movMBaseR(10, 0, 80);
+        cg.asm.movRMBase(0, 5, titleOff);
+        cg.asm.movMBaseR(10, 0, 88);
+        cg.asm.movRMBase(0, 5, flagsOff);
+        cg.asm.movMBaseR(10, 0, 96);
+        cg.asm.movRMBase(0, 5, extPtrOff);
+        cg.asm.movMBaseR(10, 0, 104);
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRMBase(1, 5, stOff);
+        cg.addImportPatch("comdlg32.dll", "GetSaveFileNameA");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        int done = cg.newLabel();
+        int cancelled = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(cancelled);
+        cg.asm.movRMBase(0, 5, fileOff);
+        cg.asm.jmpLabel(done);
+        cg.asm.bindLabel(cancelled);
+        cg.emitLlmaiStringLiteral("");
+        cg.asm.bindLabel(done);
+    }
+
+    public void genDialogFolderCall(MiniCg cg, Node call, int argStart) {
+        if (call.childCount() <= argStart) { cg.emitLlmaiStringLiteral(""); return; }
+        int titleOff = cg.allocLocal("__dlg_title");
+        cg.genExpr(call.child(argStart));
+        cg.asm.movMBaseR(5, 0, titleOff);
+        cg.asm.movRI64(8, 512);
+        this.dlgHeapAllocFromR8(cg);
+        int displayOff = cg.allocLocal("__dlg_display");
+        cg.asm.movMBaseR(5, 0, displayOff);
+        cg.asm.movRI64(8, 64);
+        this.dlgHeapAllocFromR8(cg);
+        int stOff = cg.allocLocal("__dlg_struct");
+        cg.asm.movMBaseR(5, 0, stOff);
+        cg.asm.movRMBase(10, 5, stOff);
+        cg.asm.movRMBase(0, 5, displayOff);
+        cg.asm.movMBaseR(10, 0, 16);
+        cg.asm.movRMBase(0, 5, titleOff);
+        cg.asm.movMBaseR(10, 0, 24);
+        cg.asm.movRI64(0, 65);
+        cg.asm.movMBaseR(10, 0, 32);
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRMBase(1, 5, stOff);
+        cg.addImportPatch("shell32.dll", "SHBrowseForFolderA");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        int done = cg.newLabel();
+        int cancelled = cg.newLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(cancelled);
+        int pidlOff = cg.allocLocal("__dlg_pidl");
+        cg.asm.movMBaseR(5, 0, pidlOff);
+        cg.asm.movRI64(8, 4096);
+        this.dlgHeapAllocFromR8(cg);
+        int pathOff = cg.allocLocal("__dlg_path");
+        cg.asm.movMBaseR(5, 0, pathOff);
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRMBase(1, 5, pidlOff);
+        cg.asm.movRMBase(2, 5, pathOff);
+        cg.addImportPatch("shell32.dll", "SHGetPathFromIDListA");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(cancelled);
+        cg.asm.movRMBase(0, 5, pathOff);
+        cg.asm.jmpLabel(done);
+        cg.asm.bindLabel(cancelled);
+        cg.emitLlmaiStringLiteral("");
+        cg.asm.bindLabel(done);
+    }
 }

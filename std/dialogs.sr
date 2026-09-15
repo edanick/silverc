@@ -1,0 +1,213 @@
+import * from msgbox;
+
+mod export dialogs;
+
+// DOCS -- public `dialogs` module (DOCS/259). Modal file/folder picker
+// dialogs mirroring C# with Silver casing: `OpenFileDialog`,
+// `SaveFileDialog` and `OpenFolderDialog` are configured through setter
+// methods; `showDialog()` blocks until dismissal and returns a
+// `dialogResult` (`dialogResult.Ok` on accept, `dialogResult.Cancel`
+// otherwise -- reused from `msgbox`, see `258. message box.md`).
+// Windows-only (comdlg32 GetOpenFileNameA/GetSaveFileNameA + shell32
+// SHBrowseForFolderA/SHGetPathFromIDListA, ANSI text like the tray-balloon
+// path); no #else and no LINUX/MAC placeholders -- the other-OS regions get
+// filled on their own machines later. Off-target builds fall through to
+// `dialogResult.None` / `""` (same posture as std/msgbox.sr).
+//
+// One module, one OS layer (dialogs -> comdlg32/shell32): every bridge call
+// lives INSIDE its showDialog() body behind a `#on WINDOWS` region. OS
+// selection is compile-time via the preprocessor; the module does not use
+// the runtime `os` check.
+//
+// DISPATCH (per compiler): `dialogs` is NOT builtin-reserved anywhere, so
+// it resolves as an ORDINARY SOURCE module from disk (silverc/std/
+// dialogs.sr) on silverc-rs, the self-hosted compiler, and the interpreter
+// alike (same posture as std/msgbox.sr).
+//
+// NO WIN32 IMPORT GRANTS -- deliberate, same shape as the toast bridge in
+// std/notifications.sr: the work is done by the COMPILER-SYNTHESIZED
+// `nativeOpenFile` / `nativeSaveFile` / `nativeFolder` bridges dispatched BY
+// NAME from this module (there is no module-scoped dispatch and nothing to
+// grant), so each showDialog() region contains the plain call with no
+// import:
+//
+// - silverc-rs: the calls are intercepted in src/codegen.rs and lowered to
+//   src/stdlib/dialogs.rs, which registers the IAT imports DIRECTLY
+//   (comdlg32 GetOpenFileNameA/GetSaveFileNameA, shell32
+//   SHBrowseForFolderA/SHGetPathFromIDListA). Those exports live in the
+//   compiler's own IAT tables, NOT in any win32.* Silver grant table.
+// - self-hosted silverc: compiler/parser.sr whitelists the three names and
+//   compiler/mini_cg.sr lowers each call to the real Win32 sequence (heap
+//   OPENFILENAMEA/BROWSEINFOA + file buffers + IAT call via addImportPatch).
+// - silveri: eval.sr defines the three builtins as no-ops returning ""
+//   (the interpreter cannot build Win32 structs; documented limitation --
+//   deterministic Cancel semantics).
+//
+// BRIDGE CONTRACTS (Silver-level signatures, WINDOWS regions only):
+//   nativeOpenFile(filter, initDir, title, defExt, filterIndex, flags)
+//     -> "" on cancel, else the path (or \n-joined dir\file lines when a
+//     multiselect pick returned several files).
+//   nativeSaveFile(filter, initDir, title, defExt, filterIndex, flags)
+//     -> "" on cancel, else the chosen path.
+//   nativeFolder(title) -> "" on cancel, else the chosen folder path.
+// Filter uses `|` separators (the NATIVE side converts to \0-joined +
+// \0\0); a bare defExt ("txt") or "" (=> NULL); filterIndex 1-based (the
+// native side clamps to >= 1).
+//
+// CANCEL yields dialogResult.Cancel with empty results -- never an
+// exception. With multiselect on, fileNames() holds every pick and
+// fileName() holds the first.
+//
+// PRIVATE FIELDS stay terse and prefixed (dlg*); every public signature
+// uses full words (filter/filterIndex/initialDirectory/title/defaultExt,
+// never w/h/fd).
+
+// OFN_EXPLORER (0x80000) + OFN_NOCHANGEDIR (8) + OFN_HIDEREADONLY (4) always;
+// OFN_FILEMUSTEXIST (0x1000) + OFN_PATHMUSTEXIST (0x800) when the check is
+// on; OFN_ALLOWMULTISELECT (0x200) when multi is on.
+int dlgOpenFlags(bool checkFileExists, bool multi) {
+    int flags = 524288;
+    flags = flags | 8;
+    flags = flags | 4;
+    if (checkFileExists) {
+        flags = flags | 4096;
+        flags = flags | 2048;
+    }
+    if (multi) {
+        flags = flags | 512;
+    }
+    return flags;
+}
+
+// Same base, plus OFN_OVERWRITEPROMPT (2) when the prompt is on.
+int dlgSaveFlags(bool overwrite) {
+    int flags = 524288;
+    flags = flags | 8;
+    flags = flags | 4;
+    if (overwrite) {
+        flags = flags | 2;
+    }
+    return flags;
+}
+
+class OpenFileDialog {
+    private string dlgFilter;
+    private string dlgInitDir;
+    private string dlgTitle;
+    private string dlgDefExt;
+    private int dlgFilterIndex;
+    private bool dlgCheckExists;
+    private bool dlgMulti;
+    private string dlgPicked;
+
+    construct() {
+        this.dlgFilter = "";
+        this.dlgInitDir = "";
+        this.dlgTitle = "";
+        this.dlgDefExt = "";
+        this.dlgFilterIndex = 1;
+        this.dlgCheckExists = false;
+        this.dlgMulti = false;
+        this.dlgPicked = "";
+    }
+
+    public void setFilter(string filter) { this.dlgFilter = filter; }
+    public void setFilterIndex(int filterIndex) { this.dlgFilterIndex = filterIndex; }
+    public void setInitialDirectory(string initialDirectory) { this.dlgInitDir = initialDirectory; }
+    public void setTitle(string title) { this.dlgTitle = title; }
+    public void setDefaultExt(string defaultExt) { this.dlgDefExt = defaultExt; }
+    public void setCheckFileExists(bool checkFileExists) { this.dlgCheckExists = checkFileExists; }
+    public void setMultiselect(bool multi) { this.dlgMulti = multi; }
+
+    public dialogResult showDialog() {
+        #on WINDOWS
+        int flags = dlgOpenFlags(this.dlgCheckExists, this.dlgMulti);
+        string raw = nativeOpenFile(this.dlgFilter, this.dlgInitDir, this.dlgTitle, this.dlgDefExt, this.dlgFilterIndex, flags);
+        this.dlgPicked = raw;
+        if (raw == "") { return dialogResult.Cancel; }
+        return dialogResult.Ok;
+        #off
+        return dialogResult.None;
+    }
+
+    public string fileName() {
+        if (this.dlgPicked == "") { return ""; }
+        string[] parts = this.dlgPicked.split("\n");
+        if (parts.length == 0) { return ""; }
+        return parts[0];
+    }
+
+    public string[] fileNames() {
+        string[] out = [];
+        if (this.dlgPicked == "") { return out; }
+        return this.dlgPicked.split("\n");
+    }
+}
+
+class SaveFileDialog {
+    private string dlgFilter;
+    private string dlgInitDir;
+    private string dlgTitle;
+    private string dlgDefExt;
+    private int dlgFilterIndex;
+    private bool dlgOverwrite;
+    private string dlgPicked;
+
+    construct() {
+        this.dlgFilter = "";
+        this.dlgInitDir = "";
+        this.dlgTitle = "";
+        this.dlgDefExt = "";
+        this.dlgFilterIndex = 1;
+        this.dlgOverwrite = true;
+        this.dlgPicked = "";
+    }
+
+    public void setFilter(string filter) { this.dlgFilter = filter; }
+    public void setFilterIndex(int filterIndex) { this.dlgFilterIndex = filterIndex; }
+    public void setInitialDirectory(string initialDirectory) { this.dlgInitDir = initialDirectory; }
+    public void setTitle(string title) { this.dlgTitle = title; }
+    public void setDefaultExt(string defaultExt) { this.dlgDefExt = defaultExt; }
+    public void setOverwritePrompt(bool overwrite) { this.dlgOverwrite = overwrite; }
+
+    public dialogResult showDialog() {
+        #on WINDOWS
+        int flags = dlgSaveFlags(this.dlgOverwrite);
+        string raw = nativeSaveFile(this.dlgFilter, this.dlgInitDir, this.dlgTitle, this.dlgDefExt, this.dlgFilterIndex, flags);
+        this.dlgPicked = raw;
+        if (raw == "") { return dialogResult.Cancel; }
+        return dialogResult.Ok;
+        #off
+        return dialogResult.None;
+    }
+
+    public string fileName() {
+        return this.dlgPicked;
+    }
+}
+
+class OpenFolderDialog {
+    private string dlgTitle;
+    private string dlgPicked;
+
+    construct() {
+        this.dlgTitle = "";
+        this.dlgPicked = "";
+    }
+
+    public void setTitle(string title) { this.dlgTitle = title; }
+
+    public dialogResult showDialog() {
+        #on WINDOWS
+        string raw = nativeFolder(this.dlgTitle);
+        this.dlgPicked = raw;
+        if (raw == "") { return dialogResult.Cancel; }
+        return dialogResult.Ok;
+        #off
+        return dialogResult.None;
+    }
+
+    public string folderPath() {
+        return this.dlgPicked;
+    }
+}
