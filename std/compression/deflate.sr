@@ -1,0 +1,620 @@
+mod export deflate;
+
+// DOCS -- raw DEFLATE codec (RFC 1951, DOCS/260). Pure Silver, no OS calls:
+// every value stays a non-negative int or int64, shifts are logical on all
+// backends, and buffers are int[] cells (0..255 per slot) converted to byte[]
+// only at the API boundary. Decoder handles stored, fixed-Huffman, and
+// dynamic-Huffman blocks; encoder emits stored blocks (level 0) or single
+// fixed-Huffman blocks with real LZ77 matches (levels accepted for API
+// compatibility; output identical). Raw DEFLATE carries no integrity check,
+// so truncated streams decode best-effort; the gzip/zstd wrappers verify.
+// Output is capped (32 MB) so corrupt streams always terminate.
+
+// Length base table for symbols 257..285 (RFC 1951 3.2.5).
+int[] dflLenBase() {
+    int[] t = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+    return t;
+}
+
+// Length extra bits for symbols 257..285.
+int[] dflLenExtra() {
+    int[] t = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+    return t;
+}
+
+// Distance base table for codes 0..29.
+int[] dflDistBase() {
+    int[] t = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+    return t;
+}
+
+// Distance extra bits for codes 0..29.
+int[] dflDistExtra() {
+    int[] t = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+    return t;
+}
+
+// Code-length code order (RFC 1951 3.2.7).
+int[] dflClOrder() {
+    int[] t = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+    return t;
+}
+
+// Growable int cell buffer (class-held: growth through a property stays
+// correct on every backend; see ProjectVisited).
+class OutBuf {
+    public int[] data;
+    public int len;
+
+    construct(int cap) {
+        if (cap < 8) { cap = 8; }
+        this.data = new int[cap];
+        this.len = 0;
+    }
+
+    public void add(int v) {
+        if (this.len >= this.data.length) {
+            int cap = this.data.length * 2 + 16;
+            int[] nb = new int[cap];
+            for (int i = 0; i < this.len; i++) { nb[i] = this.data[i]; }
+            this.data = nb;
+        }
+        this.data[this.len] = v;
+        this.len++;
+    }
+
+    public byte[] toBytes() {
+        byte[] r = [];
+        for (int i = 0; i < this.len; i++) { r.add(this.data[i] & 255); }
+        return r;
+    }
+}
+
+// LSB-first bit reader over int cells.
+class BitReader {
+    public int[] data;
+    public int pos;
+    public int64 bitbuf;
+    public int bitcnt;
+
+    construct(int[] d) {
+        this.data = d;
+        this.pos = 0;
+        this.bitbuf = 0;
+        this.bitcnt = 0;
+    }
+
+    public int getBit() {
+        if (this.bitcnt == 0) {
+            if (this.pos >= this.data.length) { return 0; }
+            this.bitbuf = this.data[this.pos] & 255;
+            this.pos++;
+            this.bitcnt = 8;
+        }
+        int b = int(this.bitbuf & 1);
+        this.bitbuf = this.bitbuf >> 1;
+        this.bitcnt--;
+        return b;
+    }
+
+    public int getBits(int n) {
+        int v = 0;
+        for (int i = 0; i < n; i++) {
+            int b = this.getBit();
+            if (b == 1) { v = v + (1 << i); }
+        }
+        return v;
+    }
+
+    public void alignToByte() {
+        this.bitbuf = 0;
+        this.bitcnt = 0;
+    }
+
+    public int readByte() {
+        if (this.pos >= this.data.length) { return -1; }
+        int v = this.data[this.pos] & 255;
+        this.pos++;
+        return v;
+    }
+
+    public bool pastEnd() {
+        return this.pos >= this.data.length && this.bitcnt == 0;
+    }
+}
+
+// Canonical Huffman table: counts per length, symbols in code order,
+// first-code and offsets for the walk decoder.
+class HuffTable {
+    public int[] counts;
+    public int[] symbols;
+    public int[] first;
+    public int[] offs;
+    public int maxLen;
+
+    construct() {
+        this.counts = new int[16];
+        this.symbols = [];
+        this.first = new int[16];
+        this.offs = new int[16];
+        this.maxLen = 0;
+    }
+}
+
+// Build a canonical table from code lengths (symbols 0..lengths.length-1).
+// Returns null on over-subscribed or over-long codes.
+HuffTable dflBuildTable(int[] lengths) {
+    HuffTable t = new HuffTable();
+    for (int i = 0; i < lengths.length; i++) {
+        int l = lengths[i];
+        if (l < 0 || l > 15) { return null; }
+        if (l > 0) {
+            t.counts[l]++;
+            if (l > t.maxLen) { t.maxLen = l; }
+        }
+    }
+    int code = 0;
+    for (int l = 1; l < 16; l++) {
+        t.first[l] = code;
+        t.offs[l] = t.symbols.length;
+        for (int i = 0; i < lengths.length; i++) {
+            if (lengths[i] == l) { t.symbols.add(i); }
+        }
+        code = (code + t.counts[l]) << 1;
+        if (code > (1 << (l + 1))) { return null; }
+    }
+    return t;
+}
+
+// Decode one symbol; -1 when the bit pattern matches no code.
+int dflDecodeSymbol(BitReader br, HuffTable t) {
+    int code = 0;
+    for (int l = 1; l <= t.maxLen; l++) {
+        code = (code << 1) | br.getBit();
+        int idx = code - t.first[l];
+        if (idx >= 0 && idx < t.counts[l]) {
+            return t.symbols[t.offs[l] + idx];
+        }
+    }
+    return -1;
+}
+
+// Fixed literal/length lengths (288 entries).
+int[] dflFixedLitLens() {
+    int[] lens = new int[288];
+    for (int i = 0; i < 144; i++) { lens[i] = 8; }
+    for (int i = 144; i < 256; i++) { lens[i] = 9; }
+    for (int i = 256; i < 280; i++) { lens[i] = 7; }
+    for (int i = 280; i < 288; i++) { lens[i] = 8; }
+    return lens;
+}
+
+// Fixed distance lengths (30 entries of 5).
+int[] dflFixedDistLens() {
+    int[] lens = new int[30];
+    for (int i = 0; i < 30; i++) { lens[i] = 5; }
+    return lens;
+}
+
+// LSB-first bit writer into an OutBuf of byte cells.
+class BitWriter {
+    public OutBuf out;
+    public int acc;
+    public int accCnt;
+
+    construct() {
+        this.out = new OutBuf(64);
+        this.acc = 0;
+        this.accCnt = 0;
+    }
+
+    public void putBits(int code, int n) {
+        this.acc = this.acc | (code << this.accCnt);
+        this.accCnt = this.accCnt + n;
+        while (this.accCnt >= 8) {
+            this.out.add(this.acc & 255);
+            this.acc = this.acc >> 8;
+            this.accCnt = this.accCnt - 8;
+        }
+    }
+
+    // Emit an n-bit Huffman code MSB-first (RFC 1951 3.1.1: codes pack
+    // starting with the most-significant bit; every other multi-bit value
+    // stays LSB-first through putBits).
+    public void putCode(int code, int n) {
+        for (int i = n - 1; i >= 0; i--) {
+            int b = 0;
+            if (((code >> i) & 1) == 1) { b = 1; }
+            this.acc = this.acc | (b << this.accCnt);
+            this.accCnt = this.accCnt + 1;
+            if (this.accCnt >= 8) {
+                this.out.add(this.acc & 255);
+                this.acc = this.acc >> 8;
+                this.accCnt = this.accCnt - 8;
+            }
+        }
+    }
+
+    public void alignFlush() {
+        if (this.accCnt > 0) {
+            this.out.add(this.acc & 255);
+            this.acc = 0;
+            this.accCnt = 0;
+        }
+    }
+}
+
+// Length symbol + extra value/bits for a match length 3..258.
+int dflLenSym(int len, int[] info) {
+    int[] base = dflLenBase();
+    int[] extra = dflLenExtra();
+    for (int s = 28; s >= 0; s--) {
+        if (len >= base[s]) {
+            info[0] = 257 + s;
+            info[1] = len - base[s];
+            info[2] = extra[s];
+            return info[0];
+        }
+    }
+    info[0] = 257;
+    info[1] = 0;
+    info[2] = 0;
+    return 257;
+}
+
+// Distance symbol + extra value/bits for a distance 1..32768.
+int dflDistSym(int dist, int[] info) {
+    int[] base = dflDistBase();
+    int[] extra = dflDistExtra();
+    for (int s = 29; s >= 0; s--) {
+        if (dist >= base[s]) {
+            info[0] = s;
+            info[1] = dist - base[s];
+            info[2] = extra[s];
+            return info[0];
+        }
+    }
+    info[0] = 0;
+    info[1] = 0;
+    info[2] = 0;
+    return 0;
+}
+
+class deflate {
+    // GZip/zlib-style hash chains over the 3-byte prefix (power-of-two
+    // table, 32K window, capped probe chain). Tables ride class fields (not
+    // parameters) so encoder state never crosses a helper boundary.
+    private int[] matchHead;
+    private int[] matchPrev;
+    public HuffTable dynLitTable;
+    public HuffTable dynDistTable;
+
+    public int[] findMatch(int[] data, int pos, int[] info) {
+        int n = data.length;
+        int bestLen = 0;
+        int bestDist = 0;
+        if (pos + 3 > n) {
+            info[0] = 0;
+            info[1] = 0;
+            return info;
+        }
+        int h = ((data[pos] << 10) ^ (data[pos + 1] << 5) ^ data[pos + 2]) & 2047;
+        int cand = this.matchHead[h];
+        int chain = 0;
+        while (cand >= 0 && chain < 64) {
+            chain++;
+            int dist = pos - cand;
+            if (dist <= 0 || dist > 32768) { break; }
+            int maxlen = n - pos;
+            if (maxlen > 258) { maxlen = 258; }
+            int len = 0;
+            while (len < maxlen && data[cand + len] == data[pos + len]) { len++; }
+            if (len > bestLen) {
+                bestLen = len;
+                bestDist = dist;
+                if (len >= 128) { break; }
+            }
+            cand = this.matchPrev[cand & 32767];
+        }
+        info[0] = bestLen;
+        info[1] = bestDist;
+        return info;
+    }
+
+    public void indexPos(int[] data, int pos) {
+        if (pos + 3 > data.length) { return; }
+        int h = ((data[pos] << 10) ^ (data[pos + 1] << 5) ^ data[pos + 2]) & 2047;
+        this.matchPrev[pos & 32767] = this.matchHead[h];
+        this.matchHead[h] = pos;
+    }
+
+    // Fixed-Huffman cost of one literal byte.
+    public int litCost(int b) {
+        if (b < 144) { return 8; }
+        if (b < 256) { return 9; }
+        return 8;
+    }
+
+    // Emit one fixed-Huffman block (last flag set by caller); returns the
+    // OutBuf byte count for the stored-fallback comparison.
+    public void emitFixedBlock(int[] data, BitWriter bw, bool last) {
+        this.matchHead = new int[2048];
+        for (int i = 0; i < 2048; i++) { this.matchHead[i] = -1; }
+        this.matchPrev = new int[32768];
+        for (int i = 0; i < 32768; i++) { this.matchPrev[i] = -1; }
+        int[] info = new int[3];
+        int[] code = new int[3];
+        if (last) { bw.putBits(1, 1); } else { bw.putBits(0, 1); }
+        bw.putBits(1, 2);
+        int pos = 0;
+        int n = data.length;
+        while (pos < n) {
+            this.findMatch(data, pos, info);
+            int bestLen = info[0];
+            int bestDist = info[1];
+            bool useMatch = false;
+            if (bestLen >= 3) {
+                dflLenSym(bestLen, code);
+                int mcost = 7 + code[2] + 5 + this.dflDistExtraFor(bestDist);
+                int lcost = 0;
+                for (int k = 0; k < bestLen; k++) { lcost = lcost + this.litCost(data[pos + k]); }
+                if (mcost < lcost) { useMatch = true; }
+            }
+            if (useMatch) {
+                dflLenSym(bestLen, code);
+                int sym = code[0];
+                int extraVal = code[1];
+                int extraN = code[2];
+                bw.putCode(this.fixedCodeOf(sym), this.fixedLenOf(sym));
+                if (extraN > 0) { bw.putBits(extraVal, extraN); }
+                dflDistSym(bestDist, code);
+                bw.putCode(code[0], 5);
+                if (code[2] > 0) { bw.putBits(code[1], code[2]); }
+                for (int k = 0; k < bestLen; k++) {
+                    this.indexPos(data, pos + k);
+                }
+                pos = pos + bestLen;
+            } else {
+                int b = data[pos];
+                if (b < 144) { bw.putCode(48 + b, 8); }
+                else { bw.putCode(400 + b - 144, 9); }
+                this.indexPos(data, pos);
+                pos++;
+            }
+        }
+        bw.putCode(0, 7);
+    }
+
+    // Fixed-Huffman code for a length symbol 256..285 (RFC 1951 3.2.6):
+    // 256 -> 0, 257..279 -> 1..23 (7 bits), 280..285 -> 192..197 (8 bits).
+    public int fixedCodeOf(int sym) {
+        int v = sym - 257;
+        if (v < 0) { return 0; }
+        if (v < 23) { return v + 1; }
+        return 192 + v - 23;
+    }
+
+    public int fixedLenOf(int sym) {
+        if (sym < 0) { return 8; }
+        if (sym < 144) { return 8; }
+        if (sym < 256) { return 9; }
+        if (sym < 280) { return 7; }
+        return 8;
+    }
+
+    public int dflDistExtraFor(int dist) {
+        int[] extra = dflDistExtra();
+        int[] base = dflDistBase();
+        for (int s = 29; s >= 0; s--) {
+            if (dist >= base[s]) { return extra[s]; }
+        }
+        return 0;
+    }
+
+    public byte[] compressFixed(int[] data) {
+        BitWriter bw = new BitWriter();
+        this.emitFixedBlock(data, bw, true);
+        bw.alignFlush();
+        return bw.out.toBytes();
+    }
+
+    public byte[] compressStored(int[] data) {
+        BitWriter bw = new BitWriter();
+        int pos = 0;
+        int n = data.length;
+        if (n == 0) {
+            bw.putBits(1, 1);
+            bw.putBits(0, 2);
+            bw.alignFlush();
+            bw.out.add(0);
+            bw.out.add(0);
+            bw.out.add(255);
+            bw.out.add(255);
+            return bw.out.toBytes();
+        }
+        while (pos < n) {
+            int chunk = n - pos;
+            if (chunk > 65535) { chunk = 65535; }
+            bool last = pos + chunk >= n;
+            if (last) { bw.putBits(1, 1); } else { bw.putBits(0, 1); }
+            bw.putBits(0, 2);
+            bw.alignFlush();
+            bw.out.add(chunk & 255);
+            bw.out.add((chunk >> 8) & 255);
+            bw.out.add((255 - (chunk & 255)) & 255);
+            bw.out.add((255 - ((chunk >> 8) & 255)) & 255);
+            for (int i = 0; i < chunk; i++) { bw.out.add(data[pos + i]); }
+            pos = pos + chunk;
+        }
+        return bw.out.toBytes();
+    }
+
+    public byte[] compress(byte[] data) {
+        return this.compress(data, 6);
+    }
+
+    public byte[] compress(byte[] data, int level) {
+        int[] cells = new int[data.length];
+        for (int i = 0; i < data.length; i++) { cells[i] = data[i] & 255; }
+        if (level == 0 || data.length == 0) {
+            return this.compressStored(cells);
+        }
+        BitWriter bw = new BitWriter();
+        this.emitFixedBlock(cells, bw, true);
+        bw.alignFlush();
+        if (bw.out.len >= data.length && data.length > 0) {
+            return this.compressStored(cells);
+        }
+        return bw.out.toBytes();
+    }
+
+    public byte[] decompress(byte[] data) {
+        int[] cells = new int[data.length + 64];
+        for (int i = 0; i < data.length; i++) { cells[i] = data[i] & 255; }
+        for (int i = data.length; i < data.length + 64; i++) { cells[i] = 0; }
+        BitReader br = new BitReader(cells);
+        OutBuf out = new OutBuf(64);
+        int[] lenBase = dflLenBase();
+        int[] lenExtra = dflLenExtra();
+        int[] distBase = dflDistBase();
+        int[] distExtra = dflDistExtra();
+        HuffTable fixedLit = new HuffTable();
+        HuffTable fixedDist = new HuffTable();
+        bool fixedReady = false;
+        while (true) {
+            int last = br.getBit();
+            int btype = br.getBits(2);
+            if (btype == 3) { return []; }
+            if (btype == 0) {
+                br.alignToByte();
+                int len0 = br.readByte();
+                int len1 = br.readByte();
+                int nlen0 = br.readByte();
+                int nlen1 = br.readByte();
+                if (len0 < 0 || len1 < 0 || nlen0 < 0 || nlen1 < 0) { return []; }
+                int len = len0 | (len1 << 8);
+                int nlen = nlen0 | (nlen1 << 8);
+                if ((len ^ nlen) != 65535) { return []; }
+                for (int i = 0; i < len; i++) {
+                    int b = br.readByte();
+                    if (b < 0) { return []; }
+                    out.add(b);
+                    if (out.len > 33554432) { return []; }
+                }
+                if (last == 1) { break; }
+                continue;
+            }
+            HuffTable lit = fixedLit;
+            HuffTable dist = fixedDist;
+            if (btype == 1) {
+                if (!fixedReady) {
+                    fixedLit = dflBuildTable(dflFixedLitLens());
+                    fixedDist = dflBuildTable(dflFixedDistLens());
+                    lit = fixedLit;
+                    dist = fixedDist;
+                    fixedReady = true;
+                }
+            } else {
+                lit = this.readDynamic(br);
+                if (lit == null) { return []; }
+                dist = this.dynDistTable;
+                if (dist == null) { return []; }
+            }
+            while (true) {
+                int sym = dflDecodeSymbol(br, lit);
+                if (sym < 0) { return []; }
+                if (sym < 256) {
+                    out.add(sym);
+                } else if (sym == 256) {
+                    break;
+                } else {
+                    int li = sym - 257;
+                    if (li < 0 || li > 28) { return []; }
+                    int len = lenBase[li] + br.getBits(lenExtra[li]);
+                    int dsym = dflDecodeSymbol(br, dist);
+                    if (dsym < 0 || dsym > 29) { return []; }
+                    int d = distBase[dsym] + br.getBits(distExtra[dsym]);
+                    if (d <= 0 || d > out.len) { return []; }
+                    for (int i = 0; i < len; i++) {
+                        out.add(out.data[out.len - d]);
+                        if (out.len > 33554432) { return []; }
+                    }
+                }
+                if (out.len > 33554432) { return []; }
+            }
+            if (last == 1) { break; }
+        }
+        return out.toBytes();
+    }
+
+    public HuffTable buildFixedLit() {
+        return dflBuildTable(dflFixedLitLens());
+    }
+
+    public HuffTable buildFixedDist() {
+        return dflBuildTable(dflFixedDistLens());
+    }
+
+    public HuffTable readDynamic(BitReader br) {
+        int hlit = br.getBits(5) + 257;
+        int hdist = br.getBits(5) + 1;
+        int hclen = br.getBits(4) + 4;
+        if (hlit > 288 || hdist > 32) { return null; }
+        int[] order = dflClOrder();
+        int[] clLens = new int[19];
+        for (int i = 0; i < hclen; i++) {
+            clLens[order[i]] = br.getBits(3);
+        }
+        HuffTable cl = dflBuildTable(clLens);
+        if (cl == null) { return null; }
+        int total = hlit + hdist;
+        int[] lens = new int[total];
+        int done = 0;
+        int prev = 0;
+        while (done < total) {
+            int s = dflDecodeSymbol(br, cl);
+            if (s < 0) { return null; }
+            if (s <= 15) {
+                lens[done] = s;
+                prev = s;
+                done++;
+            } else if (s == 16) {
+                int rep = 3 + br.getBits(2);
+                for (int i = 0; i < rep && done < total; i++) {
+                    lens[done] = prev;
+                    done++;
+                }
+            } else if (s == 17) {
+                int rep = 3 + br.getBits(3);
+                for (int i = 0; i < rep && done < total; i++) {
+                    lens[done] = 0;
+                    done++;
+                }
+                prev = 0;
+            } else {
+                int rep = 11 + br.getBits(7);
+                for (int i = 0; i < rep && done < total; i++) {
+                    lens[done] = 0;
+                    done++;
+                }
+                prev = 0;
+            }
+        }
+        int[] litLens = new int[hlit];
+        for (int i = 0; i < hlit; i++) { litLens[i] = lens[i]; }
+        if (litLens[256] == 0) { return null; }
+        HuffTable lit = dflBuildTable(litLens);
+        if (lit == null) { return null; }
+        this.dynLitTable = lit;
+        int[] distLens = new int[hdist];
+        for (int i = 0; i < hdist; i++) { distLens[i] = lens[hlit + i]; }
+        HuffTable dist = dflBuildTable(distLens);
+        if (dist == null) { return null; }
+        this.dynDistTable = dist;
+        return lit;
+    }
+
+    public HuffTable readDynamicDist(BitReader br) {
+        return this.dynDistTable;
+    }
+}

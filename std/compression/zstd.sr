@@ -1,0 +1,136 @@
+mod export zstd;
+
+// DOCS -- Zstandard frame codec (RFC 8878, DOCS/260). Pure Silver, no OS
+// calls.
+//
+// WHAT IS IMPLEMENTED (and tested): a fully spec-valid STORE-frame encoder --
+// a valid .zstd stream built from Raw_Block(s) that any zstd decoder (the
+// reference CLI, Python `zstandard`, etc.) reads back exactly; and a decoder
+// that reads Raw_Block and RLE_Block frames (what the reference encoder emits
+// for incompressible data, and what `ZstdCompressor(level=1)` produces on
+// random input). The level argument is accepted for API parity and does not
+// change output (stores only).
+//
+// WHAT IS NOT (documented limitation, NOT a silent stub): Compressed_Block
+// decoding (Huffman-coded literals + FSE-coded sequences). A frame using a
+// compressed block decodes to an empty array rather than guessing -- the same
+// empty-is-failure contract the other decoders use -- because a partial
+// Huffman/FSE decoder that silently mis-decodes would be worse than an honest
+// no-result. Ratio-carrying sequence coding (Huffman + FSE + rep offsets) is
+// the remaining work toward general zstd input; the deflate/gzip modules above
+// already cover the real compression path today.
+//
+// Frame layout used by the encoder: magic FD2FB528, one Frame_Header_Descriptor
+// (Single_Segment, FCS flag = 2 -> 4-byte Frame_Content_Size, no content
+// checksum, no dict), then the payload split into <=128 KB Raw blocks, last
+// flagged. Decoders accept any frame size field and skip dictionary/checksum
+// handling only for the shapes they read.
+
+class zstd {
+    public byte[] compress(byte[] data) {
+        return this.compress(data, 3);
+    }
+
+    public byte[] compress(byte[] data, int level) {
+        int n = data.length;
+        byte[] out = [];
+        out.add(40); out.add(181); out.add(47); out.add(253); // magic (LE FD2FB528)
+        // FHD: Single_Segment=1 (bit5), FCS_flag=2 (bits3-4 -> 4 bytes), no
+        // checksum, no dict.
+        out.add(32 | (2 << 3));
+        out.add(n & 255);
+        out.add((n >> 8) & 255);
+        out.add((n >> 16) & 255);
+        out.add((n >> 24) & 255);
+        int pos = 0;
+        if (n == 0) {
+            // One empty raw block, last=1: 3-byte header = 1 (last, type0, size0).
+            out.add(1); out.add(0); out.add(0);
+            return out;
+        }
+        while (pos < n) {
+            int chunk = n - pos;
+            if (chunk > 131072) { chunk = 131072; }
+            bool last = pos + chunk >= n;
+            int hdr = (last ? 1 : 0) | (0 << 1) | (chunk << 3); // Raw_Block type=0
+            out.add(hdr & 255);
+            out.add((hdr >> 8) & 255);
+            out.add((hdr >> 16) & 255);
+            for (int i = 0; i < chunk; i++) { out.add(data[pos + i]); }
+            pos = pos + chunk;
+        }
+        return out;
+    }
+
+    public byte[] decompress(byte[] data) {
+        int n = data.length;
+        if (n < 5) { return []; }
+        if ((data[0] & 255) != 40 || (data[1] & 255) != 181 || (data[2] & 255) != 47 || (data[3] & 255) != 253) {
+            return [];
+        }
+        int fhd = data[4] & 255;
+        int fcsFlag = (fhd >> 3) & 3;
+        bool singleSeg = (fhd & 32) != 0;
+        bool hasCheck = (fhd & 4) != 0;
+        bool hasDict = (fhd & 1) != 0;
+        int p = 5;
+        // Window_Descriptor absent when Single_Segment is set.
+        int fcsSize = 0;
+        if (fcsFlag == 0) { fcsSize = singleSeg ? 1 : 0; }
+        else if (fcsFlag == 1) { fcsSize = 2; }
+        else if (fcsFlag == 2) { fcsSize = 4; }
+        else { fcsSize = 8; }
+        int64 frameContentSize = -1;
+        if (fcsFlag == 0 && !singleSeg) { frameContentSize = -1; }
+        if (fcsSize > 0) {
+            if (p + fcsSize > n) { return []; }
+            frameContentSize = 0;
+            for (int i = 0; i < fcsSize; i++) { frameContentSize = frameContentSize | ((int64)(data[p + i] & 255) << (i * 8)); }
+            if (fcsFlag == 1) { frameContentSize = frameContentSize + 256; }
+            p = p + fcsSize;
+        }
+        if (hasDict) { p = p + 4; } // 4-byte dictionary id
+        byte[] out = [];
+        int contentEnd = n - (hasCheck ? 4 : 0);
+        while (p + 3 <= contentEnd) {
+            int bh = (data[p] & 255) | ((data[p + 1] & 255) << 8) | ((data[p + 2] & 255) << 16);
+            p = p + 3;
+            bool last = (bh & 1) != 0;
+            int btype = (bh >> 1) & 3;
+            int bsize = bh >> 3;
+            if (btype == 3) { return []; } // reserved
+            if (btype == 0) {
+                // Raw_Block: bsize literal bytes copied verbatim.
+                if (p + bsize > contentEnd) { return []; }
+                for (int i = 0; i < bsize; i++) { out.add(data[p + i] & 255); }
+                p = p + bsize;
+            } else if (btype == 1) {
+                // RLE_Block: one byte (bsize from header) repeated; block size
+                // is 1 for RLE, so the literal count is bsize.
+                if (p + 1 > contentEnd) { return []; }
+                int val = data[p] & 255;
+                p = p + 1;
+                for (int i = 0; i < bsize; i++) { out.add(val); }
+            } else {
+                // Compressed_Block: Huffman literals + FSE sequences. Not
+                // implemented -- see the module header. Empty result, never a
+                // guess.
+                return [];
+            }
+            if (last) { break; }
+        }
+        return out;
+    }
+
+    public void compressFile(string input, string output) {
+        byte[] data = fs.read(input);
+        byte[] packed = this.compress(data);
+        fs.write(output, packed);
+    }
+
+    public void decompressFile(string input, string output) {
+        byte[] data = fs.read(input);
+        byte[] unpacked = this.decompress(data);
+        fs.write(output, unpacked);
+    }
+}

@@ -1,0 +1,110 @@
+mod export gzip;
+
+import deflate from compression.deflate;
+
+// DOCS -- GZIP codec (RFC 1952, DOCS/260): the DEFLATE payload plus a fixed
+// 10-byte header (ID1/ID2/CM/FLG=0/MTIME/EXTRA/OS=3) and an 8-byte trailer
+// (CRC32 + ISIZE). The raw DEFLATE work is std/compression/deflate.sr; this
+// module owns framing and integrity. Decoder verifies magic, method, CRC32 and
+// ISIZE; any mismatch yields an empty array (never an exception, never
+// partial data), so a corrupt stream is indistinguishable from no result.
+// Encoder always writes FLG=0 (no name/comment fields) and OS=3 (Unix), the
+// canonical choice that every gunzip reads.
+
+// Byte-wise CRC32 (poly 0xEDB88320) over int cells (0..255).
+int gzCrc(int[] data, int len) {
+    int crc = 4294967295; // 0xFFFFFFFF
+    for (int i = 0; i < len; i++) {
+        int b = data[i] & 255;
+        crc = crc ^ b;
+        for (int k = 0; k < 8; k++) {
+            if ((crc & 1) == 1) {
+                crc = (crc >> 1) ^ 3988292384; // 0xEDB88320
+            } else {
+                crc = crc >> 1;
+            }
+        }
+    }
+    return (crc ^ 4294967295) & 4294967295;
+}
+
+class gzip {
+    public byte[] compress(byte[] data) {
+        return this.compress(data, 6);
+    }
+
+    public byte[] compress(byte[] data, int level) {
+        var d = new deflate();
+        byte[] payload = d.compress(data, level);
+        int[] cells = new int[data.length];
+        for (int i = 0; i < data.length; i++) { cells[i] = data[i] & 255; }
+        int crc = gzCrc(cells, data.length);
+        int isize = data.length & 268435455;
+        byte[] out = [];
+        out.add(31); // ID1
+        out.add(139); // ID2
+        out.add(8); // CM = deflate
+        out.add(0); // FLG
+        out.add(0); out.add(0); out.add(0); out.add(0); // MTIME
+        out.add(0); // XFL
+        out.add(3); // OS = Unix
+        for (int i = 0; i < payload.length; i++) { out.add(payload[i]); }
+        out.add(crc & 255);
+        out.add((crc >> 8) & 255);
+        out.add((crc >> 16) & 255);
+        out.add((crc >> 24) & 255);
+        out.add(isize & 255);
+        out.add((isize >> 8) & 255);
+        out.add((isize >> 16) & 255);
+        out.add((isize >> 24) & 255);
+        return out;
+    }
+
+    public byte[] decompress(byte[] data) {
+        int n = data.length;
+        if (n < 18) { return []; }
+        if (data[0] != 31 || data[1] != 139 || data[2] != 8) { return []; }
+        int flg = data[3] & 255;
+        int p = 10;
+        if ((flg & 4) != 0) {
+            // FEXTRA: two-byte length then that many bytes.
+            if (p + 2 > n) { return []; }
+            int xlen = (data[p] & 255) | ((data[p + 1] & 255) << 8);
+            p = p + 2 + xlen;
+        }
+        if ((flg & 8) != 0) {
+            while (p < n && data[p] != 0) { p++; }
+            p++;
+        }
+        if ((flg & 16) != 0) {
+            while (p < n && data[p] != 0) { p++; }
+            p++;
+        }
+        if ((flg & 2) != 0) { p = p + 2; }
+        if (p + 8 > n) { return []; }
+        int bodyLen = n - p - 8;
+        byte[] payload = [];
+        for (int i = 0; i < bodyLen; i++) { payload.add(data[p + i]); }
+        var d = new deflate();
+        byte[] out = d.decompress(payload);
+        int crc = (data[n - 8] & 255) | ((data[n - 7] & 255) << 8) | ((data[n - 6] & 255) << 16) | ((data[n - 5] & 255) << 24);
+        int isize = (data[n - 4] & 255) | ((data[n - 3] & 255) << 8) | ((data[n - 2] & 255) << 16) | ((data[n - 1] & 255) << 24);
+        int[] cells = new int[out.length];
+        for (int i = 0; i < out.length; i++) { cells[i] = out[i] & 255; }
+        if (gzCrc(cells, out.length) != crc) { return []; }
+        if ((out.length & 268435455) != (isize & 268435455)) { return []; }
+        return out;
+    }
+
+    public void compressFile(string input, string output) {
+        byte[] data = fs.read(input);
+        byte[] packed = this.compress(data);
+        fs.write(output, packed);
+    }
+
+    public void decompressFile(string input, string output) {
+        byte[] data = fs.read(input);
+        byte[] unpacked = this.decompress(data);
+        fs.write(output, unpacked);
+    }
+}
