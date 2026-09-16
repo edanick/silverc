@@ -87,6 +87,15 @@ class Parser {
     private string[] anonKnownGlobals;
     // Depth of anonymous-function bodies the diagnostics walk is inside.
     private int anonWalkDepth;
+    // DOCS/261 / SPEC 15.6 -- membership operators: nesting depth of `(`
+    // grouping parentheses (incremented in if/while/switch conditions and
+    // around `(` grouping prefixes).  A bare `not in` outside parentheses
+    // (depth 0) is a parse error.
+    private int parenDepth;
+    // Set while parsing the right operand of a membership operator: `in`
+    // there is an operator token again, never the `in` of a `for`/`foreach`
+    // loop header.
+    private bool inMembershipOperand;
 
     construct (Token[] toks) {
         this.tokens = toks;
@@ -119,6 +128,8 @@ class Parser {
         this.fnPtrCallScope = [];
         this.anonKnownGlobals = [];
         this.anonWalkDepth = 0;
+        this.parenDepth = 0;
+        this.inMembershipOperand = false;
     }
 
     // Provide per-line character lengths so bracket diagnostics can point
@@ -2575,7 +2586,9 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             this.expect(10);
         }
         this.expect(100);
+        this.parenDepth++;
         n.children.add(this.parseExpr(0));
+        this.parenDepth--;
         this.expect(101);
         n.children.add(this.parseBlockOrStmt());
         if (this.check(11)) {
@@ -2601,7 +2614,9 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         Node n = new Node(); n.kind = 54;
         this.expect(12);
         this.expect(100);
+        this.parenDepth++;
         n.children.add(this.parseExpr(0));
+        this.parenDepth--;
         this.expect(101);
         n.children.add(this.parseBlockOrStmt());
         return n;
@@ -2616,7 +2631,9 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         Node n = new Node(); n.kind = 76;
         this.advance();
         this.expect(100);
+        this.parenDepth++;
         n.children.add(this.parseExpr(0));
+        this.parenDepth--;
         this.expect(101);
         this.expect(102);
         while (!this.check(103) && !this.check(0)) {
@@ -3077,6 +3094,45 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 lhs = cast;
                 continue;
             }
+            // DOCS/261 / SPEC 15.6: membership operators `in` and `not in`.
+            // `not in` is a two-token sequence [Identifier "not"][In].
+            // The loop-header parsers (foreach, for-in) consume the `in`
+            // keyword themselves before any expression parse begins.
+            if (this.check(7) && this.peek().text == "not"
+                && this.pos + 1 < this.tokens.length
+                && this.tokens[this.pos + 1].kind == 54
+                && !this.inMembershipOperand) {
+                int notLine = this.peek().line;
+                int notCol = this.peek().col;
+                this.advance(); // not
+                this.advance(); // in
+                if (this.parenDepth == 0) {
+                    this.recordError("not in must be wrapped in parentheses: use (a not in b) at line " + notLine.toString() + ", column " + notCol.toString());
+                }
+                int savedInMem = this.inMembershipOperand;
+                this.inMembershipOperand = true;
+                Node rhs = this.parseExpr(6);
+                this.inMembershipOperand = savedInMem;
+                Node bin = new Node(); bin.kind = 7; bin.op = 37;
+                bin.boolVal = true;
+                bin.children.add(lhs);
+                bin.children.add(rhs);
+                lhs = bin;
+                continue;
+            }
+            if (this.check(54) && !this.inMembershipOperand) {
+                this.advance(); // in
+                int savedInMem = this.inMembershipOperand;
+                this.inMembershipOperand = true;
+                Node rhs = this.parseExpr(6);
+                this.inMembershipOperand = savedInMem;
+                Node bin = new Node(); bin.kind = 7; bin.op = 37;
+                bin.boolVal = false;
+                bin.children.add(lhs);
+                bin.children.add(rhs);
+                lhs = bin;
+                continue;
+            }
             int prec = this.getPrec(this.peek().kind);
             if (prec < minPrec) { break; }
             int nextMin = prec + 1;
@@ -3128,6 +3184,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         if (kind == 116) { return 22; }
         if (kind == 117) { return 23; }
         if (kind == 118) { return 24; }
+        if (kind == 54) { return 37; }
         return 0;
     }
 
@@ -3190,6 +3247,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         if (kind == 138) { return 3; }
         if (kind == 135 || kind == 134) { return 4; }
         if (kind == 120 || kind == 136 || kind == 121 || kind == 137) { return 5; }
+        if (kind == 54) { return 5; }
         if (kind == 117) { return 6; }
         if (kind == 116) { return 7; }
         if (kind == 118) { return 7; }
@@ -3365,6 +3423,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 }
             }
             this.pos = castSaved;
+            this.parenDepth++;
             Node first = this.parseExpr(0);
             if (this.check(107)) {
                 n.kind = 70;
@@ -3374,9 +3433,10 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     n.children.add(this.parseExpr(0));
                 }
                 this.expect(101);
+                this.parenDepth--;
                 return n;
             }
-            n.kind = 23; n.children.add(first); this.expect(101); return n;
+            n.kind = 23; n.children.add(first); this.expect(101); this.parenDepth--; return n;
         }
         if (kind == 102) {
             if (this.check(103)) {

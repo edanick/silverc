@@ -5040,6 +5040,10 @@ int strIdx = this.stringPatchIndices[i];
             if (expr.op >= 5 && expr.op <= 12) {
                 return "bool";
             }
+            // DOCS/261 / SPEC 15.6: membership test is a plain bool.
+            if (expr.op == 37) {
+                return "bool";
+            }
             return "int";
         }
         return "";
@@ -10987,6 +10991,11 @@ public void genNewCall(Node call) {
                 return;
             }
         }
+        // DOCS/261 / SPEC 15.6: `needle in collection` / `not in`.
+        if (op == 37) {
+            this.genMembership(bin);
+            return;
+        }
         if (op >= 14 && op <= 17) {
             this.genCompoundAssign(bin, op);
             return;
@@ -11160,6 +11169,89 @@ public void genNewCall(Node call) {
             this.asm.movRI64(0, 1);
             this.asm.bindLabel(e);
         }
+    }
+
+    // DOCS/261 / SPEC 15.6: membership operator codegen.  Short-circuiting
+    // loop comparing each array element against needle.  String arrays use
+    // strcmp; non-string arrays use raw 64-bit compare.  `not in` flips
+    // the result.
+    public void genMembership(Node bin) {
+        bool negated = bin.boolVal;
+        Node collection = bin.child(1);
+        Node needle = bin.child(0);
+        string arrType = this.inferExprType(collection);
+        string elemType = this.arrayElementType(arrType);
+        bool stringElements = elemType == "string";
+        // DOCS/261 parity with silverc-rs array_has_string_elements: an
+        // array literal whose items are all strings compares with strcmp,
+        // even though inferExprType does not resolve literals to `string[]`
+        // (without this, literals fell back to pointer comparison, which is
+        // only accidentally correct for interned literals). Kind-19 op=1
+        // (fixed-size decl) and op=2 (`new T[n]`) carry no literal children.
+        if (!stringElements && collection.kind == 19 && collection.op != 1 && collection.op != 2 && collection.childCount() > 0) {
+            bool allStr = true;
+            for (int ci = 0; ci < collection.childCount(); ci++) {
+                if (!this.isStringLike(collection.child(ci))) { allStr = false; }
+            }
+            if (allStr) { stringElements = true; }
+        }
+        int arrOff = this.allocLocal("__arr_membership_arr");
+        int targetOff = this.allocLocal("__arr_membership_target");
+        int iOff = this.allocLocal("__arr_membership_i");
+        int lenOff = this.allocLocal("__arr_membership_len");
+        this.genExpr(collection);
+        this.asm.movMBaseR(5, 0, arrOff);
+        this.genExpr(needle);
+        this.asm.movMBaseR(5, 0, targetOff);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        int loopLabel = this.newLabel();
+        int foundLbl = this.newLabel();
+        int notFoundLbl = this.newLabel();
+        int doneLbl = this.newLabel();
+        this.asm.bindLabel(loopLabel);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(notFoundLbl);
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.movRMBase(0, 5, iOff);
+        // Every array element is an 8-byte slot (pointers and int64 alike),
+        // so the index is always scaled by 8 -- parity with silverc-rs
+        // gen_membership, whose shl is unconditional. Gating this on
+        // !stringElements made iterations >= 1 read a misaligned address.
+        this.asm.shlR64Imm(0, 3);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(0, 1, 0);
+        if (stringElements) {
+            this.asm.movRR64(1, 0);
+            this.asm.movRMBase(2, 5, targetOff);
+            this.addImportPatch("ucrtbase.dll", "strcmp");
+            int sEq = 0xDEADBEEFCAFEBAD8;
+            this.asm.emitImm64(0, sEq);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.cmpRI32(0, 0);
+        } else {
+            this.asm.movRMBase(1, 5, targetOff);
+            this.asm.cmpRR64(0, 1);
+        }
+        this.asm.jeLabel(foundLbl);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(loopLabel);
+        this.asm.bindLabel(foundLbl);
+        if (negated) { this.asm.movRI64(0, 0); } else { this.asm.movRI64(0, 1); }
+        this.asm.jmpLabel(doneLbl);
+        this.asm.bindLabel(notFoundLbl);
+        if (negated) { this.asm.movRI64(0, 1); } else { this.asm.movRI64(0, 0); }
+        this.asm.bindLabel(doneLbl);
     }
 
     public void genCompoundAssign(Node bin, int op) {
