@@ -806,6 +806,100 @@ class MarkedChunks {
     }
 }
 
+// Grouped compiler diagnostics: `[file]` headers over unchanged bodies.
+//
+// silverc-rs prints one `[file]` header per file on the error stream and keeps
+// every error body byte-identical; the self-host mirrors that shape on the
+// stream its diagnostics already use (stdout via printline). Files print in
+// first-seen order with all of one file's errors contiguous under a single
+// header, and errors within a file keep their source order.
+//
+// The .srp/standalone aggregate is lexed and parsed as ONE unit, so error
+// lines are aggregate-relative. With --cache-bytecode the aggregate carries
+// `//@@SILVER_FILE@@ <path>` marker lines and each error's `line L` maps back
+// to its file through the MarkedChunks split above (paths/startLines).
+// Without markers per-file attribution is impossible, so every error prints
+// under a single `[input-as-given]` header. Bodies are never rewritten.
+
+// First `line <N>` in a diagnostic body (1-based aggregate line), or -1 when
+// the message carries no line. Every SYNTAX body embeds one (`at line L,
+// column C`, `in line L, column C`, `was found at line L column C`); the
+// match must start at a word boundary so prose like "outline" never hits.
+int drvDiagLine(string msg) {
+    string needle = "line ";
+    int pos = projectFind(msg, needle, 0);
+    while (pos >= 0) {
+        bool wordStart = true;
+        if (pos > 0) {
+            char pb = msg[pos - 1];
+            if ((pb >= 'a' && pb <= 'z') || (pb >= 'A' && pb <= 'Z')) { wordStart = false; }
+        }
+        int ds = pos + needle.length;
+        int de = ds;
+        while (de < msg.length && msg[de] >= '0' && msg[de] <= '9') { de++; }
+        if (wordStart && de > ds) {
+            int n = 0;
+            for (int i = ds; i < de; i++) { n = n * 10 + (msg[i] - '0'); }
+            return n;
+        }
+        pos = projectFind(msg, needle, pos + 1);
+    }
+    return -1;
+}
+
+// Marker path owning aggregate 1-based line `aggLine`: the last chunk whose
+// first content line starts at or before it (startLines is a 0-based
+// aggregate line index). "" when no chunk covers the line (empty split, or
+// the line is a marker comment itself): the caller falls back to the entry.
+string drvChunkOwner(MarkedChunks chunks, int aggLine) {
+    string owner = "";
+    for (int i = 0; i < chunks.paths.length; i++) {
+        if (chunks.startLines[i] <= aggLine - 1) { owner = chunks.paths[i]; }
+        else { break; }
+    }
+    return owner;
+}
+
+// Print `msgs` grouped under one `[file]` header per file, on stdout via
+// printline (the stream these diagnostics already use). `source` is the
+// aggregate the messages were reported against and `entryName` the input path
+// as given. With markers (useMarkers: --cache-bytecode emitted them) each
+// message maps to its file and unmappable ones fall under the entry header;
+// without markers everything prints under a single `[entryName]` header.
+void drvPrintDiagnostics(string[] msgs, string source, string entryName, bool useMarkers) {
+    if (msgs.length == 0) { return; }
+    string[] owners = [];
+    if (useMarkers) {
+        MarkedChunks chunks = new MarkedChunks();
+        chunks.split(source);
+        for (int m = 0; m < msgs.length; m++) {
+            string owner = entryName;
+            int ln = drvDiagLine(msgs[m]);
+            if (ln > 0) {
+                string hit = drvChunkOwner(chunks, ln);
+                if (hit.length > 0) { owner = hit; }
+            }
+            owners.add(owner);
+        }
+    } else {
+        for (int m = 0; m < msgs.length; m++) { owners.add(entryName); }
+    }
+    string[] order = [];
+    for (int m = 0; m < owners.length; m++) {
+        bool seen = false;
+        for (int o = 0; o < order.length; o++) {
+            if (order[o] == owners[m]) { seen = true; break; }
+        }
+        if (!seen) { order.add(owners[m]); }
+    }
+    for (int o = 0; o < order.length; o++) {
+        printline("[" + order[o] + "]");
+        for (int m = 0; m < msgs.length; m++) {
+            if (owners[m] == order[o]) { printline(msgs[m]); }
+        }
+    }
+}
+
 // Session naming mirrors silverc-rs: projects key the cache by their
 // manifest name (or manifest stem), standalone files by the source stem.
 string cacheSessionName(string inputFile, bool inputIsProject) {
@@ -1092,6 +1186,10 @@ int compileOnce(CliFlags flags, string outputFile) {
         progress.moduleDone(inputFile);
         source = collectImports(source, inputFile, "", moduleErrors, flags.cacheBytecode, progress, flags.debugBuild);
         if (moduleErrors.length > 0) {
+            // Unknown-module diagnostics are reported against the entry
+            // source (pre-collection lines), so they always belong to the
+            // entry file: single `[input-as-given]` header, bodies untouched.
+            printline("[" + inputFile + "]");
             for (int meI = 0; meI < moduleErrors.length; meI++) {
                 printline(moduleErrors[meI]);
             }
@@ -1120,11 +1218,10 @@ int compileOnce(CliFlags flags, string outputFile) {
         Lexer lexer = new Lexer(source);
         tokens = lexer.tokenize();
 
-        // Lexical diagnostics print one per line and abort before parsing.
+        // Lexical diagnostics print grouped under `[file]` headers and abort
+        // before parsing (unmarked builds: single `[input-as-given]` header).
         if (lexer.lexErrors.length > 0) {
-            for (int leI = 0; leI < lexer.lexErrors.length; leI++) {
-                printline(lexer.lexErrors[leI]);
-            }
+            drvPrintDiagnostics(lexer.lexErrors, source, inputFile, flags.cacheBytecode);
             exit(1);
         }
     } else {
@@ -1169,9 +1266,7 @@ int compileOnce(CliFlags flags, string outputFile) {
             Lexer lexer = new Lexer(source);
             tokens = lexer.tokenize();
             if (lexer.lexErrors.length > 0) {
-                for (int leJ = 0; leJ < lexer.lexErrors.length; leJ++) {
-                    printline(lexer.lexErrors[leJ]);
-                }
+                drvPrintDiagnostics(lexer.lexErrors, source, inputFile, flags.cacheBytecode);
                 exit(1);
             }
         }
@@ -1195,12 +1290,11 @@ int compileOnce(CliFlags flags, string outputFile) {
     // ValueException checks over literal path arguments.
     parser.checkCallDiagnostics(ast);
 
-    // Syntax diagnostics: one per line, in source order
-    // (SYNTAX_EXCEPTIONS.md #4).
+    // Syntax diagnostics grouped under `[file]` headers, in source order
+    // within each file (SYNTAX_EXCEPTIONS.md #4). Bodies are byte-identical;
+    // only the headers are added.
     if (parser.diagErrors.length > 0) {
-        for (int deI = 0; deI < parser.diagErrors.length; deI++) {
-            printline(parser.diagErrors[deI]);
-        }
+        drvPrintDiagnostics(parser.diagErrors, source, inputFile, flags.cacheBytecode);
         exit(1);
     }
 
@@ -1214,6 +1308,10 @@ int compileOnce(CliFlags flags, string outputFile) {
         VisibilityChecker vis = new VisibilityChecker(inputFile, flags.debugBuild);
         vis.run();
         if (vis.errors.length > 0) {
+            // Visibility diagnostics are reported against the entry file
+            // (the checker re-parses it standalone), so they always belong
+            // to the entry file: single `[input-as-given]` header.
+            printline("[" + inputFile + "]");
             for (int veI = 0; veI < vis.errors.length; veI++) {
                 printline(vis.errors[veI]);
             }
