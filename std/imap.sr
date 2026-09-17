@@ -1,4 +1,5 @@
 import * from net;
+import * from string;
 
 mod export imap;
 
@@ -50,10 +51,13 @@ mod export imap;
 // - login(): reads and validates the greeting (`* OK` or `* PREAUTH` --
 //   greetingOk()), sends LOGIN and requires the tagged OK, and records the
 //   outcome in isLoggedIn()/getLastReply(). Plain-text LOGIN only: the
-//   LOGIN command needs no base64, so the encoding.base64Encode runtime
-//   crasher (phantom string.toBytes(), 0xC0000005 rs / 0xC0000409
-//   self-host -- see std/smtp.sr's b64Encode note) is avoided entirely; no
-//   b64 is carried and the encoding import does not exist here. Against a
+//   LOGIN command carries no base64 by protocol design, so no b64 is
+//   carried and the encoding import does not exist here (the old
+//   "encoding.base64Encode runtime crasher" note was stale -- the file-39
+//   turn proved encoding.base64Encode/Decode byte-identical to the crypto
+//   copies on valid, invalid and binary 1-255 inputs with no crash on
+//   either compiler; a future AUTH PLAIN would call
+//   encoding.base64Encode). Against a
 //   non-IMAP listener the login fails gracefully: the peer's junk (or ""
 //   after a silent disconnect) is surfaced through getLastReply() and the
 //   process exits cleanly. No exceptions anywhere.
@@ -79,7 +83,7 @@ mod export imap;
 //   command), so no path can spin forever.
 //
 // SCOPE: no AUTHENTICATE/STARTTLS/TLS (plain-text LOGIN only; AUTH PLAIN
-// would need base64 -- the encoding crasher); no APPEND/STORE/EXPUNGE/
+// would need base64 via encoding.base64Encode); no APPEND/STORE/EXPUNGE/
 // COPY/STATUS/NOOP/CAPABILITY/SUBSCRIBE; no mailbox create/delete/rename
 // (select() is the mailbox surface and list() is the LIST the task's
 // IMAP4rev1 protocol set names, nothing beyond it); no EXAMINE; fetch()
@@ -118,7 +122,7 @@ mod export imap;
 // if absent -- pass "From:"/"Subject:" with the colon) are pure and
 // probeable. Module-internal: the private lastReply/loggedIn fields, the
 // private readGreeting/readTagged/fail plumbing, the private lineEndFrom/
-// blankLineIndex/sliceRange scan helpers, and construct()'s full field
+// blankLineIndex scan helpers, and construct()'s full field
 // initialization (sock to -1, strings to "", loggedIn to false), so
 // logout() never touches an uninitialized handle.
 //
@@ -147,7 +151,7 @@ mod export imap;
 // Decimal tag string for the n-th command (`1`, `2`, ...). Tags are
 // client-chosen atoms; decimal tags are valid and match nothing untagged.
 public string nextTag(int n) {
-    return n.toString();
+    return (string)n;
 }
 
 // True when the first line of `resp` is an IMAP4rev1 greeting: `* OK ...`
@@ -159,8 +163,7 @@ public bool greetingOk(string resp) {
     int we = 2;
     while (we < resp.length && resp[we] != 32 && resp[we] != 13) { we++; }
     int wlen = we - 2;
-    if (wlen == 2 && resp[2] == 79 && resp[3] == 75) { return true; }
-    if (wlen == 7 && resp[2] == 80 && resp[3] == 82 && resp[4] == 69 && resp[5] == 65 && resp[6] == 85 && resp[7] == 84 && resp[8] == 72) { return true; }
+    if ((wlen == 2 && resp[2] == 79 && resp[3] == 75) || (wlen == 7 && resp[2] == 80 && resp[3] == 82 && resp[4] == 69 && resp[5] == 65 && resp[6] == 85 && resp[7] == 84 && resp[8] == 72)) { return true; }
     return false;
 }
 
@@ -260,7 +263,7 @@ public string literalText(string resp) {
                 int end = start + val;
                 if (end > resp.length) { end = resp.length; }
                 if (end < start) { return ""; }
-                return sliceRange(resp, start, end);
+                return projectSlice(resp, start, end);
             }
         }
     }
@@ -275,7 +278,7 @@ public string messageBody(string fetchResp) {
     if (lit.length <= 0) { return ""; }
     int blank = blankLineIndex(lit);
     if (blank < 0) { return ""; }
-    return sliceRange(lit, blank + 4, lit.length);
+    return projectSlice(lit, blank + 4, lit.length);
 }
 
 // Value of an RFC 822 header line inside a FETCH literal ("" when absent):
@@ -298,7 +301,7 @@ public string headerValue(string text, string headerName) {
             if (headMatch) {
                 int valStart = pos + nameLen;
                 if (text[valStart] == 32) { valStart++; }
-                return sliceRange(text, valStart, eol);
+                return projectSlice(text, valStart, eol);
             }
         }
         pos = eol + 2;
@@ -312,7 +315,12 @@ class message {
     public string body;
     public string raw;
 
-    construct(string raw) { this.raw = raw; }
+    construct(string raw) {
+        this.raw = raw;
+        this.fromAddr = "";
+        this.subject = "";
+        this.body = "";
+    }
 }
 
 class client {
@@ -404,7 +412,7 @@ class client {
         string raw = "";
         if (this.loggedIn && this.sock >= 0) {
             net.setRecvTimeoutRaw(this.sock, 30000);
-            this.cmd("FETCH " + id.toString() + " (RFC822)");
+            this.cmd("FETCH " + (string)id + " (RFC822)");
             this.readTagged();
             if (replyOk(this.lastReply, nextTag(this.tag - 1))) { raw = this.lastReply; }
         }
@@ -422,7 +430,7 @@ class client {
         string[] empty = [];
         if (!this.loggedIn) { return empty; }
         char qc = char(34);
-        string q = qc.toString();
+        string q = (string)qc;
         net.setRecvTimeoutRaw(this.sock, 30000);
         this.cmd("LIST " + q + q + " " + q + "*");
         this.readTagged();
@@ -519,7 +527,7 @@ public string[] listLines(string resp) {
         if (lineEnd - pos >= 7 && resp[pos] == 42 && resp[pos + 1] == 32
             && resp[pos + 2] == 76 && resp[pos + 3] == 73 && resp[pos + 4] == 83
             && resp[pos + 5] == 84 && resp[pos + 6] == 32) {
-            lines.push(sliceRange(resp, pos, lineEnd));
+            lines.push(projectSlice(resp, pos, lineEnd));
         }
         if (eol < 0) { break; }
         pos = eol + 2;
@@ -545,17 +553,4 @@ private int blankLineIndex(string s) {
         if (s[i] == 13 && s[i + 1] == 10 && s[i + 2] == 13 && s[i + 3] == 10) { return i; }
     }
     return -1;
-}
-
-// Copies s[start .. end) character by character. Deliberately NOT substr:
-// rs's two-arg substr treats X as an END offset while the self-host treats
-// it as a LENGTH -- identical only when start is 0 (see
-// silverc-rs/src/string_ops.rs emit_string_substring) -- and every caller
-// here slices from a nonzero offset.
-private string sliceRange(string s, int start, int end) {
-    string result = "";
-    for (int i = start; i < end; i++) {
-        result += s[i];
-    }
-    return result;
 }
