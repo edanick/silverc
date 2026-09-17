@@ -4930,6 +4930,7 @@ int strIdx = this.stringPatchIndices[i];
                     return "bool";
                 }
                 if (cname == "replace" && recvType == "string") { return "string"; }
+                if (cname == "replaceAll" && recvType == "string") { return "string"; }
                 if (cname == "join" && expr.childCount() > 0 && expr.child(0).kind == 6 && expr.child(0).name == "string") { return "string"; }
                 if (cname == "any" || cname == "all") {
 
@@ -9400,7 +9401,7 @@ public void genNewCall(Node call) {
             }
         }
         if (recvType == "string") {
-            if (name == "contains" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "substr" || name == "substring" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toBytes" || name == "repeat") {
+            if (name == "contains" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "substr" || name == "substring" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toBytes" || name == "repeat") {
                 return true;
             }
         }
@@ -10046,8 +10047,10 @@ public void genNewCall(Node call) {
             this.asm.movRMBase(0, 5, tuDst);
             return;
         }
-        if (name == "replace") {
-            // replace(old, new) - simple implementation using strstr loops
+        if (name == "replace" || name == "replaceAll") {
+            // replace(old, new) / replaceAll(old, new) - replace every match
+            // using strstr loops. replaceAll additionally guards the empty
+            // needle (replaces nothing: returns the receiver unchanged).
             if (call.childCount() < 3) { this.genExpr(recv); return; }
             int rpR = this.allocLocal("__rep_r");
             int rpO = this.allocLocal("__rep_o");
@@ -10091,6 +10094,19 @@ public void genNewCall(Node call) {
             this.asm.callR64(0);
             this.asm.emitCallTeardown();
             this.asm.movMBaseR(5, 0, rpNL);
+            int rpEmptyDone = -1;
+            if (name == "replaceAll") {
+                // Empty needle replaces nothing: return the receiver
+                // unchanged instead of entering the scan loop.
+                rpEmptyDone = this.newLabel();
+                int rpEmptyGo = this.newLabel();
+                this.asm.movRMBase(0, 5, rpOL);
+                this.asm.cmpRI32(0, 0);
+                this.asm.jneLabel(rpEmptyGo);
+                this.asm.movRMBase(0, 5, rpR);
+                this.asm.jmpLabel(rpEmptyDone);
+                this.asm.bindLabel(rpEmptyGo);
+            }
             // Count matches using strstr
             this.asm.xorRR64(0, 0);
             this.asm.movMBaseR(5, 0, rpCnt);
@@ -10218,6 +10234,9 @@ public void genNewCall(Node call) {
             this.asm.callR64(0);
             this.asm.emitCallTeardown();
             this.asm.movRMBase(0, 5, rpDst);
+            if (name == "replaceAll") {
+                this.asm.bindLabel(rpEmptyDone);
+            }
             return;
         }
         if (name == "split" || name == "lines") {
