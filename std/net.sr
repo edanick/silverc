@@ -11,9 +11,11 @@ mod export net;
 
 // DOCS -- public `net` module. This is the universal TCP socket core
 // module: client, server, and the raw-handle primitives the protocol
-// modules (ssh, ftp, ws, smtp, ...) build on. Every ws2_32 call lives
-// inline in the `#on WINDOWS` region of the public function that needs
-// it, one unified function name per operation, no win-prefixed helpers,
+// modules (ssh, ftp, ws, smtp, ...) build on. Every OS-divergent call lives
+// inline in the `#on WINDOWS` region of the function that needs it;
+// functions whose WINDOWS and non-Windows bodies are identical are
+// region-free passthroughs delegating to the region-holding function.
+// One unified function name per operation, no win-prefixed helpers,
 // no wrapper indirection, no alias imports.
 //
 // NAME-COLLISION FINDING (probed on both compilers): the module's own public
@@ -100,28 +102,15 @@ class socket {
     construct(int fd) { this.fd = fd; }
 
     public void send(string data) {
-        #on WINDOWS
         sendRaw(this.fd, data);
-        #else
-        sendRaw(this.fd, data);
-        #off
     }
 
     public string receive(int maxLen) {
-        #on WINDOWS
         return recvRaw(this.fd, maxLen);
-        #else
-        return recvRaw(this.fd, maxLen);
-        #off
-        return "";
     }
 
     public void close() {
-        #on WINDOWS
         closeRaw(this.fd);
-        #else
-        closeRaw(this.fd);
-        #off
     }
 
     public int handle() {
@@ -135,24 +124,13 @@ class listener {
     construct(int fd) { this.fd = fd; }
 
     public socket accept() {
-        #on WINDOWS
         int client = acceptRaw(this.fd);
         if (client < 0) { return null; }
         return new socket(client);
-        #else
-        int client = acceptRaw(this.fd);
-        if (client < 0) { return null; }
-        return new socket(client);
-        #off
-        return null;
     }
 
     public void close() {
-        #on WINDOWS
         closeRaw(this.fd);
-        #else
-        closeRaw(this.fd);
-        #off
     }
 
     public int handle() {
@@ -177,74 +155,39 @@ class tls_client {
     public void setCert(string path) { this.certPath = path; }
 
     public bool connect() {
-        #on WINDOWS
         int sock = connectRaw(this.host, this.port);
         if (sock < 0) { return false; }
         this.context = sock;
         return true;
-        #else
-        int sock = connectRaw(this.host, this.port);
-        if (sock < 0) { return false; }
-        this.context = sock;
-        return true;
-        #off
-        return false;
     }
 
     public void send(string data) {
-        #on WINDOWS
         sendRaw(this.context, data);
-        #else
-        sendRaw(this.context, data);
-        #off
     }
 
     public string receive() {
-        #on WINDOWS
         return recvRaw(this.context, 8192);
-        #else
-        return recvRaw(this.context, 8192);
-        #off
-        return "";
     }
 
     public void close() {
-        #on WINDOWS
         closeRaw(this.context);
-        #else
-        closeRaw(this.context);
-        #off
     }
 }
 
 // Public API: connects to host:port and returns a socket object (null on
 // failure). host is a dotted IPv4 string (inet_addr parses it).
 public socket connect(string host, int port) {
-    #on WINDOWS
     int sock = connectRaw(host, port);
     if (sock < 0) { return null; }
     return new socket(sock);
-    #else
-    int sock = connectRaw(host, port);
-    if (sock < 0) { return null; }
-    return new socket(sock);
-    #off
-    return null;
 }
 
 // Public API: binds INADDR_ANY:port, listens (backlog 10) and returns a
 // listener object (null on failure).
 public listener listen(int port) {
-    #on WINDOWS
     int sock = listenRaw(port);
     if (sock < 0) { return null; }
     return new listener(sock);
-    #else
-    int sock = listenRaw(port);
-    if (sock < 0) { return null; }
-    return new listener(sock);
-    #off
-    return null;
 }
 
 // ---- raw-handle primitives (protocol modules build on these) -------------
@@ -256,12 +199,7 @@ public listener listen(int port) {
 // Creates a TCP socket and connects it to host:port. Returns the raw socket
 // descriptor, or -1 on failure.
 public int connectRaw(string host, int port) {
-    #on WINDOWS
     return openTcp(host, port);
-    #else
-    return openTcp(host, port);
-    #off
-    return -1;
 }
 
 // Creates a TCP socket and binds it to INADDR_ANY:port without listening.
@@ -304,33 +242,20 @@ public int bindRaw(int port) {
 // Creates a TCP socket, binds it to INADDR_ANY:port and listens (backlog 10).
 // Returns the raw listening descriptor, or -1 on failure.
 public int listenRaw(int port) {
-    #on WINDOWS
     return bindListen(port);
-    #else
-    return bindListen(port);
-    #off
-    return -1;
 }
 
 // Blocks until a client connects to the listening descriptor. Returns the raw
 // client descriptor, or -1 on failure.
 public int acceptRaw(int fd) {
-    #on WINDOWS
     int client = accept(fd, null, null);
     if (client > 2147483647) { client -= 4294967296; }
     return client;
-    #else
-    int client = accept(fd, null, null);
-    if (client > 2147483647) { client -= 4294967296; }
-    return client;
-    #off
-    return -1;
 }
 
 // Sends the string's bytes on the raw descriptor (packed into an int[]
 // qword buffer; byte[] must not cross a DLL boundary). No-op on len <= 0.
 public void sendRaw(int fd, string data) {
-    #on WINDOWS
     int len = data.length;
     if (len <= 0) { return; }
     int slots = (len + 7) / 8;
@@ -340,17 +265,6 @@ public void sendRaw(int fd, string data) {
         packedBuf[i / 8] = packedBuf[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
     }
     send(fd, packedBuf, len, 0);
-    #else
-    int len = data.length;
-    if (len <= 0) { return; }
-    int slots = (len + 7) / 8;
-    int[] packedBuf = new int[slots];
-    for (int i = 0; i < len; i++) {
-        int b = int(data[i]);
-        packedBuf[i / 8] = packedBuf[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
-    }
-    send(fd, packedBuf, len, 0);
-    #off
 }
 
 // Sends a byte[] payload on the raw descriptor: every byte is packed into an
@@ -360,7 +274,6 @@ public void sendRaw(int fd, string data) {
 // frames (encodeFrame), which may legitimately contain 0x00 bytes that a
 // Silver string cannot carry. No-op on len <= 0.
 public void sendBytesRaw(int fd, byte[] data) {
-    #on WINDOWS
     int len = data.length;
     if (len <= 0) { return; }
     int slots = (len + 7) / 8;
@@ -370,17 +283,6 @@ public void sendBytesRaw(int fd, byte[] data) {
         packedBuf[i / 8] = packedBuf[i / 8] | (b << ((i % 8) * 8));
     }
     send(fd, packedBuf, len, 0);
-    #else
-    int len = data.length;
-    if (len <= 0) { return; }
-    int slots = (len + 7) / 8;
-    int[] packedBuf = new int[slots];
-    for (int i = 0; i < len; i++) {
-        int b = data[i] & 0xFF;
-        packedBuf[i / 8] = packedBuf[i / 8] | (b << ((i % 8) * 8));
-    }
-    send(fd, packedBuf, len, 0);
-    #off
 }
 
 // Length-capped variant of sendRaw: sends the first `len` bytes of `data`
@@ -389,7 +291,6 @@ public void sendBytesRaw(int fd, byte[] data) {
 // writes the first 20 of its 22 bytes ("220 FTP Server ready" without the
 // CRLF).
 public void sendRawLen(int fd, string data, int len) {
-    #on WINDOWS
     if (len <= 0) { return; }
     if (len > data.length) { len = data.length; }
     int slots = (len + 7) / 8;
@@ -399,23 +300,11 @@ public void sendRawLen(int fd, string data, int len) {
         packedBuf[i / 8] = packedBuf[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
     }
     send(fd, packedBuf, len, 0);
-    #else
-    if (len <= 0) { return; }
-    if (len > data.length) { len = data.length; }
-    int slots = (len + 7) / 8;
-    int[] packedBuf = new int[slots];
-    for (int i = 0; i < len; i++) {
-        int b = int(data[i]);
-        packedBuf[i / 8] = packedBuf[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
-    }
-    send(fd, packedBuf, len, 0);
-    #off
 }
 
 // Receives up to maxLen bytes from the raw descriptor and returns them as a
 // string ("" on error or clean close).
 public string recvRaw(int fd, int maxLen) {
-    #on WINDOWS
     if (maxLen <= 0) { return ""; }
     int slots = (maxLen + 7) / 8;
     int[] buf = new int[slots];
@@ -426,25 +315,9 @@ public string recvRaw(int fd, int maxLen) {
     for (int i = 0; i < n; i++) {
         int b = (buf[i / 8] >> ((i % 8) * 8)) & 0xFF;
         char c = char(b);
-        result += c.toString();
+        result += (string)c;
     }
     return result;
-    #else
-    if (maxLen <= 0) { return ""; }
-    int slots = (maxLen + 7) / 8;
-    int[] buf = new int[slots];
-    int n = recv(fd, buf, maxLen, 0);
-    if (n > 2147483647) { n -= 4294967296; }
-    if (n <= 0) { return ""; }
-    string result = "";
-    for (int i = 0; i < n; i++) {
-        int b = (buf[i / 8] >> ((i % 8) * 8)) & 0xFF;
-        char c = char(b);
-        result += c.toString();
-    }
-    return result;
-    #off
-    return "";
 }
 
 // Closes the raw descriptor.
@@ -577,6 +450,18 @@ int bindListen(int port) {
     return -1;
 }
 
+// Renders a network-order IPv4 word as "a.b.c.d" (first octet = lowest
+// byte). Single home of the quad render shared by every lookup branch;
+// octet temps keep the explicit-cast shape the compilers prove (cf. the
+// pasvHost/ip quad shapes).
+string quadStr(int ip) {
+    int o0 = (ip >> 0) & 0xFF;
+    int o1 = (ip >> 8) & 0xFF;
+    int o2 = (ip >> 16) & 0xFF;
+    int o3 = (ip >> 24) & 0xFF;
+    return (string)o0 + "." + (string)o1 + "." + (string)o2 + "." + (string)o3;
+}
+
 // ---- name resolution -------------------------------------------------------
 // net is the socket AND name-resolution core: getaddrinfo is a ws2_32 call,
 // so it lives here. Resolves `host` to its IPv4 dotted-quad addresses (the
@@ -607,7 +492,7 @@ public string[] lookup(string host, int family = 2) {
     hints[1] = 1;
     int[] res = new int[1];
     int ret = getaddrinfo(host, null, hints, res);
-    if (ret != 0) { string[] empty = []; return empty; }
+    if (ret != 0) { return []; }
     string[] addresses = [];
     int node = res[0];
     while (node != 0) {
@@ -619,7 +504,7 @@ public string[] lookup(string host, int family = 2) {
             int[] sa = new int[2];
             memcpy(sa, saPtr, 16);
             int ip = (sa[0] >> 32) & 0xFFFFFFFF;
-            string ipStr = ((ip >> 0) & 0xFF) + "." + ((ip >> 8) & 0xFF) + "." + ((ip >> 16) & 0xFF) + "." + ((ip >> 24) & 0xFF);
+            string ipStr = quadStr(ip);
             addresses.push(ipStr);
         }
         node = next;
@@ -632,7 +517,7 @@ public string[] lookup(string host, int family = 2) {
     hints[1] = 1;
     int[] res = new int[1];
     int ret = getaddrinfo(host, null, hints, res);
-    if (ret != 0) { string[] empty = []; return empty; }
+    if (ret != 0) { return []; }
     string[] addresses = [];
     int node = res[0];
     while (node != 0) {
@@ -644,7 +529,7 @@ public string[] lookup(string host, int family = 2) {
             int[] sa = new int[2];
             memcpy(sa, saPtr, 16);
             int ip = (sa[0] >> 32) & 0xFFFFFFFF;
-            string ipStr = ((ip >> 0) & 0xFF) + "." + ((ip >> 8) & 0xFF) + "." + ((ip >> 16) & 0xFF) + "." + ((ip >> 24) & 0xFF);
+            string ipStr = quadStr(ip);
             addresses.push(ipStr);
         }
         node = next;
@@ -660,7 +545,7 @@ public string[] lookup(string host, int family = 2) {
     hints[1] = 1;
     int[] res = new int[1];
     int ret = getaddrinfo(host, null, hints, res);
-    if (ret != 0) { string[] empty = []; return empty; }
+    if (ret != 0) { return []; }
     string[] addresses = [];
     int node = res[0];
     while (node != 0) {
@@ -672,7 +557,7 @@ public string[] lookup(string host, int family = 2) {
             int[] sa = new int[2];
             memcpy(sa, saPtr, 16);
             int ip = (sa[0] >> 32) & 0xFFFFFFFF;
-            string ipStr = ((ip >> 0) & 0xFF) + "." + ((ip >> 8) & 0xFF) + "." + ((ip >> 16) & 0xFF) + "." + ((ip >> 24) & 0xFF);
+            string ipStr = quadStr(ip);
             addresses.push(ipStr);
         }
         node = next;
@@ -680,8 +565,7 @@ public string[] lookup(string host, int family = 2) {
     freeaddrinfo(res[0]);
     return addresses;
     #off
-    string[] empty = [];
-    return empty;
+    return [];
 }
 
 // Pure-Silver dotted-quad parse ("a.b.c.d" -> network-order u32, the
@@ -693,16 +577,15 @@ int parseDotted(string host) {
     int mult = 1;
     int start = 0;
     for (int part = 0; part < 4; part++) {
-        string tail = host.substr(start, host.length() - start);
+        string tail = host.substr(start, host.length - start);
         int rel = tail.indexOf(".");
-        int end = host.length();
+        int end = host.length;
         if (rel >= 0) { end = start + rel; }
-        if (part == 3 && rel >= 0) { return -1; }
-        if (part < 3 && rel < 0) { return -1; }
+        if ((part == 3 && rel >= 0) || (part < 3 && rel < 0)) { return -1; }
         string piece = host.substr(start, end - start);
-        if (piece.length() == 0) { return -1; }
+        if (piece.length == 0) { return -1; }
         int v = 0;
-        for (int i = 0; i < piece.length(); i++) {
+        for (int i = 0; i < piece.length; i++) {
             char c = piece[i];
             if (c < '0' || c > '9') { return -1; }
             v = v * 10 + (int(c) - 48);
