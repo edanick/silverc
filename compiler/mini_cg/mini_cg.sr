@@ -167,6 +167,10 @@ class MiniCg {
     public prop string[] dictFieldVars;
     public prop string[] dictFieldKeys;
     public prop string[] dictFieldKinds;
+    // Object-record variables (struct literals, declared `object` unless
+    // built from a string-keyed dict literal): whole-value prints render
+    // `{...}` like the interpreter, plain dicts render `dict{...}`.
+    public prop string[] objectVars;
     public prop int[] forwardCalls;
     public prop string[] forwardCallNames;
     public prop string[] forwardCallClasses;
@@ -328,6 +332,7 @@ class MiniCg {
         this.dictFieldVars = [];
         this.dictFieldKeys = [];
         this.dictFieldKinds = [];
+        this.objectVars = [];
         this.forwardCalls = [];
 
         this.forwardCallNames = [];
@@ -2856,6 +2861,7 @@ int strIdx = this.stringPatchIndices[i];
     this.dictFieldVars = [];
     this.dictFieldKeys = [];
     this.dictFieldKinds = [];
+    this.objectVars = [];
     this.stackSize = 0;
     this.currentClassName = className;
     this.asm.label(func.name);
@@ -2908,6 +2914,7 @@ int strIdx = this.stringPatchIndices[i];
     this.dictFieldVars = [];
     this.dictFieldKeys = [];
     this.dictFieldKinds = [];
+    this.objectVars = [];
     this.stackSize = 0;
     this.currentClassName = "";
     this.collectRefParams(func);
@@ -13206,19 +13213,35 @@ public void genNewCall(Node call) {
     // Register a dict/object variable plus per-key kinds for literal
     // inits. Declared `dict<K,V>` uses V's kind; `object` and untyped
     // `var` classify the initializer. Anything else is untouched.
+    // Object-record values (struct literals, declared `object` unless
+    // built from a string-keyed dict literal) join objectVars so whole
+    // prints render `{...}` instead of `dict{...}`.
     // initNode is null when the declaration has no initializer.
     public void trackDictDecl(string name, string typeHint, Node initNode) {
         bool isDict = this.isDictType(typeHint);
         bool isObj = typeHint == "object" || typeHint == "object?";
+        bool isUntyped = typeHint == "" || typeHint == "var";
         bool hasInit = initNode != null;
         bool initIsDict = false;
-        if (hasInit && (initNode.kind == 66 || initNode.kind == 74)) { initIsDict = true; }
-        if (!isDict && !isObj && !initIsDict) { return; }
+        bool initIsObj = false;
+        if (hasInit && initNode.kind == 66) { initIsDict = true; }
+        if (hasInit && initNode.kind == 74) { initIsObj = true; }
+        if (!isDict && !isObj && !(isUntyped && (initIsDict || initIsObj))) { return; }
         string kind = "";
         if (isDict) { kind = this.dictDeclKind(typeHint); }
-        else if (initIsDict) { kind = this.dictInitKind(initNode); }
+        else if (initIsDict || initIsObj) { kind = this.dictInitKind(initNode); }
         this.trackDictVar(name, kind);
-        if (initIsDict) {
+        bool isObjVal = false;
+        if (isObj && !initIsDict) { isObjVal = true; }
+        if (isUntyped && initIsObj) { isObjVal = true; }
+        if (isObjVal) {
+            bool seen = false;
+            for (int i = 0; i < this.objectVars.length; i++) {
+                if (this.objectVars[i] == name) { seen = true; break; }
+            }
+            if (!seen) { this.objectVars.add(name); }
+        }
+        if (initIsDict || initIsObj) {
             for (int i = 0; i < initNode.childCount(); i++) {
                 Node pair = initNode.child(i);
                 if (pair.kind != 18 || pair.childCount() < 2) { continue; }
@@ -13251,6 +13274,28 @@ public void genNewCall(Node call) {
             if (this.isDictType(t)) { whole = this.dictDeclKind(t); }
         }
         if (whole != rhsKind) { this.trackDictVar(name, ""); }
+    }
+
+    // True when the expression evaluates to an object record value
+    // (as opposed to a plain dict): struct literals, object-declared
+    // variables, and object-typed fields. Whole-object prints render
+    // `{...}`; plain dicts render `dict{...}` (interpreter parity).
+    public bool isObjectValue(Node expr) {
+        if (expr.kind == 74) { return true; }
+        if (expr.kind == 66) { return false; }
+        if (expr.kind == 6) {
+            for (int i = 0; i < this.objectVars.length; i++) {
+                if (this.objectVars[i] == expr.name) { return true; }
+            }
+            return false;
+        }
+        if (expr.kind == 13) {
+            if (expr.childCount() < 1) { return false; }
+            if (this.isDictOrObjectType(this.inferExprType(expr.child(0)))) { return false; }
+            string ft = this.inferExprType(expr);
+            return ft == "object" || ft == "object?";
+        }
+        return false;
     }
 
     // True when the expression evaluates to a whole dict/object value
@@ -13303,8 +13348,10 @@ public void genNewCall(Node call) {
             return;
         }
         if (this.isWholeDict(arg)) {
-            if (newline) { this.emitArrayText("dict{...}\n"); }
-            else { this.emitArrayText("dict{...}"); }
+            string wholeText = "dict{...}";
+            if (this.isObjectValue(arg)) { wholeText = "{...}"; }
+            if (newline) { wholeText += "\n"; }
+            this.emitArrayText(wholeText);
             return;
         }
         bool fltArg = false;
