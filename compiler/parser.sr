@@ -1868,6 +1868,17 @@ class Parser {
             this.advance();
         }
         if (this.classSectionInternal) { memberInternal = true; }
+        // `read only` contextual modifier pair directly before `prop`.
+        // `read`/`only` are not keywords (kind 7 identifiers) and stay
+        // usable as ordinary names everywhere else.
+        bool memberReadOnly = false;
+        if (this.check(7) && this.peek().text == "read"
+            && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 7 && this.tokens[this.pos + 1].text == "only"
+            && this.pos + 2 < this.tokens.length && this.tokens[this.pos + 2].kind == 47) {
+            this.advance();
+            this.advance();
+            memberReadOnly = true;
+        }
         // `def construct(...)` / `def construct { ... }` spells the
         // constructor with an explicit `def` (mirrors silverc-rs).
         if (this.check(32) && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 48) {
@@ -1985,6 +1996,24 @@ class Parser {
             field.typeHint = ft;
             field.name = this.advance().text;
             field.isInternal = memberInternal;
+            field.isReadOnly = memberReadOnly;
+            // Read-only props are set exactly once, by the declaration
+            // initializer (`=` is kind 110, like default values). Mutable
+            // props take no initializer.
+            if (memberReadOnly) {
+                if (!this.check(110)) {
+                    Token roTok = this.peek();
+                    this.recordError(roTok.line.toString() + ":" + roTok.col.toString() + ": read-only prop \"" + field.name + "\" must be declared with a value");
+                } else {
+                    this.advance();
+                    field.children.add(this.parseExpr(0));
+                }
+            } else if (this.check(110)) {
+                Token mutTok = this.peek();
+                this.recordError(mutTok.line.toString() + ":" + mutTok.col.toString() + ": prop \"" + field.name + "\" takes an initializer only as `read only prop`");
+                this.advance();
+                field.children.add(this.parseExpr(0));
+            }
             this.expect(106);
             return field;
         }
