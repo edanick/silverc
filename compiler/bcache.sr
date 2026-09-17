@@ -8,7 +8,6 @@ import * from fs;
 #on WINDOWS
 import * from win32.kernel32;
 import * from win32.msvcrt;
-#off
 #on LINUX
 import * from linux.libc;
 #off
@@ -99,7 +98,7 @@ class CacheSession {
         this.ok = true;
         return;
         #off
-        string appdata = bcEnvValue("APPDATA");
+        string appdata = env.get("APPDATA");
         if (appdata.length == 0) { return; }
         this.dir = appdata + "\\silver cache\\" + bcSanitize(projName);
         ensureDirTree(this.dir);
@@ -215,9 +214,7 @@ class CacheSession {
 
         ensureDirTree(this.dir);
         string sbcriOut = this.dir + "\\project.sbcri";
-        #on LINUX
-        sbcriOut = this.dir + "/project.sbcri";
-        #on MAC
+        #on LINUX or MAC
         sbcriOut = this.dir + "/project.sbcri";
         #off
         file.writeString(sbcriOut, indexText);
@@ -225,9 +222,7 @@ class CacheSession {
         // Reference-format binary record (little-endian, see module docs),
         // streamed in bounded chunks like the .srbc artifacts.
         string sbcrOut = this.dir + "\\project.sbcr";
-        #on LINUX
-        sbcrOut = this.dir + "/project.sbcr";
-        #on MAC
+        #on LINUX or MAC
         sbcrOut = this.dir + "/project.sbcr";
         #off
         BcBinWriter bw = new BcBinWriter(sbcrOut);
@@ -273,9 +268,7 @@ class CacheSession {
 
     private void loadRecords() {
         string sbcriPath = this.dir + "\\project.sbcri";
-        #on LINUX
-        sbcriPath = this.dir + "/project.sbcri";
-        #on MAC
+        #on LINUX or MAC
         sbcriPath = this.dir + "/project.sbcri";
         #off
         string text = tryReadText(sbcriPath);
@@ -349,24 +342,15 @@ class CacheSession {
     // ------------------------------------------------------------------
 
     private string srbcPathFor(string keyOrAbs) {
-        #on LINUX
-        string relL = this.relKey(keyOrAbs);
-        if (relL.length == 0) { return ""; }
-        string dottedL = relL;
-        if (dottedL.length >= 3 && dottedL[dottedL.length - 1] == 'r'
-            && dottedL[dottedL.length - 2] == 's' && dottedL[dottedL.length - 3] == '.') {
-            dottedL = sliceRange(dottedL, 0, dottedL.length - 3);
+        #on LINUX or MAC
+        string relP = this.relKey(keyOrAbs);
+        if (relP.length == 0) { return ""; }
+        string dottedP = relP;
+        if (dottedP.length >= 3 && dottedP[dottedP.length - 1] == 'r'
+            && dottedP[dottedP.length - 2] == 's' && dottedP[dottedP.length - 3] == '.') {
+            dottedP = sliceRange(dottedP, 0, dottedP.length - 3);
         }
-        return this.dir + "/" + dottedL + ".srbc";
-        #on MAC
-        string relM = this.relKey(keyOrAbs);
-        if (relM.length == 0) { return ""; }
-        string dottedM = relM;
-        if (dottedM.length >= 3 && dottedM[dottedM.length - 1] == 'r'
-            && dottedM[dottedM.length - 2] == 's' && dottedM[dottedM.length - 3] == '.') {
-            dottedM = sliceRange(dottedM, 0, dottedM.length - 3);
-        }
-        return this.dir + "/" + dottedM + ".srbc";
+        return this.dir + "/" + dottedP + ".srbc";
         #off
         string rel = this.relKey(keyOrAbs);
         if (rel.length == 0) { return ""; }
@@ -807,7 +791,6 @@ public string bcEnvValue(string name) {
 public int bcNowMillis() {
     #on WINDOWS
     return time(0) * 1000;
-    #off
     #on LINUX
     int[] ts = [];
     for (int i = 0; i < 16; i++) { ts.add(0); }
@@ -830,7 +813,6 @@ public int bcFileSize(string path) {
     CloseHandle(h);
     if (sz < 0) { return 0; }
     return sz;
-    #off
     #on LINUX
     int[] st = [];
     for (int i = 0; i < 144; i++) { st.add(0); }
@@ -923,10 +905,7 @@ public string bcDirname(string path) {
 }
 
 public string resolveRel(string root, string rel) {
-    #on LINUX
-    if (root.length == 0 || root == ".") { return rel; }
-    return root + "/" + rel;
-    #on MAC
+    #on LINUX or MAC
     if (root.length == 0 || root == ".") { return rel; }
     return root + "/" + rel;
     #off
@@ -940,31 +919,18 @@ public string resolveRel(string root, string rel) {
 // exists, matching the old direct CreateDirectoryA semantics. Inherited
 // drive-prefix components (e.g. "C:") skip creation exactly as before.
 public void ensureDirTree(string dir) {
-    #on LINUX
-    string curL = "";
+    #on LINUX or MAC
+    string curP = "";
     for (int i = 0; i < dir.length; i++) {
         char c = dir[i];
         if (c == '\\' || c == '/') {
-            if (curL.length >= 2) { fs.createDir(curL); }
-            curL += '/';
+            if (curP.length >= 2) { fs.createDir(curP); }
+            curP += '/';
         } else {
-            curL += c;
+            curP += c;
         }
     }
-    if (curL.length >= 2) { fs.createDir(curL); }
-    return;
-    #on MAC
-    string curM = "";
-    for (int i = 0; i < dir.length; i++) {
-        char c = dir[i];
-        if (c == '\\' || c == '/') {
-            if (curM.length >= 2) { fs.createDir(curM); }
-            curM += '/';
-        } else {
-            curM += c;
-        }
-    }
-    if (curM.length >= 2) { fs.createDir(curM); }
+    if (curP.length >= 2) { fs.createDir(curP); }
     return;
     #off
     string cur = "";
