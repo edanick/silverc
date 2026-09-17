@@ -157,6 +157,16 @@ class MiniCg {
     public prop string currentFunctionName;
     public prop bool dynamicAsmActive;
     public prop string[] localTypes;
+    // Whole-dict print kinds by variable ("string"/"float"/""), mirroring
+    // silverc-rs dict_value_types: only uniform kinds are stored, anything
+    // else renders decimal (a %s on a non-pointer crashes).
+    public prop string[] dictValueNames;
+    public prop string[] dictValueKinds;
+    // Per-key print kinds ("var" + "key" triples) for heterogeneous
+    // records, mirroring silverc-rs dict_field_types.
+    public prop string[] dictFieldVars;
+    public prop string[] dictFieldKeys;
+    public prop string[] dictFieldKinds;
     public prop int[] forwardCalls;
     public prop string[] forwardCallNames;
     public prop string[] forwardCallClasses;
@@ -313,6 +323,11 @@ class MiniCg {
         this.dynamicAsmActive = false;
         this.hasMain = false;
         this.localTypes = [];
+        this.dictValueNames = [];
+        this.dictValueKinds = [];
+        this.dictFieldVars = [];
+        this.dictFieldKeys = [];
+        this.dictFieldKinds = [];
         this.forwardCalls = [];
 
         this.forwardCallNames = [];
@@ -2836,6 +2851,11 @@ int strIdx = this.stringPatchIndices[i];
     this.localOffsets = [];
     this.localNames = [];
     this.localTypes = [];
+    this.dictValueNames = [];
+    this.dictValueKinds = [];
+    this.dictFieldVars = [];
+    this.dictFieldKeys = [];
+    this.dictFieldKinds = [];
     this.stackSize = 0;
     this.currentClassName = className;
     this.asm.label(func.name);
@@ -2883,6 +2903,11 @@ int strIdx = this.stringPatchIndices[i];
     this.localOffsets = [];
     this.localNames = [];
     this.localTypes = [];
+    this.dictValueNames = [];
+    this.dictValueKinds = [];
+    this.dictFieldVars = [];
+    this.dictFieldKeys = [];
+    this.dictFieldKinds = [];
     this.stackSize = 0;
     this.currentClassName = "";
     this.collectRefParams(func);
@@ -3178,8 +3203,19 @@ int strIdx = this.stringPatchIndices[i];
                     declType = this.inferExprType(node.child(0));
                 }
                 this.localTypes[this.localTypes.length - 1] = declType;
-                if (node.childCount() > 0 && node.child(0).kind == 66) {
+                // A dict literal init only forces the structural fallback
+                // when no type was declared: an explicit `dict<K,V>`
+                // keeps its spelled value type (without this,
+                // `dict<string,string>` degraded to int values and string
+                // reads printed the raw pointer).
+                if ((declType == "" || declType == "var") && node.childCount() > 0 && node.child(0).kind == 66) {
                     this.localTypes[this.localTypes.length - 1] = "dict<string,int>";
+                }
+                // An object literal init without a declared type is a
+                // dynamic record: without this, member reads and prints
+                // saw an untyped variable and rendered the raw pointer.
+                if ((declType == "" || declType == "var") && node.childCount() > 0 && node.child(0).kind == 74) {
+                    this.localTypes[this.localTypes.length - 1] = "object";
                 }
                 if (node.childCount() > 0 && node.child(0).kind == 70) {
                     this.localTypes[this.localTypes.length - 1] = "tuple";
@@ -3250,7 +3286,14 @@ int strIdx = this.stringPatchIndices[i];
                 this.genExpr(stmt.child(0));
             }
     } else if (stmt.kind == 50) {
-        int off = this.findLocal(stmt.name);            if (stmt.childCount() > 0) {
+        int off = this.findLocal(stmt.name);
+        // Dict/object print tracking (member reads, whole-dict prints):
+        // declared dicts use V's kind, `object` and untyped `var` classify
+        // a literal initializer.
+        Node trackInit = null;
+        if (stmt.childCount() > 0) { trackInit = stmt.child(0); }
+        this.trackDictDecl(stmt.name, stmt.typeHint, trackInit);
+        if (stmt.childCount() > 0) {
                 Node initNode = stmt.child(0);
                 if (initNode.kind == 7 && initNode.op == 28) {
                     if (initNode.childCount() > 1) {
@@ -3752,6 +3795,14 @@ int strIdx = this.stringPatchIndices[i];
     }
 
     public void genStructLiteral(Node expr, string typeName) {
+        // `object` (and untyped) struct literals are dynamic records, not
+        // class instances: lower to the dict layout so member access and
+        // prints behave like dicts. Without this the fields were skipped
+        // and reads came back uninitialized malloc memory.
+        if (typeName == "object" || typeName == "object?" || typeName == "" || typeName == "var") {
+            this.genStructLiteralAsDict(expr);
+            return;
+        }
         // Allocate a struct object (same layout as a class instance: each
         // field at offset cnt*8), then store every `name: value` pair at the
         // offset registered for that field.
@@ -4677,6 +4728,21 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.movRMBase(0, 0, -8);
             return;
         }
+        // `dict.key` / `object.key` member access lowers to a dict key
+        // lookup, mirroring `dict["key"]` (genDictIndexGet). Without this,
+        // unknown-typed receivers fell through to the struct field path,
+        // which emitted nothing, and reads came back stale registers.
+        if (fieldName != "length" && this.isDictOrObjectType(this.inferExprType(obj))) {
+            Node idxNode = new Node();
+            idxNode.kind = 24;
+            idxNode.children.add(obj);
+            Node keyNode = new Node();
+            keyNode.kind = 2;
+            keyNode.strVal = fieldName;
+            idxNode.children.add(keyNode);
+            this.genDictIndexGet(idxNode);
+            return;
+        }
         if (obj.kind == 6 && obj.name == "this") {
             int thisOff = this.findLocal("this");
             int fieldOff = this.findFieldOffset(this.currentClassName, fieldName);
@@ -5153,7 +5219,7 @@ int strIdx = this.stringPatchIndices[i];
     public void genArrayIndex(Node idx) {
         Node arrNode = idx.child(0);
         Node idxNode = idx.child(1);
-        if (this.isDictType(this.inferReceiverType(arrNode))) {
+        if (this.isDictOrObjectType(this.inferReceiverType(arrNode))) {
             this.genDictIndexGet(idx);
             return;
         }
@@ -7283,15 +7349,15 @@ int strIdx = this.stringPatchIndices[i];
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && call.child(0).name == "Value") {
             // Static factory on the builtin Value tagged union (e.g. Value.makeInt).
             this.genValueFactoryCall(call);
-        } else if (call.isMember && call.childCount() > 1 && call.name == "contains" && this.isDictType(this.inferReceiverType(call.child(0)))) {
+        } else if (call.isMember && call.childCount() > 1 && call.name == "contains" && this.isDictOrObjectType(this.inferReceiverType(call.child(0)))) {
             this.genDictContains(call);
-        } else if (call.isMember && call.childCount() > 0 && call.name == "count" && this.isDictType(this.inferReceiverType(call.child(0)))) {
+        } else if (call.isMember && call.childCount() > 0 && call.name == "count" && this.isDictOrObjectType(this.inferReceiverType(call.child(0)))) {
             this.genDictCount(call);
-        } else if (call.isMember && call.childCount() > 0 && call.name == "remove" && this.isDictType(this.inferReceiverType(call.child(0)))) {
+        } else if (call.isMember && call.childCount() > 0 && call.name == "remove" && this.isDictOrObjectType(this.inferReceiverType(call.child(0)))) {
             this.genDictRemove(call);
-        } else if (call.isMember && call.childCount() > 0 && call.name == "keys" && this.isDictType(this.inferReceiverType(call.child(0)))) {
+        } else if (call.isMember && call.childCount() > 0 && call.name == "keys" && this.isDictOrObjectType(this.inferReceiverType(call.child(0)))) {
             this.genDictKeys(call);
-        } else if (call.isMember && call.childCount() > 0 && call.name == "values" && this.isDictType(this.inferReceiverType(call.child(0)))) {
+        } else if (call.isMember && call.childCount() > 0 && call.name == "values" && this.isDictOrObjectType(this.inferReceiverType(call.child(0)))) {
             this.genDictValues(call);
         } else if (call.isMember && this.isThisAsmMember(call)) {
             // MiniAsm is a runtime object owned by MiniCg. Every this.asm
@@ -7640,6 +7706,15 @@ int strIdx = this.stringPatchIndices[i];
         Node rhs = bin.child(1);
         Node dictNode = lhs.child(0);
         Node keyNode = lhs.child(1);
+        // Keep print kinds sound across writes: a stale "string" would
+        // crash %s on the new value. Literal keys refresh per-key; any
+        // other key drops the whole kind and every per-key kind.
+        if (dictNode.kind == 6) {
+            string rhsKind = this.classifyDictValue(rhs);
+            string keyText = "";
+            if (keyNode.kind == 2) { keyText = keyNode.strVal; }
+            this.noteDictWrite(dictNode.name, keyText, rhsKind);
+        }
         this.genExpr(dictNode);
         int dBase = this.allocLocal("__ds_base");
         this.asm.movMBaseR(5, 0, dBase);
@@ -11611,7 +11686,7 @@ public void genNewCall(Node call) {
             Node idxNode = lhs.child(1);
             // dict[k] op= r lowers to dict[k] = dict[k] op r (mirrors the
             // silverc-rs Index compound-assign arm).
-            if (this.isDictType(this.inferReceiverType(arrNode))) {
+            if (this.isDictOrObjectType(this.inferReceiverType(arrNode))) {
                 Node keyExpr = new Node();
                 keyExpr.kind = 24;
                 keyExpr.children.add(arrNode);
@@ -12087,6 +12162,25 @@ public void genNewCall(Node call) {
         if (lhs.kind == 13 && lhs.childCount() >= 1) {
             Node obj = lhs.child(0);
             string fieldName = lhs.name;
+            if (this.isDictOrObjectType(this.inferExprType(obj))) {
+                // Dict/object member store routes through the key path (a
+                // raw field store would corrupt the entry-count header).
+                // genDictIndexSet also refreshes the print kinds.
+                Node idxNode = new Node();
+                idxNode.kind = 24;
+                idxNode.children.add(obj);
+                Node keyNode = new Node();
+                keyNode.kind = 2;
+                keyNode.strVal = fieldName;
+                idxNode.children.add(keyNode);
+                Node setBin = new Node();
+                setBin.kind = bin.kind;
+                setBin.op = bin.op;
+                setBin.children.add(idxNode);
+                setBin.children.add(rhs);
+                this.genDictIndexSet(setBin);
+                return;
+            }
             if (obj.kind == 6 && obj.name == "this") {
                 int thisOff = this.findLocal("this");
                 int fieldOff = this.findFieldOffset(this.currentClassName, fieldName);
@@ -12163,7 +12257,7 @@ public void genNewCall(Node call) {
         if (lhs.kind == 24 && lhs.childCount() >= 2) {
             Node arrNode = lhs.child(0);
             Node idxNode = lhs.child(1);
-            if (this.isDictType(this.inferReceiverType(arrNode))) {
+            if (this.isDictOrObjectType(this.inferReceiverType(arrNode))) {
                 this.genDictIndexSet(bin);
                 return;
             }
@@ -12469,10 +12563,23 @@ public void genNewCall(Node call) {
             return t == "string";
         }
         if (expr.kind == 13) {
+            // Dict/object member reads (`d.key`, `o.key`): per-key kind
+            // first, then the whole-dict kind; string only when "string"
+            // (never %s on unknown — it would dereference a non-pointer).
+            if (expr.childCount() > 0 && this.isDictOrObjectType(this.inferExprType(expr.child(0)))) {
+                return this.dictReadKind(expr.child(0), expr.name) == "string";
+            }
             string t = this.inferMemberAccessType(expr);
             return t == "string";
         }
         if (expr.kind == 24) {
+            // Dict index reads (`d["k"]`): literal keys classify per-key,
+            // else the whole-dict kind.
+            if (expr.childCount() > 1 && this.isDictOrObjectType(this.inferExprType(expr.child(0)))) {
+                string keyText = "";
+                if (expr.child(1).kind == 2) { keyText = expr.child(1).strVal; }
+                return this.dictReadKind(expr.child(0), keyText) == "string";
+            }
             string t = this.inferExprType(expr);
             return t == "string";
         }
@@ -12555,10 +12662,22 @@ public void genNewCall(Node call) {
             return false;
         }
         if (expr.kind == 13) {
+            // Dict/object member reads: per-key kind first, then the
+            // whole-dict kind; a double bit pattern only when "float".
+            if (expr.childCount() > 0 && this.isDictOrObjectType(this.inferExprType(expr.child(0)))) {
+                return this.dictReadKind(expr.child(0), expr.name) == "float";
+            }
             string t = this.inferMemberAccessType(expr);
             return t == "float" || t == "float64" || t == "double";
         }
         if (expr.kind == 24) {
+            // Dict index reads: literal keys classify per-key, else the
+            // whole-dict kind.
+            if (expr.childCount() > 1 && this.isDictOrObjectType(this.inferExprType(expr.child(0)))) {
+                string keyText = "";
+                if (expr.child(1).kind == 2) { keyText = expr.child(1).strVal; }
+                return this.dictReadKind(expr.child(0), keyText) == "float";
+            }
             string t = this.inferExprType(expr);
             if (t == "float" || t == "float64" || t == "double") { return true; }
             // Element reads on arrays whose declared element type is float64
@@ -12932,11 +13051,260 @@ public void genNewCall(Node call) {
         else { this.emitArrayText("]"); }
     }
 
+    // True for dict types and the dynamic `object` type: both lower to
+    // the same key/value runtime layout, so member access, methods and
+    // printing treat them alike (mirrors silverc-rs is_dict_or_object_type).
+    public bool isDictOrObjectType(string t) {
+        if (t == "object" || t == "object?") { return true; }
+        return this.isDictType(t);
+    }
+
+    // Print kind of a declared dict value type: "string" renders with %s,
+    // "float" with %g, anything else decimal.
+    public string dictDeclKind(string t) {
+        string v = this.dictValueType(t).trim();
+        if (v == "string") { return "string"; }
+        if (v == "float" || v == "float64" || v == "double") { return "float"; }
+        return "";
+    }
+
+    // Whole-dict print kind by variable: the recorded kind first, else the
+    // declared type's kind, else "" (decimal fallback — always safe).
+    public string dictWholeKindOf(string name) {
+        for (int i = 0; i < this.dictValueNames.length; i++) {
+            if (this.dictValueNames[i] == name) { return this.dictValueKinds[i]; }
+        }
+        string t = this.getLocalType(name);
+        if (t == "") {
+            int gi = this.findGlobal(name);
+            if (gi >= 0 && gi < this.globalTypes.length) { t = this.globalTypes[gi]; }
+        }
+        if (this.isDictType(t)) { return this.dictDeclKind(t); }
+        return "";
+    }
+
+    // Per-key print kind for `name.key` reads, else "".
+    public string dictFieldKindOf(string name, string key) {
+        for (int i = 0; i < this.dictFieldVars.length; i++) {
+            if (this.dictFieldVars[i] == name && this.dictFieldKeys[i] == key) { return this.dictFieldKinds[i]; }
+        }
+        return "";
+    }
+
+    // Value kind for a dict member/index read: per-key kind first, then
+    // the whole-dict kind, else "". Only plain identifiers carry recorded
+    // kinds; anything else renders decimal.
+    public string dictReadKind(Node recv, string key) {
+        if (recv.kind == 6) {
+            if (key != "") {
+                string fk = this.dictFieldKindOf(recv.name, key);
+                if (fk != "") { return fk; }
+            }
+            return this.dictWholeKindOf(recv.name);
+        }
+        return "";
+    }
+
+    // Record a variable's whole-dict kind (upsert, "" included so an
+    // invalidated kind keeps overriding the declared fallback).
+    public void trackDictVar(string name, string kind) {
+        this.dropDictVar(name);
+        this.dictValueNames.add(name);
+        this.dictValueKinds.add(kind);
+    }
+
+    public void dropDictVar(string name) {
+        string[] nn = [];
+        string[] nk = [];
+        for (int i = 0; i < this.dictValueNames.length; i++) {
+            if (this.dictValueNames[i] != name) {
+                nn.add(this.dictValueNames[i]);
+                nk.add(this.dictValueKinds[i]);
+            }
+        }
+        this.dictValueNames = nn;
+        this.dictValueKinds = nk;
+    }
+
+    // Record one per-key kind (upsert; "" drops the entry).
+    public void trackDictKey(string name, string key, string kind) {
+        this.dropDictKey(name, key);
+        if (kind != "") {
+            this.dictFieldVars.add(name);
+            this.dictFieldKeys.add(key);
+            this.dictFieldKinds.add(kind);
+        }
+    }
+
+    public void dropDictKey(string name, string key) {
+        string[] nv = [];
+        string[] nk = [];
+        string[] nd = [];
+        for (int i = 0; i < this.dictFieldVars.length; i++) {
+            if (this.dictFieldVars[i] != name || this.dictFieldKeys[i] != key) {
+                nv.add(this.dictFieldVars[i]);
+                nk.add(this.dictFieldKeys[i]);
+                nd.add(this.dictFieldKinds[i]);
+            }
+        }
+        this.dictFieldVars = nv;
+        this.dictFieldKeys = nk;
+        this.dictFieldKinds = nd;
+    }
+
+    // Drop every per-key kind of one variable (dynamic-key writes could
+    // alias any of them).
+    public void dropDictKeysOf(string name) {
+        string[] nv = [];
+        string[] nk = [];
+        string[] nd = [];
+        for (int i = 0; i < this.dictFieldVars.length; i++) {
+            if (this.dictFieldVars[i] != name) {
+                nv.add(this.dictFieldVars[i]);
+                nk.add(this.dictFieldKeys[i]);
+                nd.add(this.dictFieldKinds[i]);
+            }
+        }
+        this.dictFieldVars = nv;
+        this.dictFieldKeys = nk;
+        this.dictFieldKinds = nd;
+    }
+
+    // Print kind of a single dict value expression.
+    public string classifyDictValue(Node e) {
+        if (this.isStringLike(e)) { return "string"; }
+        if (this.isFloatLike(e)) { return "float"; }
+        return "";
+    }
+
+    // Whole-kind of a dict/object literal: "string" only when every value
+    // is a string, "float" when every value is a double (int literals
+    // allowed alongside), else "".
+    public string dictInitKind(Node initNode) {
+        int n = initNode.childCount();
+        if (n == 0) { return ""; }
+        bool allStr = true;
+        for (int i = 0; i < n; i++) {
+            Node pair = initNode.child(i);
+            if (pair.kind != 18 || pair.childCount() < 2) { allStr = false; break; }
+            if (!this.isStringLike(pair.child(1))) { allStr = false; break; }
+        }
+        if (allStr) { return "string"; }
+        bool allNum = true;
+        bool anyFlt = false;
+        for (int i = 0; i < n; i++) {
+            Node pair = initNode.child(i);
+            if (pair.kind != 18 || pair.childCount() < 2) { allNum = false; break; }
+            Node v = pair.child(1);
+            if (this.isFloatLike(v)) { anyFlt = true; }
+            else if (v.kind != 0) { allNum = false; break; }
+        }
+        if (allNum && anyFlt) { return "float"; }
+        return "";
+    }
+
+    // Register a dict/object variable plus per-key kinds for literal
+    // inits. Declared `dict<K,V>` uses V's kind; `object` and untyped
+    // `var` classify the initializer. Anything else is untouched.
+    // initNode is null when the declaration has no initializer.
+    public void trackDictDecl(string name, string typeHint, Node initNode) {
+        bool isDict = this.isDictType(typeHint);
+        bool isObj = typeHint == "object" || typeHint == "object?";
+        bool hasInit = initNode != null;
+        bool initIsDict = false;
+        if (hasInit && (initNode.kind == 66 || initNode.kind == 74)) { initIsDict = true; }
+        if (!isDict && !isObj && !initIsDict) { return; }
+        string kind = "";
+        if (isDict) { kind = this.dictDeclKind(typeHint); }
+        else if (initIsDict) { kind = this.dictInitKind(initNode); }
+        this.trackDictVar(name, kind);
+        if (initIsDict) {
+            for (int i = 0; i < initNode.childCount(); i++) {
+                Node pair = initNode.child(i);
+                if (pair.kind != 18 || pair.childCount() < 2) { continue; }
+                Node keyNode = pair.child(0);
+                string keyText = "";
+                if (keyNode.kind == 2) { keyText = keyNode.strVal; }
+                else if (keyNode.kind == 6) { keyText = keyNode.name; }
+                else { continue; }
+                this.trackDictKey(name, keyText, this.classifyDictValue(pair.child(1)));
+            }
+        }
+    }
+
+    // Refresh print kinds after a keyed dict write so a stale "string"
+    // can never crash %s on the new value. Empty key means a dynamic key:
+    // drop the whole kind and every per-key kind.
+    public void noteDictWrite(string name, string key, string rhsKind) {
+        if (key != "") {
+            this.trackDictKey(name, key, rhsKind);
+        } else {
+            this.dropDictKeysOf(name);
+        }
+        string whole = "";
+        bool hasWhole = false;
+        for (int i = 0; i < this.dictValueNames.length; i++) {
+            if (this.dictValueNames[i] == name) { whole = this.dictValueKinds[i]; hasWhole = true; break; }
+        }
+        if (!hasWhole) {
+            string t = this.getLocalType(name);
+            if (this.isDictType(t)) { whole = this.dictDeclKind(t); }
+        }
+        if (whole != rhsKind) { this.trackDictVar(name, ""); }
+    }
+
+    // True when the expression evaluates to a whole dict/object value
+    // (not a member/index value read out of one): literals, dict-typed
+    // variables, and dict-typed fields on class-typed receivers. Key
+    // reads through a dict receiver yield values and keep value formats.
+    public bool isWholeDict(Node expr) {
+        if (expr.kind == 66 || expr.kind == 74) { return true; }
+        if (expr.kind == 6) {
+            return this.isDictOrObjectType(this.getLocalType(expr.name));
+        }
+        if (expr.kind == 13) {
+            if (expr.name == "length") { return false; }
+            if (expr.childCount() < 1) { return false; }
+            if (this.isDictOrObjectType(this.inferExprType(expr.child(0)))) { return false; }
+            return this.isDictOrObjectType(this.inferExprType(expr));
+        }
+        return false;
+    }
+
+    // Lower an anonymous object literal (`{ k: v, ... }`, kind 74) to the
+    // dict runtime layout so `object` values and member access behave
+    // like dicts. Identifier keys become string keys.
+    public void genStructLiteralAsDict(Node expr) {
+        Node dictNode = new Node();
+        dictNode.kind = 66;
+        for (int i = 0; i < expr.childCount(); i++) {
+            Node pair = expr.child(i);
+            if (pair.kind != 18 || pair.childCount() < 2) { continue; }
+            Node key = pair.child(0);
+            Node value = pair.child(1);
+            Node strKey = new Node();
+            strKey.kind = 2;
+            if (key.kind == 2) { strKey.strVal = key.strVal; }
+            else { strKey.strVal = key.name; }
+            Node dpair = new Node();
+            dpair.kind = 18;
+            dpair.children.add(strKey);
+            dpair.children.add(value);
+            dictNode.children.add(dpair);
+        }
+        this.genExpr(dictNode);
+    }
+
     public void genPrintCall(Node call, bool newline) {
         if (call.childCount() < 1) { return; }
         Node arg = call.child(0);
         if (this.isArrayValue(arg)) {
             this.genArrayPrintValue(arg, newline);
+            return;
+        }
+        if (this.isWholeDict(arg)) {
+            if (newline) { this.emitArrayText("dict{...}\n"); }
+            else { this.emitArrayText("dict{...}"); }
             return;
         }
         bool fltArg = false;
@@ -13840,7 +14208,7 @@ public void genNewCall(Node call) {
 
         if (rtNullableChar) {
             this.genCharToString(bin.child(1));
-        } else if (rt == "string") {
+        } else if (rt == "string" || this.isStringLike(bin.child(1))) {
             this.genExpr(bin.child(1));
         } else if (this.isFloatLike(bin.child(1))) {
             // Float operands stringify with %g via sprintf (silverc-rs
@@ -13856,7 +14224,7 @@ public void genNewCall(Node call) {
         bool ltNullableChar = this.isCharExpr(bin.child(0));
         if (ltNullableChar) {
             this.genCharToString(bin.child(0));
-        } else if (lt == "string") {
+        } else if (lt == "string" || this.isStringLike(bin.child(0))) {
             this.genExpr(bin.child(0));
         } else if (this.isFloatLike(bin.child(0))) {
             this.genFloatToString(bin.child(0));
