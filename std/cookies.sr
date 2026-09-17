@@ -14,6 +14,10 @@ class cookie {
         this.name = name;
         this.value = value;
         this.path = "/";
+        this.domain = "";
+        this.httpOnly = false;
+        this.secure = false;
+        this.sameSite = "";
         this.maxAge = -1;
     }
 
@@ -26,33 +30,56 @@ class cookie {
 
     public string serialize() {
         string result = this.name + "=" + this.value;
-        if (this.path.length() > 0) { result += "; Path=" + this.path; }
-        if (this.domain.length() > 0) { result += "; Domain=" + this.domain; }
+        if (this.path.length > 0) { result += "; Path=" + this.path; }
+        if (this.domain.length > 0) { result += "; Domain=" + this.domain; }
         if (this.httpOnly) { result += "; HttpOnly"; }
         if (this.secure) { result += "; Secure"; }
-        if (this.sameSite.length() > 0) { result += "; SameSite=" + this.sameSite; }
-        if (this.maxAge >= 0) { result += "; Max-Age=" + this.maxAge; }
+        if (this.sameSite.length > 0) { result += "; SameSite=" + this.sameSite; }
+        if (this.maxAge >= 0) { result += "; Max-Age=" + (string)this.maxAge; }
         return result;
     }
 }
 
 class multimap {
-    private kvp<string, string> data;
+    private string[] keys;
+    private string[] vals;
 
+    construct {
+        this.keys = [];
+        this.vals = [];
+    }
 
     public string get(string name) {
-        return this.data.get(name);
+        for (int i = 0; i < this.keys.length; i++) {
+            if (this.keys[i] == name) { return this.vals[i]; }
+        }
+        return "";
     }
 
     public void set(string name, string value) {
-        this.data.set(name, value);
+        this.removeKey(name);
+        this.keys.push(name);
+        this.vals.push(value);
+    }
+
+    private void removeKey(string key) {
+        string[] keepKeys = [];
+        string[] keepVals = [];
+        for (int i = 0; i < this.keys.length; i++) {
+            if (this.keys[i] != key) {
+                keepKeys.push(this.keys[i]);
+                keepVals.push(this.vals[i]);
+            }
+        }
+        this.keys = keepKeys;
+        this.vals = keepVals;
     }
 }
 
 public multimap parse(string raw) {
     multimap m = new multimap();
     string[] pairs = raw.split("; ");
-    for (int pi = 0; pi < pairs.length(); pi++) {
+    for (int pi = 0; pi < pairs.length; pi++) {
         string pair = pairs[pi];
         int eq = pair.indexOf("=");
         if (eq < 0) {
@@ -80,7 +107,7 @@ public cookie parseSetCookie(string raw) {
     if (semicolon >= 0) {
         string rest = raw.substr(semicolon + 1);
         string[] parts = rest.split(";");
-        for (int pi = 0; pi < parts.length(); pi++) {
+        for (int pi = 0; pi < parts.length; pi++) {
             string part = parts[pi];
             string p = part.trim();
             int colon = p.indexOf("=");
@@ -91,15 +118,15 @@ public cookie parseSetCookie(string raw) {
             else if (attr.toLower() == "httponly") { c.httpOnly = true; }
             else if (attr.toLower() == "secure") { c.secure = true; }
             else if (attr.toLower() == "samesite") { c.sameSite = val; }
-            else if (attr.toLower() == "max-age") { c.maxAge = int(val); }
+            else if (attr.toLower() == "max-age") { c.maxAge = (int)val; }
         }
     }
     return c;
 }
 
 public cookie[] parseSetCookies(string[] headers) {
-    cookie[] cookies;
-    for (int hi = 0; hi < headers.length(); hi++) {
+    cookie[] cookies = [];
+    for (int hi = 0; hi < headers.length; hi++) {
         string h = headers[hi];
         cookies.push(parseSetCookie(h));
     }
