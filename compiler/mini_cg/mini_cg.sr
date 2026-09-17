@@ -4852,6 +4852,10 @@ int strIdx = this.stringPatchIndices[i];
                 }
             }
             if (!expr.isMember && cname == "char") { return "char"; }
+            if (!expr.isMember && (cname == "int" || cname == "int32" || cname == "int64")) { return "int"; }
+            if (!expr.isMember && (cname == "float" || cname == "float64" || cname == "double")) { return "float64"; }
+            if (!expr.isMember && cname == "bool") { return "bool"; }
+            if (!expr.isMember && cname == "string_cast") { return "string"; }
             string recvType = "";
             if (expr.isMember && expr.childCount() > 0) {
                 recvType = this.inferExprType(expr.child(0));
@@ -6937,7 +6941,9 @@ int strIdx = this.stringPatchIndices[i];
                     this.asm.movRMBase(2, 5, toStrOff);
                     this.asm.cmpRR64(1, 2);
                     this.asm.jneLabel(toOk);
-                    this.emitThrowException("invalid number format");
+                    // No digits parsed: strtoll already returned 0, matching
+                    // the reference compilers (no throw).
+                    this.asm.xorRR64(0, 0);
                     this.asm.bindLabel(toOk);
                 } else {
                     this.genExpr(arg);
@@ -6987,6 +6993,67 @@ int strIdx = this.stringPatchIndices[i];
             if (call.childCount() > 0) {
                 this.genExpr(call.child(0));
                 this.asm.andRImm(0, 0xFF);
+            } else {
+                this.asm.xorRR64(0, 0);
+            }
+        } else if (builtinName && name == "string_cast" && !call.isMember) {
+            // string_cast(...) conversion: renders exactly like .toString()
+            // (DOCS/113). This is also what the C-style `(string) x` cast
+            // lowers to in the parser.
+            if (call.childCount() > 0) {
+                Node sarg = call.child(0);
+                string srt = this.inferExprType(sarg);
+                if (srt == "string") {
+                    this.genExpr(sarg);
+                } else if (this.isCharExpr(sarg)) {
+                    this.genCharToString(sarg);
+                } else if (srt == "float" || srt == "float64" || srt == "double") {
+                    this.genFloatToString(sarg);
+                } else {
+                    this.genIntToString(sarg);
+                }
+            } else {
+                this.emitLlmaiStringLiteral("");
+            }
+        } else if (builtinName && name == "bool" && !call.isMember) {
+            // bool(...) conversion: 1 unless the operand equals its zero
+            // value — 0 for ints/chars/bytes/bools, 0.0 for floats, ""
+            // for strings via strlen (DOCS/113). This is also what the
+            // C-style `(bool) x` cast lowers to in the parser. The float
+            // branch compares with ucomisd + jne, so NaN behaves exactly
+            // as `f != 0.0` does.
+            if (call.childCount() > 0) {
+                Node barg = call.child(0);
+                string bt = this.inferExprType(barg);
+                if (bt == "string") {
+                    this.genExpr(barg);
+                    this.asm.movRR64(1, 0);
+                    this.addImportPatch("ucrtbase.dll", "strlen");
+                    int bSl = 0xDEADBEEFCAFEBAD1;
+                    this.asm.emitImm64(0, bSl);
+                    this.asm.movRMBase(0, 0, 0);
+                    this.asm.emitCallSetup(0);
+                    this.asm.callR64(0);
+                    this.asm.emitCallTeardown();
+                    this.asm.cmpRI32(0, 0);
+                } else if (bt == "float" || bt == "float64" || bt == "double") {
+                    this.genExpr(barg);
+                    this.asm.movqXMMR64(0, 0);
+                    this.asm.xorRR64(2, 2);
+                    this.asm.movqXMMR64(1, 2);
+                    this.asm.ucomisdXMM(0, 1);
+                } else {
+                    this.genExpr(barg);
+                    this.asm.cmpRI32(0, 0);
+                }
+                int bT = this.newLabel();
+                int bD = this.newLabel();
+                this.asm.jneLabel(bT);
+                this.asm.movRI64(0, 0);
+                this.asm.jmpLabel(bD);
+                this.asm.bindLabel(bT);
+                this.asm.movRI64(0, 1);
+                this.asm.bindLabel(bD);
             } else {
                 this.asm.xorRR64(0, 0);
             }

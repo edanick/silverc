@@ -833,6 +833,7 @@ class Parser {
         if (name == "int" || name == "float") { return true; }
         if (name == "double" || name == "char") { return true; }
         if (name == "byte" || name == "string_cast") { return true; }
+        if (name == "bool") { return true; }
         if (name == "now" || name == "cargs") { return true; }
         if (name == "getCommandLine" || name == "super") { return true; }
         if (name == "readFile" || name == "readString") { return true; }
@@ -898,6 +899,7 @@ class Parser {
         cands.add("int"); cands.add("float");
         cands.add("double"); cands.add("char");
         cands.add("byte"); cands.add("string_cast");
+        cands.add("bool");
         cands.add("now"); cands.add("cargs");
         cands.add("getCommandLine");
         cands.add("readFile"); cands.add("readString");
@@ -3382,19 +3384,27 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 unsupportedNul.kind = 5;
                 return unsupportedNul;
             }
-            // C-style casts used by legacy/runtime modules, e.g. `(int) c`.
-            // Integer and character values share the native scalar
-            // representation, so the self-hosted backend can lower these
-            // casts as the operand itself.  Detect the cast before ordinary
-            // parenthesized/tuple expressions; the required closing `)` makes
-            // the forms unambiguous.
+            // C-style casts, e.g. `(int) c`: primitive targets lower as the
+            // matching conversion call (DOCS/113) so every cast converts;
+            // void/var/user-type names keep the legacy pass-through.
             int castSaved = this.pos;
-            bool castType = this.check(17) || this.check(18) || this.check(19) || this.check(20) || this.check(22) || this.check(23) || this.check(25) || this.check(26) || this.check(27) || this.check(28) || this.check(7);
-            if (castType) {
+            bool castPrim = this.check(18) || this.check(19) || this.check(20) || this.check(22) || this.check(23) || this.check(25) || this.check(26) || this.check(27);
+            bool castNop = this.check(17) || this.check(28) || this.check(7);
+            if (castPrim || castNop) {
+                Token typeTok = this.peek();
                 this.advance();
                 if (this.check(101)) {
                     this.advance();
-                    return this.parseExpr(10);
+                    Node operand = this.parseExpr(10);
+                    if (castNop) { return operand; }
+                    string convName = typeTok.text;
+                    if (typeTok.text == "string") { convName = "string_cast"; }
+                    Node conv = new Node();
+                    conv.kind = 10;
+                    conv.name = convName;
+                    conv.line = typeTok.line; conv.col = typeTok.col;
+                    conv.children.add(operand);
+                    return conv;
                 }
             }
             this.pos = castSaved;
