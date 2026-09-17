@@ -113,27 +113,8 @@ class MemoryGuard {
         this.unwrapDepth = 0;
     }
 
-    private bool endsWithQ(string s) {
-        if (s.length == 0) { return false; }
-        return s[s.length - 1] == '?';
-    }
-
-    private string i2s(int v) {
-        if (v == 0) { return "0"; }
-        bool neg = false;
-        if (v < 0) { neg = true; v = 0 - v; }
-        int[] digs = [];
-        while (v > 0) { digs.add(v % 10); v = v / 10; }
-        string s = "";
-        if (neg) { s = "-"; }
-        for (int i = digs.length - 1; i >= 0; i--) {
-            s += charToString((char)(48 + digs[i]));
-        }
-        return s;
-    }
-
     private void fail(string exc, int line, int col, string varName, string msg) {
-        printline("GuardError: " + exc + " at line " + this.i2s(line) + ", column " + this.i2s(col) + ": " + varName + ": " + msg);
+        printline("GuardError: " + exc + " at line " + (string)line + ", column " + (string)col + ": " + varName + ": " + msg);
         exit(1);
     }
 
@@ -397,7 +378,7 @@ class MemoryGuard {
                 if (rhs.kind == GND_IDENT && n.op == GOP_ASSIGN) {
                     int ri = this.findVar(rhs.name);
                     if (ri >= 0 && this.vars[ri].isNullable) {
-                        if (v.typeHint.length > 0 && !this.endsWithQ(v.typeHint)) {
+                        if (v.typeHint.length > 0 && !v.typeHint.endsWith("?")) {
                             this.fail("NullValueException", rhs.line, rhs.col, lhs.name, "nullable value " + rhs.name + " used without a null check (use ??)");
                         }
                     }
@@ -415,10 +396,7 @@ class MemoryGuard {
     }
 
     private bool isPrimitive(string t) {
-        if (t == "int" || t == "string" || t == "bool" || t == "char") { return true; }
-        if (t == "float" || t == "float64" || t == "int32" || t == "int64") { return true; }
-        if (t == "uint" || t == "double" || t == "void" || t == "var") { return true; }
-        if (t == "byte") { return true; }
+        if (t == "int" || t == "string" || t == "bool" || t == "char" || t == "float" || t == "float64" || t == "int32" || t == "int64" || t == "uint" || t == "double" || t == "void" || t == "var" || t == "byte") { return true; }
         return false;
     }
 
@@ -426,7 +404,7 @@ class MemoryGuard {
         if (init.kind == GND_IDENT) {
             int ri = this.findVar(init.name);
             if (ri >= 0 && this.vars[ri].isNullable) {
-                if (node.typeHint.length > 0 && !this.endsWithQ(node.typeHint)) {
+                if (node.typeHint.length > 0 && !node.typeHint.endsWith("?")) {
                     this.fail("NullValueException", init.line, init.col, node.name, "nullable value " + init.name + " used without a null check (use ??)");
                 }
             }
@@ -435,7 +413,7 @@ class MemoryGuard {
 
     private void checkVarDecl(Node n) {
         string name = n.name;
-        bool nullable = this.endsWithQ(n.typeHint);
+        bool nullable = n.typeHint.endsWith("?");
         bool onceFlag = n.isOnce;
         bool fixedFlag = n.isFixed;
         bool liveFlag = n.isLive;
@@ -472,7 +450,7 @@ class MemoryGuard {
 
     private void checkAlias(Node n) {
         string aname = n.name;
-        bool nullable = this.endsWithQ(n.typeHint);
+        bool nullable = n.typeHint.endsWith("?");
         if (n.childCount() >= 2) {
             Node tgt = n.child(1);
             if (tgt.kind == GND_IDENT) {
@@ -587,7 +565,7 @@ class MemoryGuard {
         this.checkExpr(n.child(1));
         this.pushScope();
         Node vd = n.child(0);
-        this.declareVar(vd.name, vd.typeHint, true, true, false, false, this.endsWithQ(vd.typeHint), false, vd.line, vd.col);
+        this.declareVar(vd.name, vd.typeHint, true, true, false, false, vd.typeHint.endsWith("?"), false, vd.line, vd.col);
         this.checkStmt(n.child(2));
         this.popScope();
     }
@@ -601,7 +579,7 @@ class MemoryGuard {
         this.pushScope();
         string cv = n.name;
         if (cv.length > 0) {
-            this.declareVar(cv, n.typeHint, true, true, false, false, this.endsWithQ(n.typeHint), false, n.line, n.col);
+            this.declareVar(cv, n.typeHint, true, true, false, false, n.typeHint.endsWith("?"), false, n.line, n.col);
         }
         this.checkStmt(n.child(1));
         this.popScope();
@@ -642,9 +620,7 @@ class MemoryGuard {
     }
 
     private bool isArithOp(int op) {
-        if (op == GOP_ADD || op == GOP_SUB || op == GOP_MUL || op == GOP_DIV || op == GOP_MOD) { return true; }
-        if (op == GOP_SHL || op == GOP_SHR || op == GOP_BIT_AND || op == GOP_BIT_OR || op == GOP_BIT_XOR) { return true; }
-        if (op == GOP_AND || op == GOP_OR) { return true; }
+        if (op == GOP_ADD || op == GOP_SUB || op == GOP_MUL || op == GOP_DIV || op == GOP_MOD || op == GOP_SHL || op == GOP_SHR || op == GOP_BIT_AND || op == GOP_BIT_OR || op == GOP_BIT_XOR || op == GOP_AND || op == GOP_OR) { return true; }
         return false;
     }
 
@@ -787,7 +763,7 @@ class MemoryGuard {
         Node params = n.child(0);
         for (int i = 0; i < params.childCount(); i++) {
             Node p = params.child(i);
-            this.declareVar(p.name, p.typeHint, true, true, false, false, this.endsWithQ(p.typeHint), false, p.line, p.col);
+            this.declareVar(p.name, p.typeHint, true, true, false, false, p.typeHint.endsWith("?"), false, p.line, p.col);
         }
         if (n.childCount() >= 2) {
             Node body = n.child(1);
