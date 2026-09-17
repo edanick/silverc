@@ -4879,7 +4879,7 @@ int strIdx = this.stringPatchIndices[i];
                 if ((expr.child(0).name == "fs" || expr.child(0).name == "file" || expr.child(0).name == "folder") && (cname == "isDir" || cname == "isFile" || cname == "isDriveRoot" || cname == "exists")) {
                     return "bool";
                 }
-                if ((expr.child(0).name == "fs" || expr.child(0).name == "file" || expr.child(0).name == "folder") && cname == "getSize") {
+                if ((expr.child(0).name == "fs" || expr.child(0).name == "file" || expr.child(0).name == "folder") && (cname == "getSize" || cname == "size")) {
                     return "int64";
                 }
                 if ((expr.child(0).name == "fs" || expr.child(0).name == "folder") && (cname == "getEntries" || cname == "entries" || cname == "list" || cname == "getFiles" || cname == "files" || cname == "getFolders" || cname == "folders")) {
@@ -7169,7 +7169,7 @@ int strIdx = this.stringPatchIndices[i];
             this.genFileCopyCall(call);
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file") && (call.name == "rename" || call.name == "move")) {
             this.genFileRenameCall(call);
-        } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file") && call.name == "getSize") {
+        } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file") && (call.name == "getSize" || call.name == "size")) {
             this.genFileSizeCall(call);
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && call.child(0).name == "folder" && call.name == "getSize") {
             this.genFolderSizeCall(call);
@@ -7191,7 +7191,7 @@ int strIdx = this.stringPatchIndices[i];
             if (call.name == "getFiles" || call.name == "files") { entFilter = 1; }
             else if (call.name == "getFolders" || call.name == "folders") { entFilter = 2; }
             this.genFolderEntriesCall(call, entFilter);
-        } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.isFileOpsReceiver(call.child(0)) && (call.name == "readString" || call.name == "readFile" || call.name == "writeString" || call.name == "writeBytes" || call.name == "writeFile" || call.name == "exists" || call.name == "delete" || call.name == "rename" || call.name == "move" || call.name == "copy" || call.name == "getSize" || call.name == "isDir" || call.name == "isFile" || call.name == "isDriveRoot" || call.name == "getExt" || call.name == "getExtension" || call.name == "getEntries" || call.name == "entries" || call.name == "list" || call.name == "getFiles" || call.name == "files" || call.name == "getFolders" || call.name == "folders")) {
+        } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.isFileOpsReceiver(call.child(0)) && (call.name == "readString" || call.name == "readFile" || call.name == "writeString" || call.name == "writeBytes" || call.name == "writeFile" || call.name == "exists" || call.name == "delete" || call.name == "rename" || call.name == "move" || call.name == "copy" || call.name == "getSize" || call.name == "size" || call.name == "isDir" || call.name == "isFile" || call.name == "isDriveRoot" || call.name == "getExt" || call.name == "getExtension" || call.name == "getEntries" || call.name == "entries" || call.name == "list" || call.name == "getFiles" || call.name == "files" || call.name == "getFolders" || call.name == "folders")) {
             // Instance call on a FileOps/FolderOps-typed value (e.g.
             // `FileOps file; file.readString(p)`). fs.sr sources are
             // builtin-reserved so these classes have no collected methods;
@@ -7216,7 +7216,7 @@ int strIdx = this.stringPatchIndices[i];
                 this.genFileRenameCall(call);
             } else if (call.name == "copy") {
                 this.genFileCopyCall(call);
-            } else if (call.name == "getSize") {
+            } else if (call.name == "getSize" || call.name == "size") {
                 if (isFolderOps) { this.genFolderSizeCall(call); }
                 else { this.genFileSizeCall(call); }
             } else if (call.name == "isDir") {
@@ -12624,9 +12624,240 @@ public void genNewCall(Node call) {
         this.linuxBackend.emitLinuxSprintfStaged(this, isFloat);
     }
 
+    // True when expr evaluates to an array data pointer (mirrors
+    // silverc-rs is_array_value): an index (kind 24) and `.length` are
+    // scalars derived from arrays and must keep scalar formatting, and a
+    // same-named user class method (Box.add) is a normal call, never the
+    // array builtin. Routing a scalar through genArrayPrintValue would
+    // dereference it as a pointer, so the print arm must use this.
+    public bool isArrayValue(Node expr) {
+        if (expr.kind == 24) { return false; }
+        if (expr.kind == 13) {
+            if (expr.name == "length") { return false; }
+            string arrMt = this.inferExprType(expr);
+            if (arrMt.length >= 2 && arrMt[arrMt.length - 2] == '[' && arrMt[arrMt.length - 1] == ']') { return true; }
+            return false;
+        }
+        if (expr.kind == 19) { return true; }
+        if (expr.kind == 6) {
+            string arrT = this.inferExprType(expr);
+            if (arrT.length >= 2 && arrT[arrT.length - 2] == '[' && arrT[arrT.length - 1] == ']') { return true; }
+            return false;
+        }
+        if (expr.kind == 10) {
+            if (expr.isMember && expr.childCount() > 0 && this.isUserClassMemberCall(expr)) {
+                string arrRt = this.inferExprType(expr);
+                if (arrRt.length >= 2 && arrRt[arrRt.length - 2] == '[' && arrRt[arrRt.length - 1] == ']') { return true; }
+                return false;
+            }
+            if (expr.isMember && expr.childCount() > 0 && (expr.name == "split" || expr.name == "lines" || expr.name == "toBytes")) {
+                string arrRecv = this.inferExprType(expr.child(0));
+                if (arrRecv == "string") { return true; }
+                return false;
+            }
+            if (expr.isMember && expr.childCount() > 0 && (expr.name == "add" || expr.name == "push" || expr.name == "slice" || expr.name == "map" || expr.name == "reverse" || expr.name == "unique" || expr.name == "distinct" || expr.name == "sort" || expr.name == "filter" || expr.name == "concat" || expr.name == "flat" || expr.name == "take" || expr.name == "skip" || expr.name == "chunk" || expr.name == "zip" || expr.name == "partition")) {
+                string arrRecv2 = this.inferExprType(expr.child(0));
+                if (arrRecv2.length >= 2 && arrRecv2[arrRecv2.length - 2] == '[' && arrRecv2[arrRecv2.length - 1] == ']') { return true; }
+                return false;
+            }
+            if (!expr.isMember && (expr.name == "cargs" || expr.name == "split")) { return true; }
+            string arrCt = this.inferExprType(expr);
+            if (arrCt.length >= 2 && arrCt[arrCt.length - 2] == '[' && arrCt[arrCt.length - 1] == ']') { return true; }
+            return false;
+        }
+        if (expr.kind == 23) {
+            if (expr.childCount() > 0) { return this.isArrayValue(expr.child(0)); }
+            return false;
+        }
+        if (expr.kind == 65) {
+            if (expr.childCount() >= 3) {
+                if (!this.isArrayValue(expr.child(1))) { return false; }
+                return this.isArrayValue(expr.child(2));
+            }
+            return false;
+        }
+        return false;
+    }
+
+    // Element type for whole-array printing: the declared element type when
+    // inferExprType resolves one, else the builtin knowledge below (split /
+    // lines yield strings, toBytes yields bytes, element-preserving
+    // transforms keep the receiver's element type, literals classify by
+    // their children like the membership strcmp check does). "" means
+    // unknown and renders decimal.
+    public string arrayPrintElemType(Node arg) {
+        string pt = this.inferExprType(arg);
+        if (pt.length >= 2 && pt[pt.length - 2] == '[' && pt[pt.length - 1] == ']') {
+            return this.arrayElementType(pt);
+        }
+        if (arg.kind == 19 && arg.op != 1 && arg.op != 2 && arg.childCount() > 0) {
+            bool litAllStr = true;
+            for (int ci = 0; ci < arg.childCount(); ci++) {
+                if (!this.isStringLike(arg.child(ci))) { litAllStr = false; break; }
+            }
+            if (litAllStr) { return "string"; }
+            bool litAllNum = true;
+            bool litAnyFlt = false;
+            for (int ci = 0; ci < arg.childCount(); ci++) {
+                Node le = arg.child(ci);
+                if (this.isFloatLike(le)) { litAnyFlt = true; }
+                else if (le.kind != 0) { litAllNum = false; break; }
+            }
+            if (litAllNum && litAnyFlt) { return "float64"; }
+            return "int";
+        }
+        if (arg.kind == 10 && arg.isMember && arg.childCount() > 0) {
+            if (arg.name == "split" || arg.name == "lines") { return "string"; }
+            if (arg.name == "toBytes") { return "byte"; }
+            if (arg.name == "slice" || arg.name == "reverse" || arg.name == "unique" || arg.name == "distinct" || arg.name == "sort" || arg.name == "filter" || arg.name == "concat" || arg.name == "flat" || arg.name == "take" || arg.name == "skip" || arg.name == "chunk" || arg.name == "zip" || arg.name == "partition") {
+                return this.arrayPrintElemType(arg.child(0));
+            }
+        }
+        if (arg.kind == 23 && arg.childCount() > 0) { return this.arrayPrintElemType(arg.child(0)); }
+        if (arg.kind == 65 && arg.childCount() >= 3) {
+            string ta = this.arrayPrintElemType(arg.child(1));
+            string tb = this.arrayPrintElemType(arg.child(2));
+            if (ta == tb) { return ta; }
+        }
+        return "";
+    }
+
+    // printf(text) with no varargs: one bracket / separator piece of an
+    // array print. Mirrors the scalar literal path (fmt address through the
+    // string patch table, first-arg register, shared printf tail).
+    public void emitArrayText(string text) {
+        int fmtIdx = this.addString(text);
+        int sp = this.asm.buf.length;
+        this.asm.emitImm64(0, 0);
+        this.stringPatchOffsets.add(sp + 2);
+        this.stringPatchIndices.add(fmtIdx);
+        this.asm.movRR64(1, 0);
+        if (this.isLinuxTarget()) {
+            this.asm.movRR64(7, 1);
+            this.asm.movRR64(6, 2);
+            this.emitAbiCallSetup(0);
+            this.addImportPatchDirect("libc.so.6", "printf");
+            this.asm.emitImm64(0, 0);
+            this.asm.movRMBase(10, 0, 0);
+            this.asm.xorRR64(0, 0);
+            this.asm.callR64(10);
+            this.emitAbiCallTeardown();
+        } else {
+            this.addImportPatch("msvcrt.dll", "printf");
+            int s1 = 0xDEADBEEFCAFEBAD0;
+            this.asm.emitImm64(0, s1);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+        }
+    }
+
+    // printf(fmt, value) where the value sits in RAX on entry. Mirrors the
+    // scalar print tail exactly (GP slot plus XMM0/AL for floats), so %g
+    // array elements read the same bits %g scalars do.
+    public void emitArrayElement(string fmt, bool isFloat) {
+        this.asm.pushR64(0);
+        int fmtIdx = this.addString(fmt);
+        int sp = this.asm.buf.length;
+        this.asm.emitImm64(0, 0);
+        this.stringPatchOffsets.add(sp + 2);
+        this.stringPatchIndices.add(fmtIdx);
+        this.asm.movRR64(1, 0);
+        this.asm.popR64(2);
+        if (this.isLinuxTarget()) {
+            this.asm.movRR64(7, 1);
+            this.asm.movRR64(6, 2);
+            if (isFloat) { this.emitMovqXmmGpr(0, 6); }
+            this.emitAbiCallSetup(0);
+            this.addImportPatchDirect("libc.so.6", "printf");
+            this.asm.emitImm64(0, 0);
+            this.asm.movRMBase(10, 0, 0);
+            this.asm.xorRR64(0, 0);
+            if (isFloat) { this.asm.incR64(0); }
+            this.asm.callR64(10);
+            this.emitAbiCallTeardown();
+        } else {
+            this.addImportPatch("msvcrt.dll", "printf");
+            int s1 = 0xDEADBEEFCAFEBAD0;
+            if (isFloat) {
+                this.asm.emitImm64(0, s1);
+                this.asm.emitCallSetup(0);
+                this.asm.movRMBase(10, 0, 0);
+                this.asm.movRI64(0, 1);
+                this.asm.callR64(10);
+                this.asm.emitCallTeardown();
+            } else {
+                this.asm.emitImm64(0, s1);
+                this.asm.movRMBase(0, 0, 0);
+                this.asm.emitCallSetup(0);
+                this.asm.callR64(0);
+                this.asm.emitCallTeardown();
+            }
+        }
+    }
+
+    // Whole-array print (DOCS/233, DOCS/234): `[elem, elem, ...]` with
+    // `", "` separators — strings double-quoted, floats via %g, everything
+    // else decimal — matching the interpreter's arrayToString. Previously
+    // arrays fell through to %lld and printed the raw data pointer.
+    public void genArrayPrintValue(Node arg, bool newline) {
+        if (arg.kind == 19 && arg.op != 1 && arg.op != 2 && arg.childCount() == 0) {
+            if (newline) { this.emitArrayText("[]\n"); }
+            else { this.emitArrayText("[]"); }
+            return;
+        }
+        string elemT = this.arrayPrintElemType(arg);
+        bool strElem = elemT == "string";
+        bool fltElem = elemT == "float" || elemT == "float64" || elemT == "double";
+        this.genExpr(arg);
+        int arrOff = this.allocLocal("__parr_arr");
+        this.asm.movMBaseR(5, 0, arrOff);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(0, 0, -8);
+        int lenOff = this.allocLocal("__parr_len");
+        this.asm.movMBaseR(5, 0, lenOff);
+        int iOff = this.allocLocal("__parr_i");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.emitArrayText("[");
+        int loopStart = this.newLabel();
+        int loopEnd = this.newLabel();
+        int noSep = this.newLabel();
+        this.asm.bindLabel(loopStart);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(loopEnd);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(noSep);
+        this.emitArrayText(", ");
+        this.asm.bindLabel(noSep);
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(0, 1, 0);
+        if (strElem) { this.emitArrayElement("\"%s\"", false); }
+        else if (fltElem) { this.emitArrayElement("%g", true); }
+        else { this.emitArrayElement("%lld", false); }
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(loopStart);
+        this.asm.bindLabel(loopEnd);
+        if (newline) { this.emitArrayText("]\n"); }
+        else { this.emitArrayText("]"); }
+    }
+
     public void genPrintCall(Node call, bool newline) {
         if (call.childCount() < 1) { return; }
         Node arg = call.child(0);
+        if (this.isArrayValue(arg)) {
+            this.genArrayPrintValue(arg, newline);
+            return;
+        }
         bool fltArg = false;
         if (arg.kind == 2) {
             string s = arg.strVal;
@@ -12637,7 +12868,7 @@ public void genNewCall(Node call) {
             string esc = "";
             for (int qi = 0; qi < s.length; qi++) {
                 if (s[qi] == '%') { esc += "%%"; }
-                else { esc += charToString(s[qi]); }
+                else { esc += s[qi].toString(); }
             }
             if (newline) { esc += "\n"; }
             int strIdx = this.addString(esc);
@@ -12661,7 +12892,7 @@ public void genNewCall(Node call) {
                     string txt = part.strVal;
                     for (int ci = 0; ci < txt.length; ci++) {
                         if (txt[ci] == '%') { fmt += "%%"; }
-                        else { fmt += charToString(txt[ci]); }
+                        else { fmt += txt[ci].toString(); }
                     }
                 } else {
                     if (this.isStringLike(part)) { fmt += "%s"; }
@@ -12883,7 +13114,7 @@ public void genNewCall(Node call) {
                 string txt = part.strVal;
                 for (int ci = 0; ci < txt.length; ci++) {
                     if (txt[ci] == '%') { fmt += "%%"; }
-                    else { fmt += charToString(txt[ci]); }
+                    else { fmt += txt[ci].toString(); }
                 }
             } else {
                 if (this.isStringLike(part)) { fmt += "%s"; }
