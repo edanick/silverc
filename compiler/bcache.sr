@@ -85,22 +85,15 @@ class CacheSession {
         this.createdStamp = 0;
         this.oldIndexText = "";
         this.dirtyCount = 0;
-        #on LINUX
-        this.dir = "/var/cache/silver/" + bcSanitize(projName);
-        ensureDirTree(this.dir);
-        this.loadRecords();
-        this.ok = true;
-        return;
-        #on MAC
-        this.dir = "/Library/Caches/Silver/" + bcSanitize(projName);
-        ensureDirTree(this.dir);
-        this.loadRecords();
-        this.ok = true;
-        return;
-        #off
+        #on WINDOWS
         string appdata = env.get("APPDATA");
         if (appdata.length == 0) { return; }
         this.dir = appdata + "\\silver cache\\" + bcSanitize(projName);
+        #on LINUX
+        this.dir = "/var/cache/silver/" + bcSanitize(projName);
+        #on MAC
+        this.dir = "/Library/Caches/Silver/" + bcSanitize(projName);
+        #off
         ensureDirTree(this.dir);
         this.loadRecords();
         this.ok = true;
@@ -342,16 +335,6 @@ class CacheSession {
     // ------------------------------------------------------------------
 
     private string srbcPathFor(string keyOrAbs) {
-        #on LINUX or MAC
-        string relP = this.relKey(keyOrAbs);
-        if (relP.length == 0) { return ""; }
-        string dottedP = relP;
-        if (dottedP.length >= 3 && dottedP[dottedP.length - 1] == 'r'
-            && dottedP[dottedP.length - 2] == 's' && dottedP[dottedP.length - 3] == '.') {
-            dottedP = sliceRange(dottedP, 0, dottedP.length - 3);
-        }
-        return this.dir + "/" + dottedP + ".srbc";
-        #off
         string rel = this.relKey(keyOrAbs);
         if (rel.length == 0) { return ""; }
         string dotted = rel;
@@ -359,6 +342,9 @@ class CacheSession {
             && dotted[dotted.length - 2] == 's' && dotted[dotted.length - 3] == '.') {
             dotted = sliceRange(dotted, 0, dotted.length - 3);
         }
+        #on LINUX or MAC
+        return this.dir + "/" + dotted + ".srbc";
+        #off
         return this.dir + "\\" + bcReplaceAll(dotted, "/", "\\") + ".srbc";
     }
 
@@ -919,26 +905,16 @@ public string resolveRel(string root, string rel) {
 // exists, matching the old direct CreateDirectoryA semantics. Inherited
 // drive-prefix components (e.g. "C:") skip creation exactly as before.
 public void ensureDirTree(string dir) {
+    string sep = "\\";
     #on LINUX or MAC
-    string curP = "";
-    for (int i = 0; i < dir.length; i++) {
-        char c = dir[i];
-        if (c == '\\' || c == '/') {
-            if (curP.length >= 2) { fs.createDir(curP); }
-            curP += '/';
-        } else {
-            curP += c;
-        }
-    }
-    if (curP.length >= 2) { fs.createDir(curP); }
-    return;
+    sep = "/";
     #off
     string cur = "";
     for (int i = 0; i < dir.length; i++) {
         char c = dir[i];
         if (c == '\\' || c == '/') {
             if (cur.length >= 2) { fs.createDir(cur); }
-            cur += '\\';
+            cur += sep;
         } else {
             cur += c;
         }
