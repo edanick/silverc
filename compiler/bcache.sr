@@ -5,6 +5,7 @@ import * from lexer;
 import * from env;
 import * from fs;
 import * from path;
+import * from string;
 
 #on WINDOWS
 import * from win32.kernel32;
@@ -121,9 +122,9 @@ class CacheSession {
         string key = this.relKey(absPath);
         if (key.length == 0) { return bcLex(bcSliceSlow(aggSource, start, end)); }
         int64 hash = bcFnv1Range(aggSource, start, end);
-        int size = bcFileSize(absPath);
-        string hashKey = bcIntToStr(hash);
-        string sizeKey = size.toString();
+        int size = file.size(absPath);
+        string hashKey = (string)hash;
+        string sizeKey = (string)size;
         int idx = this.indexOfKey(key);
         if (idx >= 0) {
             if (this.hashesStr[idx] == hashKey && this.mTimesStr[idx] == sizeKey) {
@@ -141,18 +142,18 @@ class CacheSession {
         int stamp = bcNowMillis();
         if (this.encodable(tokens)) {
             this.storeSrbc(absPath, tokens, stamp, hashKey, sizeKey);
-            string created = stamp.toString();
+            string created = (string)stamp;
             if (idx >= 0) {
                 created = this.cTimesStr[idx];
                 this.mTimesStr[idx] = sizeKey;
                 this.hashesStr[idx] = hashKey;
-                this.cachedAtStr[idx] = stamp.toString();
+                this.cachedAtStr[idx] = (string)stamp;
             } else {
                 this.keys.add(key);
                 this.cTimesStr.add(created);
                 this.mTimesStr.add(sizeKey);
                 this.hashesStr.add(hashKey);
-                this.cachedAtStr.add(stamp.toString());
+                this.cachedAtStr.add((string)stamp);
             }
             this.dirtyCount++;
         }
@@ -198,7 +199,7 @@ class CacheSession {
         // Linear index build: one small string per line, joined once
         // (per-line concatenation was quadratic in the record count).
         string[] idxParts = [];
-        idxParts.add("created " + bcIntToStr(this.createdStamp) + "\n");
+        idxParts.add("created " + (string)this.createdStamp + "\n");
         idxParts.add("name " + this.projectName + "\n");
         for (int r = 0; r < this.keys.length; r++) {
             idxParts.add("f " + this.keyOf(r) + "\n");
@@ -239,10 +240,10 @@ class CacheSession {
                 for (int pi = 0; pi < kp.length; pi++) {
                     bw.b8(kp[pi] & 0xFF);
                 }
-                bw.b64(decToI64(this.cTimesStr[rb]));
-                bw.b64(decToI64(this.mTimesStr[rb]));
-                bw.b64(decToI64(this.hashesStr[rb]));
-                bw.b64(decToI64(this.cachedAtStr[rb]));
+                bw.b64((int)this.cTimesStr[rb]);
+                bw.b64((int)this.mTimesStr[rb]);
+                bw.b64((int)this.hashesStr[rb]);
+                bw.b64((int)this.cachedAtStr[rb]);
             }
         }
         bw.close();
@@ -272,15 +273,15 @@ class CacheSession {
         while (pos < text.length) {
             int eol = pos;
             while (eol < text.length && text[eol] != '\n') { eol++; }
-            string line = sliceRange(text, pos, eol);
+            string line = projectSlice(text, pos, eol);
             pos = eol + 1;
-            if (startsWith(line, "created ")) {
-                this.createdStamp = decToI64(sliceRange(line, 8, line.length));
-            } else if (startsWith(line, "f ")) {
+            if (line.startsWith("created ")) {
+                this.createdStamp = (int)projectSlice(line, 8, line.length);
+            } else if (line.startsWith("f ")) {
                 // f <key> <created> <modified-token> <hash> <cachedAt>
                 // (fields joined with the unit separator so paths containing
                 // spaces survive the round trip)
-                string rest = sliceRange(line, 2, line.length);
+                string rest = projectSlice(line, 2, line.length);
                 string f1 = wordAtSep(rest, 0, '|');
                 string f2 = wordAtSep(rest, 1, '|');
                 string f3 = wordAtSep(rest, 2, '|');
@@ -341,7 +342,7 @@ class CacheSession {
         string dotted = rel;
         if (dotted.length >= 3 && dotted[dotted.length - 1] == 'r'
             && dotted[dotted.length - 2] == 's' && dotted[dotted.length - 3] == '.') {
-            dotted = sliceRange(dotted, 0, dotted.length - 3);
+            dotted = projectSlice(dotted, 0, dotted.length - 3);
         }
         #on LINUX or MAC
         return this.dir + "/" + dotted + ".srbc";
@@ -366,7 +367,7 @@ class CacheSession {
             bw.b8(66);
             bw.b8(67);
             bw.b16(1);
-            bw.b64(decToI64(hashKey));
+            bw.b64((int)hashKey);
             int64 sv = stamp;
             bw.b64(sv);
             bw.b32(tokens.length);
@@ -401,9 +402,9 @@ class CacheSession {
         if (tw.ok()) {
             tw.put(hashKey);
             tw.put(" ");
-            tw.put(stamp.toString());
+            tw.put((string)stamp);
             tw.put(" ");
-            tw.put(tokens.length.toString());
+            tw.put((string)tokens.length);
             tw.put("\n");
             for (int i = 0; i < tokens.length; i++) {
                 this.writeTokenLine(tw, tokens[i]);
@@ -418,14 +419,14 @@ class CacheSession {
     // tokenLine(); emitted piecewise into the streaming writer.
     private void writeTokenLine(BcTextWriter t, Token tok) {
         int tag = tagOf(tok);
-        t.put(tag.toString());
+        t.put((string)tag);
         t.put(" ");
-        t.put(tok.line.toString());
+        t.put((string)tok.line);
         t.put(" ");
-        t.put(tok.col.toString());
+        t.put((string)tok.col);
         if (tag == 200) {
             t.put(" ");
-            t.put(bcIntToStr(tok.intVal));
+            t.put((string)tok.intVal);
             t.put("\n");
             return;
         }
@@ -436,14 +437,14 @@ class CacheSession {
         if (tag == 203) {
             int cvEnc = tok.charVal;
             t.put(" ");
-            t.put(cvEnc.toString());
+            t.put((string)cvEnc);
             t.put("\n");
             return;
         }
         if (tag == 202 || tag == 204 || tag == 205) {
             t.put(" ");
             string s = tok.strVal;
-            t.put(s.length.toString());
+            t.put((string)s.length);
             t.put(":");
             string hex = "";
             for (int i = 0; i < s.length; i++) {
@@ -513,7 +514,7 @@ class CacheSession {
                 if (norm[i] != rootNorm[i]) { prefix = false; break; }
             }
             if (prefix && norm[rootNorm.length] == '/') {
-                return sliceRange(norm, rootNorm.length + 1, norm.length);
+                return projectSlice(norm, rootNorm.length + 1, norm.length);
             }
         }
         return norm;
@@ -601,7 +602,7 @@ class BcBinWriter {
             // included — the carrier's strlen-based .length is never
             // consulted.
             file.writeBytes(this.scratch, this.buf);
-            if (bcFileSize(this.scratch) == n) {
+            if (file.size(this.scratch) == n) {
                 string carrier = file.readString(this.scratch);
                 #on WINDOWS
                 int w = 0;
@@ -705,7 +706,7 @@ public string bcSpaces(int n) {
     int full = n / 20;
     for (int i = 0; i < full; i++) { parts.add(unit); }
     int rem = n - full * 20;
-    if (rem > 0) { parts.add(sliceRange(unit, 0, rem)); }
+    if (rem > 0) { parts.add(projectSlice(unit, 0, rem)); }
     return parts.join("");
 }
 
@@ -777,29 +778,6 @@ public int bcNowMillis() {
     return 0;
 }
 
-// File size via CreateFileA + GetFileSize (std fs has no size() yet —
-// reported gap), region-wrapped. LINUX branch uses stat via linux.libc
-// (st_size at offset 48), same 0-on-failure shape.
-public int bcFileSize(string path) {
-    #on WINDOWS
-    int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
-    if (h == -1 || h == 0) { return 0; }
-    int sz = GetFileSize(h, null);
-    CloseHandle(h);
-    if (sz < 0) { return 0; }
-    return sz;
-    #on LINUX
-    int[] st = [];
-    for (int i = 0; i < 144; i++) { st.add(0); }
-    int rc = stat(path, st);
-    if (rc != 0) { return 0; }
-    int szL = st[48] + st[49] * 256 + st[50] * 65536 + st[51] * 16777216;
-    if (szL < 0) { return 0; }
-    return szL;
-    #off
-    return 0;
-}
-
 // Modification-time proxy recorded in the .sbcr slot: the compiled runtime
 // has no cross-stage-safe way to read FILETIMEs, so the change token is the
 // file size. Content identity is always decided by the FNV-1 hash alongside
@@ -815,7 +793,7 @@ public int bcModifiedMs(string path) {
     int nsecM = stm[96] + stm[97] * 256 + stm[98] * 65536 + stm[99] * 16777216;
     return secM * 1000 + nsecM / 1000000;
     #off
-    return bcFileSize(path);
+    return file.size(path);
 }
 
 // FNV-1 64-bit hash (spec: "FNV-1 hash of the contents"). Compiled int64
@@ -835,34 +813,13 @@ public string bcNormalizeSlashes(string path) {
     return r;
 }
 
-public string bcReplaceAll(string s, string what, string with) {
-    string r = "";
-    int i = 0;
-    while (i < s.length) {
-        if (i + what.length <= s.length) {
-            bool hit = true;
-            for (int j = 0; j < what.length; j++) {
-                if (s[i + j] != what[j]) { hit = false; break; }
-            }
-            if (hit) {
-                r += with;
-                i += what.length;
-                continue;
-            }
-        }
-        r += s[i];
-        i++;
-    }
-    return r;
-}
-
 public string bcDirname(string path) {
     int last = -1;
     for (int i = 0; i < path.length; i++) {
         if (path[i] == '\\' || path[i] == '/') { last = i; }
     }
     if (last < 0) { return "."; }
-    return sliceRange(path, 0, last);
+    return projectSlice(path, 0, last);
 }
 
 public string resolveRel(string root, string rel) {
@@ -897,20 +854,6 @@ public void ensureDirTree(string dir) {
     if (cur.length >= 2) { fs.createDir(cur); }
 }
 
-public string sliceRange(string s, int start, int end) {
-    string r = "";
-    for (int i = start; i < end && i < s.length; i++) { r += s[i]; }
-    return r;
-}
-
-private bool startsWith(string s, string prefix) {
-    if (s.length < prefix.length) { return false; }
-    for (int i = 0; i < prefix.length; i++) {
-        if (s[i] != prefix[i]) { return false; }
-    }
-    return true;
-}
-
 private string wordAtSep(string s, int which, char sep) {
     int idx = 0;
     int i = 0;
@@ -919,25 +862,11 @@ private string wordAtSep(string s, int which, char sep) {
         int start = i;
         while (i < s.length && s[i] != sep) { i++; }
         if (i > start) {
-            if (idx == which) { return sliceRange(s, start, i); }
+            if (idx == which) { return projectSlice(s, start, i); }
             idx++;
         }
     }
     return "";
-}
-
-private int64 decToI64(string s) {
-    bool neg = false;
-    int i = 0;
-    if (s.length > 0 && s[0] == '-') { neg = true; i = 1; }
-    int64 v = 0;
-    for (; i < s.length; i++) {
-        char c = s[i];
-        if (c < '0' || c > '9') { break; }
-        v = v * 10 + (c - '0');
-    }
-    if (neg) { v = -v; }
-    return v;
 }
 
 private string tryReadText(string path) {
@@ -1097,7 +1026,7 @@ private Token? tokenFromParts(int tag, string payload, int64 iv, int cv) {
     if (tag == 200) {
         t.kind = 1;
         t.intVal = iv;
-        t.text = bcIntToStr(iv);
+        t.text = (string)iv;
         return t;
     }
     if (tag == 201) {
@@ -1115,7 +1044,7 @@ private Token? tokenFromParts(int tag, string payload, int64 iv, int cv) {
         t.kind = 4;
         t.charVal = char(cv);
         char tc = t.charVal;
-        t.text = charToString(tc);
+        t.text = (string)tc;
         return t;
     }
     if (tag == 204) {
@@ -1200,7 +1129,7 @@ private Token? tokenFromRange(string text, int start, int end) {
                 int lo = bcHexVal(text[hexStart + b * 2 + 1]);
                 if (hi < 0 || lo < 0) { return null; }
                 #on WINDOWS
-                lstrcatA(payload, charToString(char(hi * 16 + lo)));
+                lstrcatA(payload, (string)char(hi * 16 + lo));
                 #off
             }
         }
@@ -1243,25 +1172,6 @@ private int64 bcDecRangeSigned(string s, int start, int end) {
     }
     if (neg) { v = -v; }
     return v;
-}
-
-private string bcIntToStr(int64 v) {
-    if (v == 0) { return "0"; }
-    bool neg = v < 0;
-    int64 mag = v;
-    if (neg) { mag = -v; }
-    string rev = "";
-    while (mag > 0) {
-        char digit = char(48 + (mag % 10));
-        rev += digit;
-        mag = mag / 10;
-    }
-    string r = "";
-    for (int i = rev.length - 1; i >= 0; i--) {
-        r += rev[i];
-    }
-    if (neg) { r = "-" + r; }
-    return r;
 }
 
 // Lex source text fresh (cache-miss path).
