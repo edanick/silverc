@@ -1,4 +1,5 @@
 import * from net;
+import * from string;
 
 mod export http_server;
 
@@ -44,12 +45,16 @@ mod export http_server;
 // Request parsing is pure index scanning over char codes; line/header
 // splits are manual CR/LF scans (no string.split). Multi-part substr use
 // sticks to the portable forms -- substr(0, n), single-argument tails, and
-// the slice(start, endExclusive) helper -- since rs substr(start, X) is
-// (start, END) while the self-host is (start, LENGTH). On a malformed
-// request the request fields stay "". This module carries its own local
-// headermap class built on the parallel string[] idiom, whose
-// set/add/get/getAll/has/serialize surface mirrors the
-// std/headers multimap.
+// projectSlice(start, endExclusive) from std/string (the local slice helper
+// was deleted on the file-52 turn -- same end-index contract, clamped) --
+// since rs substr(start, X) is (start, END) while the self-host is (start,
+// LENGTH). On a malformed request the request fields stay "". Header
+// storage is the local headermap class (parallel string[] idiom, lowered
+// keys; set/add/get/has/serialize plus getAll) -- deliberately NOT the
+// std/headers multimap (see FORCED EXCEPTIONS). Header name/value
+// whitespace is trimmed with the s.trim() member (superset of the deleted
+// trimSpaces' space/tab set: it also strips CR/LF edges, matching
+// std/headers' own parse).
 // Response building is centralized in the pure render(body) helper (single
 // source of truth, byte-identical on both compilers -- the std/ws.sr
 // encodeFrame precedent); send() renders then writes through net.sendRaw
@@ -64,9 +69,9 @@ mod export http_server;
 // self-host; `object` locals are additionally rejected at parse time on
 // both). No stringification exists to delegate to, so the member sends
 // nothing; callers should format their JSON as text and use send()
-// (`send("{\"ok\":true}")`). Content-Length uses the property form
-// `body.length` (the `.length()` call form reads garbage on the
-// self-host).
+// (`send("{\"ok\":true}")`). Content-Length uses `(string)body.length`
+// (the int-to-string cast spelling; the `.length()` call form reads
+// garbage on the self-host).
 //
 // THE HANDLER CONTRACT (probed end-to-end on both compilers -- this is the
 // only supported way to write a handler; the probe evidence is cited per
@@ -133,11 +138,23 @@ mod export http_server;
 // writes through net.sendRaw.
 //
 // FORCED EXCEPTIONS (documented):
-// - request.headers is typed `headermap` (this module's local class, with
-//   the get/has/getAll/set/add/serialize surface) rather than the
-//   std/headers `multimap` -- the multimap's runtime shapes are landmined
-//   (string ternaries, the `.length()` call form that reads garbage on the
-//   self-host). The public field name is `headers`.
+// - request.headers is the local `headermap` class (same storage shape,
+//   same lowered-key contract, same get/has/getAll/set/add/serialize
+//   surface as the std/headers `multimap`) rather than the multimap
+//   itself. The file-52 turn PROBED the unification (import * from
+//   headers, headermap deleted) and REVERTED it: `response.header()` --
+//   `this.headers.set()` on a multimap-typed field -- is a silent no-op
+//   on the self-host (deterministic: render loses every set header;
+//   driver-owned direct multimap.set works, same-module headermap.set
+//   works), while the bootstrap applies it (500-iteration hammer green,
+//   one transient drop observed). All-or-nothing per helper: the twin
+//   stays until the backend dispatches imported-type field calls. The
+//   pre-unification comment here alleging string-ternary + `.length()`-
+//   callform landmines in `headers.sr` was STALE (neither is in
+//   headers.sr: serialize uses if/else, `.length` property everywhere --
+//   probed 2026-09) and is NOT the reason. The public field name stays
+//   `headers`; getAll absent contract stays `[]` (neither getAll has a
+//   caller -- the []-vs-null choice rides with the future unification).
 // - serve's fn-parameter is `void ()` (zero-arg) rather than
 //   `void (request, response)` -- the arg-carrying fn type parses on
 //   NEITHER compiler; the payload flows through the accessors per THE
@@ -266,12 +283,13 @@ class request {
         }
         if (i1 < 0 || i2 < 0 || i1 == i2) { return; }
         this.method = first.substr(0, i1);
-        // Index-sliced spans (slice(start, endExclusive)): the only portable
-        // substr forms are substr(0, n) and single-argument tails -- for any
-        // other start the rs (start, END) and self-host (start, LENGTH)
-        // semantics diverge (substr(i1+1, i2) yields the right span on rs
-        // and an overrun on the self-host).
-        this.path = slice(first, i1 + 1, i2);
+        // Index-sliced spans via projectSlice(start, endExclusive) from
+        // std/string (same end-index contract as the deleted local slice;
+        // clamped): the only portable substr forms are substr(0, n) and
+        // single-argument tails -- for any other start the rs (start, END)
+        // and self-host (start, LENGTH) semantics diverge (substr(i1+1, i2)
+        // yields the right span on rs and an overrun on the self-host).
+        this.path = projectSlice(first, i1 + 1, i2);
         this.version = first.substr(i2 + 1);
         int hdrEnd = -1;
         for (int i = 0; i + 3 < raw.length; i++) {
@@ -279,7 +297,7 @@ class request {
         }
         if (hdrEnd < 0) { return; }
         if (hdrEnd > lineEnd + 2) {
-            string hdrStr = slice(raw, lineEnd + 2, hdrEnd);
+            string hdrStr = projectSlice(raw, lineEnd + 2, hdrEnd);
             parseHeaderBlock(this.headers, hdrStr);
         }
         if (hdrEnd + 4 <= raw.length) {
@@ -353,12 +371,12 @@ class response {
     // and the body. NO socket write -- probeable byte-identically on both
     // compilers.
     public string render(string body) {
-        string resp = "HTTP/1.1 " + this.statusCode + " " + this.statusText + "\r\n";
+        string resp = "HTTP/1.1 " + (string)this.statusCode + " " + this.statusText + "\r\n";
         resp += this.headers.serialize();
         if (!this.headers.has("Content-Type")) {
             resp += "Content-Type: text/plain\r\n";
         }
-        resp += "Content-Length: " + body.length + "\r\n";
+        resp += "Content-Length: " + (string)body.length + "\r\n";
         resp += "Connection: close\r\n\r\n";
         resp += body;
         return resp;
@@ -410,10 +428,10 @@ class server {
     public void listenNow() {
         this.listenFd = net.listenRaw(this.port);
         if (this.listenFd < 0) {
-            printline("Failed to bind to port " + this.port);
+            printline("Failed to bind to port " + (string)this.port);
         } else {
             net.setRecvTimeoutRaw(this.listenFd, 30000);
-            printline("HTTP server listening on port " + this.port);
+            printline("HTTP server listening on port " + (string)this.port);
         }
     }
 
@@ -518,34 +536,10 @@ public string requestHeader(string name) {
     return r.headers.get(name);
 }
 
-// Index-sliced span [start, endExclusive) built by char scan -- the only
-// portable multi-part substring form (see the note in request's construct).
-private string slice(string s, int start, int endExclusive) {
-    string out = "";
-    for (int i = start; i < endExclusive; i++) {
-        out += s[i];
-    }
-    return out;
-}
-
-// Trims spaces/tabs from both ends (manual scan -- no string.trim
-// dependency).
-private string trimSpaces(string s) {
-    int a = 0;
-    int b = s.length - 1;
-    while (a <= b && (s[a] == 32 || s[a] == 9)) { a++; }
-    while (b >= a && (s[b] == 32 || s[b] == 9)) { b--; }
-    string out = "";
-    for (int i = a; i <= b; i++) {
-        out += s[i];
-    }
-    return out;
-}
-
 // Parses one "\r\n"-separated header block into m (manual CR/LF scans --
 // see the portable-substr note in request's construct for why string.split
 // is not used). Malformed lines (no colon) are skipped, exactly like the
-// std/headers parse.
+// std/headers parse (whose `.trim()` member this uses per name/value).
 private void parseHeaderBlock(headermap m, string block) {
     int i = 0;
     while (i < block.length) {
@@ -558,18 +552,18 @@ private void parseHeaderBlock(headermap m, string block) {
             line = block.substr(i);
             i = block.length;
         } else {
-            line = slice(block, i, lineEnd);
+            line = projectSlice(block, i, lineEnd);
             i = lineEnd + 2;
         }
-        string trimmed = trimSpaces(line);
+        string trimmed = line.trim();
         if (trimmed.length == 0) { continue; }
         int colon = -1;
         for (int c = 0; c < trimmed.length; c++) {
             if (trimmed[c] == 58) { colon = c; break; }
         }
         if (colon < 0) { continue; }
-        string name = trimSpaces(trimmed.substr(0, colon));
-        string value = trimSpaces(trimmed.substr(colon + 1));
+        string name = trimmed.substr(0, colon).trim();
+        string value = trimmed.substr(colon + 1).trim();
         m.add(name, value);
     }
 }
