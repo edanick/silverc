@@ -42,7 +42,8 @@ import {readString, writeString} from fs;
 // stringify() then emits only the header line). On silverc-rs writer.row
 // works fully. WORKAROUND so the FILE-level API still works everywhere:
 // save() serializes through the collision-free writer.addLine(string)
-// (both paths share the private quoteField helper), so save/load round
+// (both paths share the private serializeRow helper, which quotes through
+// quoteField), so save/load round
 // trips are byte-identical on BOTH compilers; only a hand-rolled
 // writer.row()+stringify() chain is self-host-dead (use save(), or add
 // lines via addLine).
@@ -106,13 +107,7 @@ class writer {
     // SILENT NO-OP (its name collides with the class `row` -- see the
     // collision landmine in the module header); silverc-rs runs it fully.
     public void row(string[] values) {
-        string line = "";
-        for (int i = 0; i < values.length; i++) {
-            if (i > 0) { line += ","; }
-            string v = values[i];
-            line += quoteField(v);
-        }
-        this.rows.push(line);
+        this.rows.push(serializeRow(values));
     }
 
     // Appends one already-serialized CSV line -- the collision-free path
@@ -156,6 +151,21 @@ public document load(string path) {
     return parse(content);
 }
 
+// The single home for row serialization (STANDARDS §6): writer.row and
+// save() shared one quote-and-join loop under two spellings, so both call
+// this. save() still routes through addLine, not w.row(): the row-name
+// collision makes w.row a silent no-op on the self-host (see the module
+// header) -- save() must work on both compilers.
+private string serializeRow(string[] values) {
+    string line = "";
+    for (int i = 0; i < values.length; i++) {
+        if (i > 0) { line += ","; }
+        string v = values[i];
+        line += quoteField(v);
+    }
+    return line;
+}
+
 // The writer's CSV-quoting rule, extracted verbatim so writer.row and
 // save() share one implementation: quote when the value contains a comma,
 // quote, or newline; internal quotes doubled.
@@ -175,16 +185,10 @@ public void save(string path, document doc) {
             string h = doc.headers[hi];
             vals.push(r.get(h));
         }
-        // Serialized through addLine, not w.row(): the row-name collision
-        // makes w.row a silent no-op on the self-host (see the module
-        // header) -- save() must work on both compilers.
-        string line = "";
-        for (int vi = 0; vi < vals.length; vi++) {
-            if (vi > 0) { line += ","; }
-            string v = vals[vi];
-            line += quoteField(v);
-        }
-        w.addLine(line);
+        // Serialized through serializeRow + addLine, not w.row(): the
+        // row-name collision makes w.row a silent no-op on the self-host
+        // (see the module header) -- save() must work on both compilers.
+        w.addLine(serializeRow(vals));
     }
     fs.writeString(path, w.stringify());
 }
@@ -198,12 +202,12 @@ private string[] parseLine(string line) {
         if (inQuotes) {
             if (c == '"') {
                 if (i + 1 < line.length && line[i + 1] == '"') {
-                    current += '"'; i++;
+                    current += (string)'"'; i++;
                 } else {
                     inQuotes = false;
                 }
             } else {
-                current += c;
+                current += (string)c;
             }
         } else {
             if (c == '"') {
@@ -212,7 +216,7 @@ private string[] parseLine(string line) {
                 fields.push(current);
                 current = "";
             } else {
-                current += c;
+                current += (string)c;
             }
         }
     }
