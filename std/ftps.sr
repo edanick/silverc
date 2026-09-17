@@ -1,4 +1,5 @@
 import * from net;
+import { pasvHost, pasvPort } from ftp;
 
 mod export ftps;
 
@@ -56,13 +57,15 @@ mod export ftps;
 // - QUIT: close() sends QUIT and closes immediately without waiting for
 //   the 221, so a dead peer cannot stall close().
 //
-// SCOPE: ftps is STANDALONE -- it imports only net and does not import
-// ftp or share code with it. The pure protocol helpers below are copies
-// of std/ftp.sr's helpers (verified byte-identical for ftps on both
-// compilers) rather than imports, avoiding the cross-module int[]-helper
-// dispatch trap documented in std/ftp.sr. Do not "deduplicate" them
-// across the two modules without re-proving the cross-module dispatch on
-// silverc-rs.
+// SCOPE: ftps imports only net (socket core) plus the PASV pair
+// `pasvHost`/`pasvPort` selectively from std/ftp.sr (the earlier,
+// alphabetically-first home of the byte-identical twins). No int[] value
+// crosses the module boundary -- ftp's `pasvNums` stays private inside
+// ftp.sr and is called only intra-module there, so the cross-module
+// int[]-helper dispatch trap documented in std/ftp.sr cannot fire here;
+// only strings/ints cross (the same shapes as every net.* call).
+// `replyCode`/`replyComplete`/`isDigit` stay local: they unify with
+// std/smtp.sr on that module's turn (3-module audit), not here.
 //
 // PUBLIC API: enum TLSMode { Explicit, Implicit } and enum VerifyMode
 // { None, Strict } -- declared `enum X { ... }` (DOCS/212), the only enum
@@ -132,70 +135,8 @@ public bool replyComplete(string resp) {
     return false;
 }
 
-// Extracts the PASV host "h1.h2.h3.h4" from a "227 ... (h1,h2,h3,h4,p1,p2)"
-// reply ("" on any malformed input).
-public string pasvHost(string reply) {
-    int[] nums = new int[6];
-    int count = pasvNums(reply, nums);
-    if (count != 6) { return ""; }
-    return nums[0] + "." + nums[1] + "." + nums[2] + "." + nums[3];
-}
-
-// Extracts the PASV port p1*256+p2 from the same reply (-1 on malformed
-// input). Deliberately *256, not a shift: shift expressions inside
-// one-liner methods are unreliable on the self-hosted compiler.
-public int pasvPort(string reply) {
-    int[] nums = new int[6];
-    int count = pasvNums(reply, nums);
-    if (count != 6) { return -1; }
-    return nums[4] * 256 + nums[5];
-}
-
 private bool isDigit(int c) {
     return c >= 48 && c <= 57;
-}
-
-// Scans the parenthesized section of a PASV reply for its integer tokens
-// ("h1,h2,h3,h4,p1,p2"), storing the first six into `dest` and returning
-// how many were found -- callers require exactly 6, anything else means
-// the reply was not a well-formed PASV echo.
-// NOTE: deliberately scans reply[i] by index (NO substr) and fills a
-// caller-owned array (NO int[] return value). silverc-rs's two-arg
-// substr(start, X) treats X as an END offset while the self-host treats it
-// as a LENGTH -- identical only when start is 0 (see
-// silverc-rs/src/string_ops.rs emit_string_substring), so substring
-// extraction here would silently disagree across compilers. And a helper
-// RETURNING an int[] mis-dispatches across a module boundary on
-// silverc-rs (std/ftp.sr's probe: the count arrived 0 for valid input on
-// rs while the self-host returned 6). Same-module here, the shape is the
-// probed-safe one from std/ftp.sr either way.
-private int pasvNums(string reply, int[] dest) {
-    int open = reply.indexOf("(");
-    if (open < 0) { return 0; }
-    int closeIdx = reply.indexOf(")");
-    if (closeIdx < 0 || closeIdx < open) { return 0; }
-    int count = 0;
-    int val = 0;
-    bool inNum = false;
-    for (int i = open + 1; i < closeIdx; i++) {
-        int c = reply[i] & 0xFF;
-        if (isDigit(c)) {
-            val = val * 10 + (c - 48);
-            inNum = true;
-        } else {
-            if (inNum) {
-                if (count < 6) { dest[count] = val; }
-                count++;
-                val = 0;
-                inNum = false;
-            }
-        }
-    }
-    if (inNum) {
-        if (count < 6) { dest[count] = val; }
-        count++;
-    }
-    return count;
 }
 
 class client {
