@@ -62,12 +62,9 @@ mod export fs;
 import * from win32.kernel32;
 #on LINUX
 import * from linux.libc;
-#on MAC
-import * from mac.libsystem;
-#off
-#on LINUX
 import { rename as renameFile } from linux.libc;
 #on MAC
+import * from mac.libsystem;
 import { rename as renameFile } from mac.libsystem;
 #off
 
@@ -138,6 +135,37 @@ class FileOps {
         string nnew = macNormPath(newPath);
         renameFile(nold, nnew);
         #off
+    }
+
+    // Size in bytes, 0 on failure (missing file, stat error, or negative
+    // size). LINUX reads st_size (slot 6 of an int[18]); MAC reads Darwin
+    // stat64 slot 12, UNVALIDATED code-only like statSize below.
+    public int size(string path) {
+        #on WINDOWS
+        int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
+        if (h == -1 || h == 0) { return 0; }
+        int sz = GetFileSize(h, null);
+        CloseHandle(h);
+        if (sz < 0) { return 0; }
+        return sz;
+        #on LINUX
+        string npath = fsNormPath(path);
+        int[] st = new int[18];
+        int rc = stat(npath, st);
+        if (rc != 0) { return 0; }
+        int result = st[6];
+        if (result < 0) { return 0; }
+        return result;
+        #on MAC
+        string npath = macNormPath(path);
+        int[] st = new int[18];
+        int rc = stat(npath, st);
+        if (rc != 0) { return 0; }
+        int result = st[12];
+        if (result < 0) { return 0; }
+        return result;
+        #off
+        return 0;
     }
 
     public string readString(string path) {
@@ -637,8 +665,7 @@ string[] readDirNames(string path) {
     closedir(dir);
     return names;
     #off
-    string[] empty = [];
-    return empty;
+    return [];
 }
 
 construct {
