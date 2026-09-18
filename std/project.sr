@@ -88,11 +88,7 @@ string projectManifestValue(string manifest, string key) {
     while (end < manifest.length && manifest[end] != '\"') {
         end++;
     }
-    string result = "";
-    for (int i = quote + 1; i < end; i++) {
-        result += manifest[i];
-    }
-    return result;
+    return projectSlice(manifest, quote + 1, end);
 }
 
 string projectDirname(string path) {
@@ -109,101 +105,47 @@ string projectJoin(string root, string path) {
     if (path.length > 0 && (path[0] == '/' || path[0] == '\\')) {
         return root + path;
     }
-    #on LINUX
-    return root + "/" + path;
-    #on MAC
+    #on LINUX or MAC
     return root + "/" + path;
     #off
     return root + "\\" + path;
 }
 
+string[] projectManifestArray(string manifest, string key) {
+    // Single home for the manifest string-array readers (`sources`,
+    // `imports`, `exclude`): one projectFind call keeps the self-hosted
+    // stage-2 lowering well-behaved (see projectManifestValue).
+    string[] result = [];
+    int keyPos = projectFind(manifest, key, 0);
+    if (keyPos < 0) { return result; }
+    int cursor = keyPos;
+    while (cursor < manifest.length && manifest[cursor] != '[') {
+        cursor++;
+    }
+    if (cursor >= manifest.length) { return result; }
+    cursor++;
+    while (cursor < manifest.length && manifest[cursor] != ']') {
+        while (cursor < manifest.length && manifest[cursor] != '"' && manifest[cursor] != ']') {
+            cursor++;
+        }
+        if (cursor >= manifest.length || manifest[cursor] == ']') { break; }
+        int start = cursor + 1;
+        cursor = start;
+        while (cursor < manifest.length && manifest[cursor] != '"') {
+            cursor++;
+        }
+        if (cursor <= manifest.length) {
+            result.add(projectSlice(manifest, start, cursor));
+        }
+        cursor++;
+    }
+    return result;
+}
+
 string[] projectManifestSources(string manifest) {
-    string[] result = [];
-    int keyPos = projectFind(manifest, "sources", 0);
-    if (keyPos < 0) { return result; }
-    int cursor = keyPos;
-    while (cursor < manifest.length && manifest[cursor] != '[') {
-        cursor++;
-    }
-    if (cursor >= manifest.length) { return result; }
-    cursor++;
-    while (cursor < manifest.length && manifest[cursor] != ']') {
-        while (cursor < manifest.length && manifest[cursor] != '"' && manifest[cursor] != ']') {
-            cursor++;
-        }
-        if (cursor >= manifest.length || manifest[cursor] == ']') { break; }
-        int start = cursor + 1;
-        cursor = start;
-        while (cursor < manifest.length && manifest[cursor] != '"') {
-            cursor++;
-        }
-        if (cursor <= manifest.length) {
-            result.add(projectSlice(manifest, start, cursor));
-        }
-        cursor++;
-    }
-    return result;
-}
-
-string[] projectManifestImports(string manifest) {
-    // Mirrors projectManifestSources but reads the `imports` array (`.qs`
-    // libraries made available to the project). One projectFind call keeps
-    // the self-hosted stage-2 lowering well-behaved.
-    string[] result = [];
-    int keyPos = projectFind(manifest, "imports", 0);
-    if (keyPos < 0) { return result; }
-    int cursor = keyPos;
-    while (cursor < manifest.length && manifest[cursor] != '[') {
-        cursor++;
-    }
-    if (cursor >= manifest.length) { return result; }
-    cursor++;
-    while (cursor < manifest.length && manifest[cursor] != ']') {
-        while (cursor < manifest.length && manifest[cursor] != '"' && manifest[cursor] != ']') {
-            cursor++;
-        }
-        if (cursor >= manifest.length || manifest[cursor] == ']') { break; }
-        int start = cursor + 1;
-        cursor = start;
-        while (cursor < manifest.length && manifest[cursor] != '"') {
-            cursor++;
-        }
-        if (cursor <= manifest.length) {
-            result.add(projectSlice(manifest, start, cursor));
-        }
-        cursor++;
-    }
-    return result;
-}
-
-string[] projectManifestExcludes(string manifest) {
-    // Mirrors projectManifestSources but reads the `exclude` array. One
-    // projectFind call keeps the self-hosted stage-2 lowering well-behaved.
-    string[] result = [];
-    int keyPos = projectFind(manifest, "exclude", 0);
-    if (keyPos < 0) { return result; }
-    int cursor = keyPos;
-    while (cursor < manifest.length && manifest[cursor] != '[') {
-        cursor++;
-    }
-    if (cursor >= manifest.length) { return result; }
-    cursor++;
-    while (cursor < manifest.length && manifest[cursor] != ']') {
-        while (cursor < manifest.length && manifest[cursor] != '"' && manifest[cursor] != ']') {
-            cursor++;
-        }
-        if (cursor >= manifest.length || manifest[cursor] == ']') { break; }
-        int start = cursor + 1;
-        cursor = start;
-        while (cursor < manifest.length && manifest[cursor] != '"') {
-            cursor++;
-        }
-        if (cursor <= manifest.length) {
-            result.add(projectSlice(manifest, start, cursor));
-        }
-        cursor++;
-    }
-    return result;
+    // Public `sources` entry point (compiler-driver callers); `imports` and
+    // `exclude` readers call projectManifestArray directly.
+    return projectManifestArray(manifest, "sources");
 }
 
 bool projectIsExcluded(string rel, string[] excludes) {
@@ -228,8 +170,7 @@ bool projectIsExcluded(string rel, string[] excludes) {
         if (hit) {
             if (rel.length == pat.length) { return true; }
             char sep = rel[pat.length];
-            if (sep == '\\') { return true; }
-            if (sep == '/') { return true; }
+            if (sep == '\\' || sep == '/') { return true; }
         }
     }
     return false;
@@ -293,7 +234,7 @@ string projectDottedPath(string name, string sep) {
     string out = "";
     for (int i = 0; i < name.length; i++) {
         if (name[i] == '.') { out += sep; }
-        else { out += name[i]; }
+        else { out += (string)name[i]; }
     }
     return out;
 }
@@ -402,13 +343,6 @@ string projectImportModule(string statement) {
     return projectSlice(statement, start, i);
 }
 
-bool projectVisited(string[] visited, string path) {
-    for (int i = 0; i < visited.length; i++) {
-        if (visited[i] == path) { return true; }
-    }
-    return false;
-}
-
 // ---------------------------------------------------------------------------
 // Custom native modules (DOCS/261, `.srp` `nativeModules` array).
 //
@@ -431,7 +365,7 @@ string nativeLower(string s) {
     for (int i = 0; i < s.length; i++) {
         char c = s[i];
         if (c >= 'A' && c <= 'Z') { out += char(c + 32); }
-        else { out += c; }
+        else { out += (string)c; }
     }
     return out;
 }
@@ -457,7 +391,7 @@ int nativeFindUnquoted(string text, char needle, int start) {
     return -1;
 }
 
-int nativeMatchBracket(string text, int openPos) {
+int nativeMatchPair(string text, int openPos, char openCh, char closeCh) {
     int depth = 0;
     int inQuote = 0;
     for (int i = openPos; i < text.length; i++) {
@@ -474,34 +408,8 @@ int nativeMatchBracket(string text, int openPos) {
         }
         if (c == '"') { inQuote = 1; continue; }
         if (c == '\'') { inQuote = 2; continue; }
-        if (c == '[') { depth++; continue; }
-        if (c == ']') {
-            depth--;
-            if (depth == 0) { return i; }
-        }
-    }
-    return -1;
-}
-
-int nativeMatchBrace(string text, int openPos) {
-    int depth = 0;
-    int inQuote = 0;
-    for (int i = openPos; i < text.length; i++) {
-        char c = text[i];
-        if (inQuote == 1) {
-            if (c == '\\' && i + 1 < text.length) { i++; continue; }
-            if (c == '"') { inQuote = 0; }
-            continue;
-        }
-        if (inQuote == 2) {
-            if (c == '\\' && i + 1 < text.length) { i++; continue; }
-            if (c == '\'') { inQuote = 0; }
-            continue;
-        }
-        if (c == '"') { inQuote = 1; continue; }
-        if (c == '\'') { inQuote = 2; continue; }
-        if (c == '{') { depth++; continue; }
-        if (c == '}') {
+        if (c == openCh) { depth++; continue; }
+        if (c == closeCh) {
             depth--;
             if (depth == 0) { return i; }
         }
@@ -520,11 +428,11 @@ string nativeUnquoteTrim(string v) {
             for (int i = 0; i < inner.length; i++) {
                 char c = inner[i];
                 if (c == '\\' && i + 1 < inner.length) {
-                    out += inner[i + 1];
+                    out += (string)inner[i + 1];
                     i++;
                     continue;
                 }
-                out += c;
+                out += (string)c;
             }
             return out;
         }
@@ -541,12 +449,12 @@ string[] nativeSplitExports(string inner) {
         char c = inner[i];
         if (inQuote == 1) {
             if (c == '\\' && i + 1 < inner.length) {
-                cur += inner[i + 1];
+                cur += (string)inner[i + 1];
                 i++;
                 continue;
             }
             if (c == q) { inQuote = 0; continue; }
-            cur += c;
+            cur += (string)c;
             continue;
         }
         if (c == '"' || c == '\'') {
@@ -560,7 +468,7 @@ string[] nativeSplitExports(string inner) {
             cur = "";
             continue;
         }
-        cur += c;
+        cur += (string)c;
     }
     string last = projectTrim(cur);
     if (last.length > 0) { out.add(last); }
@@ -697,14 +605,14 @@ NativeModules projectParseNativeModules(string manifest) {
     if (keyPos < 0) { return nm; }
     int open = nativeFindUnquoted(manifest, '[', keyPos);
     if (open < 0) { return nm; }
-    int close = nativeMatchBracket(manifest, open);
+    int close = nativeMatchPair(manifest, open, '[', ']');
     if (close < 0) { return nm; }
     string inner = projectSlice(manifest, open + 1, close);
     int pos = 0;
     while (true) {
         int objOpen = nativeFindUnquoted(inner, '{', pos);
         if (objOpen < 0) { break; }
-        int objClose = nativeMatchBrace(inner, objOpen);
+        int objClose = nativeMatchPair(inner, objOpen, '{', '}');
         if (objClose < 0) { break; }
         string body = projectSlice(inner, objOpen + 1, objClose);
         string modName = "";
@@ -727,11 +635,11 @@ NativeModules projectParseNativeModules(string manifest) {
                 string kacc = "";
                 while (p < body.length && body[p] != qc) {
                     if (body[p] == '\\' && p + 1 < body.length) {
-                        kacc += body[p + 1];
+                        kacc += (string)body[p + 1];
                         p += 2;
                         continue;
                     }
-                    kacc += body[p];
+                    kacc += (string)body[p];
                     p++;
                 }
                 if (p < body.length) { p++; }
@@ -739,7 +647,7 @@ NativeModules projectParseNativeModules(string manifest) {
             } else {
                 string kacc2 = "";
                 while (p < body.length && body[p] != ':' && body[p] != ' ' && body[p] != '\t' && body[p] != '\r' && body[p] != '\n' && body[p] != '{' && body[p] != '}' && body[p] != ',') {
-                    kacc2 += body[p];
+                    kacc2 += (string)body[p];
                     p++;
                 }
                 key = kacc2;
@@ -756,7 +664,7 @@ NativeModules projectParseNativeModules(string manifest) {
             bool isArr = false;
             string arrInner = "";
             if (body[p] == '[') {
-                int aClose = nativeMatchBracket(body, p);
+                int aClose = nativeMatchPair(body, p, '[', ']');
                 if (aClose < 0) { p++; continue; }
                 arrInner = projectSlice(body, p + 1, aClose);
                 isArr = true;
@@ -767,11 +675,11 @@ NativeModules projectParseNativeModules(string manifest) {
                 string vacc = "";
                 while (p < body.length && body[p] != vc) {
                     if (body[p] == '\\' && p + 1 < body.length) {
-                        vacc += body[p + 1];
+                        vacc += (string)body[p + 1];
                         p += 2;
                         continue;
                     }
-                    vacc += body[p];
+                    vacc += (string)body[p];
                     p++;
                 }
                 if (p < body.length) { p++; }
@@ -779,7 +687,7 @@ NativeModules projectParseNativeModules(string manifest) {
             } else {
                 string vacc2 = "";
                 while (p < body.length && body[p] != ',' && body[p] != '}' && body[p] != '\n') {
-                    vacc2 += body[p];
+                    vacc2 += (string)body[p];
                     p++;
                 }
                 val = projectTrim(vacc2);
@@ -860,27 +768,7 @@ string nativeSideError(NativeModules nm, string module, string targetOs) {
 }
 
 bool projectIsStdModule(string name) {
-    if (name == "math") { return true; }
-    if (name == "fs") { return true; }
-    if (name == "file") { return true; }
-    if (name == "folder") { return true; }
-    if (name == "json") { return true; }
-    if (name == "http") { return true; }
-    if (name == "llmai") { return true; }
-    if (name == "LLMAI") { return true; }
-    if (name == "env") { return true; }
-    if (name == "url") { return true; }
-    if (name == "hash") { return true; }
-    if (name == "path") { return true; }
-    if (name == "keyboard") { return true; }
-    if (name == "mouse") { return true; }
-    if (name == "bom") { return true; }
-    if (name == "binary_metadata") { return true; }
-    if (name == "process") { return true; }
-    if (name == "console") { return true; }
-    if (name == "gui") { return true; }
-    if (name == "registry") { return true; }
-    if (name == "os") { return true; }
+    if (name == "math" || name == "fs" || name == "file" || name == "folder" || name == "json" || name == "http" || name == "llmai" || name == "LLMAI" || name == "env" || name == "url" || name == "hash" || name == "path" || name == "keyboard" || name == "mouse" || name == "bom" || name == "binary_metadata" || name == "process" || name == "console" || name == "gui" || name == "registry" || name == "os") { return true; }
     return false;
 }
 
@@ -983,13 +871,7 @@ string projectQsStdPath(string mod) {
         if (!projectQsWord(mod[i]) && mod[i] != '.') { return ""; }
     }
     if (projectFind(mod, "..", 0) >= 0) { return ""; }
-    string[] candidates = [];
-    candidates.add("std\\" + mod + ".sr");
-    candidates.add("silverc\\std\\" + mod + ".sr");
-    candidates.add("..\\std\\" + mod + ".sr");
-    candidates.add("..\\silverc\\std\\" + mod + ".sr");
-    candidates.add("..\\..\\std\\" + mod + ".sr");
-    candidates.add("..\\..\\silverc\\std\\" + mod + ".sr");
+    string[] candidates = ["std\\" + mod + ".sr", "silverc\\std\\" + mod + ".sr", "..\\std\\" + mod + ".sr", "..\\silverc\\std\\" + mod + ".sr", "..\\..\\std\\" + mod + ".sr", "..\\..\\silverc\\std\\" + mod + ".sr"];
     #on LINUX or MAC
     candidates.add("std/" + mod + ".sr");
     candidates.add("silverc/std/" + mod + ".sr");
@@ -1051,26 +933,26 @@ string projectMinify(string source) {
                 out += " ";
             }
             pendingSpace = false;
-            out += '$';
-            out += '"';
+            out += "$";
+            out += "\"";
             i += 2;
             int braceDepth = 0;
             while (i < source.length) {
                 char cc = source[i];
                 if (cc == '"' && braceDepth == 0) {
-                    out += cc;
+                    out += (string)cc;
                     i++;
                     break;
                 }
                 if (cc == '{') { braceDepth++; }
                 else if (cc == '}' && braceDepth > 0) { braceDepth--; }
                 else if (cc == '\\' && i + 1 < source.length) {
-                    out += cc;
-                    out += source[i + 1];
+                    out += (string)cc;
+                    out += (string)source[i + 1];
                     i += 2;
                     continue;
                 }
-                out += cc;
+                out += (string)cc;
                 i++;
             }
             continue;
@@ -1080,22 +962,22 @@ string projectMinify(string source) {
                 out += " ";
             }
             pendingSpace = false;
-            out += c;
+            out += (string)c;
             i++;
             while (i < source.length) {
                 char cc = source[i];
                 if (cc == '"') {
-                    out += cc;
+                    out += (string)cc;
                     i++;
                     break;
                 }
                 if (cc == '\\' && i + 1 < source.length) {
-                    out += cc;
-                    out += source[i + 1];
+                    out += (string)cc;
+                    out += (string)source[i + 1];
                     i += 2;
                     continue;
                 }
-                out += cc;
+                out += (string)cc;
                 i++;
             }
             continue;
@@ -1105,22 +987,22 @@ string projectMinify(string source) {
                 out += " ";
             }
             pendingSpace = false;
-            out += c;
+            out += (string)c;
             i++;
             while (i < source.length) {
                 char cc = source[i];
                 if (cc == '\'') {
-                    out += cc;
+                    out += (string)cc;
                     i++;
                     break;
                 }
                 if (cc == '\\' && i + 1 < source.length) {
-                    out += cc;
-                    out += source[i + 1];
+                    out += (string)cc;
+                    out += (string)source[i + 1];
                     i += 2;
                     continue;
                 }
-                out += cc;
+                out += (string)cc;
                 i++;
             }
             continue;
@@ -1129,7 +1011,7 @@ string projectMinify(string source) {
             out += " ";
         }
         pendingSpace = false;
-        out += c;
+        out += (string)c;
         i++;
     }
     return out;
@@ -1139,9 +1021,7 @@ string projectMinify(string source) {
 string projectRelativePath(string root, string path) {
     if (root == ".") { return path; }
     string prefix = root + "\\";
-    #on LINUX
-    prefix = root + "/";
-    #on MAC
+    #on LINUX or MAC
     prefix = root + "/";
     #off
     if (path.length > prefix.length) {
@@ -1152,8 +1032,8 @@ string projectRelativePath(string root, string path) {
         if (matched) {
             string result = "";
             for (int i = prefix.length; i < path.length; i++) {
-                if (path[i] == '\\') { result += '/'; }
-                else { result += path[i]; }
+                if (path[i] == '\\') { result += "/"; }
+                else { result += (string)path[i]; }
             }
             return result;
         }
@@ -1249,8 +1129,8 @@ string projectStripDirectives(string source) {
 string projectCacheMarker(string path) {
     string norm = "";
     for (int i = 0; i < path.length; i++) {
-        if (path[i] == '\\') { norm += '/'; }
-        else { norm += path[i]; }
+        if (path[i] == '\\') { norm += "/"; }
+        else { norm += (string)path[i]; }
     }
     return "//@@SILVER_FILE@@ " + norm + "\n";
 }
@@ -1395,7 +1275,7 @@ string projectCollectionEscape(string value) {
         if (c == '\\') { result += "\\\\"; }
         else if (c == '"') { result += "\\\""; }
         else if (c == '\t') { result += "\\t"; }
-        else { result += c; }
+        else { result += (string)c; }
     }
     return result;
 }
@@ -1425,7 +1305,7 @@ string projectCollectionLiteral(string path) {
 }
 
 void projectCollectionFail(string path, int line) {
-    printline("UnknownCollectionException: unknown collection was tried to be collected \"" + path + "\" at line " + line.toString());
+    printline("UnknownCollectionException: unknown collection was tried to be collected \"" + path + "\" at line " + (string)line);
     exit(1);
 }
 
@@ -1505,7 +1385,7 @@ string projectExpandCollections(string source, string root, string collections) 
         } else {
             result += text;
         }
-        if (end < source.length) { result += '\n'; }
+        if (end < source.length) { result += "\n"; }
         cursor = end + 1;
         line++;
     }
@@ -1517,7 +1397,7 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild)
     string root = projectDirname(projectPath);
     string entry = projectManifestValue(manifest, "entry");
     string[] sources = projectManifestSources(manifest);
-    string[] excludes = projectManifestExcludes(manifest);
+    string[] excludes = projectManifestArray(manifest, "exclude");
     string collections = projectManifestValue(manifest, "collections");
 
     string entryPath = projectJoin(root, entry);
@@ -1532,15 +1412,15 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild)
     eprintln("TRC nm begin");
     NativeModules nmBuild = projectParseNativeModules(manifest);
     string body = projectStripDirectivesCustom(collected, nmBuild);
-    eprintln("TRC strip done " + body.length.toString());
+    eprintln("TRC strip done " + (string)body.length);
 
     // `.qs` libraries listed under `imports` are not auto-imported; declaring
     // one only makes it available. Extract each module's source from the
     // bundle and compile it alongside the project sources so that
     // `import * from X;` statements in the code resolve to the library.
-    string[] imports = projectManifestImports(manifest);
+    string[] imports = projectManifestArray(manifest, "imports");
     string[] allBundleStems = [];
-    eprintln("TRC stems begin " + imports.length.toString());
+    eprintln("TRC stems begin " + (string)imports.length);
     // Shipped std SOURCE modules already collected for consumed bundles
     // (keyed by module name, so every spelling dedups): two libraries
     // needing `net` inline it once.
@@ -1558,12 +1438,12 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild)
     for (int ki = 0; ki < imports.length; ki++) {
         string qsPath = projectJoin(root, imports[ki]);
         string qsContent = file.readString(qsPath);
-        eprintln("TRC libsrc begin " + ki.toString() + " " + qsContent.length.toString());
+        eprintln("TRC libsrc begin " + (string)ki + " " + (string)qsContent.length);
         if (qsContent.length > 0) {
             string[] libSources = projectQsSources(qsContent);
-            eprintln("TRC libsrc extracted " + libSources.length.toString());
+            eprintln("TRC libsrc extracted " + (string)libSources.length);
             for (int si = 0; si < libSources.length; si++) {
-                eprintln("TRC scan " + ki.toString() + "." + si.toString() + " len " + libSources[si].length.toString() + " body " + body.length.toString());
+                eprintln("TRC scan " + (string)ki + "." + (string)si + " len " + (string)libSources[si].length + " body " + (string)body.length);
                 // DOCS/261 v1: a bundle needing an undeclared custom module
                 // fails naming the declaration. Bare sources naming project
                 // files, sibling bundle modules, or std modules are Silver
@@ -1662,17 +1542,17 @@ int[] projectBuildBundle(string projectPath) {
     string root = projectDirname(projectPath);
     string entry = projectManifestValue(manifest, "entry");
     string[] sources = projectManifestSources(manifest);
-    string[] excludes = projectManifestExcludes(manifest);
+    string[] excludes = projectManifestArray(manifest, "exclude");
     string collections = projectManifestValue(manifest, "collections");
 
     string[] files = [];
-    string[] visited = [];
+    ProjectVisited visited = new ProjectVisited();
     // Keep the manifest spelling untouched: projectJoin inserts the
     // target-OS separator itself, and every OS file API accepts `/`, so
     // rewriting to `\` here only breaks non-Windows targets (missing file
     // reads throw and abort the whole bundle with no message).
     string entryPath = projectJoin(root, entry);
-    if (!projectVisited(visited, entryPath)) {
+    if (!visited.contains(entryPath)) {
         visited.add(entryPath);
         files.add(entryPath);
     }
@@ -1682,7 +1562,7 @@ int[] projectBuildBundle(string projectPath) {
             string[] got = projectAddEntry(root, sources[i], excludes);
             for (int k = 0; k < got.length; k++) {
                 string p = got[k];
-                if (!projectVisited(visited, p)) {
+                if (!visited.contains(p)) {
                     visited.add(p);
                     files.add(p);
                 }
@@ -1692,7 +1572,7 @@ int[] projectBuildBundle(string projectPath) {
         string[] got = projectWalk(root, "", excludes);
         for (int k = 0; k < got.length; k++) {
             string p = got[k];
-            if (!projectVisited(visited, p)) {
+            if (!visited.contains(p)) {
                 visited.add(p);
                 files.add(p);
             }
