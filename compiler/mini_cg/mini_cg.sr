@@ -4886,6 +4886,17 @@ int strIdx = this.stringPatchIndices[i];
         if (expr.kind == 66) {
             return "dict<string,int>";
         }
+        if (expr.kind == 19) {
+            // Structural literal type so `var` bindings and value flows
+            // resolve depth like declared types ("int[]", "string[][]",
+            // ...). Heterogeneous ("m") and empty/fixed-size literals stay
+            // unknown ("") and render through the safe fallback.
+            // op==1/2 are fixed-size declarations, not value literals.
+            if (expr.op == 1 || expr.op == 2) { return ""; }
+            string litType = this.inferArrayLitType(expr);
+            if (litType == "m" || litType == "") { return ""; }
+            return litType;
+        }
         if (expr.kind == 23) {
             if (expr.childCount() > 0) {
                 return this.inferExprType(expr.child(0));
@@ -12128,6 +12139,16 @@ public void genNewCall(Node call) {
                     this.setLocalType(lhs.name, rhsClass);
                 }
             }
+            // Refresh the recorded array type on reassignment: a stale
+            // depth crashes later prints (`var m = [[1]]; m = [1]` would
+            // read ints as sub-array pointers). Only when the old or new
+            // value is arraylike; unknown right-hand sides keep the old
+            // type (today's behavior exactly).
+            string oldT = this.getLocalType(lhs.name);
+            string newT = this.inferExprType(rhs);
+            if (newT != "" && (this.isArrayLikeType(oldT) || this.isArrayLikeType(newT))) {
+                this.setLocalType(lhs.name, newT);
+            }
             if (off != 0) {
                 if (this.isRefParam(lhs.name)) {
                     // Write through the reference to the caller's slot.
@@ -12838,7 +12859,13 @@ public void genNewCall(Node call) {
     // array builtin. Routing a scalar through genArrayPrintValue would
     // dereference it as a pointer, so the print arm must use this.
     public bool isArrayValue(Node expr) {
-        if (expr.kind == 24) { return false; }
+        if (expr.kind == 24) {
+            // Indexing a nested array yields its element layer, which
+            // prints recursively (`m2[i]` renders `[..]`). Flat index
+            // reads stay scalar (decimal/character formatting).
+            if (expr.childCount() > 1 && this.arrayTypeDepth(this.nestedArrayTypeOf(expr.child(0))) >= 2) { return true; }
+            return false;
+        }
         if (expr.kind == 13) {
             if (expr.name == "length") { return false; }
             string arrMt = this.inferExprType(expr);
@@ -13012,6 +13039,23 @@ public void genNewCall(Node call) {
         if (arg.kind == 19 && arg.op != 1 && arg.op != 2 && arg.childCount() == 0) {
             if (newline) { this.emitArrayText("[]\n"); }
             else { this.emitArrayText("[]"); }
+            return;
+        }
+        // Nested arrays render recursively (loops per layer); mixed
+        // literals unroll their static per-index classes. Flat arrays
+        // keep the proven loop below untouched.
+        int pdepth = this.arrayPrintDepth(arg);
+        if (pdepth == -1) {
+            this.genExpr(arg);
+            this.genMixedLiteral(arg, 0, 0);
+            if (newline) { this.emitArrayText("\n"); }
+            return;
+        }
+        if (pdepth >= 2) {
+            string nt = this.nestedArrayTypeOf(arg);
+            this.genExpr(arg);
+            this.genNestedArrayLoop(pdepth, this.arrayTypeLeaf(nt), 0);
+            if (newline) { this.emitArrayText("\n"); }
             return;
         }
         string elemT = this.arrayPrintElemType(arg);
@@ -13338,6 +13382,235 @@ public void genNewCall(Node call) {
             dictNode.children.add(dpair);
         }
         this.genExpr(dictNode);
+    }
+
+    // Array type depth: trailing "[]" layers ("int" -> 0, "int[]" -> 1,
+    // "string[][]" -> 2). Mirrors silverc-rs nest_of_type.
+    public int arrayTypeDepth(string t) {
+        int depth = 0;
+        int len = t.length;
+        while (len >= 2 && t[len - 2] == '[' && t[len - 1] == ']') {
+            depth++;
+            len = len - 2;
+        }
+        return depth;
+    }
+
+    // Leaf rendering bucket of an array type: "string" renders quoted,
+    // "float" with %g, "int" decimal, "" unknown (decimal fallback).
+    public string arrayTypeLeaf(string t) {
+        int len = t.length;
+        while (len >= 2 && t[len - 2] == '[' && t[len - 1] == ']') {
+            len = len - 2;
+        }
+        string base = "";
+        for (int i = 0; i < len; i++) {
+            base += t[i].toString();
+        }
+        base = base.trim();
+        if (base == "string") { return "string"; }
+        if (base == "float" || base == "float64" || base == "double") { return "float"; }
+        if (base == "int" || base == "int32" || base == "int64" || base == "uint" || base == "byte" || base == "bool" || base == "char") { return "int"; }
+        return "";
+    }
+
+    // Structural type of an array literal: the uniform element type plus
+    // one "[]" layer ("int[]", "string[][]", ...), "m" when children mix
+    // shapes, "int[]" for empty (arbitrary leaf — empty renders "[]"
+    // regardless), "" for fixed-size declarations. Mirrors silverc-rs
+    // infer_literal_array_type (which spells leaves natively).
+    public string inferArrayLitType(Node lit) {
+        if (lit.op == 1 || lit.op == 2) { return ""; }
+        int n = lit.childCount();
+        if (n == 0) { return "int[]"; }
+        string first = this.arrayChildClass(lit.child(0));
+        if (first == "m" || first == "") { return "m"; }
+        for (int i = 1; i < n; i++) {
+            if (this.arrayChildClass(lit.child(i)) != first) { return "m"; }
+        }
+        if (first == "s") { return "string[]"; }
+        if (first == "f") { return "float64[]"; }
+        if (first == "i") { return "int[]"; }
+        return first + "[]";
+    }
+
+    // Render class of one array element: "s" (string, quoted), "f"
+    // (float), "i" (decimal fallback), "m" (mixed sub-literal), or a
+    // uniform array type for nested values. Mirrors silverc-rs
+    // array_item_shape.
+    public string arrayChildClass(Node e) {
+        if (e.kind == 19 && e.op != 1 && e.op != 2 && e.childCount() > 0) {
+            return this.inferArrayLitType(e);
+        }
+        if (this.isStringLike(e)) { return "s"; }
+        if (this.isFloatLike(e)) { return "f"; }
+        string nt = this.nestedArrayTypeOf(e);
+        if (nt != "") { return nt; }
+        return "i";
+    }
+
+    // Array type string for array-valued expressions ("int[][]", ...),
+    // "" when unknown. Structural types, nesting-preserving calls and
+    // 1D builtins; indexing a nested array yields its element layer.
+    // Print-path only (never feeds inference back, so no cycles).
+    public string nestedArrayTypeOf(Node expr) {
+        if (expr.kind == 6) {
+            string t = this.getLocalType(expr.name);
+            if (t == "") {
+                int gi = this.findGlobal(expr.name);
+                if (gi >= 0 && gi < this.globalTypes.length) { t = this.globalTypes[gi]; }
+            }
+            if (this.isArrayLikeType(t)) { return t; }
+            return "";
+        }
+        if (expr.kind == 13) {
+            string t = this.inferExprType(expr);
+            if (this.isArrayLikeType(t)) { return t; }
+            return "";
+        }
+        if (expr.kind == 19) {
+            string t = this.inferArrayLitType(expr);
+            if (t == "m" || t == "") { return ""; }
+            return t;
+        }
+        if (expr.kind == 10) {
+            if (!expr.isMember && (expr.name == "cargs" || expr.name == "split")) { return "string[]"; }
+            if (expr.isMember && expr.childCount() > 0) {
+                if (expr.name == "split" || expr.name == "lines") { return "string[]"; }
+                if (expr.name == "toBytes") { return "byte[]"; }
+                if (expr.name == "add" || expr.name == "push" || expr.name == "slice" || expr.name == "map" || expr.name == "reverse" || expr.name == "unique" || expr.name == "distinct" || expr.name == "sort" || expr.name == "filter" || expr.name == "concat" || expr.name == "flat" || expr.name == "take" || expr.name == "skip" || expr.name == "chunk" || expr.name == "zip" || expr.name == "partition") {
+                    return this.nestedArrayTypeOf(expr.child(0));
+                }
+            }
+            return "";
+        }
+        if (expr.kind == 24 && expr.childCount() > 1) {
+            string bt = this.nestedArrayTypeOf(expr.child(0));
+            if (this.arrayTypeDepth(bt) >= 2) {
+                string inner = bt;
+                int len = inner.length;
+                if (len >= 2) {
+                    string cut = "";
+                    for (int i = 0; i < len - 2; i++) {
+                        cut += inner[i].toString();
+                    }
+                    return cut;
+                }
+            }
+            return "";
+        }
+        if (expr.kind == 23 && expr.childCount() > 0) {
+            return this.nestedArrayTypeOf(expr.child(0));
+        }
+        if (expr.kind == 65 && expr.childCount() >= 3) {
+            string ta = this.nestedArrayTypeOf(expr.child(1));
+            string tb = this.nestedArrayTypeOf(expr.child(2));
+            if (ta != "" && ta == tb) { return ta; }
+            return "";
+        }
+        return "";
+    }
+
+    // Print depth of an array value: -1 mixed literal, >=1 uniform
+    // layers (1 = flat), 1 fallback for unknown (flat old path).
+    public int arrayPrintDepth(Node arg) {
+        if (arg.kind == 19 && arg.op != 1 && arg.op != 2 && arg.childCount() > 0) {
+            string first = this.arrayChildClass(arg.child(0));
+            for (int i = 1; i < arg.childCount(); i++) {
+                if (this.arrayChildClass(arg.child(i)) != first) { return -1; }
+            }
+            if (first == "m") { return -1; }
+            if (first == "s" || first == "f" || first == "i" || first == "") { return 1; }
+            return this.arrayTypeDepth(first) + 1;
+        }
+        string nt = this.nestedArrayTypeOf(arg);
+        if (nt == "") { return 1; }
+        int d = this.arrayTypeDepth(nt);
+        if (d < 1) { return 1; }
+        return d;
+    }
+
+    // Render the array data pointer in RAX as nested `[...]`: `depth`
+    // runtime loops (levels `base..`), leaves per `leaf`. All loop state
+    // lives in stack slots (printf clobbers registers); jagged and empty
+    // sub-arrays read their own lengths. Mirrors silverc-rs
+    // gen_render_array.
+    public void genNestedArrayLoop(int depth, string leaf, int base) {
+        int arrOff = this.allocLocal("__narr" + base.toString());
+        this.asm.movMBaseR(5, 0, arrOff);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(0, 0, -8);
+        int lenOff = this.allocLocal("__nlen" + base.toString());
+        this.asm.movMBaseR(5, 0, lenOff);
+        int iOff = this.allocLocal("__nidx" + base.toString());
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.emitArrayText("[");
+        int loopStart = this.newLabel();
+        int loopEnd = this.newLabel();
+        int noSep = this.newLabel();
+        this.asm.bindLabel(loopStart);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(loopEnd);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(noSep);
+        this.emitArrayText(", ");
+        this.asm.bindLabel(noSep);
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(0, 1, 0);
+        if (depth <= 1) {
+            if (leaf == "string") { this.emitArrayElement("\"%s\"", false); }
+            else if (leaf == "float") { this.emitArrayElement("%g", true); }
+            else { this.emitArrayElement("%lld", false); }
+        } else {
+            this.genNestedArrayLoop(depth - 1, leaf, base + 1);
+        }
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(loopStart);
+        this.asm.bindLabel(loopEnd);
+        this.emitArrayText("]");
+    }
+
+    // Render one mixed-literal element already in RAX per the child
+    // node's static class.
+    public void genMixedElement(Node child, int base, int mdepth) {
+        string cls = this.arrayChildClass(child);
+        if (cls == "s") { this.emitArrayElement("\"%s\"", false); }
+        else if (cls == "f") { this.emitArrayElement("%g", true); }
+        else if (cls == "m") { this.genMixedLiteral(child, base, mdepth); }
+        else if (cls != "" && cls != "i") {
+            int d = this.arrayTypeDepth(cls);
+            if (d < 1) { d = 1; }
+            this.genNestedArrayLoop(d, this.arrayTypeLeaf(cls), base);
+        } else { this.emitArrayElement("%lld", false); }
+    }
+
+    // Render a mixed literal's evaluated array (data pointer in RAX) by
+    // unrolling its static per-index classes. The spill slot
+    // `__nmix{base}_{mdepth}` is unique along any live path (siblings
+    // render sequentially and safely share).
+    public void genMixedLiteral(Node node, int base, int mdepth) {
+        int arrOff = this.allocLocal("__nmix" + base.toString() + "_" + mdepth.toString());
+        this.asm.movMBaseR(5, 0, arrOff);
+        this.emitArrayText("[");
+        for (int i = 0; i < node.childCount(); i++) {
+            if (i > 0) { this.emitArrayText(", "); }
+            // Static cell address: the literal length is fixed, and the
+            // value was evaluated once (side-effecting elements never
+            // re-run).
+            this.asm.movRMBase(1, 5, arrOff);
+            this.asm.movRMBase(0, 1, i * 8);
+            this.genMixedElement(node.child(i), base, mdepth + 1);
+        }
+        this.emitArrayText("]");
     }
 
     public void genPrintCall(Node call, bool newline) {
