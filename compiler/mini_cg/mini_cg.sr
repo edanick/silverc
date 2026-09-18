@@ -7042,41 +7042,49 @@ int strIdx = this.stringPatchIndices[i];
                 this.asm.xorRR64(0, 0);
             }
         } else if (builtinName && (name == "int" || name == "int64" || name == "int32") && !call.isMember) {
-            // int(...) / int64(...) / int32(...) conversion: strings parse via
-            // strtoll, floats truncate toward zero (cvttsd2si), ints pass
-            // through.
+            // int(...) / int64(...) / int32(...) conversion: strings parse
+            // leading decimals exactly like the bcache reference loops
+            // (`bcDecRangeSigned`): an optional leading '-', digits
+            // accumulate until the first non-digit, no-digits yields 0, and
+            // overflow WRAPS in two's-complement arithmetic (inline loop, no
+            // CRT dependency -- matches silverc-rs gen_int_conversion).
+            // Floats truncate toward zero (cvttsd2si), ints pass through.
             if (call.childCount() > 0) {
                 Node arg = call.child(0);
-                bool isStringArg = false;
-                if (arg.kind == 2) { isStringArg = true; }
-                else if (arg.kind == 6) {
-                    string lt = this.getLocalType(arg.name);
-                    if (lt == "string") { isStringArg = true; }
-                }
+                bool isStringArg = this.inferExprType(arg) == "string";
                 if (isStringArg) {
                     this.genExpr(arg);
-                    int toStrOff = this.allocLocal("__int_conv_str");
-                    this.asm.movMBaseR(5, 0, toStrOff);
-                    int toEndOff = this.allocLocal("__int_conv_end");
                     this.asm.movRR64(1, 0);
-                    this.asm.leaRBase(2, 5, toEndOff);
-                    this.asm.movRI64(8, 10);
-                    this.addImportPatch("ucrtbase.dll", "strtoll");
-                    int sConv = 0xDEADBEEFCAFEBAD3;
-                    this.asm.emitImm64(0, sConv);
-                    this.asm.movRMBase(0, 0, 0);
-                    this.asm.emitCallSetup(0);
-                    this.asm.callR64(0);
-                    this.asm.emitCallTeardown();
-                    int toOk = this.newLabel();
-                    this.asm.movRMBase(1, 5, toEndOff);
-                    this.asm.movRMBase(2, 5, toStrOff);
-                    this.asm.cmpRR64(1, 2);
-                    this.asm.jneLabel(toOk);
-                    // No digits parsed: strtoll already returned 0, matching
-                    // the reference compilers (no throw).
                     this.asm.xorRR64(0, 0);
-                    this.asm.bindLabel(toOk);
+                    this.asm.xorRR64(8, 8);
+                    this.asm.movRI64(9, 10);
+                    this.asm.movzxByteMBase(2, 1, 0);
+                    this.asm.cmpRI32(2, 45);
+                    int pcDigits = this.newLabel();
+                    int pcDone = this.newLabel();
+                    this.asm.jneLabel(pcDigits);
+                    this.asm.incR64(1);
+                    this.asm.movRI64(8, 1);
+                    this.asm.bindLabel(pcDigits);
+                    this.asm.movzxByteMBase(2, 1, 0);
+                    this.asm.subRI32(2, 48);
+                    this.asm.cmpRI32(2, 0);
+                    this.asm.jlLabel(pcDone);
+                    this.asm.cmpRI32(2, 9);
+                    this.asm.jgLabel(pcDone);
+                    // NB: imulRR64 emits IMUL reg, r/m with the SECOND
+                    // operand as the destination, so the accumulator stays
+                    // in RAX only with the operands in (9, 0) order.
+                    this.asm.imulRR64(9, 0);
+                    this.asm.addRR64(0, 2);
+                    this.asm.incR64(1);
+                    this.asm.jmpLabel(pcDigits);
+                    this.asm.bindLabel(pcDone);
+                    this.asm.cmpRI32(8, 0);
+                    int pcEnd = this.newLabel();
+                    this.asm.jeLabel(pcEnd);
+                    this.asm.negR64(0);
+                    this.asm.bindLabel(pcEnd);
                 } else {
                     this.genExpr(arg);
                     if (this.isFloatLike(arg)) {
