@@ -1,5 +1,5 @@
 import * from net;
-import { pasvHost, pasvPort } from ftp;
+import { pasvHost, pasvPort, replyCode, replyComplete } from ftp;
 
 mod export ftps;
 
@@ -57,15 +57,18 @@ mod export ftps;
 // - QUIT: close() sends QUIT and closes immediately without waiting for
 //   the 221, so a dead peer cannot stall close().
 //
-// SCOPE: ftps imports only net (socket core) plus the PASV pair
-// `pasvHost`/`pasvPort` selectively from std/ftp.sr (the earlier,
+// SCOPE: ftps imports only net (socket core) plus `pasvHost`/`pasvPort`
+// and `replyCode`/`replyComplete` selectively from std/ftp.sr (the earlier,
 // alphabetically-first home of the byte-identical twins). No int[] value
 // crosses the module boundary -- ftp's `pasvNums` stays private inside
 // ftp.sr and is called only intra-module there, so the cross-module
 // int[]-helper dispatch trap documented in std/ftp.sr cannot fire here;
 // only strings/ints cross (the same shapes as every net.* call).
-// `replyCode`/`replyComplete`/`isDigit` stay local: they unify with
-// std/smtp.sr on that module's turn (3-module audit), not here.
+// `replyCode`/`replyComplete` live in std/ftp.sr (the decided protocol-domain
+// home -- SMTP/FTP multi-line replies share the same RFC "nnn-text ... nnn
+// space" grammar, so the file-72 `isOk` keep-separation does not apply);
+// the private `isDigit` int-operand checker has no home (char-operand
+// checks use the `c.isDigit()` builtin).
 //
 // PUBLIC API: enum TLSMode { Explicit, Implicit } and enum VerifyMode
 // { None, Strict } -- declared `enum X { ... }` (DOCS/212), the only enum
@@ -100,44 +103,6 @@ mod export ftps;
 enum TLSMode { Explicit, Implicit }
 
 enum VerifyMode { None, Strict }
-
-public int replyCode(string resp) {
-    if (resp.length < 3) { return -1; }
-    int code = 0;
-    for (int i = 0; i < 3; i++) {
-        int c = resp[i] & 0xFF;
-        if (!isDigit(c)) { return -1; }
-        code = code * 10 + (c - 48);
-    }
-    return code;
-}
-
-// True when `resp` already contains a terminating FTP reply line: some
-// "\r\n"-delimited line whose first three chars are digits and whose fourth
-// char is a space (RFC 959's "nnn " terminal form). Multi-line replies
-// ("nnn-text ... nnn text") complete only at the space form, so the
-// module's readers keep accumulating until this fires or the bounded
-// loop exhausts.
-public bool replyComplete(string resp) {
-    int lineStart = 0;
-    for (int i = 0; i < resp.length; i++) {
-        if (resp[i] == 13 && i + 1 < resp.length && resp[i + 1] == 10) {
-            int lineLen = i - lineStart;
-            if (lineLen >= 4) {
-                if (isDigit(resp[lineStart] & 0xFF) && isDigit(resp[lineStart + 1] & 0xFF) && isDigit(resp[lineStart + 2] & 0xFF) && resp[lineStart + 3] == 32) {
-                    return true;
-                }
-            }
-            i++;
-            lineStart = i + 1;
-        }
-    }
-    return false;
-}
-
-private bool isDigit(int c) {
-    return c >= 48 && c <= 57;
-}
 
 class client {
     private string host;
