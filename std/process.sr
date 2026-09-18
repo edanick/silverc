@@ -124,6 +124,12 @@ class result {
     public string stdout;
     public string stderr;
     public int exitCode;
+
+    construct {
+        this.stdout = "";
+        this.stderr = "";
+        this.exitCode = 0;
+    }
 }
 
 class ProcessWindow {
@@ -168,7 +174,7 @@ class Process {
             for (int i = 0; i < 512; i++) { titleBuf += " "; }
             int titleLen = GetWindowTextA(hwnd, titleBuf, 512);
             string title = "";
-            for (int i = 0; i < titleLen && titleBuf[i] != char(0); i++) { title += char(titleBuf[i]); }
+            for (int i = 0; i < titleLen && titleBuf[i] != char(0); i++) { title += titleBuf[i]; }
             result.window.title = title;
             int pid = 0;
             GetWindowThreadProcessId(hwnd, &pid);
@@ -184,7 +190,7 @@ class Process {
                 int ok = QueryFullProcessImageNameA(hProcess, 0, pathBuf, &len);
                 CloseHandle(hProcess);
                 if (ok != 0) {
-                    for (int i = 0; i < len && pathBuf[i] != char(0); i++) { fullPath += char(pathBuf[i]); }
+                    for (int i = 0; i < len && pathBuf[i] != char(0); i++) { fullPath += pathBuf[i]; }
                 }
             }
         }
@@ -207,6 +213,10 @@ class pipe {
     private int hRead;
     private int hWrite;
 
+    construct {
+        this.hRead = 0;
+        this.hWrite = 0;
+    }
 
     public void write(string data) {
         #on WINDOWS
@@ -230,12 +240,35 @@ class pipe {
         int n = 0;
         ReadFile(this.hRead, buf, 4096, &n, null);
         if (n > 0) {
-            for (int i = 0; i < n; i++) { out += char(buf[i]); }
+            for (int i = 0; i < n; i++) { out += buf[i]; }
         }
         #off
         return out;
     }
 }
+
+#on LINUX or MAC
+// Shared spawn-drain tail (§7): both POSIX ladders in run() capture the
+// child's stdout through the same read/decode/close shape -- only the spawn
+// head differs (fork/execvpe vs posix_spawn), so the drain lives once here
+// instead of pasted into both branches. Gated LINUX or MAC because the
+// read/close natives resolve per-target (linux.libc / mac.libsystem) and
+// do not exist on WINDOWS.
+private string drainPipe(int fr) {
+    int[] chunk = new int[1024];
+    string output = "";
+    while (true) {
+        int n = read(fr, chunk, 8192);
+        if (n <= 0) { break; }
+        for (int i = 0; i < n; i++) {
+            int b = (chunk[i / 8] >> ((i % 8) * 8)) & 0xFF;
+            output += (char)b;
+        }
+    }
+    close(fr);
+    return output;
+}
+#off
 
 public result run(string cmd, string[] args) {
     result res = new result();
@@ -262,7 +295,7 @@ public result run(string cmd, string[] args) {
         int n = 0;
         string output = "";
         while (ReadFile(hReadOut, outBuf, 8192, &n, null) && n > 0) {
-            for (int i = 0; i < n; i++) { output += char(outBuf[i]); }
+            for (int i = 0; i < n; i++) { output += outBuf[i]; }
         }
         CloseHandle(hWriteOut);
         CloseHandle(hReadOut);
@@ -296,20 +329,9 @@ public result run(string cmd, string[] args) {
         _exit(127);
     } else {
         close(fw);
-        int[] chunk = new int[1024];
-        string output = "";
-        while (true) {
-            int n = read(fr, chunk, 8192);
-            if (n <= 0) { break; }
-            for (int i = 0; i < n; i++) {
-                int b = (chunk[i / 8] >> ((i % 8) * 8)) & 0xFF;
-                output += char(b);
-            }
-        }
-        close(fr);
+        res.stdout = drainPipe(fr);
         int st = 0;
         waitpid(pid, &st, 0);
-        res.stdout = output;
         res.exitCode = (st >> 8) & 0xFF;
     }
     #on MAC
@@ -338,20 +360,9 @@ public result run(string cmd, string[] args) {
         res.exitCode = -1;
         res.stderr = "Failed to create process";
     } else {
-        int[] chunk = new int[1024];
-        string output = "";
-        while (true) {
-            int n = read(fr, chunk, 8192);
-            if (n <= 0) { break; }
-            for (int i = 0; i < n; i++) {
-                int b = (chunk[i / 8] >> ((i % 8) * 8)) & 0xFF;
-                output += char(b);
-            }
-        }
-        close(fr);
+        res.stdout = drainPipe(fr);
         int st = 0;
         waitpid(pid, &st, 0);
-        res.stdout = output;
         res.exitCode = (st >> 8) & 0xFF;
     }
     #off
