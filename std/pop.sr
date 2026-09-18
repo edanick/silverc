@@ -1,4 +1,5 @@
 import * from net;
+import * from string;
 
 mod export pop;
 
@@ -34,9 +35,13 @@ mod export pop;
 // exclude list only keeps it out of the compiler's own aggregate build --
 // the same posture as smtp.sr/ftp.sr; it does not make `pop` a builtin.)
 //
-// SCOPE: plain-text USER/PASS only -- POP3 USER/PASS needs no base64, which
-// also sidesteps the encoding.base64Encode runtime crasher (phantom
-// string.toBytes(); see std/smtp.sr's b64Encode note). No AUTH/APOP/STLS
+// SCOPE: plain-text USER/PASS only -- POP3 USER/PASS needs no base64 by
+// protocol design, so no b64 is carried and the encoding import does not
+// exist here (the old "encoding.base64Encode runtime crasher" note was
+// stale -- the file-39 turn proved encoding.base64Encode/Decode
+// byte-identical to the crypto copies on valid, invalid and binary 1-255
+// inputs with no crash on either compiler; a future AUTH PLAIN would call
+// encoding.base64Encode). No AUTH/APOP/STLS
 // (APOP is an MD5 scheme and AUTH PLAIN would need base64), no UIDL/TOP/
 // RSET/NOOP, no TLS, no server class. message keeps exactly four fields:
 // sender/subject/body/raw. Bounded reads: readReply()'s accumulation loop
@@ -64,7 +69,7 @@ mod export pop;
 // accumulation lives in the private readReply/readMulti. The private
 // lastReply/loggedIn fields and the private
 // readReply/readMulti/fail/lineEndFrom/lineEndIndex/terminatorIndex/
-// blankLineIndex/sliceRange/statNumber plumbing round out the surface;
+// blankLineIndex/statNumber plumbing round out the surface;
 // construct() initializes every field (sock to -1, strings to "", loggedIn
 // to false), so no member is ever uninitialized. Every public name above is
 // keyword-free on both compilers (checked against silverc-rs src/token.rs
@@ -140,7 +145,7 @@ public string headerValue(string text, string headerName) {
             if (headMatch) {
                 int valStart = pos + nameLen;
                 if (text[valStart] == 32) { valStart++; }
-                return sliceRange(text, valStart, eol);
+                return projectSlice(text, valStart, eol);
             }
         }
         pos = eol + 2;
@@ -160,7 +165,7 @@ public string messageBody(string retrResp) {
     int term = terminatorIndex(retrResp);
     if (term >= bodyStart) { bodyEnd = term; }
     if (bodyEnd < bodyStart) { return ""; }
-    return sliceRange(retrResp, bodyStart, bodyEnd);
+    return projectSlice(retrResp, bodyStart, bodyEnd);
 }
 
 class message {
@@ -169,7 +174,12 @@ class message {
     public string body;
     public string raw;
 
-    construct(string raw) { this.raw = raw; }
+    construct(string raw) {
+        this.raw = raw;
+        this.sender = "";
+        this.subject = "";
+        this.body = "";
+    }
 }
 
 class client {
@@ -234,8 +244,7 @@ class client {
     // STAT: validated +OK, then the pure statCount() digit scan. Returns 0
     // on any failure or malformed reply.
     public int count() {
-        if (!this.loggedIn) { return 0; }
-        if (this.sock < 0) { return 0; }
+        if (!this.loggedIn || this.sock < 0) { return 0; }
         net.setRecvTimeoutRaw(this.sock, 30000);
         this.sendLine("STAT");
         this.readReply();
@@ -249,8 +258,7 @@ class client {
     // strings), split on "\r\n". Returns [] on any failure.
     public string[] list() {
         string[] empty = [];
-        if (!this.loggedIn) { return empty; }
-        if (this.sock < 0) { return empty; }
+        if (!this.loggedIn || this.sock < 0) { return empty; }
         net.setRecvTimeoutRaw(this.sock, 30000);
         this.sendLine("LIST");
         this.readMulti();
@@ -258,7 +266,7 @@ class client {
         if (term < 0) { return empty; }
         int statusEnd = lineEndIndex(this.lastReply);
         if (statusEnd < 0 || statusEnd + 2 > term) { return empty; }
-        string data = sliceRange(this.lastReply, statusEnd + 2, term);
+        string data = projectSlice(this.lastReply, statusEnd + 2, term);
         if (data.length <= 0) { return empty; }
         return data.split("\r\n");
     }
@@ -271,7 +279,7 @@ class client {
         string raw = "";
         if (this.sock >= 0 && this.loggedIn) {
             net.setRecvTimeoutRaw(this.sock, 30000);
-            this.sendLine("RETR " + id);
+            this.sendLine("RETR " + (string)id);
             this.readMulti();
             if (isOk(this.lastReply)) { raw = this.lastReply; }
         }
@@ -285,10 +293,9 @@ class client {
     // DELE: marks `id` for deletion (effective at QUIT per RFC 1939).
     // Returns true on +OK, false on any failure.
     public bool remove(int id) {
-        if (!this.loggedIn) { return false; }
-        if (this.sock < 0) { return false; }
+        if (!this.loggedIn || this.sock < 0) { return false; }
         net.setRecvTimeoutRaw(this.sock, 30000);
-        this.sendLine("DELE " + id);
+        this.sendLine("DELE " + (string)id);
         this.readReply();
         return isOk(this.lastReply);
     }
@@ -391,19 +398,6 @@ private int blankLineIndex(string s) {
         if (s[i] == 13 && s[i + 1] == 10 && s[i + 2] == 13 && s[i + 3] == 10) { return i; }
     }
     return -1;
-}
-
-// Copies s[start .. end) character by character. Deliberately NOT substr:
-// rs's two-arg substr treats X as an END offset while the self-host treats
-// it as a LENGTH -- identical only when start is 0 (probed; see
-// silverc-rs/src/string_ops.rs emit_string_substring) -- and every caller
-// here slices from a nonzero offset.
-private string sliceRange(string s, int start, int end) {
-    string result = "";
-    for (int i = start; i < end; i++) {
-        result += s[i];
-    }
-    return result;
 }
 
 // Parses the `which`-th space-separated integer after the "+OK " prefix of
