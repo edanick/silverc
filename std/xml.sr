@@ -3,12 +3,20 @@ mod export xml;
 class node {
     public string name;
     public string text;
-    private kvp<string, string> attrs;
+    private string[] attrNames;
+    private string[] attrValues;
     private node[] childNodes;
 
+    construct {
+        this.name = "";
+        this.text = "";
+        this.attrNames = [];
+        this.attrValues = [];
+        this.childNodes = [];
+    }
 
     public node[] children(string tag) {
-        node[] result;
+        node[] result = [];
         foreach (node child in this.childNodes) {
             if (child.name == tag) { result.push(child); }
         }
@@ -16,11 +24,14 @@ class node {
     }
 
     public string attribute(string name) {
-        return this.attrs.get(name);
+        for (int i = 0; i < this.attrNames.length; i++) {
+            if (this.attrNames[i] == name) { return this.attrValues[i]; }
+        }
+        return "";
     }
 
     public node query(string path) {
-        if (path.indexOf("//") == 0) {
+        if (path.startsWith("//")) {
             return deepFind(this, path.substr(2));
         }
         return this;
@@ -29,8 +40,8 @@ class node {
     private node deepFind(node n, string tag) {
         foreach (node child in n.childNodes) {
             if (child.name == tag) { return child; }
-            node found = deepFind(child, tag);
-            if (found != null) { return found; }
+            node hit = deepFind(child, tag);
+            if (hit != null) { return hit; }
         }
         return null;
     }
@@ -38,6 +49,8 @@ class node {
 
 class document {
     public node root;
+
+    construct { this.root = new node(); }
 }
 
 class builder {
@@ -55,8 +68,6 @@ class builder {
     public void start(string name, object attrs) {
         for (int i = 0; i < this.indent; i++) { this.output += "  "; }
         this.output += "<" + name;
-        if (attrs != null) {
-        }
         this.output += ">\n";
         this.indent++;
     }
@@ -80,9 +91,9 @@ public document parse(string raw) {
     doc.root = root;
 
     int i = 0;
-    int len = raw.length();
+    int len = raw.length;
     node current = root;
-    node[] stack;
+    node[] stack = [];
     stack.push(current);
 
     while (i < len) {
@@ -91,7 +102,7 @@ public document parse(string raw) {
                 int end = raw.indexOf(">", i);
                 if (end < 0) { break; }
                 stack.pop();
-                if (stack.length() > 0) { current = stack[stack.length() - 1]; }
+                if (stack.length > 0) { current = stack[stack.length - 1]; }
                 i = end + 1;
             } else if (i + 1 < len && raw[i + 1] == '?') {
                 int end = raw.indexOf("?>", i);
@@ -113,7 +124,7 @@ public document parse(string raw) {
                 if (current != null) {
                     current.childNodes.push(n);
                 }
-                if (tag[tag.length() - 1] != '/') {
+                if (tag[tag.length - 1] != '/') {
                     stack.push(n);
                     current = n;
                 }
@@ -123,8 +134,9 @@ public document parse(string raw) {
             int next = raw.indexOf("<", i);
             if (next < 0) { next = len; }
             string t = raw.substr(i, next - i);
-            if (current != null && t.trim().length() > 0) {
-                current.text = t.trim();
+            string trimmed = t.trim();
+            if (current != null && trimmed.length > 0) {
+                current.text = trimmed;
             }
             i = next;
         }
