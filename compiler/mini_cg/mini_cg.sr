@@ -7043,35 +7043,133 @@ int strIdx = this.stringPatchIndices[i];
             }
         } else if (builtinName && (name == "int" || name == "int64" || name == "int32") && !call.isMember) {
             // int(...) / int64(...) / int32(...) conversion: strings parse
-            // leading decimals exactly like the bcache reference loops
+            // leading digits exactly like the bcache reference loops
             // (`bcDecRangeSigned`): an optional leading '-', digits
-            // accumulate until the first non-digit, no-digits yields 0, and
-            // overflow WRAPS in two's-complement arithmetic (inline loop, no
-            // CRT dependency -- matches silverc-rs gen_int_conversion).
+            // accumulate until the first invalid digit, no-digits yields 0,
+            // and overflow WRAPS in two's-complement arithmetic (inline loop,
+            // no CRT dependency -- matches silverc-rs gen_int_conversion).
             // Floats truncate toward zero (cvttsd2si), ints pass through.
+            // `int(s, base)` (DOCS/113) parses in radix 2..36: digit values
+            // 0-9->c-48, A-Z->c-55, a-z->c-87 (case-insensitive) accumulate
+            // only while below the base, otherwise the prefix stops there; an
+            // out-of-range base yields 0, and without a base the radix is 10.
+            // `int(c, base)` on a char is the single digit value, or -1 when
+            // the char is not a digit below the base (the `bcHexVal`
+            // contract). Non-string/non-char inputs ignore the base.
+            // Register notes (mirror silverc-rs): the base is evaluated first
+            // and spilled to a fresh frame slot before the value (genExpr may
+            // clobber RAX); the digit gate is value<base. Signed jumps stand
+            // in for the bootstrap's unsigned ones -- equivalent here because
+            // the compared values are small positives (movzx bytes 0..255,
+            // digit values 0..35, gated base 2..36).
             if (call.childCount() > 0) {
                 Node arg = call.child(0);
+                bool hasBase = call.childCount() > 1;
                 bool isStringArg = this.inferExprType(arg) == "string";
-                if (isStringArg) {
+                if (hasBase && !isStringArg && this.isCharExpr(arg)) {
+                    this.genExpr(call.child(1));
+                    int cbSlot = this.allocLocal("__int_base");
+                    this.asm.movMBaseR(5, 0, cbSlot);
                     this.genExpr(arg);
+                    this.asm.movRMBase(9, 5, cbSlot);
+                    this.asm.movRR64(2, 0);
+                    int cbInvalid = this.newLabel();
+                    int cbBadBase = this.newLabel();
+                    int cbCheck = this.newLabel();
+                    int cbDone = this.newLabel();
+                    int cbNotDigit = this.newLabel();
+                    int cbNotUpper = this.newLabel();
+                    this.asm.cmpRI32(9, 2);
+                    this.asm.jlLabel(cbBadBase);
+                    this.asm.cmpRI32(9, 36);
+                    this.asm.jgLabel(cbBadBase);
+                    this.asm.cmpRI32(2, 48);
+                    this.asm.jlLabel(cbInvalid);
+                    this.asm.cmpRI32(2, 57);
+                    this.asm.jgLabel(cbNotDigit);
+                    this.asm.subRI32(2, 48);
+                    this.asm.jmpLabel(cbCheck);
+                    this.asm.bindLabel(cbNotDigit);
+                    this.asm.cmpRI32(2, 65);
+                    this.asm.jlLabel(cbInvalid);
+                    this.asm.cmpRI32(2, 90);
+                    this.asm.jgLabel(cbNotUpper);
+                    this.asm.subRI32(2, 55);
+                    this.asm.jmpLabel(cbCheck);
+                    this.asm.bindLabel(cbNotUpper);
+                    this.asm.cmpRI32(2, 97);
+                    this.asm.jlLabel(cbInvalid);
+                    this.asm.cmpRI32(2, 122);
+                    this.asm.jgLabel(cbInvalid);
+                    this.asm.subRI32(2, 87);
+                    this.asm.bindLabel(cbCheck);
+                    this.asm.cmpRR64(2, 9);
+                    this.asm.jgeLabel(cbInvalid);
+                    this.asm.movRR64(0, 2);
+                    this.asm.jmpLabel(cbDone);
+                    this.asm.bindLabel(cbInvalid);
+                    this.asm.movRI64(0, -1);
+                    this.asm.jmpLabel(cbDone);
+                    this.asm.bindLabel(cbBadBase);
+                    this.asm.xorRR64(0, 0);
+                    this.asm.bindLabel(cbDone);
+                } else if (isStringArg) {
+                    if (hasBase) {
+                        this.genExpr(call.child(1));
+                        int ibSlot = this.allocLocal("__int_base");
+                        this.asm.movMBaseR(5, 0, ibSlot);
+                        this.genExpr(arg);
+                        this.asm.movRMBase(9, 5, ibSlot);
+                    } else {
+                        this.genExpr(arg);
+                        this.asm.movRI64(9, 10);
+                    }
                     this.asm.movRR64(1, 0);
                     this.asm.xorRR64(0, 0);
                     this.asm.xorRR64(8, 8);
-                    this.asm.movRI64(9, 10);
-                    this.asm.movzxByteMBase(2, 1, 0);
-                    this.asm.cmpRI32(2, 45);
                     int pcDigits = this.newLabel();
                     int pcDone = this.newLabel();
+                    int pcEnd = this.newLabel();
+                    int pcNotDigit = this.newLabel();
+                    int pcNotUpper = this.newLabel();
+                    int pcCheck = this.newLabel();
+                    if (hasBase) {
+                        // RAX is already 0 here, so a bad base falls through
+                        // to the shared epilogue with the 0 result intact.
+                        this.asm.cmpRI32(9, 2);
+                        this.asm.jlLabel(pcEnd);
+                        this.asm.cmpRI32(9, 36);
+                        this.asm.jgLabel(pcEnd);
+                    }
+                    this.asm.movzxByteMBase(2, 1, 0);
+                    this.asm.cmpRI32(2, 45);
                     this.asm.jneLabel(pcDigits);
                     this.asm.incR64(1);
                     this.asm.movRI64(8, 1);
                     this.asm.bindLabel(pcDigits);
                     this.asm.movzxByteMBase(2, 1, 0);
-                    this.asm.subRI32(2, 48);
-                    this.asm.cmpRI32(2, 0);
+                    this.asm.cmpRI32(2, 48);
                     this.asm.jlLabel(pcDone);
-                    this.asm.cmpRI32(2, 9);
+                    this.asm.cmpRI32(2, 57);
+                    this.asm.jgLabel(pcNotDigit);
+                    this.asm.subRI32(2, 48);
+                    this.asm.jmpLabel(pcCheck);
+                    this.asm.bindLabel(pcNotDigit);
+                    this.asm.cmpRI32(2, 65);
+                    this.asm.jlLabel(pcDone);
+                    this.asm.cmpRI32(2, 90);
+                    this.asm.jgLabel(pcNotUpper);
+                    this.asm.subRI32(2, 55);
+                    this.asm.jmpLabel(pcCheck);
+                    this.asm.bindLabel(pcNotUpper);
+                    this.asm.cmpRI32(2, 97);
+                    this.asm.jlLabel(pcDone);
+                    this.asm.cmpRI32(2, 122);
                     this.asm.jgLabel(pcDone);
+                    this.asm.subRI32(2, 87);
+                    this.asm.bindLabel(pcCheck);
+                    this.asm.cmpRR64(2, 9);
+                    this.asm.jgeLabel(pcDone);
                     // NB: imulRR64 emits IMUL reg, r/m with the SECOND
                     // operand as the destination, so the accumulator stays
                     // in RAX only with the operands in (9, 0) order.
@@ -7081,7 +7179,6 @@ int strIdx = this.stringPatchIndices[i];
                     this.asm.jmpLabel(pcDigits);
                     this.asm.bindLabel(pcDone);
                     this.asm.cmpRI32(8, 0);
-                    int pcEnd = this.newLabel();
                     this.asm.jeLabel(pcEnd);
                     this.asm.negR64(0);
                     this.asm.bindLabel(pcEnd);

@@ -470,6 +470,56 @@ class Parser {
         this.recordError("expected a string of a number at line " + arg.line.toString() + ", column " + arg.col.toString() + ", got \"" + arg.strVal + "\"");
     }
 
+    // Static int parse conversions (`int.parseInt(s)`, `int.toInt(s)`,
+    // `int64.*`, `long.parseLong(s)`) lower to the plain `int(...)`
+    // conversion call (mirrors silverc-rs parse_expr_postfix), so an
+    // optional radix rides the same routine as `int(s, base)`.
+    private bool isIntParseConv(string recv, string method) {
+        if (recv == "int") { return method == "parseInt" || method == "toInt"; }
+        if (recv == "int64") { return method == "parseInt" || method == "toInt64"; }
+        if (recv == "long") { return method == "parseLong"; }
+        return false;
+    }
+
+    // `int(s, base)` (DOCS/113) — a string literal parsed in a literal radix
+    // is validated per-radix with the same prefix semantics the runtime loop
+    // implements (mirrors silverc-rs radix_prefix_ok): trim, an optional
+    // leading '-' (first char only), then at least one digit whose value is
+    // below the base. A non-literal or out-of-range base defers to the
+    // runtime contract (invalid base yields 0). The 1-arg free form keeps its
+    // historical behavior (no literal check here).
+    private void checkIntCallValueException(Node call) {
+        if (call.name != "int") { return; }
+        if (call.childCount() != 2) { return; }
+        Node arg = call.child(0);
+        Node base = call.child(1);
+        if (arg.kind != 2) { return; }
+        if (base.kind != 0) { return; }
+        int b = base.intVal;
+        if (b < 2 || b > 36) { return; }
+        if (this.radixPrefixOk(arg.strVal, b)) { return; }
+        this.recordError("expected a string of a number at line " + arg.line.toString() + ", column " + arg.col.toString() + ", got \"" + arg.strVal + "\"");
+    }
+
+    private bool radixPrefixOk(string s, int base) {
+        int start = 0;
+        int end = s.length;
+        while (start < end && s[start] == ' ') { start++; }
+        while (end > start && s[end - 1] == ' ') { end--; }
+        if (start < end && s[start] == '-') { start++; }
+        if (start >= end) { return false; }
+        int v = this.radixDigitVal(s[start]);
+        if (v < 0) { return false; }
+        return v < base;
+    }
+
+    private int radixDigitVal(char c) {
+        if (c >= '0' && c <= '9') { return c - '0'; }
+        if (c >= 'a' && c <= 'z') { return c - 'a' + 10; }
+        if (c >= 'A' && c <= 'Z') { return c - 'A' + 10; }
+        return -1;
+    }
+
     // TYPE_EXCEPTIONS.md — a declaration whose initializer's value kind
     // cannot possibly fit (`int x = "hello"`) points at the value and names
     // the declared type and variable.
@@ -2897,6 +2947,12 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     this.recordError("Missing close parenthesis at line " + openTok.line.toString() + ", column " + (openTok.col + 1).toString());
                 }
                 this.checkCallArgTypes(call);
+                // `int(s, base)` (DOCS/113): a string literal in a literal
+                // radix is validated per-radix here, at the only site that
+                // builds free calls (the post-parse walk skips free
+                // type-keyword calls: they carry line 0, like this one when
+                // lhs came from a type keyword).
+                this.checkIntCallValueException(call);
                 lhs = call;
                 continue;
             }
@@ -2988,10 +3044,25 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     }
                     // VALUE_EXCEPTION.md — numeric parse conversions on a
                     // literal string argument (`int.parseInt("hello")`).
+                    // Runs on the member shape before the int desugar below,
+                    // so the 1-arg rejection is preserved.
                     if (lhs.kind == 6 && mArgc == 1) {
                         this.checkParseValueException(lhs.name, name.text, call.child(1));
                     }
-                    lhs = call;
+                    if (lhs.kind == 6 && this.isIntParseConv(lhs.name, name.text)) {
+                        // Static int parse conversion: desugar to the plain
+                        // `int(...)` call with the same args (the optional
+                        // radix rides the free-call routine; literals are
+                        // validated per-radix below).
+                        Node conv = new Node(); conv.kind = 10;
+                        conv.name = "int";
+                        conv.line = call.line; conv.col = call.col;
+                        for (int ca = 1; ca < call.childCount(); ca++) { conv.children.add(call.child(ca)); }
+                        this.checkIntCallValueException(conv);
+                        lhs = conv;
+                    } else {
+                        lhs = call;
+                    }
                 } else {
                     Node member = new Node(); member.kind = 13;
                     member.name = name.text;
