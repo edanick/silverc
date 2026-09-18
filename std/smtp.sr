@@ -1,4 +1,6 @@
 import * from net;
+import { base64Encode } from encoding;
+import { replyCode, replyComplete } from ftp;
 
 mod export smtp;
 
@@ -36,8 +38,9 @@ mod export smtp;
 // LOGIN FLOW: greeting (220), EHLO (250, with a HELO fallback for servers
 // that reject EHLO), AUTH LOGIN (334), base64 user (334), base64 pass
 // (235); every step is read and validated, and the outcome is recorded in
-// isLoggedIn()/getLastReply(). The credentials are encoded by the module's
-// own b64Encode (see its note: encoding.base64Encode is a runtime crasher).
+// isLoggedIn()/getLastReply(). The credentials are encoded with
+// encoding.base64Encode (selectively imported from std/encoding.sr, the
+// base64 home -- the logic this module used to carry as its own b64Encode).
 // Against a non-SMTP listener the login fails gracefully: the server's
 // banner (or "" after a silent disconnect) is surfaced through
 // getLastReply() and the process exits cleanly. No exceptions anywhere.
@@ -60,13 +63,19 @@ mod export smtp;
 // startTLS(); login(string user, string pass); setFrom(string addr);
 // setTo(string addr); cc(string addr); subject(string s); body(string b);
 // html(string h); attach(string path); send(); close(); isLoggedIn();
-// getLastReply(); free functions replyCode(resp) (first three digits as
-// int, -1 on malformed), replyComplete(resp) (true once a terminating
-// "nnn " line is present -- SMTP multi-line replies use the same RFC
-// "nnn-text ... nnn space" shape as FTP) and buildMessage(from, to, cc,
-// subject, bodyText, isHtml) (assembles the RFC 5322 message exactly as
-// send() puts it on the wire, "\r\n.\r\n" terminated -- Cc line only when
-// cc is non-empty, text/html vs text/plain by if/else) -- all pure.
+// getLastReply(); free function buildMessage(from, to, cc, subject,
+// bodyText, isHtml) (assembles the RFC 5322 message exactly as send() puts
+// it on the wire, "\r\n.\r\n" terminated -- Cc line only when cc is
+// non-empty, text/html vs text/plain by if/else) -- pure. The reply
+// helpers replyCode(resp) (first three digits as int, -1 on malformed) and
+// replyComplete(resp) (true once a terminating "nnn " line is present) are
+// NOT defined here: they live in std/ftp.sr (the earlier,
+// alphabetically-first home of the byte-identical twins -- SMTP multi-line
+// replies use the same RFC "nnn-text ... nnn space" shape as FTP) and are
+// selectively imported from there; the base64 encoder is
+// encoding.base64Encode from std/encoding.sr (the base64 home). Only
+// strings/ints cross those module boundaries (the same shapes as every
+// net.* call -- no int[] crosses).
 // isLoggedIn() is true only after a fully accepted EHLO/HELO + AUTH LOGIN
 // exchange (through the 235 acceptance); getLastReply() returns the raw
 // text of the last server reply ("" before the first read). recvResp is a
@@ -90,42 +99,8 @@ mod export smtp;
 // module's boundary (getLastReply/buildMessage) should be assigned to a
 // local before being concatenated into larger expressions (silverc-rs
 // stringifies the return pointer in expression position; see std/dns.sr's
-// RS-ONLY CALLER LANDMINE). smtp's own b64Encode is same-module, so
-// login() has no cross-module string call at all.
-
-public int replyCode(string resp) {
-    if (resp.length < 3) { return -1; }
-    int code = 0;
-    for (int i = 0; i < 3; i++) {
-        int c = resp[i] & 0xFF;
-        if (!isDigit(c)) { return -1; }
-        code = code * 10 + (c - 48);
-    }
-    return code;
-}
-
-// True when `resp` already contains a terminating SMTP reply line: some
-// "\r\n"-delimited line whose first three chars are digits and whose fourth
-// char is a space (RFC 5321's "nnn " terminal form). Multi-line replies
-// ("nnn-text ... nnn text", e.g. EHLO capability lists) complete only at
-// the space form, so the wrapper's readers keep accumulating until this
-// fires or the bounded loop exhausts.
-public bool replyComplete(string resp) {
-    int lineStart = 0;
-    for (int i = 0; i < resp.length; i++) {
-        if (resp[i] == 13 && i + 1 < resp.length && resp[i + 1] == 10) {
-            int lineLen = i - lineStart;
-            if (lineLen >= 4) {
-                if (isDigit(resp[lineStart] & 0xFF) && isDigit(resp[lineStart + 1] & 0xFF) && isDigit(resp[lineStart + 2] & 0xFF) && resp[lineStart + 3] == 32) {
-                    return true;
-                }
-            }
-            i++;
-            lineStart = i + 1;
-        }
-    }
-    return false;
-}
+// RS-ONLY CALLER LANDMINE). login() assigns each encoding.base64Encode
+// result to a local before sending it, for the same reason.
 
 // Assembles the RFC 5322 message exactly as send() puts it on the wire:
 // From/To/optional-Cc/Subject/Content-Type headers, a blank line, the body,
@@ -145,50 +120,6 @@ public string buildMessage(string fromAddr, string toAddr, string ccAddr, string
     }
     msg += bodyText + "\r\n.\r\n";
     return msg;
-}
-
-private bool isDigit(int c) {
-    return c >= 48 && c <= 57;
-}
-
-// Base64 encoder for the AUTH LOGIN credentials. Pure and probeable.
-// Deliberately local to this module rather than a call into std/encoding:
-// encoding.base64Encode is a runtime CRASHER on both compilers (probed
-// 2026-08: a minimal `encoding.base64Encode("silveruser")` program dies
-// 0xC0000005 on silverc-rs and 0xC0000409 on the self-host) because
-// encoding.sr builds on the phantom `string.toBytes()` method. This
-// implementation indexes the input string directly (strings ARE packed byte
-// buffers -- data[i] reads one byte), needing no toBytes() at all.
-// Byte-exact RFC 4648 output with '=' padding (probed against the known
-// vectors c2lsdmVydXNlcg== / c2lsdmVycGFzcw== on both compilers). The `<<`
-// work happens inside this multi-line body only -- one-liner methods with
-// shifts are a self-host landmine.
-public string b64Encode(string data) {
-    string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    int len = data.length;
-    string result = "";
-    for (int i = 0; i < len; i += 3) {
-        int b0 = data[i] & 0xFF;
-        int n1 = (b0 >> 2) & 0x3F;
-        int n2 = (b0 & 0x03) << 4;
-        int n3 = -1;
-        int n4 = -1;
-        if (i + 1 < len) {
-            int b1 = data[i + 1] & 0xFF;
-            n2 = n2 | ((b1 >> 4) & 0x0F);
-            n3 = (b1 & 0x0F) << 2;
-            if (i + 2 < len) {
-                int b2 = data[i + 2] & 0xFF;
-                n3 = n3 | ((b2 >> 6) & 0x03);
-                n4 = b2 & 0x3F;
-            }
-        }
-        result += chars[n1];
-        result += chars[n2];
-        if (n3 < 0) { result += "="; } else { result += chars[n3]; }
-        if (n4 < 0) { result += "="; } else { result += chars[n4]; }
-    }
-    return result;
 }
 
 class client {
@@ -271,14 +202,14 @@ class client {
             this.fail();
             return;
         }
-        string u = b64Encode(user);
+        string u = base64Encode(user);
         this.sendCmd(u);
         this.readReply();
         if (replyCode(this.lastReply) != 334) {
             this.fail();
             return;
         }
-        string p = b64Encode(pass);
+        string p = base64Encode(pass);
         this.sendCmd(p);
         this.readReply();
         if (replyCode(this.lastReply) != 235) {
@@ -309,8 +240,7 @@ class client {
     // one-line-command CRLF must NOT be appended after it. A failed step
     // returns silently; getLastReply() holds the server's last words.
     public void send() {
-        if (!this.loggedIn) { return; }
-        if (this.sock < 0) { return; }
+        if (!this.loggedIn || this.sock < 0) { return; }
         net.setRecvTimeoutRaw(this.sock, 30000);
         this.sendCmd("MAIL FROM:<" + this.fromAddr + ">");
         this.readReply();
