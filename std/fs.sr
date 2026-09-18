@@ -52,11 +52,12 @@ mod export fs;
 // - struct dirent's d_name starts at offset 21 on Darwin (d_ino 8 +
 //   d_seekoff 8 + d_reclen 2 + d_namlen 2 + d_type 1, <dirent.h>) vs 19
 //   on Linux; copied bounded (256) the same way.
-// - Path normalization rides macNormPath (the fsNormPath duplicate the
-//   region style calls for: regions are per-OS, never shared, and
-//   fsNormPath lives in a `#on LINUX` region the MAC build never sees).
+// - Path normalization rides the canonical `path.normalize` (region-free
+//   `'\\'` -> `'/'` loop, no OS-unique lines, so no region is needed).
 // - APFS is case-insensitive-but-preserving by default: never assume the
 //   case-sensitivity the Linux bodies can rely on (documented, no code).
+
+import * from path;
 
 #on WINDOWS
 import * from win32.kernel32;
@@ -68,41 +69,19 @@ import * from mac.libsystem;
 import { rename as renameFile } from mac.libsystem;
 #off
 
-#on LINUX
-string fsNormPath(string path) {
-    string r = "";
-    for (int i = 0; i < path.length; i++) {
-        if (path[i] == '\\') { r += '/'; }
-        else { r += path[i]; }
-    }
-    return r;
-}
-#off
-
-#on MAC
-string macNormPath(string path) {
-    string r = "";
-    for (int i = 0; i < path.length; i++) {
-        if (path[i] == '\\') { r += '/'; }
-        else { r += path[i]; }
-    }
-    return r;
-}
-#off
-
 class FileOps {
 
     public bool exists(string path) {
         #on WINDOWS
         return GetFileAttributesA(path) != -1;
         #on LINUX
-        string npath = fsNormPath(path);
+        string npath = path.normalize(path);
         int fd = open(npath, 0, 0);
         if (fd < 0) { return false; }
         close(fd);
         return true;
         #on MAC
-        string npath = macNormPath(path);
+        string npath = path.normalize(path);
         int fd = open(npath, 0, 0);
         if (fd < 0) { return false; }
         close(fd);
@@ -115,10 +94,10 @@ class FileOps {
         #on WINDOWS
         DeleteFileA(path);
         #on LINUX
-        string npath = fsNormPath(path);
+        string npath = path.normalize(path);
         unlink(npath);
         #on MAC
-        string npath = macNormPath(path);
+        string npath = path.normalize(path);
         unlink(npath);
         #off
     }
@@ -127,12 +106,12 @@ class FileOps {
         #on WINDOWS
         MoveFileA(oldPath, newPath);
         #on LINUX
-        string nold = fsNormPath(oldPath);
-        string nnew = fsNormPath(newPath);
+        string nold = path.normalize(oldPath);
+        string nnew = path.normalize(newPath);
         renameFile(nold, nnew);
         #on MAC
-        string nold = macNormPath(oldPath);
-        string nnew = macNormPath(newPath);
+        string nold = path.normalize(oldPath);
+        string nnew = path.normalize(newPath);
         renameFile(nold, nnew);
         #off
     }
@@ -149,7 +128,7 @@ class FileOps {
         if (sz < 0) { return 0; }
         return sz;
         #on LINUX
-        string npath = fsNormPath(path);
+        string npath = path.normalize(path);
         int[] st = new int[18];
         int rc = stat(npath, st);
         if (rc != 0) { return 0; }
@@ -157,7 +136,7 @@ class FileOps {
         if (result < 0) { return 0; }
         return result;
         #on MAC
-        string npath = macNormPath(path);
+        string npath = path.normalize(path);
         int[] st = new int[18];
         int rc = stat(npath, st);
         if (rc != 0) { return 0; }
@@ -184,7 +163,7 @@ class FileOps {
         WriteFile(h, data, data.length, &wrote, null);
         CloseHandle(h);
         #on LINUX
-        string npath = fsNormPath(path);
+        string npath = path.normalize(path);
         int fd = open(npath, 0x241, 0x1A4);
         if (fd < 0) { return; }
         if (data.length > 0) {
@@ -198,7 +177,7 @@ class FileOps {
         }
         close(fd);
         #on MAC
-        string npath = macNormPath(path);
+        string npath = path.normalize(path);
         int fd = open(npath, 0x601, 0x1A4);
         if (fd < 0) { return; }
         if (data.length > 0) {
@@ -232,11 +211,11 @@ class FolderOps {
         FindClose(h);
         return names;
         #on LINUX
-        string npath = fsNormPath(path);
+        string npath = path.normalize(path);
         string[] names = readDirNames(npath);
         return names;
         #on MAC
-        string npath = macNormPath(path);
+        string npath = path.normalize(path);
         string[] names = readDirNames(npath);
         return names;
         #off
@@ -297,10 +276,10 @@ class FolderOps {
         #on WINDOWS
         CreateDirectoryA(path, null);
         #on LINUX
-        string npath = fsNormPath(path);
+        string npath = path.normalize(path);
         mkdir(npath, 493);
         #on MAC
-        string npath = macNormPath(path);
+        string npath = path.normalize(path);
         mkdir(npath, 493);
         #off
     }
@@ -309,10 +288,10 @@ class FolderOps {
         #on WINDOWS
         CreateDirectoryA(path, null);
         #on LINUX
-        string npath = fsNormPath(path);
+        string npath = path.normalize(path);
         mkdir(npath, 493);
         #on MAC
-        string npath = macNormPath(path);
+        string npath = path.normalize(path);
         mkdir(npath, 493);
         #off
     }
@@ -334,7 +313,7 @@ public string readString(string path) {
     foreach (byte b in buf) { result += char(b); }
     return result;
     #on LINUX
-    string npath = fsNormPath(path);
+    string npath = path.normalize(path);
     int fd = open(npath, 0, 0);
     if (fd < 0) { return ""; }
     int64 size = statSize(npath);
@@ -351,7 +330,7 @@ public string readString(string path) {
     }
     return result;
     #on MAC
-    string npath = macNormPath(path);
+    string npath = path.normalize(path);
     int fd = open(npath, 0, 0);
     if (fd < 0) { return ""; }
     int64 size = statSize(npath);
@@ -381,7 +360,7 @@ public byte[] read(string path) {
     CloseHandle(h);
     return buf;
     #on LINUX
-    string npath = fsNormPath(path);
+    string npath = path.normalize(path);
     int fd = open(npath, 0, 0);
     if (fd < 0) { return []; }
     int64 size = statSize(npath);
@@ -397,7 +376,7 @@ public byte[] read(string path) {
     }
     return out;
     #on MAC
-    string npath = macNormPath(path);
+    string npath = path.normalize(path);
     int fd = open(npath, 0, 0);
     if (fd < 0) { return []; }
     int64 size = statSize(npath);
@@ -424,7 +403,7 @@ public void writeString(string path, string content) {
     WriteFile(h, buf, buf.length, &wrote, null);
     CloseHandle(h);
     #on LINUX
-    string npath = fsNormPath(path);
+    string npath = path.normalize(path);
     int fd = open(npath, 0x241, 0x1A4);
     if (fd < 0) { return; }
     int len = content.length;
@@ -439,7 +418,7 @@ public void writeString(string path, string content) {
     }
     close(fd);
     #on MAC
-    string npath = macNormPath(path);
+    string npath = path.normalize(path);
     int fd = open(npath, 0x601, 0x1A4);
     if (fd < 0) { return; }
     int len = content.length;
@@ -464,7 +443,7 @@ public void write(string path, byte[] data) {
     WriteFile(h, data, data.length, &wrote, null);
     CloseHandle(h);
     #on LINUX
-    string npath = fsNormPath(path);
+    string npath = path.normalize(path);
     int fd = open(npath, 0x241, 0x1A4);
     if (fd < 0) { return; }
     if (data.length > 0) {
@@ -478,7 +457,7 @@ public void write(string path, byte[] data) {
     }
     close(fd);
     #on MAC
-    string npath = macNormPath(path);
+    string npath = path.normalize(path);
     int fd = open(npath, 0x601, 0x1A4);
     if (fd < 0) { return; }
     if (data.length > 0) {
@@ -498,13 +477,13 @@ public bool exists(string path) {
     #on WINDOWS
     return GetFileAttributesA(path) != -1;
     #on LINUX
-    string npath = fsNormPath(path);
+    string npath = path.normalize(path);
     int fd = open(npath, 0, 0);
     if (fd < 0) { return false; }
     close(fd);
     return true;
     #on MAC
-    string npath = macNormPath(path);
+    string npath = path.normalize(path);
     int fd = open(npath, 0, 0);
     if (fd < 0) { return false; }
     close(fd);
@@ -516,10 +495,10 @@ public void delete(string path) {
     #on WINDOWS
     DeleteFileA(path);
     #on LINUX
-    string npath = fsNormPath(path);
+    string npath = path.normalize(path);
     unlink(npath);
     #on MAC
-    string npath = macNormPath(path);
+    string npath = path.normalize(path);
     unlink(npath);
     #off
 }
@@ -528,12 +507,12 @@ public void rename(string oldPath, string newPath) {
     #on WINDOWS
     MoveFileA(oldPath, newPath);
     #on LINUX
-    string nold = fsNormPath(oldPath);
-    string nnew = fsNormPath(newPath);
+    string nold = path.normalize(oldPath);
+    string nnew = path.normalize(newPath);
     renameFile(nold, nnew);
     #on MAC
-    string nold = macNormPath(oldPath);
-    string nnew = macNormPath(newPath);
+    string nold = path.normalize(oldPath);
+    string nnew = path.normalize(newPath);
     renameFile(nold, nnew);
     #off
 }
@@ -553,11 +532,11 @@ public string[] listDir(string path) {
     FindClose(h);
     return names;
     #on LINUX
-    string npath = fsNormPath(path);
+    string npath = path.normalize(path);
     string[] names = readDirNames(npath);
     return names;
     #on MAC
-    string npath = macNormPath(path);
+    string npath = path.normalize(path);
     string[] names = readDirNames(npath);
     return names;
     #off
@@ -567,10 +546,10 @@ public void createDir(string path) {
     #on WINDOWS
     CreateDirectoryA(path, null);
     #on LINUX
-    string npath = fsNormPath(path);
+    string npath = path.normalize(path);
     mkdir(npath, 493);
     #on MAC
-    string npath = macNormPath(path);
+    string npath = path.normalize(path);
     mkdir(npath, 493);
     #off
 }
@@ -580,13 +559,13 @@ public void createDir(string path) {
 // stat fails. The WINDOWS bodies size via GetFileSize.
 int64 statSize(string path) {
     #on LINUX
-    string npath = fsNormPath(path);
+    string npath = path.normalize(path);
     int[] st = new int[18];
     int rc = stat(npath, st);
     if (rc != 0) { return -1; }
     return st[6];
     #on MAC
-    string npath = macNormPath(path);
+    string npath = path.normalize(path);
     int[] st = new int[18];
     int rc = stat(npath, st);
     if (rc != 0) { return -1; }
@@ -600,7 +579,7 @@ int64 statSize(string path) {
 // MAC branch (Darwin st_mode at bytes 4-5; UNVALIDATED code-only).
 int isDirPath(string path) {
     #on LINUX
-    string npath = fsNormPath(path);
+    string npath = path.normalize(path);
     int[] st = new int[18];
     int rc = stat(npath, st);
     if (rc != 0) { return 0; }
@@ -608,7 +587,7 @@ int isDirPath(string path) {
     if ((mode & 0xF000) == 0x4000) { return 1; }
     return 0;
     #on MAC
-    string npath = macNormPath(path);
+    string npath = path.normalize(path);
     int[] st = new int[18];
     int rc = stat(npath, st);
     if (rc != 0) { return 0; }
@@ -625,7 +604,7 @@ int isDirPath(string path) {
 // so no unbounded read escapes. The WINDOWS bodies enumerate with FindFirstFileA.
 string[] readDirNames(string path) {
     #on LINUX
-    string npath = fsNormPath(path);
+    string npath = path.normalize(path);
     string[] names = [];
     int dir = opendir(npath);
     if (dir == 0) { return names; }
@@ -645,7 +624,7 @@ string[] readDirNames(string path) {
     closedir(dir);
     return names;
     #on MAC
-    string npath = macNormPath(path);
+    string npath = path.normalize(path);
     string[] names = [];
     int dir = opendir(npath);
     if (dir == 0) { return names; }
