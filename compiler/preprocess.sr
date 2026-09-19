@@ -1,5 +1,7 @@
 mod export preprocess;
 
+import * from string;
+
 // DOCS/260 — the preprocessor: `#on <OS>` / `#else` / `#off` region filter.
 //
 // A line/region filter stage that runs BEFORE lexing. Lines inside regions
@@ -126,7 +128,7 @@ private string ppNormalizeOne(string source, int start, int end, string targetOs
         if (s == '/' && targetOs == "WINDOWS") { lit += "\\\\"; }
         else if (s == '\\' && targetOs != "WINDOWS") { lit += "/"; }
         else if (s == '\\') { lit += "\\\\"; }
-        else { lit += ppSlice(source, q, q + 1); }
+        else { lit += projectSlice(source, q, q + 1); }
     }
     lit += "\"";
     return lit;
@@ -154,7 +156,7 @@ public string ppNormalizePaths(string source, string targetOs, string[] errs) {
         char c = source[i];
         if (inBlock) {
             if (c == '*' && i + 1 < source.length && source[i + 1] == '/') {
-                pieces.add(ppSlice(source, runStart, i + 2));
+                pieces.add(projectSlice(source, runStart, i + 2));
                 runStart = i + 2;
                 i += 2;
                 inBlock = false;
@@ -167,13 +169,13 @@ public string ppNormalizePaths(string source, string targetOs, string[] errs) {
         if (c == '/' && i + 1 < source.length && source[i + 1] == '/') {
             int e = i;
             while (e < source.length && source[e] != '\n') { e++; }
-            pieces.add(ppSlice(source, runStart, e));
+            pieces.add(projectSlice(source, runStart, e));
             runStart = e;
             i = e;
             continue;
         }
         if (c == '/' && i + 1 < source.length && source[i + 1] == '*') {
-            pieces.add(ppSlice(source, runStart, i + 2));
+            pieces.add(projectSlice(source, runStart, i + 2));
             runStart = i + 2;
             i += 2;
             inBlock = true;
@@ -192,7 +194,7 @@ public string ppNormalizePaths(string source, string targetOs, string[] errs) {
                 }
                 j++;
             }
-            pieces.add(ppSlice(source, runStart, j));
+            pieces.add(projectSlice(source, runStart, j));
             runStart = j;
             i = j;
             continue;
@@ -210,7 +212,7 @@ public string ppNormalizePaths(string source, string targetOs, string[] errs) {
                 j++;
             }
             if (j < source.length && source[j] == '\'') { j++; }
-            pieces.add(ppSlice(source, runStart, j));
+            pieces.add(projectSlice(source, runStart, j));
             runStart = j;
             i = j;
             continue;
@@ -222,7 +224,7 @@ public string ppNormalizePaths(string source, string targetOs, string[] errs) {
                 errs.add("preprocessor: '\"*\"' path literal opened at line " + lineNo.toString() + " is never closed on the same line");
                 return source;
             }
-            pieces.add(ppSlice(source, runStart, i));
+            pieces.add(projectSlice(source, runStart, i));
             pieces.add(ppNormalizeOne(source, i + 2, k, targetOs));
             runStart = k + 1;
             i = k + 1;
@@ -231,20 +233,8 @@ public string ppNormalizePaths(string source, string targetOs, string[] errs) {
         if (c == '\n') { lineNo++; }
         i++;
     }
-    pieces.add(ppSlice(source, runStart, source.length));
+    pieces.add(projectSlice(source, runStart, source.length));
     return pieces.join("");
-}
-
-private string ppSlice(string s, int start, int end) {
-    int a = start;
-    if (a < 0) { a = 0; }
-    int b = end;
-    if (b > s.length) { b = s.length; }
-    if (b <= a) { return ""; }
-    // substring(start, len): the `s.slice(a..b)` Range-method form passes an
-    // int[] and always yields "", so spell the exclusive-end slice with the
-    // (start, length) primitive both compilers lower correctly.
-    return s.substring(a, b - a);
 }
 
 private int ppFindChar(string hay, char needle, int start) {
@@ -304,7 +294,7 @@ public string ppPreprocess(string source, string targetOs, bool debugBuild, stri
                 if (c < 'a' || c > 'z') { break; }
                 wordEnd++;
             }
-            string word = ppSlice(source, q, wordEnd);
+            string word = projectSlice(source, q, wordEnd);
             if (word == "on") {
                 isDirective = true;
                 int nameStart = ppSkipBlanks(source, wordEnd, contentEnd);
@@ -314,7 +304,7 @@ public string ppPreprocess(string source, string targetOs, bool debugBuild, stri
                     if (c == ' ' || c == '\t') { break; }
                     nameEnd++;
                 }
-                string osName = ppSlice(source, nameStart, nameEnd);
+                string osName = projectSlice(source, nameStart, nameEnd);
                 if (osName.length == 0) {
                     errs.add("preprocessor: '#on' requires an OS or build-mode name (WINDOWS, LINUX, MAC, DEBUG, RELEASE), at line " + lineNo.toString());
                     return source;
@@ -340,7 +330,7 @@ public string ppPreprocess(string source, string targetOs, bool debugBuild, stri
                         if (sc == ' ' || sc == '\t') { break; }
                         sepEnd++;
                     }
-                    string sep = ppSlice(source, sepSkip, sepEnd);
+                    string sep = projectSlice(source, sepSkip, sepEnd);
                     if (sep != "or") {
                         errs.add("preprocessor: unexpected text after '#on', at line " + lineNo.toString());
                         return source;
@@ -352,7 +342,7 @@ public string ppPreprocess(string source, string targetOs, bool debugBuild, stri
                         if (nc == ' ' || nc == '\t') { break; }
                         nextEnd++;
                     }
-                    string nextOs = ppSlice(source, nextSkip, nextEnd);
+                    string nextOs = projectSlice(source, nextSkip, nextEnd);
                     if (nextOs.length == 0) {
                         errs.add("preprocessor: '#on' requires an OS or build-mode name (WINDOWS, LINUX, MAC, DEBUG, RELEASE) after 'or', at line " + lineNo.toString());
                         return source;
@@ -421,7 +411,7 @@ public string ppPreprocess(string source, string targetOs, bool debugBuild, stri
     }
 
     if (mode == 1) {
-        string osName = ppSlice(source, regionOpenOsStart, regionOpenOsEnd);
+        string osName = projectSlice(source, regionOpenOsStart, regionOpenOsEnd);
         errs.add("preprocessor: '#on " + osName + "' region opened at line " + regionOpenLine.toString() + " is never closed by '#off' (end of file)");
         return source;
     }
@@ -437,7 +427,7 @@ public string ppPreprocess(string source, string targetOs, bool debugBuild, stri
     int copyStart = 0;
     for (int d = 0; d < dropAt.length; d++) {
         if (dropAt[d] > copyStart) {
-            result += ppSlice(source, copyStart, dropAt[d]);
+            result += projectSlice(source, copyStart, dropAt[d]);
         }
         if (dropNl[d] >= 0) {
             if (dropCr[d] == 1) { result += "\r\n"; }
@@ -446,7 +436,7 @@ public string ppPreprocess(string source, string targetOs, bool debugBuild, stri
         copyStart = (dropNl[d] >= 0) ? dropNl[d] + 1 : source.length;
     }
     if (copyStart < source.length) {
-        result += ppSlice(source, copyStart, source.length);
+        result += projectSlice(source, copyStart, source.length);
     }
     // DOCS/257 — path literals rewrite on the kept text, after region
     // filtering, so stripped regions never see the scan.
