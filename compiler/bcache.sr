@@ -351,16 +351,16 @@ class CacheSession {
     }
 
     private void storeSrbc(string absPath, Token[] tokens, int stamp, string hashKey, string sizeKey) {
-        string path = this.srbcPathFor(absPath);
-        if (path.length == 0) { return; }
-        ensureDirTree(bcDirname(path));
+        string srbcPath = this.srbcPathFor(absPath);
+        if (srbcPath.length == 0) { return; }
+        ensureDirTree(path.dirname(srbcPath));
 
         // Reference-format binary stream (see module docs), flushed in
         // bounded chunks straight to disk — never materialized as one
         // string or one whole-file array. Float literals carry all-zero
         // bits: the self-hosted front end materializes float literals as
         // 0.0 today.
-        BcBinWriter bw = new BcBinWriter(path);
+        BcBinWriter bw = new BcBinWriter(srbcPath);
         if (bw.ok()) {
             bw.b8(83);
             bw.b8(82);
@@ -398,7 +398,7 @@ class CacheSession {
         // NUL-free text companion (authoritative read side), streamed the
         // same way; hex payloads spill in bounded windows so no line is
         // ever built with per-char concatenation.
-        BcTextWriter tw = new BcTextWriter(path + ".t");
+        BcTextWriter tw = new BcTextWriter(srbcPath + ".t");
         if (tw.ok()) {
             tw.put(hashKey);
             tw.put(" ");
@@ -558,7 +558,7 @@ class BcBinWriter {
         this.failed = 0;
         this.handle = 0;
         this.scratch = outPath + ".part";
-        ensureDirTree(bcDirname(outPath));
+        ensureDirTree(path.dirname(outPath));
         #on WINDOWS
         // CREATE_ALWAYS: every artifact is rewritten whole on change.
         this.handle = CreateFileA(outPath, 0x40000000, 0, null, 2, 0x80, 0);
@@ -640,7 +640,7 @@ class BcTextWriter {
         this.path = outPath;
         this.handle = 0;
         this.buf = "";
-        ensureDirTree(bcDirname(outPath));
+        ensureDirTree(path.dirname(outPath));
         #on WINDOWS
         int h = CreateFileA(outPath, 0x40000000, 0, null, 2, 0x80, 0);
         if (h == -1 || h == 0) { return; }
@@ -791,15 +791,6 @@ public int bcModifiedMs(string path) {
 // actually hashes with.
 public int64 bcFnv1(string data) {
     return bcFnv1Range(data, 0, data.length);
-}
-
-public string bcDirname(string path) {
-    int last = -1;
-    for (int i = 0; i < path.length; i++) {
-        if (path[i] == '\\' || path[i] == '/') { last = i; }
-    }
-    if (last < 0) { return "."; }
-    return projectSlice(path, 0, last);
 }
 
 public string resolveRel(string root, string rel) {
