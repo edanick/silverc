@@ -1,11 +1,43 @@
 mod export hash;
 import * from fs;
 
+enum FnvKind {
+    FNV1,
+    FNV1A
+}
+
 public int64 djb2(string data) {
     int64 result = 5381;
     for (int i = 0; i < data.length; i++) {
         // int64() call-form, not (int): char-to-(int) miscompiles on bootstrap.
         result = result * 33 + int64(data[i]);
+    }
+    return result;
+}
+
+// FNV-1 overloads. Declaration ORDER is load-bearing: the self-host
+// selectOverloadIdx scores an exact first-argument type match but keeps
+// last-match-wins on ties, and a string argument earns no exact-type
+// score — so the string overload must stay LAST among the 1-arg shapes
+// or string calls would land on an array loop. Array arguments score
+// exact-type matches and dispatch correctly in any order. The char[]
+// overloads are REQUIRED: without one a char[] argument tie-breaks to
+// the string overload and NUL-truncates. Every overload carries its own
+// loop body — no delegating wrappers (§12).
+public int64 fnv1(byte[] data) {
+    int64 result = 14695981039346656037;
+    for (int i = 0; i < data.length; i++) {
+        result = result * 1099511628211;
+        result = result ^ int64(data[i] & 0xFF);
+    }
+    return result;
+}
+
+public int64 fnv1(char[] data) {
+    int64 result = 14695981039346656037;
+    for (int i = 0; i < data.length; i++) {
+        result = result * 1099511628211;
+        result = result ^ int64(data[i] & 0xFF);
     }
     return result;
 }
@@ -20,12 +52,96 @@ public int64 fnv1(string data) {
     return result;
 }
 
+// Kind-selected overloads: FNV-1 unless kind == 1 selects FNV-1a
+// (xor-then-multiply). `kind == 1` covers raw-int callers (and the
+// compilers, where the enum IS the int); the enum disjunct covers
+// interpreter enum values — exactly like string.equals handles
+// StringCase. Same ordering rule as above: the string+kind shape stays
+// LAST among the 2-arg overloads. Loop bodies are duplicated per
+// overload, never delegated (§12).
+public int64 fnv1(byte[] data, int kind) {
+    int64 result = 14695981039346656037;
+    if (kind == 1 || kind == FnvKind.FNV1A) {
+        for (int i = 0; i < data.length; i++) {
+            result = result ^ int64(data[i] & 0xFF);
+            result = result * 1099511628211;
+        }
+    } else {
+        for (int i = 0; i < data.length; i++) {
+            result = result * 1099511628211;
+            result = result ^ int64(data[i] & 0xFF);
+        }
+    }
+    return result;
+}
+
+public int64 fnv1(char[] data, int kind) {
+    int64 result = 14695981039346656037;
+    if (kind == 1 || kind == FnvKind.FNV1A) {
+        for (int i = 0; i < data.length; i++) {
+            result = result ^ int64(data[i] & 0xFF);
+            result = result * 1099511628211;
+        }
+    } else {
+        for (int i = 0; i < data.length; i++) {
+            result = result * 1099511628211;
+            result = result ^ int64(data[i] & 0xFF);
+        }
+    }
+    return result;
+}
+
+public int64 fnv1(string data, int kind) {
+    int64 result = 14695981039346656037;
+    if (kind == 1 || kind == FnvKind.FNV1A) {
+        for (int i = 0; i < data.length; i++) {
+            // Same char-cast gap as djb2 above: keep the int64() call-form.
+            result = result ^ int64(data[i]);
+            result = result * 1099511628211;
+        }
+    } else {
+        for (int i = 0; i < data.length; i++) {
+            result = result * 1099511628211;
+            // Same char-cast gap as djb2 above: keep the int64() call-form.
+            result = result ^ int64(data[i]);
+        }
+    }
+    return result;
+}
+
 public int64 djb2File(string path) {
     return djb2(file.readString(path));
 }
 
 public int64 fnv1File(string path) {
     return fnv1(file.readString(path));
+}
+
+// FNV-1 over the EXACT file bytes: embedded NULs hash here, while
+// fnv1File (over file.readString) truncates at the first NUL. The loop
+// is inlined rather than calling fnv1(bytes) so the read result hashes
+// directly instead of re-entering overload dispatch.
+public int64 fnv1FileBytes(string path) {
+    byte[] bytes = file.read(path);
+    int64 result = 14695981039346656037;
+    for (int i = 0; i < bytes.length; i++) {
+        result = result * 1099511628211;
+        result = result ^ int64(bytes[i] & 0xFF);
+    }
+    return result;
+}
+
+public int64 fnv1FileBytes(string path, int kind) {
+    // kind is IGNORED on this path — FNV-1 always — mirroring the
+    // bootstrap, whose file-bytes reader consumes only the path argument,
+    // so extra arguments never change the variant.
+    byte[] bytes = file.read(path);
+    int64 result = 14695981039346656037;
+    for (int i = 0; i < bytes.length; i++) {
+        result = result * 1099511628211;
+        result = result ^ int64(bytes[i] & 0xFF);
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------
