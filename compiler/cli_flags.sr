@@ -2,6 +2,7 @@ mod export cli_flags;
 
 import * from resource;
 import * from sysinfo;
+import * from string;
 
 // OVERHAUL.md — compiler CLI flags & modes.
 //
@@ -91,12 +92,12 @@ class CliFlags {
             if (path[i] == '\\' || path[i] == '/') { last = i; }
         }
         string name = path;
-        if (last >= 0) { name = cliSlice(path, last + 1, path.length); }
+        if (last >= 0) { name = projectSlice(path, last + 1, path.length); }
         int dot = -1;
         for (int j = name.length - 1; j >= 0; j--) {
             if (name[j] == '.') { dot = j; break; }
         }
-        if (dot > 0) { name = cliSlice(name, 0, dot); }
+        if (dot > 0) { name = projectSlice(name, 0, dot); }
         string low = "";
         for (int k = 0; k < name.length; k++) {
             int ci = name[k];
@@ -201,7 +202,7 @@ class CliFlags {
     }
 
     public string warnAllMessage() {
-        return "warning: using all " + this.threadCount.toString() + " system threads — the system might hang or lag; keeping a margin of at least 2 threads is recommended";
+        return "warning: using all " + (string)this.threadCount + " system threads — the system might hang or lag; keeping a margin of at least 2 threads is recommended";
     }
 
     // OVERHAUL.md CLI diagnostics go to the standard error stream
@@ -240,7 +241,7 @@ public int totalCpuThreads() {
 // identifiers inside the [...] list, both accepted (mirrors silverc-rs).
 public string[] manifestForbiddenFlags(string manifest) {
     string[] result = [];
-    int keyPos = cliFindSubstring(manifest, "forbidden_flags", 0);
+    int keyPos = projectFind(manifest, "forbidden_flags", 0);
     if (keyPos < 0) { return result; }
     int open = keyPos;
     while (open < manifest.length && manifest[open] != '[') { open++; }
@@ -257,13 +258,13 @@ public string[] manifestForbiddenFlags(string manifest) {
             int s = i + 1;
             int e = s;
             while (e < end && manifest[e] != '"') { e++; }
-            cliAddUnique(result, cliSlice(manifest, s, e));
+            cliAddUnique(result, projectSlice(manifest, s, e));
             i = e + 1;
         } else {
             int s = i;
             while (i < end && manifest[i] != ',' && manifest[i] != ']'
                 && manifest[i] != ' ' && manifest[i] != '\t' && manifest[i] != '\r' && manifest[i] != '\n') { i++; }
-            cliAddUnique(result, cliSlice(manifest, s, i));
+            cliAddUnique(result, projectSlice(manifest, s, i));
         }
     }
     return result;
@@ -273,7 +274,7 @@ public string[] manifestForbiddenFlags(string manifest) {
 // frequency, kilobytes for project_size_limit); -1 when absent. Custom
 // settings replace the automatic watcher defaults entirely.
 public int precompileNumericValue(string manifest, string key) {
-    int pos = cliFindSubstring(manifest, "precompile", 0);
+    int pos = projectFind(manifest, "precompile", 0);
     if (pos < 0) { return -1; }
     int searchEnd = manifest.length;
     int brace = pos;
@@ -288,7 +289,7 @@ public int precompileNumericValue(string manifest, string key) {
         }
         searchEnd = p;
     }
-    int keyPos = cliFindSubstring(manifest, key, pos);
+    int keyPos = projectFind(manifest, key, pos);
     if (keyPos < 0 || keyPos >= searchEnd) { return -1; }
     int colon = keyPos + key.length;
     while (colon < searchEnd && manifest[colon] != ':') { colon++; }
@@ -304,24 +305,6 @@ public int precompileNumericValue(string manifest, string key) {
     }
     if (digits == 0) { return -1; }
     return v;
-}
-
-private string cliSlice(string s, int start, int end) {
-    string r = "";
-    for (int i = start; i < end; i++) { r += s[i]; }
-    return r;
-}
-
-private int cliFindSubstring(string hay, string needle, int start) {
-    if (needle.length == 0) { return start; }
-    for (int i = start; i + needle.length <= hay.length; i++) {
-        bool hit = true;
-        for (int j = 0; j < needle.length; j++) {
-            if (hay[i + j] != needle[j]) { hit = false; break; }
-        }
-        if (hit) { return i; }
-    }
-    return -1;
 }
 
 private void cliAddUnique(string[] arr, string v) {
@@ -351,7 +334,7 @@ public CliFlags parseCliArgs(string[] args) {
                 return o;
             }
             o.threadsSet = true;
-            o.threadsN = cliUnsigned(arg);
+            o.threadsN = (int)arg;
             want = 0;
             continue;
         }
@@ -427,11 +410,7 @@ public CliFlags parseCliArgs(string[] args) {
         }
     }
     if (modeOrder.length > 1) {
-        string joined = "";
-        for (int m = 0; m < modeOrder.length; m++) {
-            if (m > 0) { joined += ", "; }
-            joined += modeOrder[m];
-        }
+        string joined = modeOrder.join(", ");
         o.error = "Error: only one of --aot/--jit/--runtime may be passed (got " + joined + ")";
         return o;
     }
@@ -449,12 +428,4 @@ private bool cliDigits(string s) {
         if (c < '0' || c > '9') { return false; }
     }
     return true;
-}
-
-private int cliUnsigned(string s) {
-    int v = 0;
-    for (int i = 0; i < s.length; i++) {
-        v = v * 10 + (s[i] - '0');
-    }
-    return v;
 }
