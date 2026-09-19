@@ -6,6 +6,7 @@ import * from env;
 import * from fs;
 import * from path;
 import * from string;
+import * from hash;
 
 #on WINDOWS
 import * from win32.kernel32;
@@ -121,9 +122,9 @@ class CacheSession {
         if (!this.ok) { return bcLex(bcSliceSlow(aggSource, start, end)); }
         string key = this.relKey(absPath);
         if (key.length == 0) { return bcLex(bcSliceSlow(aggSource, start, end)); }
-        int64 hash = bcFnv1Range(aggSource, start, end);
+        int64 rangeHash = hash.fnv1(aggSource, start, end);
         int size = file.size(absPath);
-        string hashKey = (string)hash;
+        string hashKey = (string)rangeHash;
         string sizeKey = (string)size;
         int idx = this.indexOfKey(key);
         if (idx >= 0) {
@@ -699,19 +700,12 @@ class BcTextWriter {
 // flattens into one program namespace, so duplicates would collide.
 // ---------------------------------------------------------------------------
 
-// FNV-1 over a character range of the aggregate, so cache hits hash a
-// chunk in place without ever materializing its text.
-public int64 bcFnv1Range(string data, int start, int end) {
-    int64 hash = -3750763034362895579;
-    if (end > data.length) { end = data.length; }
-    if (start < 0) { start = 0; }
-    for (int i = start; i < end; i++) {
-        hash = hash * 1099511628211;
-        int64 b = int64(data[i]);
-        hash = hash ^ b;
-    }
-    return hash;
-}
+// Range hashing is hash.sr's hash.fnv1(data, start, end) (FNV-1 over
+// [start, end)): CacheSession.tokensForRange calls it directly, so cache
+// hits hash a chunk in place without ever materializing its text. The
+// qualified spelling is load-bearing: the bootstrap routes hash.* calls
+// to its native FNV-1 loop and never compiles hash.sr source, so a bare
+// fnv1(...) would trap at runtime there.
 
 // Byte-range slice through a temp copy of the aggregate: seek + ReadFile
 // into a preallocated buffer sized exactly for the range, so the buffer's
@@ -785,13 +779,8 @@ public int bcModifiedMs(string path) {
     return file.size(path);
 }
 
-// FNV-1 64-bit hash (spec: "FNV-1 hash of the contents"). Compiled int64
-// arithmetic wraps in two's complement, matching the reference's u64
-// wrapping bit for bit. bcFnv1Range below is the range form the cache
-// actually hashes with.
-public int64 bcFnv1(string data) {
-    return bcFnv1Range(data, 0, data.length);
-}
+// Whole-string FNV-1 needs no wrapper here: hash.sr's hash.fnv1(data)
+// is the home (§6); this module keeps no hash clones.
 
 public string resolveRel(string root, string rel) {
     #on LINUX or MAC
