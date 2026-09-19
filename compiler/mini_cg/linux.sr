@@ -1309,17 +1309,15 @@ class MiniCgLinux {
         cg.asm.movRMBase(0, 0, 48);
         int sizeOff = cg.allocLocal("__rb_linux_size");
         cg.asm.movMBaseR(5, 0, sizeOff);
+        // Staging: flat packed buffer (size + 1, zeroed via the malloc +
+        // memset helper). Never array-shaped: Silver byte[] slots are 8
+        // bytes wide, so read cannot target the array directly (same shape
+        // as the WINDOWS packed-staging + expand fix in mini_cg.sr).
         cg.asm.movRMBase(8, 5, sizeOff);
-        cg.asm.addRI32(8, 16);
+        cg.asm.addRI32(8, 1);
         this.emitLinuxHeapAllocFromR8(cg);
         int bufOff = cg.allocLocal("__rb_linux_buf");
         cg.asm.movMBaseR(5, 0, bufOff);
-        cg.asm.movRMBase(1, 5, sizeOff);
-        cg.asm.movRMBase(0, 5, bufOff);
-        cg.asm.movMBaseR(0, 1, 0);
-        cg.asm.movRMBase(1, 5, sizeOff);
-        cg.asm.movRMBase(0, 5, bufOff);
-        cg.asm.movMBaseR(0, 1, 8);
         cg.asm.movRMBase(7, 5, pathOff);
         cg.asm.xorRR64(6, 6);
         cg.asm.xorRR64(2, 2);
@@ -1335,7 +1333,6 @@ class MiniCgLinux {
         cg.asm.jlLabel(rbErr);
         cg.asm.movRMBase(7, 5, hfileOff);
         cg.asm.movRMBase(6, 5, bufOff);
-        cg.asm.addRI32(6, 16);
         cg.asm.movRMBase(2, 5, sizeOff);
         cg.emitAbiCallSetup(0);
         cg.addImportPatchDirect("libc.so.6", "read");
@@ -1343,6 +1340,18 @@ class MiniCgLinux {
         cg.asm.movRMBase(0, 0, 0);
         cg.asm.callR64(0);
         cg.emitAbiCallTeardown();
+        // Length is the byte COUNT read returns (NUL bytes are data).
+        // A negative return (error) clamps to 0, mirroring the WINDOWS
+        // arm where a failed ReadFile leaves the zeroed bread temp alone.
+        int breadOff = cg.allocLocal("__rb_linux_bread");
+        cg.asm.movMBaseR(5, 0, breadOff);
+        int rbNegOk = cg.newLabel();
+        cg.asm.movRMBase(0, 5, breadOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jgeLabel(rbNegOk);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.movMBaseR(5, 0, breadOff);
+        cg.asm.bindLabel(rbNegOk);
         cg.asm.movRMBase(7, 5, hfileOff);
         cg.emitAbiCallSetup(0);
         cg.addImportPatchDirect("libc.so.6", "close");
@@ -1350,7 +1359,60 @@ class MiniCgLinux {
         cg.asm.movRMBase(0, 0, 0);
         cg.asm.callR64(0);
         cg.emitAbiCallTeardown();
+        // Capacity mirrors the array-literal/new shapes: max(bread, 8).
+        cg.asm.movRMBase(0, 5, breadOff);
+        int rbCap8 = cg.newLabel();
+        int rbCapDone = cg.newLabel();
+        cg.asm.cmpRI32(0, 8);
+        cg.asm.jgeLabel(rbCap8);
+        cg.asm.movRI64(0, 8);
+        cg.asm.jmpLabel(rbCapDone);
+        cg.asm.bindLabel(rbCap8);
+        cg.asm.movRMBase(0, 5, breadOff);
+        cg.asm.bindLabel(rbCapDone);
+        int capOff = cg.allocLocal("__rb_linux_cap");
+        cg.asm.movMBaseR(5, 0, capOff);
+        // Destination: genuine Silver array, (cap + 2) * 8, header
+        // [0] = capacity, [8] = bread.
+        cg.asm.movRMBase(8, 5, capOff);
+        cg.asm.addRI32(8, 2);
+        cg.asm.shlR64Imm(8, 3);
+        this.emitLinuxHeapAllocFromR8(cg);
+        int dstOff = cg.allocLocal("__rb_linux_dst");
+        cg.asm.movMBaseR(5, 0, dstOff);
+        cg.asm.movRMBase(0, 5, capOff);
+        cg.asm.movRMBase(1, 5, dstOff);
+        cg.asm.movMBaseR(1, 0, 0);
+        cg.asm.movRMBase(0, 5, breadOff);
+        cg.asm.movRMBase(1, 5, dstOff);
+        cg.asm.movMBaseR(1, 0, 8);
+        // Expand: dst slot i (8-byte cell) gets zero-extended staging byte i.
+        int iOff = cg.allocLocal("__rb_linux_i");
+        cg.asm.movRI64(0, 0);
+        cg.asm.movMBaseR(5, 0, iOff);
+        int rbLoop = cg.newLabel();
+        int rbLoopDone = cg.newLabel();
+        cg.asm.bindLabel(rbLoop);
+        cg.asm.movRMBase(0, 5, iOff);
+        cg.asm.movRMBase(1, 5, breadOff);
+        cg.asm.cmpRR64(0, 1);
+        cg.asm.jgeLabel(rbLoopDone);
         cg.asm.movRMBase(0, 5, bufOff);
+        cg.asm.movRMBase(1, 5, iOff);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movzxByteMBase(2, 0, 0);
+        cg.asm.movRMBase(0, 5, dstOff);
+        cg.asm.addRI32(0, 16);
+        cg.asm.movRMBase(1, 5, iOff);
+        cg.asm.shlR64Imm(1, 3);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movMBaseR(0, 2, 0);
+        cg.asm.movRMBase(0, 5, iOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, iOff);
+        cg.asm.jmpLabel(rbLoop);
+        cg.asm.bindLabel(rbLoopDone);
+        cg.asm.movRMBase(0, 5, dstOff);
         cg.asm.addRI32(0, 16);
         cg.asm.jmpLabel(rbDone);
         cg.asm.bindLabel(rbErr);

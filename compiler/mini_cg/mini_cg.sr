@@ -16156,11 +16156,18 @@ public void genNewCall(Node call) {
     // self-host dispatcher was missing: the call fell through to the
     // unresolvable path and yielded null, so every .length/index use
     // faulted). Same CreateFileA shape as genReadStringCall, but the
-    // payload is a Silver array, not a string: HeapAlloc(size + 16) with
-    // header [0] = size, [8] = size, ReadFile fills buf + 16, and buf + 16
-    // is returned -- the raw-buffer shape the Rust backend emits, never a
-    // Silver array handed to Win32 (the DELEGATION QUIRK in std/fs.sr).
-    // Missing files throw "file not found" like readString and Rust
+    // payload is a Silver array, not a string: ReadFile fills a FLAT packed
+    // staging buffer (HeapAlloc(size + 1)), then an expand loop copies each
+    // packed byte into its own 8-byte array slot (HeapAlloc((cap + 2) * 8)
+    // with header [0] = capacity, [8] = length, element 0 at buf + 16 --
+    // the array shape every other backend path emits, since Silver byte[]
+    // elements are 8-byte cells, never packed). Packing the file bytes
+    // straight into an array-shaped buffer was the corruption: lengths read
+    // exact while slots held packed qwords plus heap garbage past the short
+    // allocation (and 64KB files AV'd on out-of-bounds qword reads). The
+    // length stored is the byte COUNT ReadFile actually returned (bread),
+    // never GetFileSize and never strlen, so NUL bytes are data. Missing
+    // files throw "file not found" like readString and Rust
     // (std/fs.sr's `return []` documents the S6 surface only). No
     // readBytes alias exists in S6; bare POSIX read(fd, buf, n) never
     // reaches here (member dispatch only).
@@ -16239,6 +16246,10 @@ public void genNewCall(Node call) {
         int sizeOff = this.allocLocal("__rb_size");
         this.asm.movMBaseR(5, 0, sizeOff);
 
+        // Staging: flat packed buffer holding the raw file bytes
+        // (HeapAlloc(size + 1), zeroed; terminated at the bytes read like
+        // genReadStringCall). Never array-shaped: Silver byte[] slots are
+        // 8 bytes wide, so ReadFile cannot target the array directly.
         this.asm.emitCallSetup(0);
         this.emitGetProcessHeapCall();
         this.asm.emitCallTeardown();
@@ -16247,18 +16258,12 @@ public void genNewCall(Node call) {
         this.asm.movRR64(1, 0);
         this.asm.movRI64(2, 8);
         this.asm.movRMBase(8, 5, sizeOff);
-        this.asm.addRI32(8, 16);
+        this.asm.addRI32(8, 1);
         this.emitHeapAllocCall();
         this.asm.emitCallTeardown();
 
         int bufOff = this.allocLocal("__rb_buf");
         this.asm.movMBaseR(5, 0, bufOff);
-        this.asm.movRMBase(1, 5, sizeOff);
-        this.asm.movRMBase(0, 5, bufOff);
-        this.asm.movMBaseR(0, 1, 0);
-        this.asm.movRMBase(1, 5, sizeOff);
-        this.asm.movRMBase(0, 5, bufOff);
-        this.asm.movMBaseR(0, 1, 8);
 
         int breadOff = this.allocLocal("__rb_bread");
         this.asm.movRI64(0, 0);
@@ -16269,7 +16274,6 @@ public void genNewCall(Node call) {
         this.asm.movMBaseR(4, 0, 32);
         this.asm.movRMBase(1, 5, hfileOff);
         this.asm.movRMBase(2, 5, bufOff);
-        this.asm.addRI32(2, 16);
         this.asm.movRMBase(8, 5, sizeOff);
         this.asm.leaRBase(9, 5, breadOff);
         this.addImportPatch("kernel32.dll", "ReadFile");
@@ -16277,6 +16281,14 @@ public void genNewCall(Node call) {
         this.asm.movRMBase(0, 0, 0);
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
+
+        // Terminate the staging buffer at the bytes actually read (heap is
+        // zeroed; belt and braces like genReadStringCall).
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.movRMBase(1, 5, breadOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movRI64(1, 0);
+        this.asm.movMBaseByteR(0, 1, 0);
 
         this.asm.emitCallSetup(0);
         this.asm.movRMBase(1, 5, hfileOff);
@@ -16286,7 +16298,74 @@ public void genNewCall(Node call) {
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
 
+        // Capacity mirrors the array-literal/new shapes: max(bread, 8).
+        this.asm.movRMBase(0, 5, breadOff);
+        int rbCap8 = this.newLabel();
+        int rbCapDone = this.newLabel();
+        this.asm.cmpRI32(0, 8);
+        this.asm.jgeLabel(rbCap8);
+        this.asm.movRI64(0, 8);
+        this.asm.jmpLabel(rbCapDone);
+        this.asm.bindLabel(rbCap8);
+        this.asm.movRMBase(0, 5, breadOff);
+        this.asm.bindLabel(rbCapDone);
+        int capOff = this.allocLocal("__rb_cap");
+        this.asm.movMBaseR(5, 0, capOff);
+
+        // Destination: genuine Silver array, HeapAlloc((cap + 2) * 8) with
+        // header [0] = capacity, [8] = bread (the ReadFile byte COUNT).
+        this.asm.emitCallSetup(0);
+        this.emitGetProcessHeapCall();
+        this.asm.emitCallTeardown();
+
+        this.asm.emitCallSetup(0);
+        this.asm.movRR64(1, 0);
+        this.asm.movRI64(2, 8);
+        this.asm.movRMBase(8, 5, capOff);
+        this.asm.addRI32(8, 2);
+        this.asm.shlR64Imm(8, 3);
+        this.emitHeapAllocCall();
+        this.asm.emitCallTeardown();
+
+        int dstOff = this.allocLocal("__rb_dst");
+        this.asm.movMBaseR(5, 0, dstOff);
+        this.asm.movRMBase(0, 5, capOff);
+        this.asm.movRMBase(1, 5, dstOff);
+        this.asm.movMBaseR(1, 0, 0);
+        this.asm.movRMBase(0, 5, breadOff);
+        this.asm.movRMBase(1, 5, dstOff);
+        this.asm.movMBaseR(1, 0, 8);
+
+        // Expand: dst slot i (8-byte cell at dst + 16 + i * 8) gets the
+        // zero-extended staging byte i, so every file byte -- NULs included
+        // -- lands in exactly one slot.
+        int iOff = this.allocLocal("__rb_i");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        int rbLoop = this.newLabel();
+        int rbLoopDone = this.newLabel();
+        this.asm.bindLabel(rbLoop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, breadOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(rbLoopDone);
         this.asm.movRMBase(0, 5, bufOff);
+        this.asm.movRMBase(1, 5, iOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movzxByteMBase(2, 0, 0);
+        this.asm.movRMBase(0, 5, dstOff);
+        this.asm.addRI32(0, 16);
+        this.asm.movRMBase(1, 5, iOff);
+        this.asm.shlR64Imm(1, 3);
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(0, 2, 0);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(rbLoop);
+        this.asm.bindLabel(rbLoopDone);
+
+        this.asm.movRMBase(0, 5, dstOff);
         this.asm.addRI32(0, 16);
         this.asm.jmpLabel(rbDone);
         this.asm.bindLabel(rbEmpty);
