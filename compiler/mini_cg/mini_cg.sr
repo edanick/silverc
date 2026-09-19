@@ -9667,7 +9667,7 @@ public void genNewCall(Node call) {
             }
         }
         if (recvType == "string") {
-            if (name == "contains" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "substr" || name == "substring" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toBytes" || name == "repeat") {
+            if (name == "contains" || name == "isDigits" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "substr" || name == "substring" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toBytes" || name == "repeat") {
                 return true;
             }
         }
@@ -9835,6 +9835,58 @@ public void genNewCall(Node call) {
             this.asm.bindLabel(notFound);
             this.asm.xorRR64(0, 0);
             this.asm.bindLabel(containsDone);
+            return;
+        }
+        if (name == "isDigits") {
+            // s.isDigits(): true iff s is non-empty and every byte is 0-9.
+            // Pure inline compares (strlen only; no strstr-style DLL import).
+            // Mirrors the contains tail shape for the 1/0 bool result.
+            int dgRecv = this.allocLocal("__isdigits_recv");
+            int dgLen = this.allocLocal("__isdigits_len");
+            int dgI = this.allocLocal("__isdigits_i");
+            this.genExpr(recv);
+            this.asm.movMBaseR(5, 0, dgRecv);
+            this.asm.movRMBase(1, 5, dgRecv);
+            this.addImportPatch("ucrtbase.dll", "strlen");
+            int sDgLen = 0xDEADBEEFCAFEBAD7;
+            this.asm.emitImm64(0, sDgLen);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movMBaseR(5, 0, dgLen);
+            int dgFalse = this.newLabel();
+            int dgTrue = this.newLabel();
+            int dgDone = this.newLabel();
+            this.asm.movRMBase(0, 5, dgLen);
+            this.asm.cmpRI32(0, 0);
+            this.asm.jeLabel(dgFalse);
+            this.asm.xorRR64(0, 0);
+            this.asm.movMBaseR(5, 0, dgI);
+            int dgLoop = this.newLabel();
+            this.asm.bindLabel(dgLoop);
+            this.asm.movRMBase(0, 5, dgI);
+            this.asm.movRMBase(1, 5, dgLen);
+            this.asm.cmpRR64(0, 1);
+            this.asm.jgeLabel(dgTrue);
+            this.asm.movRMBase(11, 5, dgI);
+            this.asm.movRMBase(0, 5, dgRecv);
+            this.asm.addRR64(0, 11);
+            this.asm.movzxByteMBase(1, 0, 0);
+            this.asm.cmpRI32(1, 48);
+            this.asm.jlLabel(dgFalse);
+            this.asm.cmpRI32(1, 57);
+            this.asm.jgLabel(dgFalse);
+            this.asm.movRMBase(0, 5, dgI);
+            this.asm.addRI32(0, 1);
+            this.asm.movMBaseR(5, 0, dgI);
+            this.asm.jmpLabel(dgLoop);
+            this.asm.bindLabel(dgTrue);
+            this.asm.movRI64(0, 1);
+            this.asm.jmpLabel(dgDone);
+            this.asm.bindLabel(dgFalse);
+            this.asm.xorRR64(0, 0);
+            this.asm.bindLabel(dgDone);
             return;
         }
         if (name == "toInt64" || name == "toInt" || name == "toNumber") {
