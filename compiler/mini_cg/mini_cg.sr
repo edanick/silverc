@@ -9667,7 +9667,7 @@ public void genNewCall(Node call) {
             }
         }
         if (recvType == "string") {
-            if (name == "contains" || name == "isDigits" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "substr" || name == "substring" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toBytes" || name == "repeat") {
+            if (name == "contains" || name == "isDigits" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "substr" || name == "substring" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toFloatBits" || name == "toBytes" || name == "repeat") {
                 return true;
             }
         }
@@ -9916,6 +9916,28 @@ public void genNewCall(Node call) {
             this.asm.jneLabel(toOk);
             this.emitThrowException("invalid number format");
             this.asm.bindLabel(toOk);
+            return;
+        }
+        if (name == "toFloatBits") {
+            // Parse a decimal float string to its IEEE-754 double bit
+            // pattern: strtod(recv, NULL), then movq the XMM0 result bits
+            // into RAX. The result is an int64, not a typed float, so no
+            // float_vars involvement. Mirrors silverc-rs
+            // emit_string_to_float_bits (strtod + movq bits, oracle-exact).
+            if (call.childCount() < 1) { this.asm.xorRR64(0, 0); return; }
+            this.genExpr(recv);
+            int tfRecv = this.allocLocal("__tofbits_recv");
+            this.asm.movMBaseR(5, 0, tfRecv);
+            this.asm.movRMBase(1, 5, tfRecv);
+            this.asm.xorRR64(2, 2);
+            this.addImportPatch("ucrtbase.dll", "strtod");
+            int sToFb = 0xDEADBEEFCAFEBAC4;
+            this.asm.emitImm64(0, sToFb);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movqR64XMM(0, 0);
             return;
         }
         if (name == "trim" || name == "trimEnd" || name == "trimRight" || name == "trimStart" || name == "trimLeft") {
