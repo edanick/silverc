@@ -10103,6 +10103,86 @@ public void genNewCall(Node call) {
         }
         if (name == "indexOf" || name == "find") {
             if (call.childCount() < 2) { this.asm.movRI64(0, -1); return; }
+            if (this.isCharExpr(call.child(1))) {
+                // Char needle: byte-scan from clamp(start, 0, len),
+                // absolute index or -1 in R0 (matches silverc-rs
+                // emit_string_find_char). Pure inline compares, no imports.
+                int fcRecv = this.allocLocal("__find_recv");
+                int fcByte = this.allocLocal("__find_byte");
+                int fcStart = this.allocLocal("__find_start");
+                int fcLen = this.allocLocal("__find_len");
+                int fcI = this.allocLocal("__find_i");
+                this.genExpr(recv);
+                this.asm.movMBaseR(5, 0, fcRecv);
+                this.genExpr(call.child(1));
+                this.asm.movMBaseR(5, 0, fcByte);
+                if (call.childCount() >= 3) {
+                    this.genExpr(call.child(2));
+                    this.asm.movMBaseR(5, 0, fcStart);
+                } else {
+                    this.asm.xorRR64(0, 0);
+                    this.asm.movMBaseR(5, 0, fcStart);
+                }
+                // len = strlen(recv)
+                this.asm.movRMBase(1, 5, fcRecv);
+                this.addImportPatch("ucrtbase.dll", "strlen");
+                int fcSL = 0xDEADBEEFCAFEBADD;
+                this.asm.emitImm64(0, fcSL);
+                this.asm.movRMBase(0, 0, 0);
+                this.asm.emitCallSetup(0);
+                this.asm.callR64(0);
+                this.asm.emitCallTeardown();
+                this.asm.movMBaseR(5, 0, fcLen);
+                // start = clamp(start, 0, len)
+                int fcStartOk = this.newLabel();
+                int fcLenOk = this.newLabel();
+                this.asm.movRMBase(0, 5, fcStart);
+                this.asm.cmpRI32(0, 0);
+                this.asm.jgeLabel(fcStartOk);
+                this.asm.xorRR64(0, 0);
+                this.asm.bindLabel(fcStartOk);
+                this.asm.movRMBase(1, 5, fcLen);
+                this.asm.cmpRR64(0, 1);
+                this.asm.jleLabel(fcLenOk);
+                this.asm.movRR64(0, 1);
+                this.asm.bindLabel(fcLenOk);
+                this.asm.movMBaseR(5, 0, fcI);
+                // needle low byte (genExpr may leave wider values)
+                this.asm.movRMBase(2, 5, fcByte);
+                this.asm.andRImm(2, 0xFF);
+                this.asm.movMBaseR(5, 2, fcByte);
+                int fcLoop = this.newLabel();
+                int fcFound = this.newLabel();
+                int fcDone = this.newLabel();
+                int fcMissed = this.newLabel();
+                this.asm.bindLabel(fcLoop);
+                this.asm.movRMBase(0, 5, fcI);
+                this.asm.movRMBase(1, 5, fcLen);
+                this.asm.cmpRR64(0, 1);
+                this.asm.jgeLabel(fcDone);
+                this.asm.movRMBase(11, 5, fcI);
+                this.asm.movRMBase(0, 5, fcRecv);
+                this.asm.addRR64(0, 11);
+                this.asm.movzxByteMBase(0, 0, 0);
+                this.asm.movRMBase(1, 5, fcByte);
+                this.asm.cmpRR64(0, 1);
+                this.asm.jeLabel(fcFound);
+                this.asm.movRMBase(0, 5, fcI);
+                this.asm.addRI32(0, 1);
+                this.asm.movMBaseR(5, 0, fcI);
+                this.asm.jmpLabel(fcLoop);
+                this.asm.bindLabel(fcFound);
+                this.asm.movRMBase(0, 5, fcI);
+                this.asm.jmpLabel(fcDone);
+                this.asm.bindLabel(fcDone);
+                // Not found exits with i == len; a hit exits with i < len.
+                this.asm.movRMBase(1, 5, fcLen);
+                this.asm.cmpRR64(0, 1);
+                this.asm.jneLabel(fcMissed);
+                this.asm.movRI64(0, -1);
+                this.asm.bindLabel(fcMissed);
+                return;
+            }
             int ioRecv = this.allocLocal("__index_recv");
             int ioNeedle = this.allocLocal("__index_needle");
             this.genExpr(recv);
