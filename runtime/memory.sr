@@ -2,10 +2,6 @@ mod export memory;
 
 import * from sysinfo;
 
-#on WINDOWS
-import * from win32.kernel32;
-#on LINUX
-import * from linux.libc;
 #on MAC
 import * from mac.libsystem;
 #off
@@ -451,53 +447,12 @@ public string smSpillPath(int64 pageId, int64 ownerId, int64 generation, int kin
     return "";
 }
 
-// Binary file I/O for .sm spill paging. Existence, deletion, rename, and
-// writes go through the file.* compiler intrinsics (intrinsics add no
-// grants, unlike the fs.* Silver wrappers). Reads and size stay native:
-// file.read is byte-corrupt on the bootstrap (packed slots, exact lengths)
-// and throws on a missing path on both compilers where the pager returns
-// [] (smWritePage/smPageInBytes error-code flow); file.size reports 0 on
-// missing, so it migrates only together with the read whose <= 0 check
-// absorbs both -1 and 0.
-int64 smStatSize(string path) {
-    #on LINUX
-    int[] st = new int[18];
-    int rc = stat(path, st);
-    if (rc != 0) { return -1; }
-    return st[6];
-    #off
-    return -1;
-}
-
-byte[] smFileRead(string path) {
-    #on WINDOWS
-    int h = CreateFileA(path, 0x80000000, 3, null, 3, 0x80, 0);
-    if (h == -1) { return []; }
-    int size = GetFileSize(h, null);
-    byte[] buf = new byte[size];
-    int got = 0;
-    ReadFile(h, buf, size, &got, null);
-    CloseHandle(h);
-    return buf;
-    #on LINUX
-    int fd = open(path, 0, 0);
-    if (fd < 0) { return []; }
-    int64 size = smStatSize(path);
-    if (size <= 0) { close(fd); return []; }
-    int slots = int((size + 7) / 8);
-    int[] buf = new int[slots];
-    int n = read(fd, buf, int(size));
-    close(fd);
-    if (n < 0) { return []; }
-    byte[] out = new byte[n];
-    for (int i = 0; i < n; i++) {
-        out[i] = (buf[i / 8] >> ((i % 8) * 8)) & 0xFF;
-    }
-    return out;
-    #off
-    byte[] empty = [];
-    return empty;
-}
+// Binary file I/O for .sm spill paging goes through the file.* compiler
+// intrinsics (intrinsics add no grants, unlike the fs.* Silver wrappers):
+// writes via file.writeBytes, reads via file.read guarded by file.exists.
+// file.read is NUL-exact on every backend; it still throws on a missing
+// path by design, so the pager keeps its missing→[] contract with the
+// exists-guard while the length checks below absorb the empty case.
 
 // One 32-byte chunk-index record per chunk (see DOCS/GC hybrid paging
 // design.md): logical/file offsets, logical/stored lengths, CRC32C of the
@@ -600,7 +555,8 @@ public string smWritePage(byte[] payload, int kind) {
     file.rename(tmp, path);
     smUntrackTmp(tmp);
     if (!file.exists(path)) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return ""; }
-    byte[] back = smFileRead(path);
+    byte[] back = [];
+    if (file.exists(path)) { back = file.read(path); }
     if (back.length != fileBytes.length) { file.delete(path); smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return ""; }
     byte[] hbuf = new byte[SM_HEADER_SIZE];
     for (int i = 0; i < SM_HEADER_SIZE; i++) { hbuf[i] = back[i]; }
@@ -684,25 +640,26 @@ bool smVerifyIndex(SmHeader h, byte[] file, byte[] payload) {
 // CRC and every index record, then return the payload ([] on failure).
 public byte[] smPageInBytes(string path) {
     smFl[SM_FL_LAST_ERR] = SM_OK;
-    byte[] file = smFileRead(path);
-    if (file.length < SM_HEADER_SIZE) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return []; }
+    byte[] fileBytes = [];
+    if (file.exists(path)) { fileBytes = file.read(path); }
+    if (fileBytes.length < SM_HEADER_SIZE) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return []; }
     string stem = smFileStem(path);
     if (!smIsHex16(stem)) { smFl[SM_FL_LAST_ERR] = SM_ERR_NAME_HASH; return []; }
     int64 want = smParseHex16(stem);
     byte[] hbuf = new byte[SM_HEADER_SIZE];
-    for (int i = 0; i < SM_HEADER_SIZE; i++) { hbuf[i] = file[i]; }
+    for (int i = 0; i < SM_HEADER_SIZE; i++) { hbuf[i] = fileBytes[i]; }
     SmHeader d = new SmHeader();
     int dec = smHeaderDecode(hbuf, d);
     if (dec != SM_OK) { smFl[SM_FL_LAST_ERR] = dec; return []; }
-    int chk = smHeaderValidate(d, (int64)file.length, 1, want, 1);
+    int chk = smHeaderValidate(d, (int64)fileBytes.length, 1, want, 1);
     if (chk != SM_OK) { smFl[SM_FL_LAST_ERR] = chk; return []; }
     int idxSize = int(d.index_size);
     int payLen = int(d.payload_size);
-    if (file.length != SM_HEADER_SIZE + idxSize + payLen) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return []; }
+    if (fileBytes.length != SM_HEADER_SIZE + idxSize + payLen) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return []; }
     byte[] payload = new byte[payLen];
-    for (int i = 0; i < payLen; i++) { payload[i] = file[SM_HEADER_SIZE + idxSize + i]; }
+    for (int i = 0; i < payLen; i++) { payload[i] = fileBytes[SM_HEADER_SIZE + idxSize + i]; }
     if (crc32cBytes(payload) != d.payload_checksum) { smFl[SM_FL_LAST_ERR] = SM_ERR_CHECKSUM; return []; }
-    if (!smVerifyIndex(d, file, payload)) { smFl[SM_FL_LAST_ERR] = SM_ERR_INDEX; return []; }
+    if (!smVerifyIndex(d, fileBytes, payload)) { smFl[SM_FL_LAST_ERR] = SM_ERR_INDEX; return []; }
     smSt[SM_ST_FAULTS]++;
     smSt[SM_ST_RESIDENT] += (int64)payLen;
     return payload;
