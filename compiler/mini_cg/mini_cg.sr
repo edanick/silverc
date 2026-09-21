@@ -5115,13 +5115,16 @@ int strIdx = this.stringPatchIndices[i];
             if (!clsIsClass) {
                 int nargs = expr.childCount();
                 Node probe = null;
+                Node probeB = null;
                 if (expr.isMember && expr.childCount() > 0) {
                     nargs = expr.childCount() - 1;
                     if (expr.childCount() > 1) { probe = expr.child(1); }
+                    if (expr.childCount() > 2) { probeB = expr.child(2); }
                 } else if (expr.childCount() > 0) {
                     probe = expr.child(0);
+                    if (expr.childCount() > 1) { probeB = expr.child(1); }
                 }
-                int wi = this.selectOverloadIdx(cname, cls, nargs, probe);
+                int wi = this.selectOverloadIdx(cname, cls, nargs, probe, probeB);
                 if (wi >= 0 && wi < this.funcRetTypes.length) { return this.funcRetTypes[wi]; }
             }
             for (int i = 0; i < this.funcNames.length; i++) {
@@ -8847,7 +8850,7 @@ public void genNewCall(Node call) {
     // whose parameter list accepts `nargs` arguments. The variadic tail is
     // itself optional (required = non-default count among the fixed prefix);
     // same-arity ties keep the last declaration. -1 when nothing matches.
-    public int selectOverloadIdx(string name, string cls, int nargs, Node probe) {
+    public int selectOverloadIdx(string name, string cls, int nargs, Node probe, Node probeB) {
         // Overload dispatch by argument count, with a type tie-break on the
         // first explicit argument (probe, null when unavailable): a float
         // argument prefers a float-typed first parameter, an array argument
@@ -8855,8 +8858,15 @@ public void genNewCall(Node call) {
         // routes math.abs(-1.5)/max/min/sum to the matching math.sr overload
         // instead of always taking the last declaration. Without a probe (or
         // on score ties) the legacy last-match behavior is preserved exactly.
+        // Second-argument tie-break (hash(int,byte[]/char[]/string) family):
+        // when the top first-argument score is SHARED by 2+ candidates (and
+        // only then), the call's second explicit argument (probeB, null when
+        // unavailable) scores the same way against each tied candidate's
+        // SECOND parameter type; the best second score wins and any remaining
+        // tie keeps last-match-wins. Without probeB the legacy result stands.
         int best = -1;
         int bestScore = -1;
+        int bestTies = 0;
         bool haveProbe = probe != null;
         bool probeFloat = false;
         bool probeArr = false;
@@ -8899,9 +8909,72 @@ public void genNewCall(Node call) {
                             if (p0 == "int" || p0 == "int32" || p0 == "int64" || p0 == "uint") { score = 2; }
                         }
                     }
-                    if (score > bestScore || score == bestScore) { best = i; bestScore = score; }
+                    if (score > bestScore) { best = i; bestScore = score; bestTies = 1; }
+                    else if (score == bestScore) { best = i; bestTies++; }
                 }
             }
+        }
+        // Second-argument tie-break: only a shared top first-argument score
+        // reaches here; anything else (unique winner, no probeB, single
+        // explicit argument) keeps the legacy result above byte-for-byte.
+        bool haveProbeB = probeB != null;
+        if (bestTies > 1 && haveProbeB && nargs > 1) {
+            bool probeBFloat = this.isFloatLike(probeB);
+            string probeBType = this.inferExprType(probeB);
+            bool probeBArr = false;
+            if (probeBType.length >= 2) {
+                if (probeBType[probeBType.length - 2] == '[' && probeBType[probeBType.length - 1] == ']') { probeBArr = true; }
+            }
+            int bestB = -1;
+            int bestBScore = -1;
+            for (int j = 0; j < this.funcNames.length; j++) {
+                if (this.funcNames[j] == name && this.funcClasses[j] == cls) {
+                    int pcB = (j < this.funcParamCounts.length) ? this.funcParamCounts[j] : -1;
+                    if (pcB < 0) { continue; }
+                    int pStartB = this.funcParamStarts[j];
+                    bool variadicB = j < this.funcHasVariadic.length && this.funcHasVariadic[j] == 1;
+                    int fixedLenB = pcB;
+                    if (variadicB && pcB > 0) { fixedLenB = pcB - 1; }
+                    int minArgsB = 0;
+                    for (int kb = 0; kb < fixedLenB; kb++) {
+                        if (pStartB + kb < this.funcParamHasDefaults.length && this.funcParamHasDefaults[pStartB + kb] == 0) { minArgsB++; }
+                    }
+                    bool acceptsB;
+                    if (variadicB) {
+                        acceptsB = nargs >= minArgsB;
+                    } else {
+                        acceptsB = nargs >= minArgsB && nargs <= pcB;
+                    }
+                    if (acceptsB) {
+                        int scoreA = 0;
+                        if (haveProbe && nargs > 0) {
+                            string p0B = "";
+                            if (pStartB < this.funcParamTypes.length) { p0B = this.funcParamTypes[pStartB]; }
+                            if (probeFloat) {
+                                if (p0B == "float" || p0B == "float64" || p0B == "double") { scoreA = 2; }
+                            } else if (probeArr) {
+                                if (p0B == probeType) { scoreA = 2; }
+                            } else {
+                                if (p0B == "int" || p0B == "int32" || p0B == "int64" || p0B == "uint") { scoreA = 2; }
+                            }
+                        }
+                        if (scoreA == bestScore) {
+                            string p1B = "";
+                            if (pStartB + 1 < this.funcParamTypes.length) { p1B = this.funcParamTypes[pStartB + 1]; }
+                            int scoreB = 0;
+                            if (probeBFloat) {
+                                if (p1B == "float" || p1B == "float64" || p1B == "double") { scoreB = 2; }
+                            } else if (probeBArr) {
+                                if (p1B == probeBType) { scoreB = 2; }
+                            } else {
+                                if (p1B == "int" || p1B == "int32" || p1B == "int64" || p1B == "uint") { scoreB = 2; }
+                            }
+                            if (scoreB > bestBScore || scoreB == bestBScore) { bestB = j; bestBScore = scoreB; }
+                        }
+                    }
+                }
+            }
+            if (bestB >= 0) { best = bestB; }
         }
         return best;
     }
@@ -9009,7 +9082,7 @@ public void genNewCall(Node call) {
             }
         }
         if (s1Count > 1) {
-            funcIdx = this.selectOverloadIdx(name, this.currentClassName, nargs, null);
+            funcIdx = this.selectOverloadIdx(name, this.currentClassName, nargs, null, null);
             if (funcIdx < 0) {
                 // UNIFIED_CORE_LIBRARY.md §4 rule 6: when no class-method
                 // overload accepts the argument count but the name resolves
@@ -9040,12 +9113,14 @@ public void genNewCall(Node call) {
                 // Type-aware tie-break on the first explicit argument
                 // (module calls like math.abs(-1.5) need the float overload).
                 Node probe2 = null;
+                Node probe2B = null;
                 if (nargs > 0) {
                     int ai = 0;
                     if (call.isMember) { ai = 1; }
                     if (ai < call.childCount()) { probe2 = call.child(ai); }
+                    if (ai + 1 < call.childCount()) { probe2B = call.child(ai + 1); }
                 }
-                funcIdx = this.selectOverloadIdx(name, "", nargs, probe2);
+                funcIdx = this.selectOverloadIdx(name, "", nargs, probe2, probe2B);
                 if (funcIdx < 0) {
                     // UNIFIED_CORE_LIBRARY.md §4 rule 6 -- resolution prefers
                     // the DLL export inside regions: when NO user overload of
@@ -11265,7 +11340,7 @@ public void genNewCall(Node call) {
             }
         }
         if (haveExactClass) {
-            funcIdx = this.selectOverloadIdx(name, recvClass, explicitUserArgs, null);
+            funcIdx = this.selectOverloadIdx(name, recvClass, explicitUserArgs, null, null);
         }
         // Inheritance: an inherited method must resolve to the ancestor
         // that declares it, not to the any-class fallback below (which
@@ -11285,7 +11360,7 @@ public void genNewCall(Node call) {
             ancestor = this.parentClassName(ancestor);
             for (int depth = 0; depth < 64; depth++) {
                 if (ancestor == "") { break; }
-                funcIdx = this.selectOverloadIdx(name, ancestor, explicitUserArgs, null);
+                funcIdx = this.selectOverloadIdx(name, ancestor, explicitUserArgs, null, null);
                 if (funcIdx >= 0) { break; }
                 ancestor = this.parentClassName(ancestor);
             }
@@ -13134,13 +13209,16 @@ public void genNewCall(Node call) {
             // math.max(3, 7) (int overload) is not treated as float.
             int nargs = expr.childCount();
             Node fprobe = null;
+            Node fprobeB = null;
             if (expr.isMember && expr.childCount() > 0) {
                 nargs = expr.childCount() - 1;
                 if (expr.childCount() > 1) { fprobe = expr.child(1); }
+                if (expr.childCount() > 2) { fprobeB = expr.child(2); }
             } else if (expr.childCount() > 0) {
                 fprobe = expr.child(0);
+                if (expr.childCount() > 1) { fprobeB = expr.child(1); }
             }
-            int wi = this.selectOverloadIdx(cn, "", nargs, fprobe);
+            int wi = this.selectOverloadIdx(cn, "", nargs, fprobe, fprobeB);
             if (wi >= 0 && wi < this.funcRetTypes.length) {
                 string wrt = this.funcRetTypes[wi];
                 if (wrt == "float" || wrt == "float64" || wrt == "double") { return true; }
