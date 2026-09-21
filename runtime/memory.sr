@@ -102,16 +102,6 @@ public int smCrc32c(string data) {
     return (crc ^ 0xffffffff) & 0xffffffff;
 }
 
-// TEMPORARY (FORBIDDEN.md bans comparison builtins by name): restored after
-// the uint64Gt/uint64Lt builtin removal. Goes away with the uint64 type,
-// whose > is unsigned — then the two call sites below use symbol syntax.
-bool uint64Gt(int64 a, int64 b) {
-    if (a >= 0 && b >= 0) { return a > b; }
-    if (a < 0 && b < 0) { return a > b; }
-    if (a < 0) { return true; }
-    return false;
-}
-
 int smGetU16(byte[] p, int off) {
     return p[off] | (p[off + 1] << 8);
 }
@@ -163,12 +153,14 @@ public int smHeaderValidate(SmHeader h, int64 fileSize, int checkFileSize, int64
     if (h.index_offset != SM_INDEX_OFFSET_REQUIRED) { return SM_ERR_INDEX; }
     int64 expectedIndexSize = expectedCount * (int64)SM_INDEX_RECORD_SIZE;
     if (h.index_size != expectedIndexSize) { return SM_ERR_INDEX; }
-    if (uint64Gt(h.index_offset, 0xffffffffffffffff - h.index_size)) { return SM_ERR_INDEX; }
+    uint64 spanEnd = 0xffffffffffffffff - h.index_size;
+    if (h.index_offset > spanEnd) { return SM_ERR_INDEX; }
     int64 dataOffset = h.index_offset + h.index_size;
     if (h.payload_size != h.logical_size) { return SM_ERR_SIZE; }
     if (checkNameHash != 0 && h.name_hash != expectedNameHash) { return SM_ERR_NAME_HASH; }
     if (checkFileSize != 0) {
-        if (uint64Gt(dataOffset, 0xffffffffffffffff - h.payload_size)) { return SM_ERR_BOUNDS; }
+        uint64 dataEnd = 0xffffffffffffffff - h.payload_size;
+        if (dataOffset > dataEnd) { return SM_ERR_BOUNDS; }
         if (dataOffset + h.payload_size != fileSize) { return SM_ERR_BOUNDS; }
     }
     return SM_OK;
