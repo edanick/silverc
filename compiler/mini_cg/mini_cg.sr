@@ -4984,6 +4984,8 @@ int strIdx = this.stringPatchIndices[i];
             }
             if (!expr.isMember && cname == "char") { return "char"; }
             if (!expr.isMember && (cname == "int" || cname == "int32" || cname == "int64")) { return "int"; }
+            // uint64Gt/uint64Lt lower to 0/1 ints (unsigned compare).
+            if (!expr.isMember && (cname == "uint64Gt" || cname == "uint64Lt")) { return "int"; }
             if (!expr.isMember && (cname == "float" || cname == "float64" || cname == "double")) { return "float64"; }
             if (!expr.isMember && cname == "bool") { return "bool"; }
             if (!expr.isMember && cname == "string_cast") { return "string"; }
@@ -7356,6 +7358,34 @@ int strIdx = this.stringPatchIndices[i];
                 this.asm.bindLabel(bT);
                 this.asm.movRI64(0, 1);
                 this.asm.bindLabel(bD);
+            } else {
+                this.asm.xorRR64(0, 0);
+            }
+        } else if (builtinName && (name == "uint64Gt" || name == "uint64Lt") && !call.isMember) {
+            // uint64Gt(a, b) / uint64Lt(a, b): unsigned 64-bit comparison of
+            // the two's-complement bit patterns (all Silver ints are signed
+            // at runtime, so plain >/< cannot spell this). Eval both, cmp,
+            // ja/jb to 1 else 0; missing args read 0 (mirrors silverc-rs
+            // gen_uint64). The asm layer exposes only signed jumps
+            // (jl/jle/jg/jge), so the unsigned branch goes through
+            // emitJccRel32 (135=0x87 ja, 130=0x82 jb, decimal to stay clear
+            // of hex-literal operand handling).
+            if (call.childCount() > 1) {
+                this.genExpr(call.child(0));
+                int ucmpSlot = this.allocLocal("__ucmp_lhs");
+                this.asm.movMBaseR(5, 0, ucmpSlot);
+                this.genExpr(call.child(1));
+                this.asm.movRR64(1, 0);
+                this.asm.movRMBase(0, 5, ucmpSlot);
+                this.asm.cmpRR64(0, 1);
+                int ucmpYes = this.newLabel();
+                int ucmpDone = this.newLabel();
+                if (name == "uint64Gt") { this.emitJccRel32(135, ucmpYes); } else { this.emitJccRel32(130, ucmpYes); }
+                this.asm.movRI64(0, 0);
+                this.asm.jmpLabel(ucmpDone);
+                this.asm.bindLabel(ucmpYes);
+                this.asm.movRI64(0, 1);
+                this.asm.bindLabel(ucmpDone);
             } else {
                 this.asm.xorRR64(0, 0);
             }
