@@ -1,6 +1,7 @@
 mod export memory;
 
 import * from sysinfo;
+import * from path;
 
 #on MAC
 import * from mac.libsystem;
@@ -587,22 +588,6 @@ public string smPageOutString(string data) {
     return smPageOutBytes(bytes, SM_KIND_STRING);
 }
 
-// Filename stem (after the last separator, without a trailing .sm).
-string smFileStem(string path) {
-    int start = 0;
-    for (int i = 0; i < path.length; i++) {
-        if (path[i] == '/' || path[i] == '\\') { start = i + 1; }
-    }
-    string tail = "";
-    for (int i = start; i < path.length; i++) { tail += path[i]; }
-    if (tail.length > 3 && tail[tail.length - 3] == '.' && tail[tail.length - 2] == 's' && tail[tail.length - 1] == 'm') {
-        string stem = "";
-        for (int i = 0; i < tail.length - 3; i++) { stem += tail[i]; }
-        return stem;
-    }
-    return tail;
-}
-
 // Every index record must agree with the header and its chunk checksum;
 // [] on any mismatch (partial bytes are never exposed).
 bool smVerifyIndex(SmHeader h, byte[] file, byte[] payload) {
@@ -638,13 +623,15 @@ bool smVerifyIndex(SmHeader h, byte[] file, byte[] payload) {
 // Fault a page back in: read, check magic/reserved/header checksum,
 // require exact bounds and filename-hash agreement, require the payload
 // CRC and every index record, then return the payload ([] on failure).
-public byte[] smPageInBytes(string path) {
+public byte[] smPageInBytes(string spillPath) {
     smFl[SM_FL_LAST_ERR] = SM_OK;
     byte[] fileBytes = [];
-    if (file.exists(path)) { fileBytes = file.read(path); }
+    if (file.exists(spillPath)) { fileBytes = file.read(spillPath); }
     if (fileBytes.length < SM_HEADER_SIZE) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return []; }
-    string stem = smFileStem(path);
-    if (!smIsHex16(stem)) { smFl[SM_FL_LAST_ERR] = SM_ERR_NAME_HASH; return []; }
+    string stem = path.stem(spillPath);
+    // Tightening: bare-hex names without `.sm` now reject where the old gate
+    // accepted — no live flow produces them (spills are always `<hex>.sm`).
+    if (!spillPath.endsWith(".sm") || !smIsHex16(stem)) { smFl[SM_FL_LAST_ERR] = SM_ERR_NAME_HASH; return []; }
     int64 want = smParseHex16(stem);
     byte[] hbuf = new byte[SM_HEADER_SIZE];
     for (int i = 0; i < SM_HEADER_SIZE; i++) { hbuf[i] = fileBytes[i]; }
