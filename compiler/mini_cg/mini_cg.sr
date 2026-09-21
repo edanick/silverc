@@ -7557,7 +7557,7 @@ int strIdx = this.stringPatchIndices[i];
             this.genBuiltinMemberCall(call);
         } else if (call.isMember && !this.isThisAsmMember(call) && this.isUserClassMemberCall(call)) {
             this.genMemberCall(call);
-        } else if (name == "pushR64" || name == "popR64" || name == "movRR64" || name == "movRI64" || name == "movRMBase" || name == "movMBaseR" || name == "subRI32" || name == "addRI32" || name == "xorRR64" || name == "cmpRI32" || name == "cmpRR64" || name == "ret" || name == "callR64" || name == "leaRBase" || name == "emitU8" || name == "emitU32" || name == "emitImm64" || name == "emitCallSetup" || name == "emitCallTeardown" || name == "addRR64" || name == "subRR64" || name == "mulRR64" || name == "andRImm" || name == "shlR64Imm" || name == "incR64" || name == "decR64" || name == "movByteMBaseIdxR" || name == "movMBaseByteR" || name == "label" || name == "bindLabel" || name == "jeLabel" || name == "jneLabel" || name == "jmpLabel" || name == "jlLabel" || name == "jleLabel" || name == "jgLabel" || name == "jgeLabel" || name == "movzxByteMBase" || name == "callRel32") {
+        } else if (name == "pushR64" || name == "popR64" || name == "movRR64" || name == "movRI64" || name == "movRMBase" || name == "movMBaseR" || name == "subRI32" || name == "addRI32" || name == "xorRR64" || name == "cmpRI32" || name == "cmpRR64" || name == "ret" || name == "callR64" || name == "leaRBase" || name == "emitU8" || name == "emitU32" || name == "emitImm64" || name == "emitCallSetup" || name == "emitCallTeardown" || name == "addRR64" || name == "subRR64" || name == "mulRR64" || name == "andRImm" || name == "shlR64Imm" || name == "incR64" || name == "decR64" || name == "movByteMBaseIdxR" || name == "movMBaseByteR" || name == "label" || name == "bindLabel" || name == "jeLabel" || name == "jneLabel" || name == "jmpLabel" || name == "jlLabel" || name == "jleLabel" || name == "jgLabel" || name == "jgeLabel" || name == "jbLabel" || name == "jbeLabel" || name == "jaLabel" || name == "jaeLabel" || name == "movzxByteMBase" || name == "callRel32") {
             this.genAsmCall(call);        } else if (call.isMember && call.childCount() > 1 && call.child(1).kind == 80 && this.isHofMethod(name) && this.isArrayLikeType(this.inferExprType(call.child(0)))) {
             if (name == "map" || name == "forEach") { this.genLambdaMap(call); }
             else if (name == "filter") { this.genLambdaFilter(call); }
@@ -8642,6 +8642,10 @@ public void genNewCall(Node call) {
         else if (name == "jleLabel") { this.asm.jleLabel(this.asmArg(args, 0)); }
         else if (name == "jgLabel") { this.asm.jgLabel(this.asmArg(args, 0)); }
         else if (name == "jgeLabel") { this.asm.jgeLabel(this.asmArg(args, 0)); }
+        else if (name == "jbLabel") { this.asm.jbLabel(this.asmArg(args, 0)); }
+        else if (name == "jbeLabel") { this.asm.jbeLabel(this.asmArg(args, 0)); }
+        else if (name == "jaLabel") { this.asm.jaLabel(this.asmArg(args, 0)); }
+        else if (name == "jaeLabel") { this.asm.jaeLabel(this.asmArg(args, 0)); }
         else if (name == "movzxByteMBase") { this.asm.movzxByteMBase(this.asmArg(args, 0), this.asmArg(args, 1), this.asmArg(args, 2)); }
         else if (name == "callRel32") { this.asm.callRel32(this.asmArg(args, 0)); }
     }
@@ -11726,6 +11730,9 @@ public void genNewCall(Node call) {
             // the IEEE-754 unordered rules).  Integer operands on either
             // side are widened with cvtsi2sd.
             bool cmpFlt = this.isFloatLike(bin.child(0)) || this.isFloatLike(bin.child(1));
+            // Unsigned select: either operand uint64 (Eq/Ne are
+            // bit-identity either way and keep the shared arms).
+            bool cmpU64 = this.isUint64Like(bin.child(0)) || this.isUint64Like(bin.child(1));
             if (cmpFlt) {
                 if (this.isFloatLike(bin.child(0))) { this.emitMovqXmmGpr(0, 0); }
                 else { this.emitCvtsi2sdRax(); }
@@ -11739,10 +11746,10 @@ public void genNewCall(Node call) {
             int e = this.newLabel();
             if (op == 5) { this.asm.jeLabel(t); }
             else if (op == 6) { this.asm.jneLabel(t); }
-            else if (op == 7) { if (cmpFlt) { this.emitJccRel32(0x82, t); } else { this.asm.jlLabel(t); } }
-            else if (op == 8) { if (cmpFlt) { this.emitJccRel32(0x86, t); } else { this.asm.jleLabel(t); } }
-            else if (op == 9) { if (cmpFlt) { this.emitJccRel32(0x87, t); } else { this.asm.jgLabel(t); } }
-            else if (op == 10) { if (cmpFlt) { this.emitJccRel32(0x83, t); } else { this.asm.jgeLabel(t); } }
+            else if (op == 7) { if (cmpFlt) { this.emitJccRel32(0x82, t); } else if (cmpU64) { this.asm.jbLabel(t); } else { this.asm.jlLabel(t); } }
+            else if (op == 8) { if (cmpFlt) { this.emitJccRel32(0x86, t); } else if (cmpU64) { this.asm.jbeLabel(t); } else { this.asm.jleLabel(t); } }
+            else if (op == 9) { if (cmpFlt) { this.emitJccRel32(0x87, t); } else if (cmpU64) { this.asm.jaLabel(t); } else { this.asm.jgLabel(t); } }
+            else if (op == 10) { if (cmpFlt) { this.emitJccRel32(0x83, t); } else if (cmpU64) { this.asm.jaeLabel(t); } else { this.asm.jgeLabel(t); } }
             this.asm.movRI64(0, 0);
             this.asm.jmpLabel(e);
             this.asm.bindLabel(t);
@@ -12996,6 +13003,29 @@ public void genNewCall(Node call) {
         if (expr.kind == 10) {
             if (!expr.isMember && expr.name == "char") { return true; }
             return this.inferExprType(expr) == "char";
+        }
+        return false;
+    }
+
+    // True when the expression holds an unsigned 64-bit value: a local or
+    // parameter declared uint64 (tracked in the local type table), or a
+    // member read on a field declared uint64. Either comparison operand
+    // being uint64 selects unsigned branches (like C promotion); values
+    // are bit-identical to int64 at runtime, and Eq/Ne stay on the shared
+    // bit-identity arms. Mirrors silverc-rs codegen is_uint64_expr
+    // (Identifier / MemberAccess / Paren arms only: literals, index reads,
+    // arithmetic results, calls and consts stay signed there, so they stay
+    // signed here too).
+    public bool isUint64Like(Node expr) {
+        if (expr.kind == 6) {
+            return this.getLocalType(expr.name) == "uint64";
+        }
+        if (expr.kind == 13) {
+            return this.inferMemberAccessType(expr) == "uint64";
+        }
+        if (expr.kind == 23) {
+            if (expr.childCount() > 0) { return this.isUint64Like(expr.child(0)); }
+            return false;
         }
         return false;
     }
