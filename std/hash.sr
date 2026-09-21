@@ -1,9 +1,13 @@
 mod export hash;
 import * from fs;
 
-enum FnvKind {
+// Declaration ORDER is load-bearing: FNV1=0, FNV1A=1 preserves the
+// kind==1 contract; DJB2=2, CRC32C=3.
+enum HashAlgorithms {
     FNV1,
-    FNV1A
+    FNV1A,
+    DJB2,
+    CRC32C
 }
 
 public int64 djb2(string data) {
@@ -52,6 +56,48 @@ public int64 fnv1(string data) {
     return result;
 }
 
+// CRC-32C overloads (Castagnoli, reflected poly 0x82F63B78). Same
+// declaration-order rule as the FNV-1 set above: byte[]/char[] FIRST,
+// string LAST, or string calls would land on an array loop. Every
+// overload carries its own loop body — no delegating wrappers (§12).
+// Init/xorout 0xFFFFFFFF, result masked to 32 bits.
+public int64 crc32c(byte[] data) {
+    int64 crc = 0xffffffff;
+    for (int i = 0; i < data.length; i++) {
+        crc = crc ^ int64(data[i] & 0xFF);
+        for (int bit = 0; bit < 8; bit++) {
+            int64 mask = -(crc & 1);
+            crc = ((crc >> 1) & 0x7fffffff) ^ (0x82f63b78 & mask);
+        }
+    }
+    return (crc ^ 0xffffffff) & 0xffffffff;
+}
+
+public int64 crc32c(char[] data) {
+    int64 crc = 0xffffffff;
+    for (int i = 0; i < data.length; i++) {
+        crc = crc ^ int64(data[i] & 0xFF);
+        for (int bit = 0; bit < 8; bit++) {
+            int64 mask = -(crc & 1);
+            crc = ((crc >> 1) & 0x7fffffff) ^ (0x82f63b78 & mask);
+        }
+    }
+    return (crc ^ 0xffffffff) & 0xffffffff;
+}
+
+public int64 crc32c(string data) {
+    int64 crc = 0xffffffff;
+    for (int i = 0; i < data.length; i++) {
+        // Same char-cast gap as djb2 above: keep the int64() call-form.
+        crc = crc ^ int64(data[i]);
+        for (int bit = 0; bit < 8; bit++) {
+            int64 mask = -(crc & 1);
+            crc = ((crc >> 1) & 0x7fffffff) ^ (0x82f63b78 & mask);
+        }
+    }
+    return (crc ^ 0xffffffff) & 0xffffffff;
+}
+
 // Range form: FNV-1 over [start, end) (end > length clamps to length,
 // start < 0 clamps to 0) — the home for range hashing; bcache.sr calls
 // this directly. Loop body duplicated, never delegated (§12).
@@ -76,7 +122,7 @@ public int64 fnv1(string data, int start, int end) {
 // overload, never delegated (§12).
 public int64 fnv1(byte[] data, int kind) {
     int64 result = 14695981039346656037;
-    if (kind == 1 || kind == FnvKind.FNV1A) {
+    if (kind == 1 || kind == HashAlgorithms.FNV1A) {
         for (int i = 0; i < data.length; i++) {
             result = result ^ int64(data[i] & 0xFF);
             result = result * 1099511628211;
@@ -92,7 +138,7 @@ public int64 fnv1(byte[] data, int kind) {
 
 public int64 fnv1(char[] data, int kind) {
     int64 result = 14695981039346656037;
-    if (kind == 1 || kind == FnvKind.FNV1A) {
+    if (kind == 1 || kind == HashAlgorithms.FNV1A) {
         for (int i = 0; i < data.length; i++) {
             result = result ^ int64(data[i] & 0xFF);
             result = result * 1099511628211;
@@ -108,7 +154,7 @@ public int64 fnv1(char[] data, int kind) {
 
 public int64 fnv1(string data, int kind) {
     int64 result = 14695981039346656037;
-    if (kind == 1 || kind == FnvKind.FNV1A) {
+    if (kind == 1 || kind == HashAlgorithms.FNV1A) {
         for (int i = 0; i < data.length; i++) {
             // Same char-cast gap as djb2 above: keep the int64() call-form.
             result = result ^ int64(data[i]);
@@ -131,7 +177,7 @@ public int64 fnv1(string data, int start, int end, int kind) {
     int64 result = 14695981039346656037;
     if (end > data.length) { end = data.length; }
     if (start < 0) { start = 0; }
-    if (kind == 1 || kind == FnvKind.FNV1A) {
+    if (kind == 1 || kind == HashAlgorithms.FNV1A) {
         for (int i = start; i < end; i++) {
             // Same char-cast gap as djb2 above: keep the int64() call-form.
             result = result ^ int64(data[i]);
@@ -145,6 +191,127 @@ public int64 fnv1(string data, int start, int end, int kind) {
         }
     }
     return result;
+}
+
+// Universal overloads: hash(algo, data) — algo FIRST (hashlib shape);
+// the (data, kind) FNV-1 kind-overloads above stay untouched. algo:
+// 0=FNV-1, 1=FNV-1a, 2=DJB2, 3=CRC-32C, anything else yields 0. The
+// new (int, data) shapes share arity with the (data, int) kind shapes
+// but overload resolution separates them by first-argument type.
+// `algo == 1` covers raw-int callers (and the compilers, where the
+// enum IS the int); the enum disjunct covers interpreter enum values.
+// String shape stays LAST. Loop bodies are duplicated per overload,
+// never delegated (§12).
+public int64 hash(int algo, byte[] data) {
+    if (algo == 0) {
+        int64 result = 14695981039346656037;
+        for (int i = 0; i < data.length; i++) {
+            result = result * 1099511628211;
+            result = result ^ int64(data[i] & 0xFF);
+        }
+        return result;
+    } else if (algo == 1 || algo == HashAlgorithms.FNV1A) {
+        int64 result = 14695981039346656037;
+        for (int i = 0; i < data.length; i++) {
+            result = result ^ int64(data[i] & 0xFF);
+            result = result * 1099511628211;
+        }
+        return result;
+    } else if (algo == 2) {
+        int64 result = 5381;
+        for (int i = 0; i < data.length; i++) {
+            result = result * 33 + int64(data[i] & 0xFF);
+        }
+        return result;
+    } else if (algo == 3) {
+        int64 crc = 0xffffffff;
+        for (int i = 0; i < data.length; i++) {
+            crc = crc ^ int64(data[i] & 0xFF);
+            for (int bit = 0; bit < 8; bit++) {
+                int64 mask = -(crc & 1);
+                crc = ((crc >> 1) & 0x7fffffff) ^ (0x82f63b78 & mask);
+            }
+        }
+        return (crc ^ 0xffffffff) & 0xffffffff;
+    } else {
+        return 0;
+    }
+}
+
+public int64 hash(int algo, char[] data) {
+    if (algo == 0) {
+        int64 result = 14695981039346656037;
+        for (int i = 0; i < data.length; i++) {
+            result = result * 1099511628211;
+            result = result ^ int64(data[i] & 0xFF);
+        }
+        return result;
+    } else if (algo == 1 || algo == HashAlgorithms.FNV1A) {
+        int64 result = 14695981039346656037;
+        for (int i = 0; i < data.length; i++) {
+            result = result ^ int64(data[i] & 0xFF);
+            result = result * 1099511628211;
+        }
+        return result;
+    } else if (algo == 2) {
+        int64 result = 5381;
+        for (int i = 0; i < data.length; i++) {
+            result = result * 33 + int64(data[i] & 0xFF);
+        }
+        return result;
+    } else if (algo == 3) {
+        int64 crc = 0xffffffff;
+        for (int i = 0; i < data.length; i++) {
+            crc = crc ^ int64(data[i] & 0xFF);
+            for (int bit = 0; bit < 8; bit++) {
+                int64 mask = -(crc & 1);
+                crc = ((crc >> 1) & 0x7fffffff) ^ (0x82f63b78 & mask);
+            }
+        }
+        return (crc ^ 0xffffffff) & 0xffffffff;
+    } else {
+        return 0;
+    }
+}
+
+public int64 hash(int algo, string data) {
+    if (algo == 0) {
+        int64 result = 14695981039346656037;
+        for (int i = 0; i < data.length; i++) {
+            result = result * 1099511628211;
+            // Same char-cast gap as djb2 above: keep the int64() call-form.
+            result = result ^ int64(data[i]);
+        }
+        return result;
+    } else if (algo == 1 || algo == HashAlgorithms.FNV1A) {
+        int64 result = 14695981039346656037;
+        for (int i = 0; i < data.length; i++) {
+            // Same char-cast gap as djb2 above: keep the int64() call-form.
+            result = result ^ int64(data[i]);
+            result = result * 1099511628211;
+        }
+        return result;
+    } else if (algo == 2) {
+        int64 result = 5381;
+        for (int i = 0; i < data.length; i++) {
+            // Same char-cast gap as djb2 above: keep the int64() call-form.
+            result = result * 33 + int64(data[i]);
+        }
+        return result;
+    } else if (algo == 3) {
+        int64 crc = 0xffffffff;
+        for (int i = 0; i < data.length; i++) {
+            // Same char-cast gap as djb2 above: keep the int64() call-form.
+            crc = crc ^ int64(data[i]);
+            for (int bit = 0; bit < 8; bit++) {
+                int64 mask = -(crc & 1);
+                crc = ((crc >> 1) & 0x7fffffff) ^ (0x82f63b78 & mask);
+            }
+        }
+        return (crc ^ 0xffffffff) & 0xffffffff;
+    } else {
+        return 0;
+    }
 }
 
 public int64 djb2File(string path) {
