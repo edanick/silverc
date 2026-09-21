@@ -6,7 +6,6 @@ import * from sysinfo;
 import * from win32.kernel32;
 #on LINUX
 import * from linux.libc;
-import { rename as renameFile } from linux.libc;
 #on MAC
 import * from mac.libsystem;
 #off
@@ -438,12 +437,12 @@ public string smSpillPath(int64 pageId, int64 ownerId, int64 generation, int kin
     int64 h = smFnv1_64(virt);
     smSt[SM_ST_NAME_HASH] = h;
     string path = smJoinPath(smTempDir(), smHex16(h) + ".sm");
-    if (!smFileExists(path)) { return path; }
+    if (!file.exists(path)) { return path; }
     for (int i = 1; i < 8; i++) {
         string salted = virt + "/r" + i.toString();
         int64 h2 = smFnv1_64(salted);
         string p2 = smJoinPath(smTempDir(), smHex16(h2) + ".sm");
-        if (!smFileExists(p2)) {
+        if (!file.exists(p2)) {
             smFl[SM_FL_SALTED] = 1;
             smSt[SM_ST_NAME_HASH] = h2;
             return p2;
@@ -452,65 +451,14 @@ public string smSpillPath(int64 pageId, int64 ownerId, int64 generation, int kin
     return "";
 }
 
-// Raw binary file primitives for .sm spill I/O (mirroring std/fs.sr
-// statement-for-statement). The file.* builtins cannot serve here:
-// readString NUL-truncates, and there is no byte[] read builtin; the
-// fs.* Silver wrappers would push a linux.libc grant onto every downstream
-// program, while module-local imports keep this manager self-sufficient.
-bool smFileExists(string path) {
-    #on WINDOWS
-    return GetFileAttributesA(path) != -1;
-    #on LINUX
-    int fd = open(path, 0, 0);
-    if (fd < 0) { return false; }
-    close(fd);
-    return true;
-    #off
-    return false;
-}
-
-void smFileDelete(string path) {
-    #on WINDOWS
-    DeleteFileA(path);
-    #on LINUX
-    unlink(path);
-    #off
-}
-
-void smFileRename(string oldPath, string newPath) {
-    #on WINDOWS
-    MoveFileA(oldPath, newPath);
-    #on LINUX
-    renameFile(oldPath, newPath);
-    #off
-}
-
-bool smFileWrite(string path, byte[] data) {
-    #on WINDOWS
-    int h = CreateFileA(path, 0x40000000, 0, null, 2, 0x80, 0);
-    if (h == -1) { return false; }
-    int wrote = 0;
-    WriteFile(h, data, data.length, &wrote, null);
-    CloseHandle(h);
-    return true;
-    #on LINUX
-    int fd = open(path, 0x241, 0x1A4);
-    if (fd < 0) { return false; }
-    if (data.length > 0) {
-        int slots = (data.length + 7) / 8;
-        int[] packed = new int[slots];
-        for (int i = 0; i < data.length; i++) {
-            int b = data[i] & 0xFF;
-            packed[i / 8] = packed[i / 8] | (b << ((i % 8) * 8));
-        }
-        write(fd, packed, data.length);
-    }
-    close(fd);
-    return true;
-    #off
-    return false;
-}
-
+// Binary file I/O for .sm spill paging. Existence, deletion, rename, and
+// writes go through the file.* compiler intrinsics (intrinsics add no
+// grants, unlike the fs.* Silver wrappers). Reads and size stay native:
+// file.read is byte-corrupt on the bootstrap (packed slots, exact lengths)
+// and throws on a missing path on both compilers where the pager returns
+// [] (smWritePage/smPageInBytes error-code flow); file.size reports 0 on
+// missing, so it migrates only together with the read whose <= 0 check
+// absorbs both -1 and 0.
 int64 smStatSize(string path) {
     #on LINUX
     int[] st = new int[18];
@@ -647,18 +595,18 @@ public string smWritePage(byte[] payload, int kind) {
     #on MAC
     mkdir("/tmp/silver", 493);
     #off
-    smFileWrite(tmp, fileBytes);
-    if (!smFileExists(tmp)) { smUntrackTmp(tmp); smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return ""; }
-    smFileRename(tmp, path);
+    file.writeBytes(tmp, fileBytes);
+    if (!file.exists(tmp)) { smUntrackTmp(tmp); smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return ""; }
+    file.rename(tmp, path);
     smUntrackTmp(tmp);
-    if (!smFileExists(path)) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return ""; }
+    if (!file.exists(path)) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return ""; }
     byte[] back = smFileRead(path);
-    if (back.length != fileBytes.length) { smFileDelete(path); smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return ""; }
+    if (back.length != fileBytes.length) { file.delete(path); smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return ""; }
     byte[] hbuf = new byte[SM_HEADER_SIZE];
     for (int i = 0; i < SM_HEADER_SIZE; i++) { hbuf[i] = back[i]; }
     SmHeader d = new SmHeader();
-    if (smHeaderDecode(hbuf, d) != SM_OK) { smFileDelete(path); smFl[SM_FL_LAST_ERR] = SM_ERR_CHECKSUM; return ""; }
-    if (smHeaderValidate(d, (int64)back.length, 1, h.name_hash, 1) != SM_OK) { smFileDelete(path); smFl[SM_FL_LAST_ERR] = SM_ERR_CHECKSUM; return ""; }
+    if (smHeaderDecode(hbuf, d) != SM_OK) { file.delete(path); smFl[SM_FL_LAST_ERR] = SM_ERR_CHECKSUM; return ""; }
+    if (smHeaderValidate(d, (int64)back.length, 1, h.name_hash, 1) != SM_OK) { file.delete(path); smFl[SM_FL_LAST_ERR] = SM_ERR_CHECKSUM; return ""; }
     smOwnedFinals.add(path);
     smSt[SM_ST_PAGEFILE] += (int64)fileBytes.length;
     if (smSt[SM_ST_RESIDENT] >= (int64)payload.length) { smSt[SM_ST_RESIDENT] -= (int64)payload.length; }
@@ -767,10 +715,10 @@ public byte[] smPageInBytes(string path) {
 public int smPageCleanup() {
     int n = 0;
     for (int i = 0; i < smOwnedTmps.length; i++) {
-        if (smOwnedTmps[i] != "") { smFileDelete(smOwnedTmps[i]); smOwnedTmps[i] = ""; n++; }
+        if (smOwnedTmps[i] != "") { file.delete(smOwnedTmps[i]); smOwnedTmps[i] = ""; n++; }
     }
     for (int i = 0; i < smOwnedFinals.length; i++) {
-        if (smOwnedFinals[i] != "") { smFileDelete(smOwnedFinals[i]); smOwnedFinals[i] = ""; n++; }
+        if (smOwnedFinals[i] != "") { file.delete(smOwnedFinals[i]); smOwnedFinals[i] = ""; n++; }
     }
     smSt[SM_ST_PAGEFILE] = 0;
     return n;
