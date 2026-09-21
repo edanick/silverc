@@ -2,6 +2,7 @@ mod export memory;
 
 import * from sysinfo;
 import * from path;
+import * from hash;
 
 #on MAC
 import * from mac.libsystem;
@@ -67,39 +68,6 @@ class SmHeader {
     public int64 index_size;
     public int payload_checksum;
     public int64 name_hash;
-}
-
-public int64 smFnv1_64(string data) {
-    int64 hash = 14695981039346656037;
-    for (int i = 0; i < data.length; i++) {
-        hash = hash * 1099511628211;
-        hash = hash ^ data[i];
-    }
-    return hash;
-}
-
-int crc32cBytes(byte[] data) {
-    int crc = 0xffffffff;
-    for (int i = 0; i < data.length; i++) {
-        crc = crc ^ data[i];
-        for (int bit = 0; bit < 8; bit++) {
-            int mask = -(crc & 1);
-            crc = ((crc >> 1) & 0x7fffffff) ^ (0x82f63b78 & mask);
-        }
-    }
-    return (crc ^ 0xffffffff) & 0xffffffff;
-}
-
-public int smCrc32c(string data) {
-    int crc = 0xffffffff;
-    for (int i = 0; i < data.length; i++) {
-        crc = crc ^ data[i];
-        for (int bit = 0; bit < 8; bit++) {
-            int mask = -(crc & 1);
-            crc = ((crc >> 1) & 0x7fffffff) ^ (0x82f63b78 & mask);
-        }
-    }
-    return (crc ^ 0xffffffff) & 0xffffffff;
 }
 
 int smGetU16(byte[] p, int off) {
@@ -189,7 +157,7 @@ public byte[] smHeaderEncode(SmHeader h) {
     smPutU64(out, 68, h.index_size);
     smPutU32(out, 76, h.payload_checksum);
     smPutU64(out, SM_NAME_HASH_OFFSET, h.name_hash);
-    smPutU32(out, SM_HEADER_CHECKSUM_OFFSET, crc32cBytes(out));
+    smPutU32(out, SM_HEADER_CHECKSUM_OFFSET, hash.crc32c(out));
     return out;
 }
 
@@ -204,7 +172,7 @@ public int smHeaderDecode(byte[] in, SmHeader h) {
     work[81] = 0;
     work[82] = 0;
     work[83] = 0;
-    int calcChecksum = crc32cBytes(work);
+    int calcChecksum = hash.crc32c(work);
     if (storedChecksum != calcChecksum) { return SM_ERR_CHECKSUM; }
     h.format_version = smGetU16(in, 2);
     h.header_size = smGetU16(in, 4);
@@ -417,13 +385,13 @@ public int64 smManaged() {
 public string smSpillPath(int64 pageId, int64 ownerId, int64 generation, int kind) {
     smFl[SM_FL_SALTED] = 0;
     string virt = "silver-memory/" + smSession() + "/" + pageId.toString() + "/" + kind.toString() + "/" + ownerId.toString() + "/g/" + generation.toString();
-    int64 h = smFnv1_64(virt);
+    int64 h = hash.hash(0, virt);
     smSt[SM_ST_NAME_HASH] = h;
     string spillPath = path.join(smTempDir(), smHex16(h) + ".sm");
     if (!file.exists(spillPath)) { return spillPath; }
     for (int i = 1; i < 8; i++) {
         string salted = virt + "/r" + i.toString();
-        int64 h2 = smFnv1_64(salted);
+        int64 h2 = hash.hash(0, salted);
         string p2 = path.join(smTempDir(), smHex16(h2) + ".sm");
         if (!file.exists(p2)) {
             smFl[SM_FL_SALTED] = 1;
@@ -456,7 +424,7 @@ byte[] smBuildIndex(SmHeader h, byte[] payload) {
         int64 fo = (int64)h.index_offset + h.index_size + lo;
         byte[] chunk = new byte[wantLen];
         for (int j = 0; j < wantLen; j++) { chunk[j] = payload[int(lo) + j]; }
-        int crc = crc32cBytes(chunk);
+        int crc = hash.crc32c(chunk);
         int flags = 0;
         if (i == n - 1) { flags = 1; }
         int base = i * SM_INDEX_RECORD_SIZE;
@@ -524,7 +492,7 @@ public string smWritePage(byte[] payload, int kind) {
     h.chunk_count = count;
     h.index_offset = SM_INDEX_OFFSET_REQUIRED;
     h.index_size = (int64)(count * SM_INDEX_RECORD_SIZE);
-    h.payload_checksum = crc32cBytes(payload);
+    h.payload_checksum = hash.crc32c(payload);
     h.name_hash = smSt[SM_ST_NAME_HASH];
     byte[] fileBytes = smBuildPageFile(h, payload);
     if (fileBytes.length == 0) { smFl[SM_FL_LAST_ERR] = SM_ERR_INDEX; return ""; }
@@ -601,7 +569,7 @@ bool smVerifyIndex(SmHeader h, byte[] file, byte[] payload) {
         if (flags != wantFlags) { return false; }
         byte[] chunk = new byte[wantLen];
         for (int j = 0; j < wantLen; j++) { chunk[j] = payload[int(wantLo) + j]; }
-        if (crc32cBytes(chunk) != crc) { return false; }
+        if (hash.crc32c(chunk) != crc) { return false; }
     }
     return true;
 }
@@ -631,7 +599,7 @@ public byte[] smPageInBytes(string spillPath) {
     if (fileBytes.length != SM_HEADER_SIZE + idxSize + payLen) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return []; }
     byte[] payload = new byte[payLen];
     for (int i = 0; i < payLen; i++) { payload[i] = fileBytes[SM_HEADER_SIZE + idxSize + i]; }
-    if (crc32cBytes(payload) != d.payload_checksum) { smFl[SM_FL_LAST_ERR] = SM_ERR_CHECKSUM; return []; }
+    if (hash.crc32c(payload) != d.payload_checksum) { smFl[SM_FL_LAST_ERR] = SM_ERR_CHECKSUM; return []; }
     if (!smVerifyIndex(d, fileBytes, payload)) { smFl[SM_FL_LAST_ERR] = SM_ERR_INDEX; return []; }
     smSt[SM_ST_FAULTS]++;
     smSt[SM_ST_RESIDENT] += (int64)payLen;
