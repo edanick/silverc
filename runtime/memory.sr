@@ -3,6 +3,7 @@ mod export memory;
 import * from sysinfo;
 import * from path;
 import * from hash;
+import * from string;
 
 #on MAC
 import * from mac.libsystem;
@@ -269,18 +270,6 @@ private int[] smFl = [0, 0];
 private string[] smOwnedFinals = [];
 private string[] smOwnedTmps = [];
 
-// 16 lowercase hex digits, most significant nibble first.
-string smHex16(int64 v) {
-    string digits = "0123456789abcdef";
-    string r = "";
-    for (int i = 0; i < 16; i++) {
-        int shift = (15 - i) * 4;
-        int nib = int((v >> shift) & 15);
-        r += digits[nib];
-    }
-    return r;
-}
-
 bool smIsHex16(string s) {
     if (s.length != 16) { return false; }
     for (int i = 0; i < 16; i++) {
@@ -382,17 +371,22 @@ public int64 smManaged() {
 // hashed virtual path carries the opaque session salt (with getpid as its
 // only pid use), page/kind/owner/generation. On collision the salt grows
 // (SALTED_NAME) and the winner hash is kept in smSt[SM_ST_NAME_HASH].
+// Hex renders via h.toString("x") + the string.sr free padLeft (count form);
+// the member form AVs on the self-host (pre-existing backend gap), so the
+// free home stays per the STANDARDS §13 exception.
 public string smSpillPath(int64 pageId, int64 ownerId, int64 generation, int kind) {
     smFl[SM_FL_SALTED] = 0;
     string virt = "silver-memory/" + smSession() + "/" + pageId.toString() + "/" + kind.toString() + "/" + ownerId.toString() + "/g/" + generation.toString();
     int64 h = hash.hash(0, virt);
     smSt[SM_ST_NAME_HASH] = h;
-    string spillPath = path.join(smTempDir(), smHex16(h) + ".sm");
+    string hx = h.toString("x");
+    string spillPath = path.join(smTempDir(), padLeft(hx, 16 - hx.length, "0") + ".sm");
     if (!file.exists(spillPath)) { return spillPath; }
     for (int i = 1; i < 8; i++) {
         string salted = virt + "/r" + i.toString();
         int64 h2 = hash.hash(0, salted);
-        string p2 = path.join(smTempDir(), smHex16(h2) + ".sm");
+        string hx2 = h2.toString("x");
+        string p2 = path.join(smTempDir(), padLeft(hx2, 16 - hx2.length, "0") + ".sm");
         if (!file.exists(p2)) {
             smFl[SM_FL_SALTED] = 1;
             smSt[SM_ST_NAME_HASH] = h2;
