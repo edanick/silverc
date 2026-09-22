@@ -33,8 +33,13 @@ mod export fs;
 // precedent. Paths use `/` (no drive letters) and are case-sensitive.
 // NUL bytes cannot ride string concat (dropped on both backends), so short
 // reads and binary tails behave the same here as under ReadFile.
-// Times/attrs beyond size are not queried: stat is used for size only
-// (st_size, i64 at offset 48 = slot 6 of an int[18]); directory/file kinds
+// Times/attrs beyond size are queried only by FileOps.modification (last-write
+// time as a datetime): LINUX reads st_mtim (tv_sec at offset 88 = slot 11,
+// tv_nsec at offset 96 = slot 12 of an int[18]); MAC reads Darwin stat64
+// st_mtimespec (tv_sec at offset 48 = slot 6, tv_nsec at offset 56 = slot 7,
+// UNVALIDATED code-only); WINDOWS reads the FILETIME out of FindFirstFileA's
+// data (bytes 20-27). stat elsewhere stays size-only (st_size, i64 at offset
+// 48 = slot 6 of an int[18]); directory/file kinds
 // decode st_mode (u32 at offset 24, low half of slot 3) with S_IFMT/FDIR.
 // struct dirent's d_name starts at offset 19 and is copied bounded (256)
 // out of libc's static storage into an int[] before the NUL scan.
@@ -58,6 +63,7 @@ mod export fs;
 //   case-sensitivity the Linux bodies can rely on (documented, no code).
 
 import * from path;
+import * from datetime;
 
 #on WINDOWS
 import * from win32.kernel32;
@@ -145,6 +151,48 @@ class FileOps {
         return result;
         #off
         return 0;
+    }
+
+    // Last-write time as a datetime (epoch-ms via .milliseconds()), epoch-zero
+    // (all fields 1970-01-01T00:00:00Z) on failure (missing file, stat error).
+    // WINDOWS reads the real FILETIME out of FindFirstFileA's data (bytes
+    // 20-27: dwLow in the high half of slot 2, dwHigh in the low half of slot
+    // 3 of an int[40]); LINUX moves bcache's stat st_mtim shape (tv_sec bytes
+    // 88-95 = slot 11, tv_nsec bytes 96-103 = slot 12 of an int[18], unpacked
+    // per the slot idiom, not the byte loop); MAC reads Darwin stat64
+    // st_mtimespec (tv_sec bytes 48-55 = slot 6, tv_nsec bytes 56-63 = slot 7)
+    // code-only UNVALIDATED.
+    public now modification(string path) {
+        int64 ms = 0;
+        #on WINDOWS
+        int[] fd = new int[40];
+        int h = FindFirstFileA(path, fd);
+        if (h == -1) { return datetime.fromUnixTimestamp(0); }
+        FindClose(h);
+        int low = (fd[2] >> 32) & 0xFFFFFFFF;
+        int high = fd[3] & 0xFFFFFFFF;
+        int64 ft = high * 4294967296 + low;
+        ms = ft / 10000 - 11644473600000;
+        #on LINUX
+        string npath = path.normalize(path);
+        int[] st = new int[18];
+        int rc = stat(npath, st);
+        if (rc != 0) { return datetime.fromUnixTimestamp(0); }
+        int64 sec = st[11];
+        int64 nsec = st[12];
+        ms = sec * 1000 + nsec / 1000000;
+        #on MAC
+        string npath = path.normalize(path);
+        int[] st = new int[18];
+        int rc = stat(npath, st);
+        if (rc != 0) { return datetime.fromUnixTimestamp(0); }
+        int64 sec = st[6];
+        int64 nsec = st[7];
+        ms = sec * 1000 + nsec / 1000000;
+        #off
+        now stamp = datetime.fromUnixTimestamp(ms / 1000);
+        stamp.millisecond = (int)(ms % 1000);
+        return stamp;
     }
 
     public string readString(string path) {
