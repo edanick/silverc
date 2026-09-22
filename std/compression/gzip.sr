@@ -2,6 +2,7 @@ mod export gzip;
 
 import DeflateEngine from compression.deflate;
 import * from exception;
+import * from hash;
 
 // DOCS -- GZIP codec (RFC 1952, DOCS/260): the DEFLATE payload plus a fixed
 // 10-byte header (ID1/ID2/CM/FLG=0/MTIME/EXTRA/OS=3) and an 8-byte trailer
@@ -11,23 +12,6 @@ import * from exception;
 // partial data), so a corrupt stream is indistinguishable from no result.
 // Encoder always writes FLG=0 (no name/comment fields) and OS=3 (Unix), the
 // canonical choice that every gunzip reads.
-
-// Byte-wise CRC32 (poly 0xEDB88320) over int cells (0..255).
-int gzCrc(int[] data, int len) {
-    int crc = 4294967295; // 0xFFFFFFFF
-    for (int i = 0; i < len; i++) {
-        int b = data[i] & 255;
-        crc = crc ^ b;
-        for (int k = 0; k < 8; k++) {
-            if ((crc & 1) == 1) {
-                crc = (crc >> 1) ^ 3988292384; // 0xEDB88320
-            } else {
-                crc = crc >> 1;
-            }
-        }
-    }
-    return (crc ^ 4294967295) & 4294967295;
-}
 
 class GzipEngine {
     // GZIP levels are zlib-style 0..9 (0 = stored); forwarded to the deflate
@@ -50,9 +34,7 @@ class GzipEngine {
         int lvl = this.checkedLevel(level);
         var d = new DeflateEngine();
         byte[] payload = d.compress(data, lvl);
-        int[] cells = new int[data.length];
-        for (int i = 0; i < data.length; i++) { cells[i] = data[i] & 255; }
-        int crc = gzCrc(cells, data.length);
+        int crc = hash.crc32(data);
         int isize = data.length & 268435455;
         byte[] out = [];
         out.add(31); // ID1
@@ -103,9 +85,7 @@ class GzipEngine {
         byte[] out = d.decompress(payload);
         int crc = (data[n - 8] & 255) | ((data[n - 7] & 255) << 8) | ((data[n - 6] & 255) << 16) | ((data[n - 5] & 255) << 24);
         int isize = (data[n - 4] & 255) | ((data[n - 3] & 255) << 8) | ((data[n - 2] & 255) << 16) | ((data[n - 1] & 255) << 24);
-        int[] cells = new int[out.length];
-        for (int i = 0; i < out.length; i++) { cells[i] = out[i] & 255; }
-        if (gzCrc(cells, out.length) != crc) { return []; }
+        if (hash.crc32(out) != crc) { return []; }
         if ((out.length & 268435455) != (isize & 268435455)) { return []; }
         return out;
     }
