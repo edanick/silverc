@@ -8854,7 +8854,10 @@ public void genNewCall(Node call) {
         // Overload dispatch by argument count, with a type tie-break on the
         // first explicit argument (probe, null when unavailable): a float
         // argument prefers a float-typed first parameter, an array argument
-        // prefers the same array type, otherwise an int-typed one. This
+        // prefers the same array type — with an int-family rule (a
+        // byte[]/char[]/int[] probe matches any byte[]/char[]/int[] param:
+        // all three loops hash the low byte identically), otherwise an
+        // int-typed one. This
         // routes math.abs(-1.5)/max/min/sum to the matching math.sr overload
         // instead of always taking the last declaration. Without a probe (or
         // on score ties) the legacy last-match behavior is preserved exactly.
@@ -8874,6 +8877,10 @@ public void genNewCall(Node call) {
         if (haveProbe) {
             probeFloat = this.isFloatLike(probe);
             probeType = this.inferExprType(probe);
+            if (probeType == "" && probe.kind == 19) {
+                probeType = this.inferArrayLitType(probe);
+                if (probeType == "m") { probeType = ""; }
+            }
             if (probeType.length >= 2) {
                 if (probeType[probeType.length - 2] == '[' && probeType[probeType.length - 1] == ']') { probeArr = true; }
             }
@@ -8905,6 +8912,7 @@ public void genNewCall(Node call) {
                             if (p0 == "float" || p0 == "float64" || p0 == "double") { score = 2; }
                         } else if (probeArr) {
                             if (p0 == probeType) { score = 2; }
+                            else if ((probeType == "byte[]" || probeType == "char[]" || probeType == "int[]") && (p0 == "byte[]" || p0 == "char[]" || p0 == "int[]")) { score = 2; }
                         } else {
                             if (p0 == "int" || p0 == "int32" || p0 == "int64" || p0 == "uint") { score = 2; }
                         }
