@@ -2,12 +2,13 @@ mod export hash;
 import * from fs;
 
 // Declaration ORDER is load-bearing: FNV1=0, FNV1A=1 preserves the
-// kind==1 contract; DJB2=2, CRC32C=3.
+// kind==1 contract; DJB2=2, CRC32C=3, CRC32=4.
 enum HashAlgorithms {
     FNV1,
     FNV1A,
     DJB2,
-    CRC32C
+    CRC32C,
+    CRC32
 }
 
 public int64 djb2(string data) {
@@ -93,6 +94,48 @@ public int64 crc32c(string data) {
         for (int bit = 0; bit < 8; bit++) {
             int64 mask = -(crc & 1);
             crc = ((crc >> 1) & 0x7fffffff) ^ (0x82f63b78 & mask);
+        }
+    }
+    return (crc ^ 0xffffffff) & 0xffffffff;
+}
+
+// CRC-32 overloads (zlib/ISO-HDLC, reflected poly 0xEDB88320). Same
+// declaration-order rule as the FNV-1 set above: byte[]/char[] FIRST,
+// string LAST, or string calls would land on an array loop. Every
+// overload carries its own loop body — no delegating wrappers (§12).
+// Init/xorout 0xFFFFFFFF, result masked to 32 bits.
+public int64 crc32(byte[] data) {
+    int64 crc = 0xffffffff;
+    for (int i = 0; i < data.length; i++) {
+        crc = crc ^ int64(data[i] & 0xFF);
+        for (int bit = 0; bit < 8; bit++) {
+            int64 mask = -(crc & 1);
+            crc = ((crc >> 1) & 0x7fffffff) ^ (0xedb88320 & mask);
+        }
+    }
+    return (crc ^ 0xffffffff) & 0xffffffff;
+}
+
+public int64 crc32(char[] data) {
+    int64 crc = 0xffffffff;
+    for (int i = 0; i < data.length; i++) {
+        crc = crc ^ int64(data[i] & 0xFF);
+        for (int bit = 0; bit < 8; bit++) {
+            int64 mask = -(crc & 1);
+            crc = ((crc >> 1) & 0x7fffffff) ^ (0xedb88320 & mask);
+        }
+    }
+    return (crc ^ 0xffffffff) & 0xffffffff;
+}
+
+public int64 crc32(string data) {
+    int64 crc = 0xffffffff;
+    for (int i = 0; i < data.length; i++) {
+        // Same char-cast gap as djb2 above: keep the int64() call-form.
+        crc = crc ^ int64(data[i]);
+        for (int bit = 0; bit < 8; bit++) {
+            int64 mask = -(crc & 1);
+            crc = ((crc >> 1) & 0x7fffffff) ^ (0xedb88320 & mask);
         }
     }
     return (crc ^ 0xffffffff) & 0xffffffff;
@@ -233,6 +276,16 @@ public int64 hash(int algo, byte[] data) {
             }
         }
         return (crc ^ 0xffffffff) & 0xffffffff;
+    } else if (algo == 4 || algo == HashAlgorithms.CRC32) {
+        int64 crc = 0xffffffff;
+        for (int i = 0; i < data.length; i++) {
+            crc = crc ^ int64(data[i] & 0xFF);
+            for (int bit = 0; bit < 8; bit++) {
+                int64 mask = -(crc & 1);
+                crc = ((crc >> 1) & 0x7fffffff) ^ (0xedb88320 & mask);
+            }
+        }
+        return (crc ^ 0xffffffff) & 0xffffffff;
     } else {
         return 0;
     }
@@ -266,6 +319,16 @@ public int64 hash(int algo, char[] data) {
             for (int bit = 0; bit < 8; bit++) {
                 int64 mask = -(crc & 1);
                 crc = ((crc >> 1) & 0x7fffffff) ^ (0x82f63b78 & mask);
+            }
+        }
+        return (crc ^ 0xffffffff) & 0xffffffff;
+    } else if (algo == 4 || algo == HashAlgorithms.CRC32) {
+        int64 crc = 0xffffffff;
+        for (int i = 0; i < data.length; i++) {
+            crc = crc ^ int64(data[i] & 0xFF);
+            for (int bit = 0; bit < 8; bit++) {
+                int64 mask = -(crc & 1);
+                crc = ((crc >> 1) & 0x7fffffff) ^ (0xedb88320 & mask);
             }
         }
         return (crc ^ 0xffffffff) & 0xffffffff;
@@ -306,6 +369,17 @@ public int64 hash(int algo, string data) {
             for (int bit = 0; bit < 8; bit++) {
                 int64 mask = -(crc & 1);
                 crc = ((crc >> 1) & 0x7fffffff) ^ (0x82f63b78 & mask);
+            }
+        }
+        return (crc ^ 0xffffffff) & 0xffffffff;
+    } else if (algo == 4 || algo == HashAlgorithms.CRC32) {
+        int64 crc = 0xffffffff;
+        for (int i = 0; i < data.length; i++) {
+            // Same char-cast gap as djb2 above: keep the int64() call-form.
+            crc = crc ^ int64(data[i]);
+            for (int bit = 0; bit < 8; bit++) {
+                int64 mask = -(crc & 1);
+                crc = ((crc >> 1) & 0x7fffffff) ^ (0xedb88320 & mask);
             }
         }
         return (crc ^ 0xffffffff) & 0xffffffff;
