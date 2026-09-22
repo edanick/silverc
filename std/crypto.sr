@@ -1,5 +1,6 @@
 mod export crypto;
 import * from fs;
+import { base64Encode, base64Decode } from encoding;
 
 // DOCS -- public `crypto` module.
 // This is the universal crypto module: all OS code lives inline in
@@ -23,18 +24,14 @@ import * from fs;
 // compilers, so it takes the star form. Everything else in this file is
 // pure Silver, with no regions.
 //
-// BASE64 NOTE: aes*/rsa* payloads are base64 strings, but std/encoding.sr
-// is broken on BOTH compilers (its `data.toBytes()` opening crashes the
-// self-host at runtime and yields an empty/garbage string on silverc-rs),
-// and no std module or test exercises it successfully. The base64 codec
-// therefore lives here as private pure-Silver helpers
-// (cryptoBase64Encode/cryptoBase64Decode) implementing the standard
-// RFC 4648 alphabet with '=' padding, built only from primitives probed
-// byte-identical on both compilers (string indexing, int shifts/masks,
-// string += char, char() casts). The functions' documented contract is
+// BASE64 NOTE: aes*/rsa* payloads are base64 strings, and the codec lives
+// in std/encoding.sr (the §6 home) -- encoding.base64Encode/base64Decode
+// were probed byte-identical to the former private helpers on both
+// compilers (RFC vectors, binary 1-255 round-trip, invalid-char skip,
+// '='-padding stop), so crypto delegates to them and carries no codec of
+// its own. The functions' documented contract is unchanged:
 // aesEncrypt = base64("data:key"), rsaEncrypt = base64(data), aesDecrypt =
-// the "data" part of the decoded payload. If encoding.sr is ever fixed,
-// these helpers can delegate to it.
+// the "data" part of the decoded payload.
 //
 // RNG NOTE: salt/key material routes through the module's
 // cryptoRandomRange (msvcrt rand inside its Windows region, libc rand
@@ -100,62 +97,6 @@ private int cryptoRandomRange(int min, int max) {
     return min;
 }
 
-// Standard RFC 4648 base64 with '=' padding; private portable codec (see
-// BASE64 NOTE).
-private string cryptoBase64Encode(string data) {
-    string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    string result = "";
-    for (int i = 0; i < data.length; i += 3) {
-        int b0 = data[i];
-        int b1 = 0;
-        int b2 = 0;
-        if (i + 1 < data.length) { b1 = data[i + 1]; }
-        if (i + 2 < data.length) { b2 = data[i + 2]; }
-        int triple = (b0 << 16) | (b1 << 8) | b2;
-        result += chars[(triple >> 18) & 0x3F];
-        result += chars[(triple >> 12) & 0x3F];
-        if (i + 1 < data.length) {
-            result += chars[(triple >> 6) & 0x3F];
-        } else {
-            result += '=';
-        }
-        if (i + 2 < data.length) {
-            result += chars[triple & 0x3F];
-        } else {
-            result += '=';
-        }
-    }
-    return result;
-}
-
-// Inverse of cryptoBase64Encode: decodes the standard alphabet, stops at
-// '=' padding, skips characters outside the alphabet.
-private string cryptoBase64Decode(string data) {
-    string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    string result = "";
-    int acc = 0;
-    int bits = 0;
-    for (int i = 0; i < data.length; i++) {
-        char c = data[i];
-        if (c == '=') { break; }
-        int v = -1;
-        for (int j = 0; j < chars.length; j++) {
-            if (chars[j] == c) {
-                v = j;
-                break;
-            }
-        }
-        if (v < 0) { continue; }
-        acc = (acc << 6) | v;
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            result += char((acc >> bits) & 0xFF);
-        }
-    }
-    return result;
-}
-
 public string bcrypt(string password) {
     string salt = "$2a$10$";
     string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789./";
@@ -185,11 +126,11 @@ public string generateKey(int length) {
 }
 
 public string aesEncrypt(string data, string key) {
-    return cryptoBase64Encode(data + ":" + key);
+    return encoding.base64Encode(data + ":" + key);
 }
 
 public string aesDecrypt(string data, string key) {
-    string decoded = cryptoBase64Decode(data);
+    string decoded = encoding.base64Decode(data);
     int colon = decoded.indexOf(":");
     if (colon < 0) { return ""; }
     return decoded.substr(0, colon);
@@ -212,11 +153,11 @@ public rsaKeyPair rsaGenerate(int bits) {
 }
 
 public string rsaEncrypt(string data, string publicKey) {
-    return cryptoBase64Encode(data);
+    return encoding.base64Encode(data);
 }
 
 public string rsaDecrypt(string data, string privateKey) {
-    return cryptoBase64Decode(data);
+    return encoding.base64Decode(data);
 }
 
 public byte[] randomBytes(int count) {
