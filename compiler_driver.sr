@@ -31,6 +31,7 @@ import * from preprocess;
 // (see jitExecute) because process.run cannot supply its contract (no exit
 // code, faults on self-host — see that function's comment).
 import * from time;
+import * from datetime;
 import * from sysinfo;
 #on LINUX
 import * from linux.libc;
@@ -674,7 +675,7 @@ int jitExecute(CliFlags flags, int[] peData, string inputPath) {
     ensureDirTree(jitDir);
     string stem = drvFileStem(inputPath);
     if (stem.length == 0) { stem = "jit"; }
-    string exePath = jitDir + "\\" + stem + "_" + bcNowMillis().toString() + "_" + sysinfo.pid().toString() + ".exe";
+    string exePath = jitDir + "\\" + stem + "_" + datetime.now().milliseconds().toString() + "_" + sysinfo.pid().toString() + ".exe";
     #on LINUX
     string tmpL = env.get("TMPDIR");
     if (tmpL.length == 0) { tmpL = "/tmp"; }
@@ -682,7 +683,7 @@ int jitExecute(CliFlags flags, int[] peData, string inputPath) {
     ensureDirTree(jitDirL);
     string stemL = drvFileStem(inputPath);
     if (stemL.length == 0) { stemL = "jit"; }
-    string elfPath = jitDirL + "/" + stemL + "_" + bcNowMillis().toString() + "_" + sysinfo.pid().toString();
+    string elfPath = jitDirL + "/" + stemL + "_" + datetime.now().milliseconds().toString() + "_" + sysinfo.pid().toString();
     file.writeBytes(elfPath, peData);
     int pid = fork();
     if (pid == 0) {
@@ -1516,7 +1517,7 @@ void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, stri
     int[] sigSizes = [];
     for (int i = 0; i < files.length; i++) {
         sigPaths.add(files[i]);
-        sigMtimes.add(bcModifiedMs(files[i]));
+        sigMtimes.add(file.modification(files[i]).milliseconds());
         sigSizes.add(file.size(files[i]));
     }
 
@@ -1533,7 +1534,7 @@ void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, stri
         int newestSrc = 0;
         for (int c = 0; c < current.length && !changed; c++) {
             string path = current[c];
-            int m = bcModifiedMs(path);
+            int m = file.modification(path).milliseconds();
             if (m <= 0) {
                 // File vanished mid-save; treat as a change.
                 changed = true;
@@ -1561,7 +1562,7 @@ void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, stri
             sigSizes = [];
             for (int r = 0; r < current.length; r++) {
                 sigPaths.add(current[r]);
-                sigMtimes.add(bcModifiedMs(current[r]));
+                sigMtimes.add(file.modification(current[r]).milliseconds());
                 sigSizes.add(file.size(current[r]));
             }
             idleStart = time.now();
@@ -1577,7 +1578,7 @@ void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, stri
         // newest source mtime recorded at the last check, someone built it
         // externally since then — skip this tick and resync.
         if (file.exists(outputFile)) {
-            int outM = bcModifiedMs(outputFile);
+            int outM = file.modification(outputFile).milliseconds();
             for (int m2 = 0; m2 < sigMtimes.length; m2++) {
                 if (sigMtimes[m2] > newestSrc) { newestSrc = sigMtimes[m2]; }
             }
@@ -1602,7 +1603,7 @@ void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, stri
         if (inputIsProject) { post = watchScanSources(root); }
         for (int q = 0; q < post.length; q++) {
             sigPaths.add(post[q]);
-            sigMtimes.add(bcModifiedMs(post[q]));
+            sigMtimes.add(file.modification(post[q]).milliseconds());
             sigSizes.add(file.size(post[q]));
         }
         idleStart = time.now();

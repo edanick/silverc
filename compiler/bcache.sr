@@ -7,12 +7,10 @@ import * from fs;
 import * from path;
 import * from string;
 import * from hash;
+import * from datetime;
 
 #on WINDOWS
 import * from win32.kernel32;
-import * from win32.msvcrt;
-#on LINUX
-import * from linux.libc;
 #off
 
 // OVERHAUL.md --cache-bytecode — persistent bytecode cache.
@@ -140,7 +138,7 @@ class CacheSession {
         if (hopPath.length > 0) { body = bcSliceViaFile(hopPath, start, end - start); }
         if (body.length == 0) { body = bcSliceSlow(aggSource, start, end); }
         Token[] tokens = bcLex(body);
-        int stamp = bcNowMillis();
+        int stamp = datetime.now().milliseconds();
         if (this.encodable(tokens)) {
             this.storeSrbc(absPath, tokens, stamp, hashKey, sizeKey);
             string created = (string)stamp;
@@ -740,43 +738,6 @@ public string bcSliceSlow(string s, int start, int end) {
     string r = "";
     for (int i = start; i < end; i++) { r += s[i]; }
     return r;
-}
-
-// Epoch-millisecond wall stamp: time(0) is msvcrt's epoch-seconds clock.
-// std has no epoch-ms source (time.now() is the QPC boot counter;
-// datetime.unix() is whole seconds), so the raw call stays — region-wrapped
-// per UNIFIED_CORE_LIBRARY.md §2/§4 rule 6. LINUX branch uses clock_gettime
-// (CLOCK_REALTIME) via linux.libc, same ms shape.
-public int bcNowMillis() {
-    #on WINDOWS
-    return time(0) * 1000;
-    #on LINUX
-    int[] ts = [];
-    for (int i = 0; i < 16; i++) { ts.add(0); }
-    clock_gettime(0, ts);
-    int secLow = ts[0] + ts[1] * 256 + ts[2] * 65536 + ts[3] * 16777216;
-    int nsecLow = ts[8] + ts[9] * 256 + ts[10] * 65536 + ts[11] * 16777216;
-    return secLow * 1000 + nsecLow / 1000000;
-    #off
-    return 0;
-}
-
-// Modification-time proxy recorded in the .sbcr slot: the compiled runtime
-// has no cross-stage-safe way to read FILETIMEs, so the change token is the
-// file size. Content identity is always decided by the FNV-1 hash alongside
-// it, so cache hits remain correct. LINUX branch reads the real mtime via
-// stat (st_mtim at offset 88) in the same ms shape.
-public int bcModifiedMs(string path) {
-    #on LINUX
-    int[] stm = [];
-    for (int i = 0; i < 144; i++) { stm.add(0); }
-    int rcm = stat(path, stm);
-    if (rcm != 0) { return 0; }
-    int secM = stm[88] + stm[89] * 256 + stm[90] * 65536 + stm[91] * 16777216;
-    int nsecM = stm[96] + stm[97] * 256 + stm[98] * 65536 + stm[99] * 16777216;
-    return secM * 1000 + nsecM / 1000000;
-    #off
-    return file.size(path);
 }
 
 // Whole-string FNV-1 needs no wrapper here: hash.sr's hash.fnv1(data)
