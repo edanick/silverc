@@ -112,14 +112,21 @@ class CacheSession {
 
     // Return cached tokens for the source range [start, end) of aggSource
     // when its contents are unchanged and the stored bytecode decodes;
-    // otherwise materialize the body (hop file first, char-copy fallback),
-    // lex it fresh, store the new bytecode, and return those tokens. Range
-    // hashing means full-project cache hits never slice the aggregate at
-    // all — the O(bodyLen^2) slice is paid only per actual miss.
+    // otherwise materialize the body (hop file first, builtin-slice
+    // fallback), lex it fresh, store the new bytecode, and return those
+    // tokens. Range hashing means full-project cache hits never slice the
+    // aggregate at all — the linear builtin slice is paid only per miss.
     public Token[] tokensForRange(string absPath, string aggSource, int start, int end, string hopPath) {
-        if (!this.ok) { return bcLex(bcSliceSlow(aggSource, start, end)); }
+        // Slice clamps (old bcSliceSlow conditions): the bootstrap clamps
+        // itself but the self-host reads OOB without them — clamped once
+        // here so every site below stays in range on both backends.
+        int cs = start;
+        if (cs < 0) { cs = 0; }
+        int ce = end;
+        if (ce > aggSource.length) { ce = aggSource.length; }
+        if (!this.ok) { return bcLex(aggSource[cs..ce]); }
         string key = this.relKey(absPath);
-        if (key.length == 0) { return bcLex(bcSliceSlow(aggSource, start, end)); }
+        if (key.length == 0) { return bcLex(aggSource[cs..ce]); }
         int64 rangeHash = hash.fnv1(aggSource, start, end);
         int size = file.size(absPath);
         string hashKey = (string)rangeHash;
@@ -136,7 +143,7 @@ class CacheSession {
         // Re-cache this file: materialize the body, lex, encode, mark dirty.
         string body = "";
         if (hopPath.length > 0) { body = bcSliceViaFile(hopPath, start, end - start); }
-        if (body.length == 0) { body = bcSliceSlow(aggSource, start, end); }
+        if (body.length == 0) { body = aggSource[cs..ce]; }
         Token[] tokens = bcLex(body);
         int stamp = datetime.now().milliseconds();
         if (this.encodable(tokens)) {
@@ -727,17 +734,6 @@ public string bcSliceViaFile(string hopPath, int start, int len) {
     return r;
     #off
     return "";
-}
-
-// Fallback slice for tiny ranges and hop failures: plain per-char copy,
-// correct for any size but quadratic on large bodies — used only when the
-// bounded paths above are unavailable.
-public string bcSliceSlow(string s, int start, int end) {
-    if (end > s.length) { end = s.length; }
-    if (start < 0) { start = 0; }
-    string r = "";
-    for (int i = start; i < end; i++) { r += s[i]; }
-    return r;
 }
 
 // Whole-string FNV-1 needs no wrapper here: hash.sr's hash.fnv1(data)
