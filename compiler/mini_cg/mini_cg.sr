@@ -56,6 +56,12 @@ class MiniCg {
     public prop int mainLabelOffset;
     public prop string[] funcNames;
     public prop string[] funcClasses;
+    // Owning module per collected function (parallel to funcNames): the
+    // `mod export` name of the file that declared it, "" for the entry file
+    // and synthetic helpers. A module-qualified call (`datetime.now()`)
+    // resolves to the named module's own entry when two collected modules
+    // export the same top-level name; bare calls never consult it.
+    public prop string[] funcModules;
     public prop string[] constNames;
     public prop int[] constValues;
     public prop string[] constStringValues;
@@ -260,6 +266,7 @@ class MiniCg {
         this.mainLabelOffset = 0;
         this.funcNames = [];
         this.funcClasses = [];
+        this.funcModules = [];
         this.constNames = [];
         this.constValues = [];
         this.constStringValues = [];
@@ -1953,6 +1960,7 @@ int strIdx = this.stringPatchIndices[i];
             if (pi.kind == 100) {
                 this.funcNames.add(pi.name);
                 this.funcClasses.add("");
+                this.funcModules.add(pi.srcModule);
                 this.funcRetTypes.add(pi.typeHint);
                 this.funcOffsets.add(-1);
                 int paramStart = this.funcParamDefaults.length;
@@ -1988,6 +1996,7 @@ int strIdx = this.stringPatchIndices[i];
                     if (member.kind == 100) {
                         this.funcNames.add(member.name);
                         this.funcClasses.add(pi2.name);
+                        this.funcModules.add(pi2.srcModule);
                         this.funcRetTypes.add(member.typeHint);
                         this.funcOffsets.add(-1);
                         int paramStart = this.funcParamDefaults.length;
@@ -2187,6 +2196,7 @@ int strIdx = this.stringPatchIndices[i];
         if (!existed) {
             this.funcNames.add(fname);
             this.funcClasses.add("");
+            this.funcModules.add("");
             this.funcRetTypes.add("void");
             this.funcOffsets.add(off);
         }
@@ -2850,6 +2860,7 @@ int strIdx = this.stringPatchIndices[i];
     } else {
         this.funcNames.add(func.name);
         this.funcClasses.add(className);
+        this.funcModules.add(func.srcModule);
         this.funcRetTypes.add(func.typeHint);
         this.funcOffsets.add(this.asm.buf.length);
     }
@@ -2903,6 +2914,7 @@ int strIdx = this.stringPatchIndices[i];
     } else {
         this.funcNames.add(func.name);
         this.funcClasses.add("");
+        this.funcModules.add(func.srcModule);
         this.funcRetTypes.add(func.typeHint);
         this.funcOffsets.add(this.asm.buf.length);
     }
@@ -5127,7 +5139,7 @@ int strIdx = this.stringPatchIndices[i];
                     probe = expr.child(0);
                     if (expr.childCount() > 1) { probeB = expr.child(1); }
                 }
-                int wi = this.selectOverloadIdx(cname, cls, nargs, probe, probeB);
+                int wi = this.selectOverloadIdx(cname, cls, nargs, probe, probeB, this.moduleCallTarget(expr));
                 if (wi >= 0 && wi < this.funcRetTypes.length) { return this.funcRetTypes[wi]; }
             }
             for (int i = 0; i < this.funcNames.length; i++) {
@@ -7033,6 +7045,27 @@ int strIdx = this.stringPatchIndices[i];
         if (recv.name == "url") { return true; }
         return false;
     }
+
+    public string moduleCallTarget(Node call) {
+        // The module a module-qualified call names (`datetime` in
+        // `datetime.now()`), or "" when the call is not module-qualified:
+        // bare calls and class-typed receivers (static calls) never name a
+        // module. An unknown identifier has recvType "" which is exactly
+        // the module case. genUserCall binds through it, and return-type
+        // inference plus the float check read it too, so the caller's value
+        // handling always agrees with the bound body: when two collected
+        // modules export the same top-level name with different return
+        // types (`time.now` vs `datetime.now`), an unscoped last-wins type
+        // read would store the wrong shape.
+        if (!call.isMember || call.childCount() < 1 || call.child(0).kind != 6) { return ""; }
+        string recvName = call.child(0).name;
+        string recvType = this.inferExprType(call.child(0));
+        if (recvType == "this") { return ""; }
+        for (int ci = 0; ci < this.classNames.length; ci++) {
+            if (this.classNames[ci] == recvType || recvType == this.classNames[ci] + "?") { return ""; }
+        }
+        return recvName;
+    }
     public bool isFileOpsReceiver(Node recv) {
         // True when the receiver is a FileOps/FolderOps-typed value (e.g. a
         // `FileOps file;` local). fs.sr sources are builtin-reserved so these
@@ -8864,7 +8897,21 @@ public void genNewCall(Node call) {
     // whose parameter list accepts `nargs` arguments. The variadic tail is
     // itself optional (required = non-default count among the fixed prefix);
     // same-arity ties keep the last declaration. -1 when nothing matches.
-    public int selectOverloadIdx(string name, string cls, int nargs, Node probe, Node probeB) {
+    private bool funcModuleMatches(int idx, string want) {
+        // True when the collected function at idx was declared in module
+        // `want`: exact match first, then a case-insensitive fallback for a
+        // receiver whose spelling differs in case only (llmai/LLMAI shape).
+        // Untracked entries (runtime helpers, older table tails) and the
+        // moduless entry file never match, so those calls keep the legacy
+        // bare-name scan exactly.
+        string have = "";
+        if (idx >= 0 && idx < this.funcModules.length) { have = this.funcModules[idx]; }
+        if (have.length == 0 || want.length == 0) { return false; }
+        if (have == want) { return true; }
+        return have.toLower() == want.toLower();
+    }
+
+    public int selectOverloadIdx(string name, string cls, int nargs, Node probe, Node probeB, string wantMod = "") {
         // Overload dispatch by argument count, with a type tie-break on the
         // first explicit argument (probe, null when unavailable): a float
         // argument prefers a float-typed first parameter, an array argument
@@ -8881,6 +8928,9 @@ public void genNewCall(Node call) {
         // unavailable) scores the same way against each tied candidate's
         // SECOND parameter type; the best second score wins and any remaining
         // tie keeps last-match-wins. Without probeB the legacy result stands.
+        // wantMod scopes the scan to one module's globals for qualified
+        // calls (`datetime.now()` binds datetime's entry even when another
+        // module exports the same name); "" keeps the class-scoped scan.
         int best = -1;
         int bestScore = -1;
         int bestTies = 0;
@@ -8900,7 +8950,16 @@ public void genNewCall(Node call) {
             }
         }
         for (int i = 0; i < this.funcNames.length; i++) {
-            if (this.funcNames[i] == name && this.funcClasses[i] == cls) {
+            // A module-qualified call (wantMod set) matches only globals
+            // collected from the named module; every other caller keeps the
+            // legacy class-scoped scan byte-for-byte.
+            bool scopeHit = false;
+            if (wantMod.length > 0) {
+                scopeHit = this.funcClasses[i] == "" && this.funcModuleMatches(i, wantMod);
+            } else {
+                scopeHit = this.funcClasses[i] == cls;
+            }
+            if (this.funcNames[i] == name && scopeHit) {
                 int pc = (i < this.funcParamCounts.length) ? this.funcParamCounts[i] : -1;
                 if (pc < 0) { continue; }
                 int pStart = this.funcParamStarts[i];
@@ -8950,7 +9009,13 @@ public void genNewCall(Node call) {
             int bestB = -1;
             int bestBScore = -1;
             for (int j = 0; j < this.funcNames.length; j++) {
-                if (this.funcNames[j] == name && this.funcClasses[j] == cls) {
+                bool scopeHitB = false;
+                if (wantMod.length > 0) {
+                    scopeHitB = this.funcClasses[j] == "" && this.funcModuleMatches(j, wantMod);
+                } else {
+                    scopeHitB = this.funcClasses[j] == cls;
+                }
+                if (this.funcNames[j] == name && scopeHitB) {
                     int pcB = (j < this.funcParamCounts.length) ? this.funcParamCounts[j] : -1;
                     if (pcB < 0) { continue; }
                     int pStartB = this.funcParamStarts[j];
@@ -9053,24 +9118,11 @@ public void genNewCall(Node call) {
         // method). The receiver is an identifier that is neither a user-class
         // instance nor `this`, so it names a module: the target must resolve
         // to the GLOBAL function, never to a method of the current class
-
-        // (SessionStore.get would otherwise shadow json_runtime.get).
-        bool isModuleCall = false;
-        if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6) {
-            string recvType = this.inferExprType(call.child(0));
-            bool recvIsClass = false;
-            for (int ci = 0; ci < this.classNames.length; ci++) {
-                if ((this.classNames[ci] == recvType || recvType == this.classNames[ci] + "?")) { recvIsClass = true; }
-            }
-            // Any receiver that is not a class instance and not `this` names a
-            // module: the call must resolve to the GLOBAL function (e.g.
-            // json_runtime.get, fs.read). An unknown identifier has recvType
-            // "" which is exactly the module case. Class methods of the
-            // current class must NOT shadow global functions here.
-            if (!recvIsClass && recvType != "this") {
-                isModuleCall = true;
-            }
-        }
+        // (SessionStore.get would otherwise shadow json_runtime.get). One
+        // helper answers for binding, return-type inference, and the float
+        // check alike (see moduleCallTarget).
+        string callMod = this.moduleCallTarget(call);
+        bool isModuleCall = callMod.length > 0;
         int funcIdx = -1;
         // Count the explicit arguments the call passes to a GLOBAL function.
         // A member call on a non-class identifier (module receiver, e.g.
@@ -9123,6 +9175,51 @@ public void genNewCall(Node call) {
         // class does not declare). Same overload rule; a single global
         // keeps the legacy behavior of the old closest-arity scan.
         if (funcIdx < 0) {
+            // A module-qualified call binds to the named module's own
+            // global first: two collected modules may export the same
+            // top-level name (`time.now` vs `datetime.now`), and the
+            // bare-name scan below would hand either spelling to whichever
+            // module was collected last. The qualifier names a module, never
+            // a class, so construction never triggers here (a1d43cc gate
+            // above already requires the parser `new` marker for that).
+            // Bare calls skip this entirely and keep legacy behavior.
+            string wantMod = callMod;
+            int modMatched = -1;
+            int modCount = 0;
+            if (wantMod.length > 0) {
+                for (int mi = 0; mi < this.funcNames.length; mi++) {
+                    if (this.funcNames[mi] == name && this.funcClasses[mi] == "" && this.funcModuleMatches(mi, wantMod)) {
+                        modMatched = mi;
+                        modCount++;
+                    }
+                }
+            }
+            if (modCount == 1) {
+                funcIdx = modMatched;
+            } else if (modCount > 1) {
+                // One module declares the name more than once: the same
+                // type-aware overload rule, scoped to that module.
+                Node mprobe = null;
+                Node mprobeB = null;
+                if (nargs > 0) {
+                    int mai = 0;
+                    if (call.isMember) { mai = 1; }
+                    if (mai < call.childCount()) { mprobe = call.child(mai); }
+                    if (mai + 1 < call.childCount()) { mprobeB = call.child(mai + 1); }
+                }
+                funcIdx = this.selectOverloadIdx(name, "", nargs, mprobe, mprobeB, wantMod);
+                if (funcIdx < 0) {
+                    // Same UNIFIED_CORE_LIBRARY.md §4 rule 6 DLL preference
+                    // as the legacy scan below: no accepting overload in the
+                    // named module, but an imported native export, reaches
+                    // the DLL instead of aborting.
+                    if (this.win32CallResolves(name) || this.linuxCallResolves(name) || this.macCallResolves(name)) { funcIdx = -1; } else {
+                    printline("no overload of '" + name + "' takes " + nargs.toString() + " argument(s)");
+                    exit(1);
+                    return;
+                    }
+                }
+            } else {
             int s2Matched = -1;
             int s2Count = 0;
             for (int i = 0; i < this.funcNames.length; i++) {
@@ -9158,6 +9255,7 @@ public void genNewCall(Node call) {
                 }
             } else {
                 funcIdx = s2Matched;
+            }
             }
         }
         if (funcIdx < 0) {
@@ -13240,7 +13338,7 @@ public void genNewCall(Node call) {
                 fprobe = expr.child(0);
                 if (expr.childCount() > 1) { fprobeB = expr.child(1); }
             }
-            int wi = this.selectOverloadIdx(cn, "", nargs, fprobe, fprobeB);
+            int wi = this.selectOverloadIdx(cn, "", nargs, fprobe, fprobeB, this.moduleCallTarget(expr));
             if (wi >= 0 && wi < this.funcRetTypes.length) {
                 string wrt = this.funcRetTypes[wi];
                 if (wrt == "float" || wrt == "float64" || wrt == "double") { return true; }

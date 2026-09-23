@@ -75,6 +75,13 @@ class Parser {
     // drops these containers, so the visibility pass reads them from here.
     public string[] modExportNames;
     public bool[] modExportInternal;
+    // Owning module of the top-level item currently being parsed: the last
+    // `mod export NAME;` (or `mod NAME;`) declaration seen. parseProgram tags
+    // every hoisted item with it, so codegen can bind a module-qualified call
+    // (`datetime.now()`) to the named module's own global when two collected
+    // modules export the same top-level name. The entry file declares no
+    // module, so its items keep "" and resolve exactly as before.
+    public string curModule;
     // `internal:` section marker active inside the class body being parsed
     // (reset by `public:`/`private:` and at the start of every class).
     private bool classSectionInternal;
@@ -127,6 +134,7 @@ class Parser {
         this.customTargetOs = "";
         this.modExportNames = [];
         this.modExportInternal = [];
+        this.curModule = "";
         this.classSectionInternal = false;
         this.fnPtrCallScope = [];
         this.anonKnownGlobals = [];
@@ -1210,9 +1218,13 @@ class Parser {
                 if (item.kind == 112) {
                     // Inline module block: hoist its items to top level. An
                     // `internal mod` block marks everything inside it internal.
+                    // Each hoisted item belongs to the block's own module, so
+                    // qualified calls bind to it exactly like `mod export`
+                    // items do (see curModule).
                     for (int mi = 0; mi < item.childCount(); mi++) {
                         Node inner = item.child(mi);
                         if (item.isInternal) { inner.isInternal = true; }
+                        inner.srcModule = item.name;
                         if (inner.kind == 100 && inner.name == "main") {
                             mainSeen = true;
                         }
@@ -1225,6 +1237,7 @@ class Parser {
                 } else if (item.kind == 61 || item.kind == 50 || item.kind == 73 || item.kind == 16 || item.kind == 53 || item.kind == 54 || item.kind == 55 || item.kind == 59 || item.kind == 68) {
                     mainBody.children.add(item);
                 } else {
+                    item.srcModule = this.curModule;
                     items.add(item);
                 }
             }
@@ -1288,6 +1301,12 @@ class Parser {
                     modName += "." + this.advance().text;
                 }
             }
+            // The file's own module starts here: every following top-level
+            // item belongs to it until the next module declaration. The
+            // inline-block arm below saves and restores it, so a nested
+            // declaration cannot leak into the enclosing module.
+            string outerMod = this.curModule;
+            this.curModule = modName;
             if (this.check(102)) {
                 // Inline module block `mod name { ... }`: lift the inner items
                 // to top level so `name.f()` qualified calls resolve to global
@@ -1315,6 +1334,7 @@ class Parser {
                     }
                 }
                 this.expect(103);
+                this.curModule = outerMod;
                 return modNode;
             }
             this.expect(106);
