@@ -7362,13 +7362,20 @@ int strIdx = this.stringPatchIndices[i];
             } else {
                 this.asm.xorRR64(0, 0);
             }
-        } else if (isClass == 1 && (call.isStatic || (!this.win32CallResolves(name) && !this.linuxCallResolves(name) && !this.macCallResolves(name)))) {
-            // UNIFIED_CORE_LIBRARY.md §4 rule 6 -- a bare (non-new) call whose
-            // name is both a class and an imported win32 export reaches the
-            // DLL, mirroring silverc-rs (win32::resolve runs before the bare
-            // class-name fallback; net.sr's `socket(2,1,0)` under
-            // `class socket`). `new T(...)` nodes carry isStatic from the
-            // parser and always construct.
+        } else if (isClass == 1 && call.isStatic) {
+            // Construction runs ONLY for parser-marked `new` nodes
+            // (isStatic): a bare or module-qualified call that merely shares
+            // a class's name resolves as an ordinary call below (free
+            // function, method, or DLL export), mirroring silverc-rs, which
+            // distinguishes `new T(...)` at parse level. Without the marker
+            // a qualified factory call like `datetime.now()` was hijacked
+            // here with the module identifier evaluated as construct arg 0
+            // (defaults shifted: y=0 in main frames, stack garbage in
+            // method frames), and a bare factory call skipped the free
+            // function's body entirely. UNIFIED_CORE_LIBRARY.md §4 rule 6
+            // still holds: a bare call that is also a win32 export (net.sr's
+            // `socket(2,1,0)` under `class socket`) never carries isStatic
+            // and keeps reaching the DLL path below.
             this.genNewCall(call);
         } else if (builtinName && name == "printline") {
             this.genPrintCall(call, 1);
