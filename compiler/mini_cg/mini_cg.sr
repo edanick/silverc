@@ -5013,6 +5013,9 @@ int strIdx = this.stringPatchIndices[i];
                 if ((expr.child(0).name == "fs" || expr.child(0).name == "file" || expr.child(0).name == "folder") && (cname == "getSize" || cname == "size")) {
                     return "int64";
                 }
+                if ((expr.child(0).name == "fs" || expr.child(0).name == "file" || expr.child(0).name == "folder" || this.isFileOpsReceiver(expr.child(0))) && cname == "modification") {
+                    return "now";
+                }
                 if ((expr.child(0).name == "fs" || expr.child(0).name == "folder") && (cname == "getEntries" || cname == "entries" || cname == "list" || cname == "getFiles" || cname == "files" || cname == "getFolders" || cname == "folders")) {
                     return "string[]";
                 }
@@ -7482,6 +7485,8 @@ int strIdx = this.stringPatchIndices[i];
             this.genFileRenameCall(call);
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file") && (call.name == "getSize" || call.name == "size")) {
             this.genFileSizeCall(call);
+        } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file") && call.name == "modification") {
+            this.genFileModificationCall(call);
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && call.child(0).name == "folder" && call.name == "getSize") {
             this.genFolderSizeCall(call);
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file" || call.child(0).name == "folder") && call.name == "isDir") {
@@ -7502,7 +7507,7 @@ int strIdx = this.stringPatchIndices[i];
             if (call.name == "getFiles" || call.name == "files") { entFilter = 1; }
             else if (call.name == "getFolders" || call.name == "folders") { entFilter = 2; }
             this.genFolderEntriesCall(call, entFilter);
-        } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.isFileOpsReceiver(call.child(0)) && (call.name == "readString" || call.name == "readFile" || call.name == "writeString" || call.name == "writeBytes" || call.name == "writeFile" || call.name == "exists" || call.name == "delete" || call.name == "rename" || call.name == "move" || call.name == "copy" || call.name == "getSize" || call.name == "size" || call.name == "isDir" || call.name == "isFile" || call.name == "isDriveRoot" || call.name == "getExt" || call.name == "getExtension" || call.name == "getEntries" || call.name == "entries" || call.name == "list" || call.name == "getFiles" || call.name == "files" || call.name == "getFolders" || call.name == "folders")) {
+        } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.isFileOpsReceiver(call.child(0)) && (call.name == "readString" || call.name == "readFile" || call.name == "writeString" || call.name == "writeBytes" || call.name == "writeFile" || call.name == "exists" || call.name == "delete" || call.name == "rename" || call.name == "move" || call.name == "copy" || call.name == "getSize" || call.name == "size" || call.name == "modification" || call.name == "isDir" || call.name == "isFile" || call.name == "isDriveRoot" || call.name == "getExt" || call.name == "getExtension" || call.name == "getEntries" || call.name == "entries" || call.name == "list" || call.name == "getFiles" || call.name == "files" || call.name == "getFolders" || call.name == "folders")) {
             // Instance call on a FileOps/FolderOps-typed value (e.g.
             // `FileOps file; file.readString(p)`). fs.sr sources are
             // builtin-reserved so these classes have no collected methods;
@@ -7530,6 +7535,8 @@ int strIdx = this.stringPatchIndices[i];
             } else if (call.name == "getSize" || call.name == "size") {
                 if (isFolderOps) { this.genFolderSizeCall(call); }
                 else { this.genFileSizeCall(call); }
+            } else if (call.name == "modification") {
+                this.genFileModificationCall(call);
             } else if (call.name == "isDir") {
                 this.genIsDirCall(call);
             } else if (call.name == "isFile") {
@@ -15777,6 +15784,133 @@ public void genNewCall(Node call) {
     // the failing remap. Returns 1 on success, 0 on failure (BOOL posture).
     public void genLinuxFileCopyCall(Node call) {
         this.linuxBackend.genLinuxFileCopyCall(this, call);
+    }
+
+    // FileOps.modification(path) -> now: last-write time as a `now` object
+    // (epoch-ms via .milliseconds()), epoch-zero on failure (missing file,
+    // failed FindFirstFileA). The fs module is builtin-skipped so FileOps
+    // methods are never collected; the Silver body in std/fs.sr cannot be
+    // dispatched to. Lower it here with the body's exact WINDOWS arithmetic
+    // (FindFirstFileA FILETIME bytes 20-27 -> ft/10000 - 11644473600000)
+    // and delegate the ms -> civil conversion to the collected
+    // datetime.fromUnixTimestamp plus the millisecond field, mirroring the
+    // body's closing lines. POSIX targets keep the collected-method
+    // fallthrough (status quo ante); without a collected conversion or
+    // field the call yields null like an unresolvable one instead of
+    // storing through a bad pointer. The receiver is ignored, like the
+    // other native fs lowerings in the dispatching arm.
+    public void genFileModificationCall(Node call) {
+        if (this.isLinuxTarget() || this.isMacTarget()) {
+            this.genMemberCall(call);
+            return;
+        }
+        int msFieldOff = this.findFieldOffset("now", "millisecond");
+        bool haveConv = false;
+        for (int i = 0; i < this.funcNames.length; i++) {
+            if (this.funcNames[i] == "fromUnixTimestamp") { haveConv = true; }
+        }
+        if (msFieldOff < 0 || !haveConv) {
+            this.asm.xorRR64(0, 0);
+            return;
+        }
+        int pathIdx = 1;
+        int msOff = this.allocLocal("__mod_ms");
+        if (call.childCount() <= pathIdx) {
+            // No path: epoch-zero, like a failed stat.
+            this.asm.xorRR64(0, 0);
+            this.asm.movMBaseR(5, 0, msOff);
+        } else {
+            this.genExpr(call.child(pathIdx));
+            int pathOff = this.allocLocal("__mod_path");
+            this.asm.movMBaseR(5, 0, pathOff);
+            // fd = malloc(320); h = FindFirstFileA(path, fd).
+            this.asm.movRI64(1, 320);
+            this.addImportPatch("msvcrt.dll", "malloc");
+            this.asm.emitImm64(0, 0);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            int fdOff = this.allocLocal("__mod_fd");
+            this.asm.movMBaseR(5, 0, fdOff);
+            this.asm.emitCallSetup(0);
+            this.asm.movRMBase(1, 5, pathOff);
+            this.asm.movRMBase(2, 5, fdOff);
+            this.addImportPatch("kernel32.dll", "FindFirstFileA");
+            this.asm.emitImm64(0, 0);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            int hOff = this.allocLocal("__mod_h");
+            this.asm.movMBaseR(5, 0, hOff);
+            int modFail = this.newLabel();
+            int modHave = this.newLabel();
+            this.asm.movRI64(1, 0xFFFFFFFFFFFFFFFF);
+            this.asm.cmpRR64(0, 1);
+            this.asm.jeLabel(modFail);
+            // FindClose(h); ft = qword [fd+20];
+            // ms = ft/10000 - 11644473600000 (FILETIME stays far below 2^63,
+            // so the signed division is exact).
+            this.asm.emitCallSetup(0);
+            this.asm.movRMBase(1, 5, hOff);
+            this.addImportPatch("kernel32.dll", "FindClose");
+            this.asm.emitImm64(0, 0);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movRMBase(0, 5, fdOff);
+            this.asm.movRMBase(0, 0, 20);
+            this.asm.movRI64(1, 10000);
+            this.asm.cqo();
+            this.asm.idivR64(1);
+            this.asm.movRI64(1, 11644473600000);
+            this.asm.subRR64(0, 1);
+            this.asm.movMBaseR(5, 0, msOff);
+            this.asm.jmpLabel(modHave);
+            this.asm.bindLabel(modFail);
+            this.asm.xorRR64(0, 0);
+            this.asm.movMBaseR(5, 0, msOff);
+            this.asm.bindLabel(modHave);
+        }
+        // sec = ms/1000, msec = ms%1000: truncating idiv exactly as the
+        // body's ms/1000 and (ms%1000) lower (self-consistent on negatives).
+        this.asm.movRMBase(0, 5, msOff);
+        this.asm.movRI64(1, 1000);
+        this.asm.cqo();
+        this.asm.idivR64(1);
+        int secOff = this.allocLocal("__mod_sec");
+        this.asm.movMBaseR(5, 0, secOff);
+        this.asm.movRR64(0, 2);
+        int msecOff = this.allocLocal("__mod_msec");
+        this.asm.movMBaseR(5, 0, msecOff);
+        // stamp = datetime.fromUnixTimestamp(sec): a synthesized call in the
+        // shape user code takes, so dispatch resolves the collected
+        // conversion exactly as for a written call (ordinary call, never
+        // construction: the name is no class and the node is member-marked).
+        Node recvNode = new Node();
+        recvNode.kind = 6;
+        recvNode.name = "datetime";
+        Node secNode = new Node();
+        secNode.kind = 6;
+        secNode.name = "__mod_sec";
+        Node convCall = new Node();
+        convCall.kind = 10;
+        convCall.isMember = true;
+        convCall.name = "fromUnixTimestamp";
+        convCall.children.add(recvNode);
+        convCall.children.add(secNode);
+        this.genCall(convCall);
+        int stampOff = this.allocLocal("__mod_stamp");
+        this.asm.movMBaseR(5, 0, stampOff);
+        // stamp.millisecond = msec: the member-store emission for a
+        // local-held object (genAssign shape), then return the stamp.
+        this.asm.movRMBase(0, 5, msecOff);
+        this.asm.pushR64(0);
+        this.asm.movRMBase(0, 5, stampOff);
+        this.asm.addRI32(0, msFieldOff);
+        this.asm.popR64(1);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(0, 5, stampOff);
     }
 
     public void genFileSizeCall(Node call) {
