@@ -11,7 +11,9 @@ mod export mini_cg.windows;
 // genSleepCall / genCursorXCall / genCursorYCall / genCursorPosCall /
 // genOsVersionCall / genOsBuildCall / emitGetProcessHeapCall /
 // emitHeapAllocCall / emitLlmaiHeapAlloc / emitUtf8ConsoleSetup /
-// genEprintCall / genInputCall / genGetCommandLineCall / genGetEnvCall). All bodies are Win64-only: RCX/RDX/R8/R9 + 32-byte shadow
+// genEprintCall / genInputCall / genGetCommandLineCall / genGetEnvCall /
+// genFileExistsCall / genFileDeleteCall / genFolderDeleteCall /
+// genFileRenameCall / genFileCopyCall / genIsDirCall / genIsFileCall). All bodies are Win64-only: RCX/RDX/R8/R9 + 32-byte shadow
 // space, kernel32/msvcrt/ucrtbase/version.dll imports.
 //
 // The file is UNGATED (no whole-file #on): the helpers must exist on both
@@ -1065,8 +1067,7 @@ class MiniCgWindows {
         cg.asm.emitCallTeardown();
     }
 
-    public void genGetEnvCall(MiniCg cg, Node call) {
-        // The variable-name argument sits at child(1) for member calls
+    public void genGetEnvCall(MiniCg cg, Node call) {        // The variable-name argument sits at child(1) for member calls
         // (`env.get(name)` where child(0) is the receiver) and at child(0) for
         // a global `getenv(name)` call.
         int keyIdx = 0;
@@ -1119,5 +1120,134 @@ class MiniCgWindows {
         cg.asm.bindLabel(notFound);
         cg.emitLlmaiStringLiteral("");
         cg.asm.bindLabel(done);
+    }
+
+    // File/folder Win64 tails (moved from mini_cg core). Core wrappers
+    // dispatch on isLinuxTarget() and only call these on WINDOWS.
+    public void genFileExistsCall(MiniCg cg, int pathOff) {
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRMBase(1, 5, pathOff);
+        cg.addImportPatch("kernel32.dll", "GetFileAttributesA");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        int feNo = cg.newLabel();
+        int feDone = cg.newLabel();
+        cg.asm.movRI64(1, 0xFFFFFFFF);
+        cg.asm.cmpRR64(0, 1);
+        cg.asm.jeLabel(feNo);
+        cg.asm.movRI64(0, 1);
+        cg.asm.jmpLabel(feDone);
+        cg.asm.bindLabel(feNo);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.bindLabel(feDone);
+    }
+
+    public void genFileDeleteCall(MiniCg cg, Node call) {
+        int pathIdx = 1;
+        if (call.childCount() <= pathIdx) { cg.asm.xorRR64(0, 0); return; }
+        cg.genExpr(call.child(pathIdx));
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRR64(1, 0);
+        cg.addImportPatch("kernel32.dll", "DeleteFileA");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+    }
+
+    public void genFolderDeleteCall(MiniCg cg, Node call) {
+        int pathIdx = 1;
+        if (call.childCount() <= pathIdx) { cg.asm.xorRR64(0, 0); return; }
+        cg.genExpr(call.child(pathIdx));
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRR64(1, 0);
+        cg.addImportPatch("kernel32.dll", "RemoveDirectoryA");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+    }
+
+    public void genFileRenameCall(MiniCg cg, Node call) {
+        if (call.childCount() < 3) { cg.asm.xorRR64(0, 0); return; }
+        cg.genExpr(call.child(1));
+        int srcOff = cg.allocLocal("__fr_src");
+        cg.asm.movMBaseR(5, 0, srcOff);
+        cg.genExpr(call.child(2));
+        int dstOff = cg.allocLocal("__fr_dst");
+        cg.asm.movMBaseR(5, 0, dstOff);
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRMBase(1, 5, srcOff);
+        cg.asm.movRMBase(2, 5, dstOff);
+        cg.addImportPatch("kernel32.dll", "MoveFileA");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+    }
+
+    public void genFileCopyCall(MiniCg cg, Node call) {
+        if (call.childCount() < 3) { cg.asm.xorRR64(0, 0); return; }
+        cg.genExpr(call.child(1));
+        int srcOff = cg.allocLocal("__fc_src");
+        cg.asm.movMBaseR(5, 0, srcOff);
+        cg.genExpr(call.child(2));
+        int dstOff = cg.allocLocal("__fc_dst");
+        cg.asm.movMBaseR(5, 0, dstOff);
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRMBase(1, 5, srcOff);
+        cg.asm.movRMBase(2, 5, dstOff);
+        cg.asm.xorRR64(8, 8);
+        cg.addImportPatch("kernel32.dll", "CopyFileA");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+    }
+
+    public void genIsDirCall(MiniCg cg) {
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRR64(1, 0);
+        cg.addImportPatch("kernel32.dll", "GetFileAttributesA");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        int idNo = cg.newLabel();
+        int idDone = cg.newLabel();
+        cg.asm.movRI64(1, 0xFFFFFFFF);
+        cg.asm.cmpRR64(0, 1);
+        cg.asm.jeLabel(idNo);            cg.asm.andRImm(0, 0x10);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(idNo);
+        cg.asm.movRI64(0, 1);
+        cg.asm.jmpLabel(idDone);
+        cg.asm.bindLabel(idNo);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.bindLabel(idDone);
+    }
+
+    public void genIsFileCall(MiniCg cg) {
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRR64(1, 0);
+        cg.addImportPatch("kernel32.dll", "GetFileAttributesA");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        int ifNo = cg.newLabel();
+        int ifDone = cg.newLabel();
+        cg.asm.movRI64(1, 0xFFFFFFFF);
+        cg.asm.cmpRR64(0, 1);
+        cg.asm.jeLabel(ifNo);            cg.asm.andRImm(0, 0x10);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jneLabel(ifNo);
+        cg.asm.movRI64(0, 1);
+        cg.asm.jmpLabel(ifDone);
+        cg.asm.bindLabel(ifNo);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.bindLabel(ifDone);
     }
 }
