@@ -3,13 +3,15 @@ mod export mini_cg.windows;
 // ============================================================================
 // WINDOWS backend - MiniCg Win64 emission helpers (split from mini_cg core).
 // ============================================================================
-// Holds the 18 Win64-only helpers moved out of `class MiniCg`: the win32 grant
+// Holds the Win64-only helpers moved out of `class MiniCg`: the win32 grant
 // tables (win32ModuleDll / win32ExportTable / win32TableHas / win32AddDll /
 // win32AddGrant / win32AddGrantAlias / win32AddGrantNamed / win32Allowed /
 // registerWin32Import / checkWin32ModuleGrant / win32ModuleOf /
 // win32CallResolves) plus the Windows-only emitters (genExitCall /
-// genCursorXCall / genCursorYCall / genCursorPosCall / genOsVersionCall /
-// genOsBuildCall). All bodies are Win64-only: RCX/RDX/R8/R9 + 32-byte shadow
+// genSleepCall / genCursorXCall / genCursorYCall / genCursorPosCall /
+// genOsVersionCall / genOsBuildCall / emitGetProcessHeapCall /
+// emitHeapAllocCall / emitLlmaiHeapAlloc / emitUtf8ConsoleSetup /
+// genEprintCall / genInputCall / genGetCommandLineCall / genGetEnvCall). All bodies are Win64-only: RCX/RDX/R8/R9 + 32-byte shadow
 // space, kernel32/msvcrt/ucrtbase/version.dll imports.
 //
 // The file is UNGATED (no whole-file #on): the helpers must exist on both
@@ -889,6 +891,232 @@ class MiniCgWindows {
         cg.asm.movRMBase(0, 5, pathOff);
         cg.asm.jmpLabel(done);
         cg.asm.bindLabel(cancelled);
+        cg.emitLlmaiStringLiteral("");
+        cg.asm.bindLabel(done);
+    }
+
+    // Win64 heap helpers (moved from mini_cg core): the historical Win64
+    // 4-liner tails. The core wrappers dispatch on isLinuxTarget() and only
+    // call these on the WINDOWS path, so the bodies stay byte-identical with
+    // no target branch inside (mirrors the linux.sr pure-SysV shape).
+    public void emitGetProcessHeapCall(MiniCg cg) {
+        cg.addImportPatch("kernel32.dll", "GetProcessHeap");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+    }
+
+    public void emitHeapAllocCall(MiniCg cg) {
+        cg.addImportPatch("kernel32.dll", "HeapAlloc");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+    }
+
+    public void emitLlmaiHeapAlloc(MiniCg cg, int sizeOff) {
+        // RAX = HeapAlloc(GetProcessHeap(), 0, [sizeOff]).
+        cg.asm.emitCallSetup(0);
+        cg.addImportPatch("kernel32.dll", "GetProcessHeap");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRR64(1, 0);
+        cg.asm.xorRR64(2, 2);
+        cg.asm.movRMBase(8, 5, sizeOff);
+        cg.addImportPatch("kernel32.dll", "HeapAlloc");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+    }
+
+    public void emitUtf8ConsoleSetup(MiniCg cg) {
+        // Silver strings and file contents are UTF-8 bytes. Configure the
+        // Windows console so printf/WriteFile displays those bytes correctly.
+        cg.asm.movRI64(1, 65001);
+        cg.asm.emitCallSetup(0);
+        cg.addImportPatch("kernel32.dll", "SetConsoleOutputCP");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+    }
+
+    // Console I/O Win64 tails (moved from mini_cg core). Core wrappers
+    // dispatch on isLinuxTarget() and only call these on WINDOWS.
+    public void genEprintCall(MiniCg cg, Node call, bool newline) {
+        if (call.childCount() < 1) { return; }
+        Node arg = call.child(0);
+        cg.genExpr(arg);
+        int msgOff = cg.allocLocal("__emsg");
+        cg.asm.movMBaseR(5, 0, msgOff);
+        int lenOff = cg.allocLocal("__elen");
+        int hOff = cg.allocLocal("__ehnd");
+        int wroteOff = cg.allocLocal("__ewrote");
+        cg.asm.movRMBase(1, 5, msgOff);
+        cg.addImportPatch("ucrtbase.dll", "strlen");
+        cg.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.emitCallSetup(0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        cg.asm.movMBaseR(5, 0, lenOff);
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRI64(1, -12);
+        cg.addImportPatch("kernel32.dll", "GetStdHandle");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        cg.asm.movMBaseR(5, 0, hOff);
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRMBase(1, 5, hOff);
+        cg.asm.movRMBase(2, 5, msgOff);
+        cg.asm.movRMBase(8, 5, lenOff);
+        cg.asm.leaRBase(9, 5, wroteOff);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.movMBaseR(4, 0, 32);
+        cg.addImportPatch("kernel32.dll", "WriteFile");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        if (newline) {
+            int nlIdx = cg.addString("\n");
+            int sp = cg.asm.buf.length;
+            cg.asm.emitImm64(0, 0);
+            cg.stringPatchOffsets.add(sp + 2);
+            cg.stringPatchIndices.add(nlIdx);
+            cg.asm.emitCallSetup(0);
+            cg.asm.movRR64(2, 0);
+            cg.asm.movRMBase(1, 5, hOff);
+            cg.asm.movRI64(8, 1);
+            cg.asm.leaRBase(9, 5, wroteOff);
+            cg.asm.xorRR64(0, 0);
+            cg.asm.movMBaseR(4, 0, 32);
+            cg.addImportPatch("kernel32.dll", "WriteFile");
+            cg.asm.emitImm64(0, 0);
+            cg.asm.movRMBase(0, 0, 0);
+            cg.asm.callR64(0);
+            cg.asm.emitCallTeardown();
+        }
+    }
+
+    public void genInputCall(MiniCg cg, Node call) {
+        // GetStdHandle(-10) -> stdin handle + 4096-byte heap buffer + ReadFile.
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRI64(1, -10);
+        cg.addImportPatch("kernel32.dll", "GetStdHandle");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        int hstdinOff = cg.allocLocal("__in_hstdin");
+        cg.asm.movMBaseR(5, 0, hstdinOff);
+        int bufSize = 4096;
+        int sizeOff = cg.allocLocal("__in_size");
+        cg.asm.movRI64(0, bufSize);
+        cg.asm.movMBaseR(5, 0, sizeOff);
+        cg.asm.emitCallSetup(0);
+        cg.emitGetProcessHeapCall();
+        cg.asm.emitCallTeardown();
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRR64(1, 0);
+        cg.asm.xorRR64(2, 2);
+        cg.asm.movRMBase(8, 5, sizeOff);
+        cg.emitHeapAllocCall();
+        cg.asm.emitCallTeardown();
+        int bufOff = cg.allocLocal("__in_buf");
+        cg.asm.movMBaseR(5, 0, bufOff);
+        int breadOff = cg.allocLocal("__in_bread");
+        cg.asm.movRI64(0, 0);
+        cg.asm.movMBaseR(5, 0, breadOff);
+        // ReadFile(stdin, buf, 4096, &read, 0)
+        cg.asm.emitCallSetup(8);
+        cg.asm.xorRR64(0, 0);
+        cg.asm.movMBaseR(4, 0, 32);
+        cg.asm.movRMBase(1, 5, hstdinOff);
+        cg.asm.movRMBase(2, 5, bufOff);
+        cg.asm.movRMBase(8, 5, sizeOff);
+        cg.asm.leaRBase(9, 5, breadOff);
+        cg.addImportPatch("kernel32.dll", "ReadFile");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        // Null-terminate the buffer at the bytes-read position
+        cg.asm.movRMBase(0, 5, bufOff);
+        cg.asm.movRMBase(1, 5, breadOff);
+        cg.asm.addRR64(0, 1);
+        cg.asm.movRI64(1, 0);
+        cg.asm.movMBaseByteR(0, 1, 0);
+        // Return buffer pointer in RAX
+        cg.asm.movRMBase(0, 5, bufOff);
+    }
+
+    public void genGetCommandLineCall(MiniCg cg, Node call) {
+        cg.addImportPatch("kernel32.dll", "GetCommandLineA");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.emitCallSetup(0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+    }
+
+    public void genGetEnvCall(MiniCg cg, Node call) {
+        // The variable-name argument sits at child(1) for member calls
+        // (`env.get(name)` where child(0) is the receiver) and at child(0) for
+        // a global `getenv(name)` call.
+        int keyIdx = 0;
+        if (call.isMember) { keyIdx = 1; }
+        if (call.childCount() <= keyIdx) { cg.emitLlmaiStringLiteral(""); return; }
+        cg.genExpr(call.child(keyIdx));
+        int keyOff = cg.allocLocal("__env_key");
+        cg.asm.movMBaseR(5, 0, keyOff);
+        // size = GetEnvironmentVariableA(key, NULL, 0): returns the required
+        // buffer size including the NUL terminator, or 0 when unset.
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRMBase(1, 5, keyOff);
+        cg.asm.xorRR64(2, 2);
+        cg.asm.xorRR64(8, 8);
+        cg.addImportPatch("kernel32.dll", "GetEnvironmentVariableA");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        int sizeOff = cg.allocLocal("__env_size");
+        cg.asm.movMBaseR(5, 0, sizeOff);
+        int notFound = cg.asm.createLabel();
+        int done = cg.asm.createLabel();
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jeLabel(notFound);
+        // buf = HeapAlloc(GetProcessHeap(), 0, size)
+        cg.asm.emitCallSetup(0);
+        cg.emitGetProcessHeapCall();
+        cg.asm.emitCallTeardown();
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRR64(1, 0);
+        cg.asm.xorRR64(2, 2);
+        cg.asm.movRMBase(8, 5, sizeOff);
+        cg.emitHeapAllocCall();
+        cg.asm.emitCallTeardown();
+        int bufOff = cg.allocLocal("__env_buf");
+        cg.asm.movMBaseR(5, 0, bufOff);
+        // GetEnvironmentVariableA(key, buf, size) writes the value + NUL
+        cg.asm.emitCallSetup(0);
+        cg.asm.movRMBase(1, 5, keyOff);
+        cg.asm.movRMBase(2, 5, bufOff);
+        cg.asm.movRMBase(8, 5, sizeOff);
+        cg.addImportPatch("kernel32.dll", "GetEnvironmentVariableA");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.asm.emitCallTeardown();
+        cg.asm.movRMBase(0, 5, bufOff);
+        cg.asm.jmpLabel(done);
+        cg.asm.bindLabel(notFound);
         cg.emitLlmaiStringLiteral("");
         cg.asm.bindLabel(done);
     }

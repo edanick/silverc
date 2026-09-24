@@ -10,9 +10,9 @@
 //     tables, ELF addressing, SysV ABI tails, genLinux* file/os/input/print
 //     tails). UNGATED so the helpers exist on both targets; they are simply
 //     never CALLED on Windows.
-//   windows.sr - `class MiniCgWindows`: Win64-only helpers (18 methods: win32
-//     grant tables plus ExitProcess/cursor/version emitters). UNGATED for the
-//     same reason; never CALLED on Linux.
+//   windows.sr - `class MiniCgWindows`: Win64-only helpers (win32 grant
+//     tables plus ExitProcess/cursor/version/heap/console/input/env emitters).
+//     UNGATED for the same reason; never CALLED on Linux.
 //   mac.sr - `class MiniCgMac`: AAPCS64-only helpers (28 methods: AAPCS64
 //     policy + Mach-O addressing, mac grant tables, libSystem remaps).
 //     UNGATED for the same reason; never CALLED on Win64/SysV paths.
@@ -2948,25 +2948,13 @@ int strIdx = this.stringPatchIndices[i];
 
     this.emitFunctionBody(func);
 }    // WINDOWS-TARGET: main()'s console setup — SetConsoleOutputCP(65001)
-    // so printf/WriteFile renders Silver's UTF-8 output correctly. Linux:
-    // a no-op or termios/locale init — keep the same-signature method (the
-    // currentIsMain call site below is ungated).
+    // so printf/WriteFile renders Silver's UTF-8 output correctly. Linux/Mac:
+    // a no-op (printf handles UTF-8 natively). The Win64 tail lives in
+    // MiniCgWindows; this stays a thin target dispatcher (call site ungated).
     public void emitUtf8ConsoleSetup() {
-        #on WINDOWS
-        // Silver strings and file contents are UTF-8 bytes. Configure the
-        // Windows console so printf/WriteFile displays those bytes correctly.
-        this.asm.movRI64(1, 65001);
-        this.asm.emitCallSetup(0);
-        this.addImportPatch("kernel32.dll", "SetConsoleOutputCP");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-        #on LINUX
-        // Linux slot: no-op or terminal/locale init (printf handles UTF-8
-        // natively); keep the same-signature method — the currentIsMain call
-        // site is ungated.
-        #off
+        if (this.isLinuxTarget()) { return; }
+        if (this.isMacTarget()) { return; }
+        this.windowsBackend.emitUtf8ConsoleSetup(this);
     }
 
     public void emitFunctionBody(Node func) {
@@ -14347,65 +14335,12 @@ public void genNewCall(Node call) {
         // string arguments reach this path -- every compiler diagnostic is
         // built by string concatenation before printing.
         // LINUX SysV backend (additive): write(2, msg, len) instead.
+        // Win64 tail lives in MiniCgWindows.
         if (this.isLinuxTarget()) {
             this.genLinuxEprintCall(call, newline);
             return;
         }
-        if (call.childCount() < 1) { return; }
-        Node arg = call.child(0);
-        this.genExpr(arg);
-        int msgOff = this.allocLocal("__emsg");
-        this.asm.movMBaseR(5, 0, msgOff);
-        int lenOff = this.allocLocal("__elen");
-        int hOff = this.allocLocal("__ehnd");
-        int wroteOff = this.allocLocal("__ewrote");
-        this.asm.movRMBase(1, 5, msgOff);
-        this.addImportPatch("ucrtbase.dll", "strlen");
-        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.emitCallSetup(0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-        this.asm.movMBaseR(5, 0, lenOff);
-        this.asm.emitCallSetup(0);
-        this.asm.movRI64(1, -12);
-        this.addImportPatch("kernel32.dll", "GetStdHandle");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-        this.asm.movMBaseR(5, 0, hOff);
-        this.asm.emitCallSetup(0);
-        this.asm.movRMBase(1, 5, hOff);
-        this.asm.movRMBase(2, 5, msgOff);
-        this.asm.movRMBase(8, 5, lenOff);
-        this.asm.leaRBase(9, 5, wroteOff);
-        this.asm.xorRR64(0, 0);
-        this.asm.movMBaseR(4, 0, 32);
-        this.addImportPatch("kernel32.dll", "WriteFile");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-        if (newline) {
-            int nlIdx = this.addString("\n");
-            int sp = this.asm.buf.length;
-            this.asm.emitImm64(0, 0);
-            this.stringPatchOffsets.add(sp + 2);
-            this.stringPatchIndices.add(nlIdx);
-            this.asm.emitCallSetup(0);
-            this.asm.movRR64(2, 0);
-            this.asm.movRMBase(1, 5, hOff);
-            this.asm.movRI64(8, 1);
-            this.asm.leaRBase(9, 5, wroteOff);
-            this.asm.xorRR64(0, 0);
-            this.asm.movMBaseR(4, 0, 32);
-            this.addImportPatch("kernel32.dll", "WriteFile");
-            this.asm.emitImm64(0, 0);
-            this.asm.movRMBase(0, 0, 0);
-            this.asm.callR64(0);
-            this.asm.emitCallTeardown();
-        }
+        this.windowsBackend.genEprintCall(this, call, newline);
     }
 
     // LINUX SysV backend (additive): write(2, msg, len) (+ "\n"), mirroring
@@ -15547,17 +15482,13 @@ public void genNewCall(Node call) {
         // LINUX SysV backend (additive): argv[0] (program path) from the
         // captured _start stack. NOTE: GetCommandLineA returns the whole
         // command line; joining all argv entries stays a stage-1 gap.
+        // Win64 tail lives in MiniCgWindows.
         if (this.isLinuxTarget()) {
             this.emitLinuxStackTopLoad();
             this.asm.movRMBase(0, 0, 8);
             return;
         }
-        this.addImportPatch("kernel32.dll", "GetCommandLineA");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.emitCallSetup(0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
+        this.windowsBackend.genGetCommandLineCall(this, call);
     }
 
     // GetCursorX/GetCursorY are real native helpers. A POINT is two int32
@@ -15585,69 +15516,12 @@ public void genNewCall(Node call) {
 
     public void genGetEnvCall(Node call) {
         // LINUX SysV backend (additive): getenv(name) via libc. The WINDOWS
-        // block below is byte-identical to before.
+        // tail lives in MiniCgWindows.
         if (this.isLinuxTarget()) {
             this.genLinuxGetEnvCall(call);
             return;
         }
-        // The variable-name argument sits at child(1) for member calls
-        // (`env.get(name)` where child(0) is the receiver) and at child(0) for
-        // a global `getenv(name)` call.
-        int keyIdx = 0;
-        if (call.isMember) { keyIdx = 1; }
-        if (call.childCount() <= keyIdx) { this.emitLlmaiStringLiteral(""); return; }
-        this.genExpr(call.child(keyIdx));
-        int keyOff = this.allocLocal("__env_key");
-        this.asm.movMBaseR(5, 0, keyOff);
-
-        // size = GetEnvironmentVariableA(key, NULL, 0): returns the required
-        // buffer size including the NUL terminator, or 0 when unset.
-        this.asm.emitCallSetup(0);
-        this.asm.movRMBase(1, 5, keyOff);
-        this.asm.xorRR64(2, 2);
-        this.asm.xorRR64(8, 8);
-        this.addImportPatch("kernel32.dll", "GetEnvironmentVariableA");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-        int sizeOff = this.allocLocal("__env_size");
-        this.asm.movMBaseR(5, 0, sizeOff);
-
-        int notFound = this.asm.createLabel();
-        int done = this.asm.createLabel();
-        this.asm.cmpRI32(0, 0);
-        this.asm.jeLabel(notFound);
-
-        // buf = HeapAlloc(GetProcessHeap(), 0, size)
-        this.asm.emitCallSetup(0);
-        this.emitGetProcessHeapCall();
-        this.asm.emitCallTeardown();
-        this.asm.emitCallSetup(0);
-        this.asm.movRR64(1, 0);
-        this.asm.xorRR64(2, 2);
-        this.asm.movRMBase(8, 5, sizeOff);
-        this.emitHeapAllocCall();
-        this.asm.emitCallTeardown();
-        int bufOff = this.allocLocal("__env_buf");
-        this.asm.movMBaseR(5, 0, bufOff);
-
-        // GetEnvironmentVariableA(key, buf, size) writes the value + NUL
-        this.asm.emitCallSetup(0);
-        this.asm.movRMBase(1, 5, keyOff);
-        this.asm.movRMBase(2, 5, bufOff);
-        this.asm.movRMBase(8, 5, sizeOff);
-        this.addImportPatch("kernel32.dll", "GetEnvironmentVariableA");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-
-        this.asm.movRMBase(0, 5, bufOff);
-        this.asm.jmpLabel(done);
-        this.asm.bindLabel(notFound);
-        this.emitLlmaiStringLiteral("");
-        this.asm.bindLabel(done);
+        this.windowsBackend.genGetEnvCall(this, call);
     }
 
     // LINUX SysV backend (additive): getenv(name) via libc, mirroring
@@ -16970,71 +16844,14 @@ public void genNewCall(Node call) {
     // input() builtin: reads a line from stdin via GetStdHandle + ReadFile.
     // Modeled after genReadStringCall but uses the stdin handle instead of
     // CreateFileA, and a fixed-size (4096-byte) heap buffer.
+    // Win64 tail lives in MiniCgWindows.
     public void genInputCall(Node call) {
         // LINUX SysV backend (additive): read(0, buf, 4096) instead.
         if (this.isLinuxTarget()) {
             this.genLinuxInputCall();
             return;
         }
-        // GetStdHandle(-10) -> stdin handle
-        this.asm.emitCallSetup(0);
-        this.asm.movRI64(1, -10);
-        this.addImportPatch("kernel32.dll", "GetStdHandle");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-
-        int hstdinOff = this.allocLocal("__in_hstdin");
-        this.asm.movMBaseR(5, 0, hstdinOff);
-
-        // Allocate a 4096-byte heap buffer
-        int bufSize = 4096;
-        int sizeOff = this.allocLocal("__in_size");
-        this.asm.movRI64(0, bufSize);
-        this.asm.movMBaseR(5, 0, sizeOff);
-
-        this.asm.emitCallSetup(0);
-        this.emitGetProcessHeapCall();
-        this.asm.emitCallTeardown();
-
-        this.asm.emitCallSetup(0);
-        this.asm.movRR64(1, 0);
-        this.asm.xorRR64(2, 2);
-        this.asm.movRMBase(8, 5, sizeOff);
-        this.emitHeapAllocCall();
-        this.asm.emitCallTeardown();
-
-        int bufOff = this.allocLocal("__in_buf");
-        this.asm.movMBaseR(5, 0, bufOff);
-
-        int breadOff = this.allocLocal("__in_bread");
-        this.asm.movRI64(0, 0);
-        this.asm.movMBaseR(5, 0, breadOff);
-
-        // ReadFile(stdin, buf, 4096, &read, 0)
-        this.asm.emitCallSetup(8);
-        this.asm.xorRR64(0, 0);
-        this.asm.movMBaseR(4, 0, 32);
-        this.asm.movRMBase(1, 5, hstdinOff);
-        this.asm.movRMBase(2, 5, bufOff);
-        this.asm.movRMBase(8, 5, sizeOff);
-        this.asm.leaRBase(9, 5, breadOff);
-        this.addImportPatch("kernel32.dll", "ReadFile");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-
-        // Null-terminate the buffer at the bytes-read position
-        this.asm.movRMBase(0, 5, bufOff);
-        this.asm.movRMBase(1, 5, breadOff);
-        this.asm.addRR64(0, 1);
-        this.asm.movRI64(1, 0);
-        this.asm.movMBaseByteR(0, 1, 0);
-
-        // Return buffer pointer in RAX
-        this.asm.movRMBase(0, 5, bufOff);
+        this.windowsBackend.genInputCall(this, call);
     }
 
     // LINUX SysV backend (additive): read(0, buf, 4096) into a heap buffer,
@@ -17064,8 +16881,8 @@ public void genNewCall(Node call) {
     }
 
     // Call-site wrappers for the inline GetProcessHeap/HeapAlloc pairs: on
-    // Linux take the malloc/free path, otherwise emit the historical Win64
-    // 4-liner byte-identically (setup/teardown stay at the call sites).
+    // Linux take the malloc/free path, otherwise delegate to the Win64 tail
+    // in MiniCgWindows (setup/teardown stay at the call sites).
     public void emitGetProcessHeapCall() {
         // No process-heap handle on Linux (malloc/free take none); a dummy
         // zero keeps the following mov RCX,RAX harmless. Mirrors silverc-rs
@@ -17074,10 +16891,7 @@ public void genNewCall(Node call) {
             this.asm.xorRR64(0, 0);
             return;
         }
-        this.addImportPatch("kernel32.dll", "GetProcessHeap");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
+        this.windowsBackend.emitGetProcessHeapCall(this);
     }
 
     public void emitHeapAllocCall() {
@@ -17086,36 +16900,20 @@ public void genNewCall(Node call) {
             this.emitLinuxHeapAllocFromR8();
             return;
         }
-        this.addImportPatch("kernel32.dll", "HeapAlloc");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
+        this.windowsBackend.emitHeapAllocCall(this);
     }
 
     public void emitLlmaiHeapAlloc(int sizeOff) {
         // RAX = HeapAlloc(GetProcessHeap(), 0, [sizeOff])
         // LINUX SysV backend (additive): malloc + memset zeroing from the
         // size local (same HEAP_ZERO_MEMORY contract as the Win64 pair).
+        // Win64 tail lives in MiniCgWindows.
         if (this.isLinuxTarget()) {
             this.asm.movRMBase(8, 5, sizeOff);
             this.emitLinuxHeapAllocFromR8();
             return;
         }
-        this.asm.emitCallSetup(0);
-        this.addImportPatch("kernel32.dll", "GetProcessHeap");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-        this.asm.emitCallSetup(0);
-        this.asm.movRR64(1, 0);
-        this.asm.xorRR64(2, 2);
-        this.asm.movRMBase(8, 5, sizeOff);
-        this.addImportPatch("kernel32.dll", "HeapAlloc");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
+        this.windowsBackend.emitLlmaiHeapAlloc(this, sizeOff);
     }
 
     public bool isLiveHeapType(string t) {
