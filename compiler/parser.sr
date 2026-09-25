@@ -3051,6 +3051,18 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                         this.checkIntCallValueException(conv);
                         lhs = conv;
                     } else {
+                        // Fast path (STANDARDS.md 10): `[lit, ...].contains(x)`
+                        // (and the `includes` alias) desugars exactly like
+                        // `x in [lit, ...]` — an `||` chain of `==` under the
+                        // same guards. A literal receiver heap-allocates on
+                        // every evaluation before the scan loop runs; the
+                        // chain compares directly with no allocation. Dict and
+                        // string receivers never match (not kind 19) and keep
+                        // their own lowering.
+                        if ((name.text == "contains" || name.text == "includes") && mArgc == 1) {
+                            Node? fastCall = this.desugarLiteralMembership(call.child(1), lhs, false);
+                            if (fastCall != null) { lhs = fastCall ?? lhs; continue; }
+                        }
                         lhs = call;
                     }
                 } else {
@@ -3182,6 +3194,8 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 this.inMembershipOperand = savedInMem;
                 Node? fastNot = this.desugarLiteralMembership(lhs, rhs, true);
                 if (fastNot != null) { lhs = fastNot ?? lhs; continue; }
+                Node? fastRangeNot = this.desugarRangeMembership(lhs, rhs, true);
+                if (fastRangeNot != null) { lhs = fastRangeNot ?? lhs; continue; }
                 Node bin = new Node(); bin.kind = 7; bin.op = 37;
                 bin.boolVal = true;
                 bin.children.add(lhs);
@@ -3197,6 +3211,8 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 this.inMembershipOperand = savedInMem;
                 Node? fast = this.desugarLiteralMembership(lhs, rhs, false);
                 if (fast != null) { lhs = fast ?? lhs; continue; }
+                Node? fastRange = this.desugarRangeMembership(lhs, rhs, false);
+                if (fastRange != null) { lhs = fastRange ?? lhs; continue; }
                 Node bin = new Node(); bin.kind = 7; bin.op = 37;
                 bin.boolVal = false;
                 bin.children.add(lhs);
@@ -3217,6 +3233,25 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             bin.op = this.tokenToOp(op);
             bin.children.add(lhs);
             bin.children.add(rhs);
+            // Fast path (STANDARDS.md 21): `"a" + "b"` folds to one string
+            // literal at parse time. Runtime concat sizes both operands by
+            // strlen and heap-allocates on every evaluation; the folded
+            // literal is emitted once, so a hot loop ties a hand-written
+            // literal. The length-sum guard rejects embedded NULs (`\0`,
+            // `\x00`): they truncate at runtime (strlen) while a folded
+            // literal would carry the NUL bytes into a different truncation.
+            if (bin.op == 1 && lhs.kind == 2 && rhs.kind == 2) {
+                string both = lhs.strVal + rhs.strVal;
+                if (both.length == lhs.strVal.length + rhs.strVal.length) {
+                    Node lit = new Node();
+                    lit.kind = 2;
+                    lit.strVal = both;
+                    lit.line = lhs.line;
+                    lit.col = lhs.col;
+                    lhs = lit;
+                    continue;
+                }
+            }
             lhs = bin;
         }
         return lhs;
@@ -3288,6 +3323,53 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         if (needle.kind == 0) { c.intVal = needle.intVal; return c; }
         if (needle.kind == 2) { c.strVal = needle.strVal; return c; }
         return c;
+    }
+
+    // Fast path: `needle in lo..hi` (int-literal bounds, pure needle)
+    // desugars to `needle >= lo && needle < hi` (`< lo || >= hi` for
+    // `not in`). A range literal heap-allocates and fills an int array on
+    // every evaluation before the membership loop scans it; two integer
+    // comparisons decide the same predicate in O(1) with no allocation.
+    // End-exclusive semantics make the empty range (`lo >= hi`) an
+    // always-false conjunction, matching the scan over zero elements, so
+    // no extra guard is needed. Anything else returns null and the caller
+    // keeps the kind-7/op-37 node.
+    private Node? desugarRangeMembership(Node needle, Node collection, bool negated) {
+        if (collection.kind != 7 || collection.op != 27) { return null; }
+        if (collection.childCount() < 2) { return null; }
+        Node lo = collection.child(0);
+        Node hi = collection.child(1);
+        if (lo.kind != 0 || hi.kind != 0) { return null; }
+        bool needleOk = false;
+        if (needle.kind == 6) { needleOk = true; }
+        else if (needle.kind == 0) { needleOk = true; }
+        if (!needleOk) { return null; }
+        int firstOp = 10;
+        int secondOp = 7;
+        int chainOp = 11;
+        if (negated) { firstOp = 7; secondOp = 10; chainOp = 12; }
+        Node first = new Node();
+        first.kind = 7;
+        first.op = firstOp;
+        first.line = needle.line;
+        first.col = needle.col;
+        first.children.add(this.freshNeedleCopy(needle));
+        first.children.add(lo);
+        Node second = new Node();
+        second.kind = 7;
+        second.op = secondOp;
+        second.line = needle.line;
+        second.col = needle.col;
+        second.children.add(this.freshNeedleCopy(needle));
+        second.children.add(hi);
+        Node ch = new Node();
+        ch.kind = 7;
+        ch.op = chainOp;
+        ch.line = needle.line;
+        ch.col = needle.col;
+        ch.children.add(first);
+        ch.children.add(second);
+        return ch;
     }
 
     private int tokenToOp(int kind) {
