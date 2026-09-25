@@ -1,0 +1,342 @@
+mod export eml;
+import * from fs;
+
+// EML -- Edan's Efficient Markup Language (proprietary format by Edan Matayev).
+//
+// Pure Silver -- no OS code, no preprocessor regions. See EML.md (repo root)
+// for the language specification.
+//
+// Syntax: Tag (Attr="value", N=123) { children... } for branches,
+// Tag (Attr="value"); for self-closing leaves. The empty attribute list may
+// be omitted (ProgressBar; == ProgressBar();). A block close may carry an
+// optional trailing semicolon (};). Whitespace is insignificant; //
+// line comments and /* block comments */ are allowed between tokens.
+//
+// API: class EmlNode (one element), class EmlDocument (root wrapper --
+// doc.root.children("") lists every top-level element, mirroring the xml
+// module's synthetic root), free functions parse(string), load(path),
+// stringify(doc), beautify(src), save(path, doc).
+//
+// LANDMINES (probed in the sibling modules): `.length` PROPERTY form
+// everywhere (the `.length()` CALL form reads garbage on the self-host);
+// string fields copied to locals before concatenation; class storage
+// `= []`-initialized inside construct; no method may share a name with a
+// class in this file (so the parser entry is parseDocument, not parse).
+class EmlNode {
+    public string name;
+    public string text;
+    private string[] attrNames;
+    private string[] attrValues;
+    private EmlNode[] childNodes;
+
+    construct {
+        this.name = "";
+        this.text = "";
+        this.attrNames = [];
+        this.attrValues = [];
+        this.childNodes = [];
+    }
+
+    public void setAttribute(string attrName, string attrValue) {
+        for (int i = 0; i < this.attrNames.length; i++) {
+            if (this.attrNames[i] == attrName) {
+                this.attrValues[i] = attrValue;
+                return;
+            }
+        }
+        this.attrNames.push(attrName);
+        this.attrValues.push(attrValue);
+    }
+
+    public string attribute(string attrName) {
+        for (int i = 0; i < this.attrNames.length; i++) {
+            if (this.attrNames[i] == attrName) { return this.attrValues[i]; }
+        }
+        return "";
+    }
+
+    public bool hasAttribute(string attrName) {
+        for (int i = 0; i < this.attrNames.length; i++) {
+            if (this.attrNames[i] == attrName) { return true; }
+        }
+        return false;
+    }
+
+    public string[] attributeNames() {
+        string[] result = [];
+        for (int i = 0; i < this.attrNames.length; i++) {
+            result.push(this.attrNames[i]);
+        }
+        return result;
+    }
+
+    public void addChild(EmlNode kid) {
+        this.childNodes.push(kid);
+    }
+
+    public EmlNode[] children(string tag) {
+        EmlNode[] result = [];
+        foreach (EmlNode kid in this.childNodes) {
+            string kidName = kid.name;
+            if (tag == "" || tag == "*" || kidName == tag) { result.push(kid); }
+        }
+        return result;
+    }
+
+    public EmlNode? child(int idx) {
+        if (idx < 0 || idx >= this.childNodes.length) { return null; }
+        return this.childNodes[idx];
+    }
+
+    public int childCount() {
+        return this.childNodes.length;
+    }
+}
+
+class EmlDocument {
+    public EmlNode root;
+
+    construct {
+        this.root = new EmlNode();
+        this.root.name = "root";
+    }
+}
+
+class EmlParser {
+    private prop string src;
+    private prop int pos;
+
+    construct (string source) {
+        this.src = source;
+        this.pos = 0;
+    }
+
+    private void skipIgnored() {
+        while (this.pos < this.src.length) {
+            char c = this.src[this.pos];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { this.pos++; }
+            else if (c == '/' && this.pos + 1 < this.src.length && this.src[this.pos + 1] == '/') {
+                this.pos += 2;
+                while (this.pos < this.src.length && this.src[this.pos] != '\n') { this.pos++; }
+            }
+            else if (c == '/' && this.pos + 1 < this.src.length && this.src[this.pos + 1] == '*') {
+                this.pos += 2;
+                while (this.pos + 1 < this.src.length) {
+                    if (this.src[this.pos] == '*' && this.src[this.pos + 1] == '/') {
+                        this.pos += 2;
+                        break;
+                    }
+                    this.pos++;
+                }
+            }
+            else { break; }
+        }
+    }
+
+    private char? peek() {
+        if (this.pos >= this.src.length) { return null; }
+        return this.src[this.pos];
+    }
+
+    private char advance() {
+        if (this.pos >= this.src.length) { return ' '; }
+        char c = this.src[this.pos];
+        this.pos++;
+        return c;
+    }
+
+    private bool isNameStart(char c) {
+        if (c == '_') { return true; }
+        if (c >= 'a' && c <= 'z') { return true; }
+        if (c >= 'A' && c <= 'Z') { return true; }
+        return false;
+    }
+
+    private bool isNameChar(char c) {
+        if (this.isNameStart(c)) { return true; }
+        if (c >= '0' && c <= '9') { return true; }
+        if (c == '-' || c == '.') { return true; }
+        return false;
+    }
+
+    private string parseName() {
+        string r = "";
+        while (this.pos < this.src.length && this.isNameChar(this.src[this.pos])) {
+            r += this.src[this.pos];
+            this.pos++;
+        }
+        return r;
+    }
+
+    private string parseValueText() {
+        this.skipIgnored();
+        if (this.pos >= this.src.length) { return ""; }
+        char q = this.src[this.pos];
+        if (q == '"' || q == '\'') {
+            this.pos++;
+            string val = "";
+            while (this.pos < this.src.length) {
+                char c = this.advance();
+                if (c == q) { break; }
+                if (c == '\\' && this.pos < this.src.length) {
+                    char n = this.advance();
+                    if (n == 'n') { val += "\n"; }
+                    else if (n == 't') { val += "\t"; }
+                    else if (n == 'r') { val += "\r"; }
+                    else if (n == '"') { val += "\""; }
+                    else if (n == '\'') { val += "'"; }
+                    else if (n == '\\') { val += "\\"; }
+                    else { val += n; }
+                } else {
+                    val += c;
+                }
+            }
+            return val;
+        }
+        int start = this.pos;
+        while (this.pos < this.src.length) {
+            char c = this.src[this.pos];
+            if (c == ',' || c == ')') { break; }
+            this.pos++;
+        }
+        string raw = this.src.substr(start, this.pos - start);
+        return raw.trim();
+    }
+
+    private void parseAttributeList(EmlNode el) {
+        this.advance();
+        this.skipIgnored();
+        if (this.peek() == ')') { this.advance(); return; }
+        while (this.pos < this.src.length) {
+            this.skipIgnored();
+            if (this.peek() == ')') { this.advance(); break; }
+            string attrName = this.parseName();
+            if (attrName.length == 0) {
+                this.skipIgnored();
+                if (this.peek() == ',') { this.advance(); continue; }
+                if (this.peek() == ')') { this.advance(); break; }
+                break;
+            }
+            this.skipIgnored();
+            if (this.peek() != '=') {
+                this.skipIgnored();
+                if (this.peek() == ',') { this.advance(); continue; }
+                if (this.peek() == ')') { this.advance(); break; }
+                break;
+            }
+            this.advance();
+            string attrValue = this.parseValueText();
+            el.setAttribute(attrName, attrValue);
+            this.skipIgnored();
+            if (this.peek() == ',') { this.advance(); continue; }
+            if (this.peek() == ')') { this.advance(); break; }
+            break;
+        }
+    }
+
+    private EmlNode? parseElement() {
+        this.skipIgnored();
+        if (this.pos >= this.src.length) { return null; }
+        if (this.peek() == '}') { return null; }
+        string tagName = this.parseName();
+        if (tagName.length == 0) { this.advance(); return null; }
+        this.skipIgnored();
+        EmlNode el = new EmlNode();
+        el.name = tagName;
+        if (this.peek() == '(') { this.parseAttributeList(el); }
+        this.skipIgnored();
+        if (this.peek() == '{') {
+            this.advance();
+            while (this.pos < this.src.length) {
+                this.skipIgnored();
+                if (this.pos >= this.src.length) { break; }
+                if (this.peek() == '}') { this.advance(); break; }
+                EmlNode? kid = this.parseElement();
+                if (kid != null) { el.addChild(kid); }
+            }
+            this.skipIgnored();
+            if (this.peek() == ';') { this.advance(); }
+            return el;
+        }
+        if (this.peek() == ';') { this.advance(); return el; }
+        return el;
+    }
+
+    public EmlDocument parseDocument() {
+        EmlDocument doc = new EmlDocument();
+        while (this.pos < this.src.length) {
+            this.skipIgnored();
+            if (this.pos >= this.src.length) { break; }
+            if (this.peek() == '}') { this.advance(); continue; }
+            EmlNode? el = this.parseElement();
+            if (el != null) { doc.root.addChild(el); }
+        }
+        return doc;
+    }
+}
+
+private string escapeEml(string v) {
+    string r = "";
+    for (int i = 0; i < v.length; i++) {
+        char c = v[i];
+        if (c == '\\') { r += "\\\\"; }
+        else if (c == '"') { r += "\\\""; }
+        else { r += c; }
+    }
+    return r;
+}
+
+private string formatEml(EmlNode el, int depth) {
+    string tagName = el.name;
+    string pad = "";
+    for (int i = 0; i < depth; i++) { pad += "  "; }
+    string r = pad + tagName;
+    string[] names = el.attributeNames();
+    if (names.length > 0) {
+        r += " (";
+        for (int i = 0; i < names.length; i++) {
+            if (i > 0) { r += ", "; }
+            string val = el.attribute(names[i]);
+            r += names[i] + "=\"" + escapeEml(val) + "\"";
+        }
+        r += ")";
+    }
+    EmlNode[] kids = el.children("");
+    if (kids.length == 0) {
+        r += ";\n";
+        return r;
+    }
+    r += " {\n";
+    foreach (EmlNode kid in kids) {
+        r += formatEml(kid, depth + 1);
+    }
+    r += pad + "}\n";
+    return r;
+}
+
+public EmlDocument parse(string raw) {
+    EmlParser p = new EmlParser(raw);
+    return p.parseDocument();
+}
+
+public EmlDocument load(string path) {
+    string content = fs.readString(path);
+    return parse(content);
+}
+
+public string stringify(EmlDocument doc) {
+    string r = "";
+    EmlNode[] tops = doc.root.children("");
+    foreach (EmlNode el in tops) {
+        r += formatEml(el, 0);
+    }
+    return r;
+}
+
+public string beautify(string raw) {
+    return stringify(parse(raw));
+}
+
+public void save(string path, EmlDocument doc) {
+    fs.writeString(path, stringify(doc));
+}
