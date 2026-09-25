@@ -3180,6 +3180,8 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 this.inMembershipOperand = true;
                 Node rhs = this.parseExpr(6);
                 this.inMembershipOperand = savedInMem;
+                Node? fastNot = this.desugarLiteralMembership(lhs, rhs, true);
+                if (fastNot != null) { lhs = fastNot ?? lhs; continue; }
                 Node bin = new Node(); bin.kind = 7; bin.op = 37;
                 bin.boolVal = true;
                 bin.children.add(lhs);
@@ -3193,6 +3195,8 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 this.inMembershipOperand = true;
                 Node rhs = this.parseExpr(6);
                 this.inMembershipOperand = savedInMem;
+                Node? fast = this.desugarLiteralMembership(lhs, rhs, false);
+                if (fast != null) { lhs = fast ?? lhs; continue; }
                 Node bin = new Node(); bin.kind = 7; bin.op = 37;
                 bin.boolVal = false;
                 bin.children.add(lhs);
@@ -3216,6 +3220,74 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             lhs = bin;
         }
         return lhs;
+    }
+
+    // Fast path (STANDARDS.md 10): `needle in [lit, ...]` desugars to an
+    // `||` chain of `==` (`&&` of `!=` for `not in`) when every element is
+    // a string literal (kind 2) and the needle is an identifier (kind 6)
+    // or a string literal, or every element is an int literal (kind 0)
+    // and the needle is an identifier or an int literal. The membership
+    // loop heap-allocates the array on every evaluation; the chain
+    // compares directly with the same equality (strcmp for strings,
+    // bit-identity for ints) in the same order, so the result is
+    // identical and performance ties a hand-written `||`. Anything else
+    // returns null and the caller keeps the kind-7/op-37 node.
+    private Node? desugarLiteralMembership(Node needle, Node collection, bool negated) {
+        if (collection.kind != 19 || collection.op == 1 || collection.op == 2) { return null; }
+        if (collection.childCount() == 0) { return null; }
+        bool allStr = true;
+        bool allInt = true;
+        for (int i = 0; i < collection.childCount(); i++) {
+            int k = collection.child(i).kind;
+            if (k != 2) { allStr = false; }
+            if (k != 0) { allInt = false; }
+        }
+        if (!allStr && !allInt) { return null; }
+        bool needleOk = false;
+        if (needle.kind == 6) { needleOk = true; }
+        else if (needle.kind == 2 && allStr) { needleOk = true; }
+        else if (needle.kind == 0 && allInt) { needleOk = true; }
+        if (!needleOk) { return null; }
+        int cmpOp = 5;
+        int chainOp = 12;
+        if (negated) { cmpOp = 6; chainOp = 11; }
+        bool first = true;
+        Node acc = new Node();
+        for (int j = 0; j < collection.childCount(); j++) {
+            Node one = new Node();
+            one.kind = 7;
+            one.op = cmpOp;
+            one.line = needle.line;
+            one.col = needle.col;
+            one.children.add(this.freshNeedleCopy(needle));
+            one.children.add(collection.child(j));
+            if (first) { acc = one; first = false; }
+            else {
+                Node ch = new Node();
+                ch.kind = 7;
+                ch.op = chainOp;
+                ch.line = needle.line;
+                ch.col = needle.col;
+                ch.children.add(acc);
+                ch.children.add(one);
+                acc = ch;
+            }
+        }
+        return acc;
+    }
+
+    // A fresh copy of a pure needle (identifier or int/string literal) so
+    // each desugared comparison owns its node; sharing one node across
+    // parents would alias later in-place passes over the tree.
+    private Node freshNeedleCopy(Node needle) {
+        Node c = new Node();
+        c.kind = needle.kind;
+        c.line = needle.line;
+        c.col = needle.col;
+        if (needle.kind == 6) { c.name = needle.name; return c; }
+        if (needle.kind == 0) { c.intVal = needle.intVal; return c; }
+        if (needle.kind == 2) { c.strVal = needle.strVal; return c; }
+        return c;
     }
 
     private int tokenToOp(int kind) {
