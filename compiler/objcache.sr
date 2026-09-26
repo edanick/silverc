@@ -1,0 +1,1092 @@
+mod export objcache;
+
+import * from fs;
+import * from path;
+import * from env;
+import * from string;
+import * from hash;
+import * from datetime;
+
+#on WINDOWS
+import * from win32.kernel32;
+#on LINUX
+import * from linux.libc;
+#on MAC
+import * from mac.libsystem;
+#off
+
+// OVERHAUL.md --cache-object — persistent per-target object cache.
+//
+// One entry per project per target OS + architecture, a tier above
+// --cache-bytecode: object emission packs the synced .srbc text when the
+// bytecode tier hit and falls back to source otherwise, so passing both
+// flags together is the fastest configuration — but --cache-object works
+// on its own too.
+//
+// Layout under the same per-host cache root as --cache-bytecode:
+//
+//   <project>\windows-x86-64\project.sbcr     # record for THIS target only
+//   <project>\windows-x86-64\src\main.o       # objects mirror the project tree
+//   <project>\linux-x86-64\project.sbcr       # separate record per target
+//   <project>\mac-aarch64\project.sbcr        # separate record per target
+//
+// (On Linux/macOS the same tree applies with / separators.)
+//
+// - The extension is always .o (never .obj); the contents are the proper
+//   linkable object format for the target, emitted by the dedicated writers
+//   below — COFF on Windows, ELF relocatable on Linux, Mach-O object on
+//   macOS. No external linker, assembler, or object toolchain of any kind
+//   (FORBIDDEN.md): in the mini_asm / mini_cg / mini_ef lineage, the
+//   containers are assembled here with plain byte pushes over int[] buffers.
+// - The record is the same .sbcr family (v3: v2 fields plus the emitting
+//   flag-set string), with text companion project.sbcri. Each <os>-<arch>
+//   directory carries its own record, and the record keys on the emitting
+//   flag set (execution mode + --optimize), so switching e.g. --aot to
+//   --runtime re-emits instead of silently reusing.
+// - Two-tier workflow: only .o files whose source hash changed are
+//   re-emitted; the built-in unify step validates the cached + refreshed
+//   objects (container magic, target machine/cpu, flag set, per-file hash)
+//   before the driver writes the final binary.
+//
+// Binary artifacts (the v3 record, the .o objects) ride file.writeBytes over
+// int[] buffers, so NUL bytes survive on every target. The .sbcri text
+// companion is NUL-free and is the authoritative read side (the compiled
+// runtime cannot re-read NUL-containing binaries safely); cached .o files
+// are read back with file.read (exact bytes as byte[]).
+
+// Target directory name for a compile target (OVERHAUL.md): the OS comes
+// from --os, the architecture follows the target — x86-64 for
+// Windows/Linux, aarch64 for mac. `targetOs` is the canonical UPPERCASE
+// name (ppTargetOsFor); anything else falls back to the Windows target.
+public string objTargetDirName(string targetOs) {
+    if (targetOs == "LINUX") { return "linux-x86-64"; }
+    if (targetOs == "MAC") { return "mac-aarch64"; }
+    return "windows-x86-64";
+}
+
+// Flag-set key recorded in the per-target record (OVERHAUL.md): the record
+// additionally keys on the emitting flag set (execution mode, --optimize)
+// so a mode/optimize switch invalidates the objects.
+public string objFlagKey(string modeName, bool optimize) {
+    if (optimize) { return modeName + "+optimize"; }
+    return modeName;
+}
+
+// 16 lowercase hex digits of a 64-bit value (the {:016x} shape the record
+// companions use for FNV-1 hashes).
+public string objHex16(int64 v) {
+    string digits = "0123456789abcdef";
+    string[] parts = [];
+    for (int i = 15; i >= 0; i--) {
+        int nib = int((v >> (i * 4)) & 0xF);
+        parts.add(digits[nib..nib + 1]);
+    }
+    return parts.join("");
+}
+
+// Escape a text-companion field so the output never contains NUL bytes or
+// line breaks (mirrors silverc-rs escape_text; companion paths never carry
+// NULs from disk, so only backslash/newline/CR need mappings).
+public string objEscapeText(string s) {
+    string[] parts = [];
+    for (int i = 0; i < s.length; i++) {
+        char c = s[i];
+        if (c == '\\') { parts.add("\\\\"); }
+        else if (c == '\n') { parts.add("\\n"); }
+        else if (c == '\r') { parts.add("\\r"); }
+        else { parts.add((string)c); }
+    }
+    return parts.join("");
+}
+
+public string objUnescapeText(string s) {
+    string[] parts = [];
+    for (int i = 0; i < s.length; i++) {
+        char c = s[i];
+        if (c == '\\' && i + 1 < s.length) {
+            char d = s[i + 1];
+            if (d == '\\') { parts.add("\\"); i++; }
+            else if (d == 'n') { parts.add("\n"); i++; }
+            else if (d == 'r') { parts.add("\r"); i++; }
+            else if (d == '0') { parts.add((string)char(0)); i++; }
+            else { parts.add((string)c); }
+        } else {
+            parts.add((string)c);
+        }
+    }
+    return parts.join("");
+}
+
+private bool objIsHex(string s) {
+    if (s.length == 0 || s.length > 16) { return false; }
+    for (int i = 0; i < s.length; i++) {
+        char c = s[i];
+        bool digit = c >= '0' && c <= '9';
+        bool lower = c >= 'a' && c <= 'f';
+        bool upper = c >= 'A' && c <= 'F';
+        if (!digit && !lower && !upper) { return false; }
+    }
+    return true;
+}
+
+private int64 objParseHex(string s) {
+    int64 v = 0;
+    for (int i = 0; i < s.length; i++) {
+        char c = s[i];
+        int d = c - '0';
+        if (c >= 'a' && c <= 'f') { d = c - 'a' + 10; }
+        else if (c >= 'A' && c <= 'F') { d = c - 'A' + 10; }
+        v = v * 16 + int64(d);
+    }
+    return v;
+}
+
+// True (1) when a /-separated record key resolves inside the project root:
+// absolute paths (leading /, drive letters) and parent escapes (..) are
+// out-of-root and are never object-cached (they still compile normally).
+private int objIsLocalKey(string key) {
+    if (key.length == 0) { return 0; }
+    if (key[0] == '/') { return 0; }
+    for (int i = 0; i < key.length; i++) {
+        if (key[i] == ':') { return 0; }
+    }
+    if (key.length >= 2 && key[0] == '.' && key[1] == '.') {
+        if (key.length == 2 || key[2] == '/') { return 0; }
+    }
+    return 1;
+}
+
+// In-memory byte sink for container emission. Methods grow the object's own
+// buffer (the BcBinWriter shape); callers pass payload/note arrays read-only
+// and take the finished buffer out once.
+class ObjWriter {
+    public prop int[] out;
+
+    construct {
+        this.out = [];
+    }
+
+    public void u8(int64 v) {
+        this.out.add(v & 0xFF);
+    }
+
+    public void u16(int64 v) {
+        this.u8(v);
+        this.u8(v >> 8);
+    }
+
+    public void u32(int64 v) {
+        for (int i = 0; i < 4; i++) { this.u8((v >> (i * 8)) & 0xFF); }
+    }
+
+    public void u64(int64 v) {
+        for (int i = 0; i < 8; i++) { this.u8((v >> (i * 8)) & 0xFF); }
+    }
+
+    public void rawStr(string s) {
+        for (int i = 0; i < s.length; i++) {
+            this.u8(int64(s[i]) & 0xFF);
+        }
+    }
+
+    // Fixed-width name field: the name bytes, then NULs up to `total`.
+    public void rawName(string s, int total) {
+        this.rawStr(s);
+        int have = s.length;
+        while (have < total) {
+            this.u8(0);
+            have++;
+        }
+    }
+
+    public void rawBytes(int[] data) {
+        for (int i = 0; i < data.length; i++) {
+            this.u8(data[i] & 0xFF);
+        }
+    }
+
+    // Raw data padded with NULs up to `padded` bytes.
+    public void rawPad(int[] data, int padded) {
+        this.rawBytes(data);
+        int n = data.length;
+        while (n < padded) {
+            this.u8(0);
+            n++;
+        }
+    }
+
+    // Length-prefixed (u32 LE) string field for the .sbcr record.
+    public void strField(string s) {
+        this.u32(s.length);
+        this.rawStr(s);
+    }
+
+    // One ELF64 section header (64 bytes).
+    public void sh(int64 name, int64 stype, int64 flags, int64 off, int64 size, int64 link, int64 info, int64 align, int64 entsize) {
+        this.u32(name);
+        this.u32(stype);
+        this.u64(flags);
+        this.u64(0);
+        this.u64(off);
+        this.u64(size);
+        this.u32(link);
+        this.u32(info);
+        this.u64(align);
+        this.u64(entsize);
+    }
+
+    // Minimal COFF relocatable object (Windows target): IMAGE_FILE_HEADER
+    // (Machine = AMD64) + .text (the payload) + .slvnote (the Silver note)
+    // + one external symbol. Built only with byte pushes.
+    public void emitCoff(int[] payload, int[] note, int64 stamp) {
+        int textPad = (payload.length + 3) / 4 * 4;
+        int notePad = (note.length + 3) / 4 * 4;
+        int textOff = 100;
+        int noteOff = textOff + textPad;
+        int symOff = noteOff + notePad;
+        this.u16(34404);
+        this.u16(2);
+        this.u32(stamp);
+        this.u32(symOff);
+        this.u32(1);
+        this.u16(0);
+        this.u16(0);
+        this.rawName(".text", 8);
+        this.u32(payload.length);
+        this.u32(0);
+        this.u32(textPad);
+        this.u32(textOff);
+        this.u32(0);
+        this.u32(0);
+        this.u16(0);
+        this.u16(0);
+        this.u32(1615855648);
+        this.rawName(".slvnote", 8);
+        this.u32(note.length);
+        this.u32(0);
+        this.u32(notePad);
+        this.u32(noteOff);
+        this.u32(0);
+        this.u32(0);
+        this.u16(0);
+        this.u16(0);
+        this.u32(1073741888);
+        this.rawPad(payload, textPad);
+        this.rawPad(note, notePad);
+        this.rawName("_slvobj", 8);
+        this.u32(0);
+        this.u16(1);
+        this.u16(32);
+        this.u8(2);
+        this.u8(0);
+    }
+
+    // Minimal ELF relocatable object (Linux target): ELF64 header (ET_REL,
+    // EM_X86_64) + .text (payload) + .slvnote (Silver note) + .shstrtab +
+    // .symtab + .strtab. Built only with byte pushes.
+    public void emitElf(int[] payload, int[] note) {
+        ObjWriter sw = new ObjWriter();
+        sw.u8(0);
+        sw.rawStr(".text");
+        sw.u8(0);
+        sw.rawStr(".slvnote");
+        sw.u8(0);
+        sw.rawStr(".shstrtab");
+        sw.u8(0);
+        sw.rawStr(".symtab");
+        sw.u8(0);
+        sw.rawStr(".strtab");
+        sw.u8(0);
+        int[] shstr = sw.out;
+        ObjWriter tw = new ObjWriter();
+        tw.u8(0);
+        tw.rawStr("_slvobj");
+        tw.u8(0);
+        int[] strtab = tw.out;
+        int textOff = 64;
+        int noteOff = textOff + payload.length;
+        int shstrOff = noteOff + note.length;
+        int symOff = shstrOff + shstr.length;
+        while (symOff % 8 != 0) { symOff++; }
+        int strOff = symOff + 48;
+        int shoff = strOff + strtab.length;
+        while (shoff % 8 != 0) { shoff++; }
+        this.u8(127);
+        this.rawStr("ELF");
+        this.u8(2);
+        this.u8(1);
+        this.u8(1);
+        this.u8(0);
+        for (int pi = 0; pi < 8; pi++) { this.u8(0); }
+        this.u16(1);
+        this.u16(62);
+        this.u32(1);
+        this.u64(0);
+        this.u64(0);
+        this.u64(shoff);
+        this.u32(0);
+        this.u16(64);
+        this.u16(0);
+        this.u16(0);
+        this.u16(64);
+        this.u16(6);
+        this.u16(3);
+        this.rawBytes(payload);
+        this.rawBytes(note);
+        this.rawBytes(shstr);
+        while (this.out.length < symOff) { this.u8(0); }
+        for (int zi = 0; zi < 24; zi++) { this.u8(0); }
+        this.u32(1);
+        this.u8(18);
+        this.u8(0);
+        this.u16(1);
+        this.u64(0);
+        this.u64(payload.length);
+        this.rawBytes(strtab);
+        while (this.out.length < shoff) { this.u8(0); }
+        this.sh(0, 0, 0, 0, 0, 0, 0, 0, 0);
+        this.sh(1, 1, 6, textOff, payload.length, 0, 0, 16, 0);
+        this.sh(7, 1, 0, noteOff, note.length, 0, 0, 1, 0);
+        this.sh(16, 3, 0, shstrOff, shstr.length, 0, 0, 1, 0);
+        this.sh(26, 2, 0, symOff, 48, 5, 1, 8, 24);
+        this.sh(34, 3, 0, strOff, strtab.length, 0, 0, 1, 0);
+    }
+
+    // Minimal Mach-O object (Mac target): mach_header_64 (ARM64, MH_OBJECT)
+    // + LC_SEGMENT_64 (__TEXT with __text payload and __slvnote sections) +
+    // LC_SYMTAB. Built only with byte pushes.
+    public void emitMacho(int[] payload, int[] note) {
+        ObjWriter tw = new ObjWriter();
+        tw.u8(0);
+        tw.rawStr("_slvobj");
+        tw.u8(0);
+        int[] strtab = tw.out;
+        int segCmdsize = 232;
+        int sizeofcmds = 256;
+        int textOff = 288;
+        int noteOff = textOff + payload.length;
+        int symOff = noteOff + note.length;
+        int strOff = symOff + 16;
+        this.u32(4277009103);
+        this.u32(16777228);
+        this.u32(0);
+        this.u32(1);
+        this.u32(2);
+        this.u32(sizeofcmds);
+        this.u32(0);
+        this.u32(0);
+        this.u32(25);
+        this.u32(segCmdsize);
+        this.rawName("__TEXT", 16);
+        this.u64(0);
+        this.u64(payload.length + note.length);
+        this.u64(textOff);
+        this.u64(payload.length + note.length);
+        this.u32(7);
+        this.u32(5);
+        this.u32(2);
+        this.u32(0);
+        this.rawName("__text", 16);
+        this.rawName("__TEXT", 16);
+        this.u64(0);
+        this.u64(payload.length);
+        this.u32(textOff);
+        this.u32(2);
+        this.u32(0);
+        this.u32(0);
+        this.u32(2147484672);
+        this.u32(0);
+        this.u32(0);
+        this.u32(0);
+        this.rawName("__slvnote", 16);
+        this.rawName("__TEXT", 16);
+        this.u64(0);
+        this.u64(note.length);
+        this.u32(noteOff);
+        this.u32(0);
+        this.u32(0);
+        this.u32(0);
+        this.u32(0);
+        this.u32(0);
+        this.u32(0);
+        this.u32(0);
+        this.u32(2);
+        this.u32(24);
+        this.u32(symOff);
+        this.u32(1);
+        this.u32(strOff);
+        this.u32(strtab.length);
+        this.rawBytes(payload);
+        this.rawBytes(note);
+        this.u32(1);
+        this.u8(15);
+        this.u8(1);
+        this.u16(0);
+        this.u64(0);
+        this.rawBytes(strtab);
+    }
+}
+
+// Indexed byte reader over a file read back with file.read (exact bytes,
+// truthful length — no NUL truncation anywhere in the path).
+class ObjReader {
+    public prop byte[] data;
+    public prop int size;
+
+    construct (byte[] d) {
+        this.data = d;
+        this.size = d.length;
+    }
+
+    public int64 u8At(int off) {
+        if (off < 0 || off >= this.size) { return -1; }
+        return int64(this.data[off] & 0xFF);
+    }
+
+    public int64 u16At(int off) {
+        int64 lo = this.u8At(off);
+        int64 hi = this.u8At(off + 1);
+        if (lo < 0 || hi < 0) { return -1; }
+        return lo | (hi << 8);
+    }
+
+    public int64 u32At(int off) {
+        int64 b0 = this.u8At(off);
+        int64 b1 = this.u8At(off + 1);
+        int64 b2 = this.u8At(off + 2);
+        int64 b3 = this.u8At(off + 3);
+        if (b0 < 0 || b1 < 0 || b2 < 0 || b3 < 0) { return -1; }
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    }
+
+    public int64 u64At(int off) {
+        int64 v = 0;
+        for (int i = 0; i < 8; i++) {
+            int64 b = this.u8At(off + i);
+            if (b < 0) { return -1; }
+            v = v | (b << (i * 8));
+        }
+        return v;
+    }
+
+    // Exact bytes as a string (callers only lift short ASCII ranges: magic
+    // words, section names, the flag set).
+    public string bytesAt(int off, int len) {
+        if (off < 0 || len < 0 || off + len > this.size) { return ""; }
+        string[] parts = [];
+        for (int i = 0; i < len; i++) {
+            int b = int(int64(this.data[off + i] & 0xFF));
+            parts.add((string)char(b));
+        }
+        return parts.join("");
+    }
+}
+
+// Silver object note: SLVOBJ1 + flag-set string + source FNV-1 hash +
+// emission stamp. Parsed back by objCheckNote.
+public int[] objEncodeNote(string flags, int64 srcHash, int64 stamp) {
+    ObjWriter w = new ObjWriter();
+    w.rawStr("SLVOBJ1");
+    w.u32(flags.length);
+    w.rawStr(flags);
+    w.u64(srcHash);
+    w.u64(stamp);
+    return w.out;
+}
+
+// Validate one object's Silver note against the expected flag set + source
+// hash. Returns "" when valid, else the exact reference error. Any mismatch
+// is a hard link error — never a silent fallback.
+private string objCheckNote(ObjReader r, int noteOff, int noteLen, string expectFlags, int64 expectHash) {
+    string badNote = "object cache: corrupt Silver note section";
+    if (noteOff < 0 || noteLen < 19 || noteOff + noteLen > r.size) { return badNote; }
+    if (r.bytesAt(noteOff, 7) != "SLVOBJ1") { return badNote; }
+    int flagLen = int(r.u32At(noteOff + 7));
+    if (flagLen < 0 || 7 + 4 + flagLen + 8 + 8 > noteLen) { return badNote; }
+    string gotFlags = r.bytesAt(noteOff + 11, flagLen);
+    if (gotFlags != expectFlags) {
+        return "object cache: flag-set switch (object has '" + gotFlags + "', build wants '" + expectFlags + "') — re-emit required";
+    }
+    int64 gotHash = r.u64At(noteOff + 11 + flagLen);
+    if (gotHash != expectHash) {
+        return "object cache: stale object (source hash changed) — re-emit required";
+    }
+    return "";
+}
+
+// Split a COFF object into its note span, then check the note.
+private string objCheckCoff(ObjReader r, string expectFlags, int64 expectHash) {
+    string bad = "object cache: corrupt COFF object";
+    if (r.size < 20) { return bad; }
+    if (int(r.u16At(0)) != 34404) { return bad; }
+    if (int(r.u16At(2)) != 2 || int(r.u16At(16)) != 0) { return bad; }
+    int textOff = -1;
+    int noteOff = -1;
+    int noteLen = 0;
+    for (int i = 0; i < 2; i++) {
+        int base = 20 + i * 40;
+        int vsize = int(r.u32At(base + 8));
+        int rawsize = int(r.u32At(base + 16));
+        int raw = int(r.u32At(base + 20));
+        if (vsize < 0 || rawsize < 0 || raw < 0 || vsize > rawsize || raw + vsize > r.size) { return bad; }
+        if (r.bytesAt(base, 5) == ".text") { textOff = raw; }
+        else if (r.bytesAt(base, 8) == ".slvnote") { noteOff = raw; noteLen = vsize; }
+    }
+    if (textOff < 0 || noteOff < 0) { return bad; }
+    return objCheckNote(r, noteOff, noteLen, expectFlags, expectHash);
+}
+
+// NUL-terminated name inside a string-table span.
+private string objCStr(ObjReader r, int strOff, int strSize, int nameOff) {
+    string[] parts = [];
+    int p = strOff + nameOff;
+    while (p < strOff + strSize) {
+        int64 b = r.u8At(p);
+        if (b < 0) { return ""; }
+        if (b == 0) { break; }
+        parts.add((string)char(int(b)));
+        p++;
+    }
+    return parts.join("");
+}
+
+// Split an ELF relocatable object into its note span, then check the note.
+private string objCheckElf(ObjReader r, string expectFlags, int64 expectHash) {
+    string bad = "object cache: corrupt ELF object";
+    if (r.size < 64) { return bad; }
+    if (int(r.u8At(0)) != 127 || int(r.u8At(1)) != 69 || int(r.u8At(2)) != 76 || int(r.u8At(3)) != 70) { return bad; }
+    if (int(r.u8At(4)) != 2 || int(r.u8At(5)) != 1) { return bad; }
+    if (int(r.u16At(16)) != 1 || int(r.u16At(18)) != 62) { return bad; }
+    int shoff = int(r.u64At(40));
+    int shnum = int(r.u16At(60));
+    int shstrndx = int(r.u16At(62));
+    if (shoff < 0 || shnum <= 0 || shstrndx < 0 || shstrndx >= shnum) { return bad; }
+    int sbase = shoff + shstrndx * 64;
+    int strOff = int(r.u64At(sbase + 24));
+    int strSize = int(r.u64At(sbase + 32));
+    if (strOff < 0 || strSize < 0 || strOff + strSize > r.size) { return bad; }
+    int textOff = -1;
+    int noteOff = -1;
+    int noteLen = 0;
+    for (int i = 1; i < shnum; i++) {
+        int base = shoff + i * 64;
+        int nameOff = int(r.u32At(base));
+        int off = int(r.u64At(base + 24));
+        int size = int(r.u64At(base + 32));
+        if (nameOff < 0 || off < 0 || size < 0 || off + size > r.size) { return bad; }
+        string secName = objCStr(r, strOff, strSize, nameOff);
+        if (secName == ".text") { textOff = off; }
+        else if (secName == ".slvnote") { noteOff = off; noteLen = size; }
+    }
+    if (textOff < 0 || noteOff < 0) { return bad; }
+    return objCheckNote(r, noteOff, noteLen, expectFlags, expectHash);
+}
+
+// Split a Mach-O object into its note span, then check the note.
+private string objCheckMacho(ObjReader r, string expectFlags, int64 expectHash) {
+    string bad = "object cache: corrupt Mach-O object";
+    if (r.size < 32) { return bad; }
+    if (int(r.u32At(0)) != 4277009103 || int(r.u32At(4)) != 16777228 || int(r.u32At(12)) != 1) { return bad; }
+    int ncmds = int(r.u32At(16));
+    if (ncmds < 0) { return bad; }
+    int off = 32;
+    int textOff = -1;
+    int noteOff = -1;
+    int noteLen = 0;
+    for (int c = 0; c < ncmds; c++) {
+        int cmd = int(r.u32At(off));
+        int cmdsize = int(r.u32At(off + 4));
+        if (cmd < 0 || cmdsize < 8 || off + cmdsize > r.size) { return bad; }
+        if (cmd == 25) {
+            int nsects = int(r.u32At(off + 64));
+            if (nsects < 0) { return bad; }
+            for (int s = 0; s < nsects; s++) {
+                int base = off + 72 + s * 80;
+                int size = int(r.u64At(base + 40));
+                int fileoff = int(r.u32At(base + 48));
+                if (size < 0 || fileoff < 0 || fileoff + size > r.size) { return bad; }
+                if (r.bytesAt(base, 6) == "__text") { textOff = fileoff; }
+                else if (r.bytesAt(base, 9) == "__slvnote") { noteOff = fileoff; noteLen = size; }
+            }
+        }
+        off += cmdsize;
+    }
+    if (textOff < 0 || noteOff < 0) { return bad; }
+    return objCheckNote(r, noteOff, noteLen, expectFlags, expectHash);
+}
+
+// An open object-cache session for one project and one target.
+class ObjSession {
+    public prop bool ok;
+    public prop string dir;
+    public prop string root;
+    public prop string projectName;
+    public prop string targetOs;
+    public prop string flags;
+    public prop int createdStamp;
+    // Record arrays keyed by /-separated relative path.
+    public prop string[] keys;
+    public prop int[] cTimes;
+    public prop int[] mTimes;
+    public prop int[] hashes;
+    public prop int[] cachedAt;
+    // Files observed this run (payload = synced .srbc text on a bytecode
+    // hit, source text otherwise).
+    public prop string[] notedKeys;
+    public prop string[] notedPayloads;
+    public prop int[] notedC;
+    public prop int[] notedM;
+    public prop int[] notedH;
+    public prop int[] notedStamps;
+
+    // Open (or prepare) the object cache for `projName` rooted at `rootDir`,
+    // targeting `targetOsName` with flag set (`modeName`, `optimize`).
+    // When the per-host cache root cannot be determined the session reports
+    // !ok and callers fall back to the uncached pipeline.
+    construct (string rootDir, string projName, string targetOsName, string modeName, bool optimize) {
+        this.ok = false;
+        this.root = rootDir;
+        this.projectName = projName;
+        this.targetOs = targetOsName;
+        this.flags = objFlagKey(modeName, optimize);
+        this.createdStamp = datetime.now().milliseconds();
+        this.keys = [];
+        this.cTimes = [];
+        this.mTimes = [];
+        this.hashes = [];
+        this.cachedAt = [];
+        this.notedKeys = [];
+        this.notedPayloads = [];
+        this.notedC = [];
+        this.notedM = [];
+        this.notedH = [];
+        this.notedStamps = [];
+        string guarded = path.guardForWindows(projName);
+        string target = objTargetDirName(targetOsName);
+        string appdata = "";
+        #on WINDOWS
+        appdata = this.objAppData();
+        if (appdata.length == 0) { return; }
+        this.dir = appdata + "\\silver cache\\" + guarded + "\\" + target;
+        #on LINUX
+        this.dir = "/var/cache/silver/" + guarded + "/" + target;
+        #on MAC
+        this.dir = "/Library/Caches/Silver/" + guarded + "/" + target;
+        #off
+        this.objMakeTree(this.dir);
+        this.loadRecords();
+        this.ok = true;
+    }
+
+    public int findRecord(string key) {
+        for (int i = 0; i < this.keys.length; i++) {
+            if (this.keys[i] == key) { return i; }
+        }
+        return -1;
+    }
+
+    private int findNoted(string key) {
+        for (int i = 0; i < this.notedKeys.length; i++) {
+            if (this.notedKeys[i] == key) { return i; }
+        }
+        return -1;
+    }
+
+    // Observe one source file. `agg` is the aggregate the file was collected
+    // into and [start, end) its chunk range; `payload` carries the synced
+    // .srbc text when the bytecode tier hit ("" selects the source slice).
+    // `mtimeMs` is the file's last-write time. Out-of-root files are skipped:
+    // they still compile normally, they just are not object-cached.
+    public void noteFile(string absPath, string agg, int start, int end, string payload, int mtimeMs) {
+        if (!this.ok) { return; }
+        int cs = start;
+        if (cs < 0) { cs = 0; }
+        int ce = end;
+        if (ce > agg.length) { ce = agg.length; }
+        if (ce < cs) { ce = cs; }
+        string key = path.relative(this.root, absPath);
+        if (key.length == 0) { return; }
+        if (objIsLocalKey(key) == 0) { return; }
+        int64 rangeHash = hash.fnv1(agg, cs, ce);
+        string body = payload;
+        if (body.length == 0) { body = agg[cs..ce]; }
+        int stamp = datetime.now().milliseconds();
+        int idx = this.findNoted(key);
+        if (idx >= 0) {
+            this.notedPayloads[idx] = body;
+            this.notedC[idx] = stamp;
+            this.notedM[idx] = mtimeMs;
+            this.notedH[idx] = rangeHash;
+            this.notedStamps[idx] = stamp;
+            return;
+        }
+        this.notedKeys.add(key);
+        this.notedPayloads.add(body);
+        this.notedC.add(stamp);
+        this.notedM.add(mtimeMs);
+        this.notedH.add(rangeHash);
+        this.notedStamps.add(stamp);
+    }
+
+    // Absolute path of the .o for a record key (mirrors the project tree,
+    // always with the .o extension — never .obj).
+    private string objectPath(string key) {
+        int slash = -1;
+        int dot = -1;
+        for (int i = 0; i < key.length; i++) {
+            if (key[i] == '/') { slash = i; }
+            if (key[i] == '.') { dot = i; }
+        }
+        string base = key;
+        if (dot > slash) { base = key[0..dot]; }
+        #on LINUX or MAC
+        return this.dir + "/" + base + ".o";
+        #off
+        return this.dir + "\\" + base.replaceAll("/", "\\") + ".o";
+    }
+
+    // Re-emit changed objects, drop stale ones, rewrite the per-target
+    // record (+ .sbcri text companion), then unify: validate the cached +
+    // refreshed objects with the built-in unifier before the driver writes
+    // them into the final binary. Returns "" on success, else the exact
+    // reference error — fails loudly (never silently) when an object is
+    // missing or corrupt.
+    public string finish() {
+        this.sortNoted();
+        for (int n = 0; n < this.notedKeys.length; n++) {
+            int idx = this.findRecord(this.notedKeys[n]);
+            bool fresh = false;
+            if (idx >= 0 && this.hashes[idx] == this.notedH[n] && this.mTimes[idx] == this.notedM[n]) {
+                string probe = this.objectPath(this.notedKeys[n]);
+                if (probe.length > 0 && file.exists(probe)) { fresh = true; }
+            }
+            if (!fresh) {
+                string objPath = this.objectPath(this.notedKeys[n]);
+                if (objPath.length == 0) {
+                    return "object cache: cannot place object for '" + this.notedKeys[n] + "'";
+                }
+                this.objMakeTree(path.dirname(objPath));
+                int[] bytes = this.emitObject(this.notedPayloads[n], int64(this.notedH[n]), this.notedStamps[n]);
+                file.writeBytes(objPath, bytes);
+                if (!file.exists(objPath) || file.size(objPath) != bytes.length) {
+                    return "object cache: cannot write " + objPath + ": verification failed";
+                }
+                if (idx >= 0) {
+                    this.mTimes[idx] = this.notedM[n];
+                    this.hashes[idx] = this.notedH[n];
+                    this.cachedAt[idx] = this.notedStamps[n];
+                } else {
+                    this.keys.add(this.notedKeys[n]);
+                    this.cTimes.add(this.notedC[n]);
+                    this.mTimes.add(this.notedM[n]);
+                    this.hashes.add(this.notedH[n]);
+                    this.cachedAt.add(this.notedStamps[n]);
+                }
+            }
+        }
+
+        // Drop records (and orphan .o files) for sources no longer built.
+        string[] stale = [];
+        for (int r = 0; r < this.keys.length; r++) {
+            if (this.findNoted(this.keys[r]) < 0) { stale.add(this.keys[r]); }
+        }
+        for (int s = 0; s < stale.length; s++) {
+            this.dropRecord(stale[s]);
+            string orphan = this.objectPath(stale[s]);
+            if (orphan.length > 0 && file.exists(orphan)) { file.delete(orphan); }
+        }
+
+        this.sortRecords();
+
+        // Reference-format binary record (v3: SBCR magic, version, creation
+        // stamp, project name, emitting flag set, then per-file entries),
+        // little-endian, byte-exact for other toolchains.
+        ObjWriter w = new ObjWriter();
+        w.rawStr("SBCR");
+        w.u16(3);
+        w.u64(this.createdStamp);
+        w.strField(this.projectName);
+        w.strField(this.flags);
+        w.u32(this.keys.length);
+        for (int rb = 0; rb < this.keys.length; rb++) {
+            w.strField(this.keys[rb]);
+            w.u64(this.cTimes[rb]);
+            w.u64(this.mTimes[rb]);
+            w.u64(this.hashes[rb]);
+            w.u64(this.cachedAt[rb]);
+        }
+        string sbcrPath = this.dir + "\\project.sbcr";
+        string sbcriPath = this.dir + "\\project.sbcri";
+        #on LINUX or MAC
+        sbcrPath = this.dir + "/project.sbcr";
+        sbcriPath = this.dir + "/project.sbcri";
+        #off
+        this.objMakeTree(this.dir);
+        file.writeBytes(sbcrPath, w.out);
+
+        // NUL-free text companion (authoritative read side): the SBCRI v2
+        // shape plus the flag-set line the object record keys on.
+        string[] lines = [];
+        lines.add("SBCRI v2\n");
+        lines.add("project " + objEscapeText(this.projectName) + "\n");
+        lines.add("flags " + objEscapeText(this.flags) + "\n");
+        lines.add("created " + (string)this.createdStamp + "\n");
+        for (int re = 0; re < this.keys.length; re++) {
+            lines.add(objEscapeText(this.keys[re]) + " " + (string)this.cTimes[re] + " " + (string)this.mTimes[re] + " " + objHex16(int64(this.hashes[re])) + " " + (string)this.cachedAt[re] + "\n");
+        }
+        file.writeString(sbcriPath, lines.join(""));
+
+        // Built-in unification: every object of this build must be present
+        // and valid (container magic, target machine/cpu, flag set, source
+        // hash) before the driver links them into the final binary.
+        string corruptEmpty = "object cache: corrupt COFF object";
+        if (this.targetOs == "LINUX") { corruptEmpty = "object cache: corrupt ELF object"; }
+        if (this.targetOs == "MAC") { corruptEmpty = "object cache: corrupt Mach-O object"; }
+        for (int u = 0; u < this.notedKeys.length; u++) {
+            string upath = this.objectPath(this.notedKeys[u]);
+            if (!file.exists(upath)) {
+                return "object cache: cannot read " + upath + ": file not found";
+            }
+            byte[] udata = [];
+            try {
+                udata = file.read(upath);
+            } catch (int e) {
+                return "object cache: cannot read " + upath + ": file not found";
+            }
+            if (udata.length == 0) { return corruptEmpty; }
+            ObjReader ur = new ObjReader(udata);
+            string uerr = this.validateObject(ur, u);
+            if (uerr.length > 0) { return uerr; }
+        }
+        return "";
+    }
+
+    // Pack one noted file into a linkable object for the session target:
+    // the proper container format per target carrying the payload plus a
+    // Silver note (flag set + source hash + stamp) the unifier validates.
+    private int[] emitObject(string payload, int64 hash, int stamp) {
+        int[] pbytes = [];
+        for (int i = 0; i < payload.length; i++) {
+            pbytes.add(int64(payload[i]) & 0xFF);
+        }
+        int[] note = objEncodeNote(this.flags, hash, stamp);
+        ObjWriter w = new ObjWriter();
+        if (this.targetOs == "LINUX") { w.emitElf(pbytes, note); }
+        else if (this.targetOs == "MAC") { w.emitMacho(pbytes, note); }
+        else { w.emitCoff(pbytes, note, stamp); }
+        return w.out;
+    }
+
+    // Built-in object unifier (no external linker — FORBIDDEN.md): validates
+    // the cached + refreshed .o of one noted file in deterministic order.
+    private string validateObject(ObjReader r, int notedIdx) {
+        int64 expectHash = int64(this.notedH[notedIdx]);
+        if (this.targetOs == "LINUX") { return objCheckElf(r, this.flags, expectHash); }
+        if (this.targetOs == "MAC") { return objCheckMacho(r, this.flags, expectHash); }
+        return objCheckCoff(r, this.flags, expectHash);
+    }
+
+    // Directory creation without fs.createDir / folder.create: those std
+    // void creators silently no-op in self-built binaries (the dirprobe
+    // series: identical shapes work from any other module, raw
+    // CreateDirectoryA works), so the object tier issues the same OS calls
+    // directly, one level at a time, through its own methods.
+    private void objMakeDir(string level) {
+        if (level.length < 2) { return; }
+        #on WINDOWS
+        CreateDirectoryA(level, null);
+        #else
+        mkdir(path.normalize(level), 493);
+        #off
+    }
+
+    // %APPDATA% lookup without env.get: the compiler build excludes env.sr,
+    // so env.get dispatches to the native mini_cg builtin, which returns the
+    // value pointer without setting the string length (garbage past a few
+    // chars at HEAD). Raw byte[] buffers cannot stand in either: Win32
+    // receives the array header, not the data (see the fs.sr readString
+    // note). A string buffer carries the data pointer, so the value lands
+    // correctly — the same carrier shape bcSliceViaFile uses for ReadFile.
+    // Linux/macOS never call it (fixed cache roots there).
+    private string objAppData() {
+        #on WINDOWS
+        int size = GetEnvironmentVariableA("APPDATA", null, 0);
+        if (size == 0) { return ""; }
+        string buf = " ".repeat(size);
+        int ret = GetEnvironmentVariableA("APPDATA", buf, size);
+        if (ret == 0) { return ""; }
+        string[] parts = [];
+        for (int i = 0; i < buf.length; i++) {
+            int b = int(int64(buf[i]) & 0xFF);
+            if (b != 0) { parts.add((string)char(b)); }
+        }
+        return parts.join("");
+        #else
+        return "";
+        #off
+    }
+
+    private void objMakeTree(string dir) {
+        string sep = "\\";
+        #on LINUX or MAC
+        sep = "/";
+        #off
+        string cur = "";
+        for (int i = 0; i < dir.length; i++) {
+            char c = dir[i];
+            if (c == '\\' || c == '/') {
+                if (cur.length >= 2) { this.objMakeDir(cur); }
+                cur += sep;
+            } else {
+                cur += c;
+            }
+        }
+        if (cur.length >= 2) { this.objMakeDir(cur); }
+    }
+
+    // Deterministic record order: sorted by relative path (matches the
+    // reference serializer).
+    private void sortRecords() {
+        for (int i = 1; i < this.keys.length; i++) {
+            string k = this.keys[i];
+            int c = this.cTimes[i];
+            int m = this.mTimes[i];
+            int h = this.hashes[i];
+            int lc = this.cachedAt[i];
+            int j = i - 1;
+            while (j >= 0 && k < this.keys[j]) {
+                this.keys[j + 1] = this.keys[j];
+                this.cTimes[j + 1] = this.cTimes[j];
+                this.mTimes[j + 1] = this.mTimes[j];
+                this.hashes[j + 1] = this.hashes[j];
+                this.cachedAt[j + 1] = this.cachedAt[j];
+                j--;
+            }
+            this.keys[j + 1] = k;
+            this.cTimes[j + 1] = c;
+            this.mTimes[j + 1] = m;
+            this.hashes[j + 1] = h;
+            this.cachedAt[j + 1] = lc;
+        }
+    }
+
+    private void sortNoted() {
+        for (int i = 1; i < this.notedKeys.length; i++) {
+            string k = this.notedKeys[i];
+            string p = this.notedPayloads[i];
+            int c = this.notedC[i];
+            int m = this.notedM[i];
+            int h = this.notedH[i];
+            int lc = this.notedStamps[i];
+            int j = i - 1;
+            while (j >= 0 && k < this.notedKeys[j]) {
+                this.notedKeys[j + 1] = this.notedKeys[j];
+                this.notedPayloads[j + 1] = this.notedPayloads[j];
+                this.notedC[j + 1] = this.notedC[j];
+                this.notedM[j + 1] = this.notedM[j];
+                this.notedH[j + 1] = this.notedH[j];
+                this.notedStamps[j + 1] = this.notedStamps[j];
+                j--;
+            }
+            this.notedKeys[j + 1] = k;
+            this.notedPayloads[j + 1] = p;
+            this.notedC[j + 1] = c;
+            this.notedM[j + 1] = m;
+            this.notedH[j + 1] = h;
+            this.notedStamps[j + 1] = lc;
+        }
+    }
+
+    private void dropRecord(string key) {
+        int w = 0;
+        for (int i = 0; i < this.keys.length; i++) {
+            if (this.keys[i] != key) {
+                this.keys[w] = this.keys[i];
+                this.cTimes[w] = this.cTimes[i];
+                this.mTimes[w] = this.mTimes[i];
+                this.hashes[w] = this.hashes[i];
+                this.cachedAt[w] = this.cachedAt[i];
+                w++;
+            }
+        }
+        while (this.keys.length > w) { this.keys.pop(); }
+        while (this.cTimes.length > w) { this.cTimes.pop(); }
+        while (this.mTimes.length > w) { this.mTimes.pop(); }
+        while (this.hashes.length > w) { this.hashes.pop(); }
+        while (this.cachedAt.length > w) { this.cachedAt.pop(); }
+    }
+
+    // Record loading (the NUL-free text companion is authoritative).
+    private void loadRecords() {
+        string sbcriPath = this.dir + "\\project.sbcri";
+        #on LINUX or MAC
+        sbcriPath = this.dir + "/project.sbcri";
+        #off
+        string text = "";
+        try {
+            text = file.readString(sbcriPath);
+        } catch (int e) {
+            text = "";
+        }
+        if (text.length == 0) { return; }
+        string storedFlags = this.flags;
+        bool sawFlags = false;
+        int pos = 0;
+        while (pos < text.length) {
+            int eol = pos;
+            while (eol < text.length && text[eol] != '\n') { eol++; }
+            string line = text[pos..eol];
+            pos = eol + 1;
+            if (line.startsWith("flags ")) {
+                storedFlags = objUnescapeText(line[6..line.length]);
+                sawFlags = true;
+            } else if (line.startsWith("created ")) {
+                string num = line[8..line.length];
+                if (num.isDigits()) { this.createdStamp = (int)num; }
+            } else if (line.startsWith("project ") || line == "SBCRI v2") {
+                continue;
+            } else if (line.length > 0) {
+                // Entry: <rel> <created> <modified> <hexhash> <cached>.
+                // The path may hold spaces, so the last four fields cut
+                // from the right.
+                int s1 = -1;
+                int s2 = -1;
+                int s3 = -1;
+                int s4 = -1;
+                int fieldCount = 0;
+                for (int i = 0; i < line.length; i++) {
+                    if (line[i] == ' ') {
+                        s1 = s2;
+                        s2 = s3;
+                        s3 = s4;
+                        s4 = i;
+                        fieldCount++;
+                    }
+                }
+                if (fieldCount < 4) { continue; }
+                string rel = objUnescapeText(line[0..s1]);
+                string created = line[s1 + 1..s2];
+                string modified = line[s2 + 1..s3];
+                string hex = line[s3 + 1..s4];
+                string cached = line[s4 + 1..line.length];
+                if (!created.isDigits() || !modified.isDigits() || !cached.isDigits()) { continue; }
+                if (!objIsHex(hex)) { continue; }
+                this.keys.add(rel);
+                this.cTimes.add((int)created);
+                this.mTimes.add((int)modified);
+                this.hashes.add(objParseHex(hex));
+                this.cachedAt.add((int)cached);
+            }
+        }
+        if (sawFlags && storedFlags != this.flags) {
+            // A flag-set switch invalidates every object: start from an
+            // empty record (keeping the original creation stamp) instead
+            // of silently reusing objects emitted under different flags.
+            while (this.keys.length > 0) { this.keys.pop(); }
+            while (this.cTimes.length > 0) { this.cTimes.pop(); }
+            while (this.mTimes.length > 0) { this.mTimes.pop(); }
+            while (this.hashes.length > 0) { this.hashes.pop(); }
+            while (this.cachedAt.length > 0) { this.cachedAt.pop(); }
+        }
+    }
+}
