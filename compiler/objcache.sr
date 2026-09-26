@@ -38,9 +38,9 @@ import * from mac.libsystem;
 //
 // The extension is always .o (never .obj); the contents are the proper
 // relocatable object format for the target, emitted by the built-in writers
-// below — COFF (IMAGE_FILE_MACHINE_AMD64) on Windows in v1 (ELF relocatable
-// and Mach-O object follow later). No external linker, assembler, or object
-// toolchain of any kind (FORBIDDEN.md).
+// below — COFF (IMAGE_FILE_MACHINE_AMD64) on Windows, ELF relocatable
+// (ET_REL, EM_X86_64) on Linux (Mach-O object follows later). No external
+// linker, assembler, or object toolchain of any kind (FORBIDDEN.md).
 //
 // Every object carries three real sections plus the container's symbol and
 // relocation tables:
@@ -68,21 +68,24 @@ import * from mac.libsystem;
 // calls whose target lives in another slice — including same-file
 // cross-function calls, whose displacement changed when the slices were
 // cut) and ABS64 (8-byte absolute addresses of data, anon-function entry
-// points, singletons, and imports). Intra-function relative branches are
+// points, singletons, and imports). The ELF writer lowers these to
+// R_X86_64_PC32 and R_X86_64_64. Intra-function relative branches are
 // already final in the slice and carry no relocation, exactly like a
 // conventional compiler's output.
 //
-// Linker flow (linkUnits):
+// Linker flow (linkUnits on Windows, linkUnitsElf on Linux):
 //
 // 1. Parse every object (hard errors on corrupt containers).
 // 2. Resolve: each referenced symbol must have exactly one definition
 //    (duplicate/undefined symbols are loud link errors, never silent).
 // 3. Lay out: code slices then data slices then the globals area (which
 //    holds the exception-state slots at offsets 0..15), through the MiniEf
-//    writer with the monolithic backend's address math (strings after the
+//    writer with the monolithic backend's address math on Windows, or
+//    through the built-in ET_EXEC writer (mirroring elf.rs plan/emit) with
+//    the monolithic backend's address math on Linux (strings after the
 //    import tables, globals after the data).
 // 4. Apply relocations and emit the final binary through the existing
-//    MiniEf writer.
+//    MiniEf writer (Windows) or the built-in ET_EXEC writer (Linux).
 //
 // Freshness:
 //
@@ -105,7 +108,7 @@ import * from mac.libsystem;
 //
 // - --runtime mode (embedded allocator/GC entry points are appended
 //   globally, not attributable to one file).
-// - Non-Windows targets (ELF/Mach-O emission is the explicit follow-up).
+// - Mac targets (Mach-O emission is the explicit follow-up).
 // - Inline-assembly raw rel32 displacements (no symbol attribution).
 // - More than 65535 relocations in one object (COFF section limit).
 // - Shared-library outputs: this toolchain always emits PE executables,
@@ -426,18 +429,20 @@ class ObjUnit {
 // array parameters: arrays received as function parameters silently stop
 // growing past 8 entries in this toolchain, while prop arrays on a passed
 // object keep growing — the writer's tables scale with the symbol count,
-// so they live here).
+// so they live here). Sizes ride alongside (ELF st_size; COFF ignores them).
 class ObjSymTab {
     public prop string[] names;
     public prop int[] sects;
     public prop int[] vals;
     public prop int[] funcs;
+    public prop int[] sizes;
 
     construct {
         this.names = [];
         this.sects = [];
         this.vals = [];
         this.funcs = [];
+        this.sizes = [];
     }
 }
 
@@ -827,33 +832,247 @@ public string objParseCoff(ObjReader r, ParsedObj obj) {
     return "";
 }
 
-// Internal symbol order shared by the writer: section anchors, defined
+// Split an ELF relocatable object into its section spans: out holds
+// [textOff, textLen, rdataOff, rdataLen, noteOff, noteLen].
+// Returns "" on success, else the exact reference error.
+private string objSplitElf(ObjReader r, int[] out) {
+    string bad = "object cache: corrupt ELF object";
+    if (r.size < 64) { return bad; }
+    if (r.u8At(0) != 127 || r.u8At(1) != 69 || r.u8At(2) != 76 || r.u8At(3) != 70) { return bad; }
+    if (r.u8At(4) != 2 || r.u8At(5) != 1) { return bad; }
+    if (int(r.u16At(16)) != 1 || int(r.u16At(18)) != 62) { return bad; }
+    int shoff = int(r.u64At(40));
+    int shnum = int(r.u16At(60));
+    int shstrndx = int(r.u16At(62));
+    if (shoff < 0 || shnum <= 0 || shstrndx < 0 || shstrndx >= shnum) { return bad; }
+    if (shoff + shnum * 64 > r.size) { return bad; }
+    int sbase = shoff + shstrndx * 64;
+    int strOff = int(r.u64At(sbase + 24));
+    int strSize = int(r.u64At(sbase + 32));
+    if (strOff < 0 || strSize < 0 || strOff + strSize > r.size) { return bad; }
+    int textOff = -1;
+    int textLen = 0;
+    int rdataOff = -1;
+    int rdataLen = 0;
+    int noteOff = -1;
+    int noteLen = 0;
+    for (int i = 0; i < shnum; i++) {
+        int base = shoff + i * 64;
+        int noff = int(r.u32At(base));
+        int off = int(r.u64At(base + 24));
+        int size = int(r.u64At(base + 32));
+        if (noff < 0 || off < 0 || size < 0 || off + size > r.size) { return bad; }
+        string sname = "";
+        if (i > 0) { sname = objCStr(r, strOff, strSize, noff); }
+        if (sname == ".text") { textOff = off; textLen = size; }
+        else if (sname == ".rdata") { rdataOff = off; rdataLen = size; }
+        else if (sname == ".slvnote") { noteOff = off; noteLen = size; }
+    }
+    if (textOff < 0 || rdataOff < 0 || noteOff < 0) { return bad; }
+    out.add(textOff);
+    out.add(textLen);
+    out.add(rdataOff);
+    out.add(rdataLen);
+    out.add(noteOff);
+    out.add(noteLen);
+    return "";
+}
+
+// Parse just the Silver note (cheap freshness probe). Returns "" and fills
+// note when the container and note are valid v4 — including v3-era objects,
+// which fail here and the planner treats as stale.
+public string objPeekElfNote(ObjReader r, ObjNote note) {
+    int[] spans = [];
+    string serr = objSplitElf(r, spans);
+    if (serr.length > 0) { return serr; }
+    return objDecodeNote(r, spans[4], spans[5], note);
+}
+
+// Fully parse one ELF relocatable object into obj (hard errors on any
+// corruption). Mirrors silverc-rs parse_elf_rel: sections by name, symbols
+// from .symtab/.strtab, relocations from .rela.text; a non-empty .rela.data
+// is corruption (a missing one is an older object and still links).
+public string objParseElf(ObjReader r, ParsedObj obj) {
+    string bad = "object cache: corrupt ELF object";
+    int[] spans = [];
+    string serr = objSplitElf(r, spans);
+    if (serr.length > 0) { return serr; }
+    int textOff = spans[0];
+    int textLen = spans[1];
+    int rdataOff = spans[2];
+    int rdataLen = spans[3];
+    int noteOff = spans[4];
+    int noteLen = spans[5];
+    obj.code = [];
+    for (int i = 0; i < textLen; i++) { obj.code.add(int(r.u8At(textOff + i))); }
+    obj.data = [];
+    for (int i = 0; i < rdataLen; i++) { obj.data.add(int(r.u8At(rdataOff + i))); }
+    ObjNote note = new ObjNote();
+    string nerr = objDecodeNote(r, noteOff, noteLen, note);
+    if (nerr.length > 0) { return nerr; }
+    obj.flags = note.flags;
+    obj.hash = note.hash;
+    obj.stamp = note.stamp;
+    obj.gas = note.gas;
+    obj.impDlls = note.impDlls;
+    obj.impNames = note.impNames;
+    obj.filekey = note.filekey;
+    int shoff = int(r.u64At(40));
+    int shnum = int(r.u16At(60));
+    int shstrndx = int(r.u16At(62));
+    int sbase = shoff + shstrndx * 64;
+    int strOff = int(r.u64At(sbase + 24));
+    int strSize = int(r.u64At(sbase + 32));
+    // Section index -> name (for STT_SECTION symbols).
+    string[] secNames = [];
+    for (int i = 0; i < shnum; i++) {
+        int base = shoff + i * 64;
+        int noff = int(r.u32At(base));
+        if (i == 0) { secNames.add(""); }
+        else { secNames.add(objCStr(r, strOff, strSize, noff)); }
+    }
+    // Locate .symtab, .strtab, .rela.text, .rela.data by name.
+    int symOff = -1;
+    int symSize = 0;
+    int stabOff = -1;
+    int stabSize = 0;
+    int relaOff = -1;
+    int relaSize = 0;
+    bool hasRelaData = false;
+    int relaDataSize = 0;
+    for (int i = 1; i < shnum; i++) {
+        int base = shoff + i * 64;
+        int stype = int(r.u32At(base + 4));
+        int off = int(r.u64At(base + 24));
+        int size = int(r.u64At(base + 32));
+        if (secNames[i] == ".symtab") {
+            if (stype != 2) { return bad; }
+            symOff = off;
+            symSize = size;
+        } else if (secNames[i] == ".strtab") {
+            stabOff = off;
+            stabSize = size;
+        } else if (secNames[i] == ".rela.text") {
+            relaOff = off;
+            relaSize = size;
+        } else if (secNames[i] == ".rela.data") {
+            hasRelaData = true;
+            relaDataSize = size;
+        }
+    }
+    if (symOff < 0 || stabOff < 0) { return bad; }
+    // .rela.data must be empty when present: .rdata carries no pointers by
+    // construction, so a data relocation has no meaning the linker could
+    // apply. A missing section is an older object and still links.
+    if (hasRelaData && relaDataSize != 0) { return bad; }
+    int nsyms = symSize / 24;
+    if (symOff + symSize > r.size || stabOff + stabSize > r.size) { return bad; }
+    obj.symNames = [];
+    obj.symSects = [];
+    obj.symVals = [];
+    obj.symIsFunc = [];
+    for (int i = 0; i < nsyms; i++) {
+        int base = symOff + i * 24;
+        if (base + 24 > r.size) { return bad; }
+        int nameOff = int(r.u32At(base));
+        int info = int(r.u8At(base + 4));
+        int shndx = int(r.u16At(base + 6));
+        int64 value = r.u64At(base + 8);
+        int64 size = r.u64At(base + 16);
+        int typ = info & 0x0F;
+        string name = "";
+        if (i == 0) {
+            name = "";
+        } else if (typ == 3) {
+            if (shndx < 0 || shndx >= secNames.length) { return bad; }
+            name = secNames[shndx];
+        } else {
+            // String-table reference: the offset must land inside .strtab
+            // with a terminator past it (an immediate NUL decodes to the
+            // empty name, exactly like the reference).
+            if (nameOff < 0 || nameOff >= stabSize) { return bad; }
+            bool term = false;
+            for (int t = stabOff + nameOff; t < stabOff + stabSize; t++) {
+                if (r.u8At(t) == 0) { term = true; break; }
+            }
+            if (!term) { return bad; }
+            name = objCStr(r, stabOff, stabSize, nameOff);
+        }
+        int sect = -1;
+        if (shndx == 0) { sect = 0; }
+        else if (shndx == 1) { sect = 1; }
+        else if (shndx == 2) { sect = 2; }
+        else { return bad; }
+        if (value < 0 || value > 4294967295 || size < 0 || size > 4294967295) { return bad; }
+        obj.symNames.add(name);
+        obj.symSects.add(sect);
+        obj.symVals.add(int(value));
+        if (typ == 2) { obj.symIsFunc.add(1); }
+        else { obj.symIsFunc.add(0); }
+    }
+    obj.relSites = [];
+    obj.relSyms = [];
+    obj.relKinds = [];
+    obj.relAddends = [];
+    if (relaOff >= 0) {
+        if (relaSize % 24 != 0) { return bad; }
+        if (relaOff + relaSize > r.size) { return bad; }
+        int nrel = relaSize / 24;
+        for (int i = 0; i < nrel; i++) {
+            int base = relaOff + i * 24;
+            int64 site = r.u64At(base);
+            int64 rinfo = r.u64At(base + 8);
+            int64 addend = r.u64At(base + 16);
+            int sni = int(rinfo >> 32);
+            int rtype = int(rinfo & 0xFFFFFFFF);
+            if (site < 0 || site > 4294967295 || sni < 0 || sni >= obj.symNames.length) { return bad; }
+            int kind = -1;
+            if (rtype == 2) { kind = 0; }
+            else if (rtype == 1) { kind = 1; }
+            else { return bad; }
+            obj.relSites.add(int(site));
+            obj.relSyms.add(sni);
+            obj.relKinds.add(kind);
+            obj.relAddends.add(addend);
+        }
+    }
+    return "";
+}
+
+// Internal symbol order shared by the writers: section anchors, defined
 // functions, the data anchor, then undefined symbols (functions,
 // singletons, imports). Built on the holder's prop arrays (see ObjSymTab).
+// Sizes ride alongside for the ELF st_size field (anchors, the datab, and
+// undefined symbols carry 0).
 private void objBuildSyms(ObjUnit unit, ObjSymTab t) {
     t.names.add(".text");
     t.sects.add(1);
     t.vals.add(0);
     t.funcs.add(0);
+    t.sizes.add(0);
     t.names.add(".rdata");
     t.sects.add(2);
     t.vals.add(0);
     t.funcs.add(0);
+    t.sizes.add(0);
     for (int i = 0; i < unit.defNames.length; i++) {
         t.names.add(unit.defNames[i]);
         t.sects.add(1);
         t.vals.add(unit.defOffs[i]);
         t.funcs.add(1);
+        t.sizes.add(unit.defSizes[i]);
     }
     t.names.add(unit.datab);
     t.sects.add(2);
     t.vals.add(0);
     t.funcs.add(0);
+    t.sizes.add(0);
     for (int i = 0; i < unit.undefFuncs.length; i++) {
         t.names.add(unit.undefFuncs[i]);
         t.sects.add(0);
         t.vals.add(0);
         t.funcs.add(1);
+        t.sizes.add(0);
     }
     for (int i = 0; i < unit.undefSingles.length; i++) {
         int s = unit.undefSingles[i];
@@ -863,12 +1082,14 @@ private void objBuildSyms(ObjUnit unit, ObjSymTab t) {
         t.sects.add(0);
         t.vals.add(0);
         t.funcs.add(0);
+        t.sizes.add(0);
     }
     for (int i = 0; i < unit.undefImports.length; i++) {
         t.names.add(objImportPrefix() + (string)unit.undefImports[i]);
         t.sects.add(0);
         t.vals.add(0);
         t.funcs.add(0);
+        t.sizes.add(0);
     }
 }
 
@@ -1027,11 +1248,172 @@ public int[] emitCoff(ObjUnit unit, int[] note, int stamp) {
     return w.out;
 }
 
-// Serialize one extracted unit for the Windows target: the COFF
-// relocatable container with real .text machine code, .rdata, .slvnote,
-// symbol table, and relocations.
-public int[] emitObject(ObjUnit unit, string flags, int64 hash, int stamp) {
+// One ELF section header (64 bytes) through the shared writer.
+private void objWriteSh(ObjWriter w, int name, int stype, int64 flags, int off, int size, int link, int info, int align, int entsize) {
+    w.u32(name);
+    w.u32(stype);
+    w.u64(flags);
+    w.u64(0);
+    w.u64(off);
+    w.u64(size);
+    w.u32(link);
+    w.u32(info);
+    w.u64(align);
+    w.u64(entsize);
+}
+
+// Minimal ELF relocatable object (Linux target): ELF64 header (ET_REL,
+// EM_X86_64) + .text (machine code) + .rdata (data) + .slvnote (Silver
+// note) + .shstrtab + .symtab + .strtab + .rela.text + .rela.data. Mirrors
+// silverc-rs emit_elf_rel byte-exactly. Built only with byte pushes.
+//
+// .rela.data is always size-0: .rdata carries string bytes and zeroed state
+// only, never pointers, so no data-section relocation can exist by
+// construction. The section is still emitted (with the .symtab link, the
+// .rdata info, alignment, and entry size) so every object carries the full
+// relocation-section pair; the reader treats a non-empty .rela.data as
+// corruption (loud, never silently ignored).
+public int[] emitElfRel(ObjUnit unit, int[] note) {
+    ObjSymTab syms = new ObjSymTab();
+    objBuildSyms(unit, syms);
+    string[] secNames = [".text", ".rdata", ".slvnote", ".shstrtab", ".symtab", ".strtab", ".rela.text", ".rela.data"];
+    int[] shstr = [];
+    shstr.add(0);
+    int[] secNameOffs = [];
+    for (int i = 0; i < secNames.length; i++) {
+        secNameOffs.add(shstr.length);
+        string snm = secNames[i];
+        for (int k = 0; k < snm.length; k++) { shstr.add(snm[k]); }
+        shstr.add(0);
+    }
+    // Symbol names into .strtab (the null entry and section symbols use
+    // st_name 0). Written order: null, SECTION .text, SECTION .rdata, the
+    // datab (GLOBAL OBJECT), defined FUNCs, undefined symbols.
+    int[] strtab = [];
+    strtab.add(0);
+    int[] symNameOff = [];
+    symNameOff.add(0);
+    for (int i = 0; i < syms.names.length; i++) {
+        if (i < 2) { symNameOff.add(0); }
+        else {
+            symNameOff.add(strtab.length);
+            string ynm = syms.names[i];
+            for (int k = 0; k < ynm.length; k++) { strtab.add(ynm[k]); }
+            strtab.add(0);
+        }
+    }
+    int nsyms = syms.names.length + 1;
+    int textOff = 64;
+    int rdataOff = textOff + unit.code.length;
+    int noteOff = rdataOff + unit.data.length;
+    int shstrOff = noteOff + note.length;
+    int symOff = (shstrOff + shstr.length + 7) / 8 * 8;
+    int strOff = symOff + nsyms * 24;
+    int relaOff = strOff + strtab.length;
+    int relaLen = unit.relSites.length * 24;
+    int shoff = (relaOff + relaLen + 7) / 8 * 8;
+    ObjWriter w = new ObjWriter();
+    // ELF header (64 bytes).
+    w.u8(127);
+    w.rawStr("ELF");
+    w.u8(2);
+    w.u8(1);
+    w.u8(1);
+    w.u8(0);
+    for (int i = 0; i < 8; i++) { w.u8(0); }
+    w.u16(1);
+    w.u16(62);
+    w.u32(1);
+    w.u64(0);
+    w.u64(0);
+    w.u64(shoff);
+    w.u32(0);
+    w.u16(64);
+    w.u16(0);
+    w.u16(0);
+    w.u16(64);
+    w.u16(9);
+    w.u16(4);
+    w.rawBytes(unit.code);
+    w.rawBytes(unit.data);
+    w.rawBytes(note);
+    w.rawBytes(shstr);
+    while (w.out.length < symOff) { w.u8(0); }
+    // .symtab (24 bytes each): null, SECTION .text, SECTION .rdata, the
+    // datab (GLOBAL OBJECT), defined FUNCs, undefined symbols.
+    for (int z = 0; z < 24; z++) { w.u8(0); }
+    for (int i = 0; i < syms.names.length; i++) {
+        int sect = syms.sects[i];
+        int isf = syms.funcs[i];
+        int bind = 0;
+        int typ = 3;
+        if (i >= 2) {
+            if (sect == 0) {
+                bind = 1;
+                if (isf == 1) { typ = 2; }
+                else { typ = 0; }
+            } else if (isf == 1) {
+                bind = 1;
+                typ = 2;
+            } else {
+                bind = 1;
+                typ = 1;
+            }
+        }
+        w.u32(symNameOff[i + 1]);
+        w.u8((bind << 4) | typ);
+        w.u8(0);
+        w.u16(sect);
+        w.u64(syms.vals[i]);
+        w.u64(syms.sizes[i]);
+    }
+    w.rawBytes(strtab);
+    // .rela.text (24 bytes each, sorted by site): Rel32 calls become
+    // R_X86_64_PC32, Abs64 addresses R_X86_64_64. Written symbol indices
+    // shift by one for the leading null entry. The addend rides the entry,
+    // read back out of the site bytes the extractor wrote (data offsets,
+    // globals-block slot offsets; zero everywhere else), so raw inspection
+    // and RELA agree.
+    for (int i = 0; i < unit.relSites.length; i++) {
+        int symidx = objSymIndexFor(unit, unit.relTargets[i], unit.relIdx[i], unit.relNames[i]);
+        int rtype = 2;
+        if (unit.relKinds[i] == 1) { rtype = 1; }
+        int64 addend = 0;
+        if (unit.relKinds[i] == 1) {
+            for (int b = 0; b < 8; b++) {
+                addend = addend | (int64(unit.code[unit.relSites[i] + b] & 0xFF) << (b * 8));
+            }
+        }
+        w.u64(unit.relSites[i]);
+        w.u64((int64(symidx + 1) << 32) | int64(rtype));
+        w.u64(addend);
+    }
+    while (w.out.length < shoff) { w.u8(0); }
+    // Section headers (64 bytes each): NULL, .text, .rdata, .slvnote,
+    // .shstrtab, .symtab, .strtab, .rela.text, .rela.data.
+    objWriteSh(w, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    objWriteSh(w, secNameOffs[0], 1, 6, textOff, unit.code.length, 0, 0, 16, 0);
+    objWriteSh(w, secNameOffs[1], 1, 2, rdataOff, unit.data.length, 0, 0, 1, 0);
+    objWriteSh(w, secNameOffs[2], 1, 0, noteOff, note.length, 0, 0, 1, 0);
+    objWriteSh(w, secNameOffs[3], 3, 0, shstrOff, shstr.length, 0, 0, 1, 0);
+    objWriteSh(w, secNameOffs[4], 2, 0, symOff, nsyms * 24, 6, 3, 8, 24);
+    objWriteSh(w, secNameOffs[5], 3, 0, strOff, strtab.length, 0, 0, 1, 0);
+    objWriteSh(w, secNameOffs[6], 4, 0, relaOff, relaLen, 5, 1, 8, 24);
+    // .rela.data is size-0 by construction (see above); sh_info still names
+    // .rdata (index 2) and sh_link the .symtab (index 5).
+    objWriteSh(w, secNameOffs[7], 4, 0, relaOff + relaLen, 0, 5, 2, 8, 24);
+    return w.out;
+}
+
+// Serialize one extracted unit for the caller's target: the COFF
+// relocatable container on Windows (real .text machine code, .rdata,
+// .slvnote, symbol table, relocations) or the ELF relocatable container on
+// Linux (ET_REL with .text/.rdata/.slvnote, symtab, .rela.text, and the
+// empty-but-present .rela.data). Selected at runtime — never a region — so
+// one binary emits every target.
+public int[] emitObject(ObjUnit unit, string flags, int64 hash, int stamp, string targetOs) {
     int[] note = objEncodeNote(unit, flags, hash, stamp);
+    if (targetOs == "LINUX") { return emitElfRel(unit, note); }
     return emitCoff(unit, note, stamp);
 }
 
@@ -1805,6 +2187,507 @@ public void linkUnits(ParsedObj[] unitsIn, int subsystem, string[] verKeys, stri
     link.bytes = pe.build(code, data, versionData);
 }
 
+// Fully-computed ELF ET_EXEC layout for one linked image (mirrors
+// silverc-rs elf.rs plan(): every address derives from (codeLen, dataLen,
+// imports, entryOff) so patching and layout can never disagree). Tables and
+// GOT bytes ride alongside for the emitter.
+class ElfPlan {
+    public prop int rxOff;
+    public prop int64 rxVaddr;
+    public prop int rxFilesz;
+    public prop int dataOff;
+    public prop int64 dataVaddr;
+    public prop int dataFilesz;
+    public prop int codeLen;
+    public prop int dataLen;
+    public prop int rFilesz;
+    public prop int offInterp;
+    public prop int offHash;
+    public prop int offDynstr;
+    public prop int offDynsym;
+    public prop int offRela;
+    public prop int offDynamic;
+    public prop int rwOff;
+    public prop int64 rwVaddr;
+    public prop int64 entryVaddr;
+    public prop int nImports;
+    public prop int64[] gotAddrs;
+    public prop int[] dynstr;
+    public prop int[] dynsym;
+    public prop int[] hash;
+    public prop int[] rela;
+    public prop int[] dynamic;
+    public prop int libcOff;
+    public prop int interpLen;
+
+    construct {
+        this.rxOff = 0;
+        this.rxVaddr = 0;
+        this.rxFilesz = 0;
+        this.dataOff = 0;
+        this.dataVaddr = 0;
+        this.dataFilesz = 0;
+        this.codeLen = 0;
+        this.dataLen = 0;
+        this.rFilesz = 0;
+        this.offInterp = 0;
+        this.offHash = 0;
+        this.offDynstr = 0;
+        this.offDynsym = 0;
+        this.offRela = 0;
+        this.offDynamic = 0;
+        this.rwOff = 0;
+        this.rwVaddr = 0;
+        this.entryVaddr = 0;
+        this.nImports = 0;
+        this.gotAddrs = [];
+        this.dynstr = [];
+        this.dynsym = [];
+        this.hash = [];
+        this.rela = [];
+        this.dynamic = [];
+        this.libcOff = 0;
+        this.interpLen = 0;
+    }
+}
+
+private int elfPad(int v, int a) {
+    return (v + a - 1) / a * a;
+}
+
+// One ELF program header (56 bytes) through the shared writer.
+private void objWritePh(ObjWriter w, int ptype, int flags, int64 off, int64 vaddr, int64 filesz, int64 memsz, int64 align) {
+    w.u32(ptype);
+    w.u32(flags);
+    w.u64(off);
+    w.u64(vaddr);
+    w.u64(vaddr);
+    w.u64(filesz);
+    w.u64(memsz);
+    w.u64(align);
+}
+
+// Compute the ELF ET_EXEC layout: codeLen bytes of code, dataLen bytes of
+// writable data, the union import list (parallel dlls/names), and the
+// RX-aware entry offset. Mirrors silverc-rs elf.rs plan() exactly,
+// including the big-import rule (RX starts past the R tables, page-aligned,
+// never hard-wired at the second page) and the 3 reserved GOT header slots.
+private void elfPlanLayout(int codeLen, int dataLen, string[] dlls, string[] names, int entryOff, ElfPlan plan) {
+    int BASE = 0x400000;
+    int PAGE = 0x1000;
+    int TEXT_RVA = 0x1000;
+    int TABLES_OFF = 456;
+    string interpStr = "/lib64/ld-linux-x86-64.so.2";
+    int interpLen = interpStr.length + 1;
+    plan.interpLen = interpLen;
+    string libcName = "libc.so.6";
+    string[] neededLibs = [];
+    for (int i = 0; i < dlls.length; i++) {
+        string libName = dlls[i];
+        if (libName.length == 0) { libName = libcName; }
+        bool seen = false;
+        for (int j = 0; j < neededLibs.length; j++) {
+            if (neededLibs[j] == libName) { seen = true; break; }
+        }
+        if (!seen) { neededLibs.add(libName); }
+    }
+    if (neededLibs.length == 0) { neededLibs.add(libcName); }
+    ObjWriter ds = new ObjWriter();
+    ds.u8(0);
+    int[] libOffs = [];
+    for (int i = 0; i < neededLibs.length; i++) {
+        libOffs.add(ds.out.length);
+        ds.rawStr(neededLibs[i]);
+        ds.u8(0);
+    }
+    int libcOff = libOffs[0];
+    for (int i = 0; i < neededLibs.length; i++) {
+        if (neededLibs[i] == libcName) { libcOff = libOffs[i]; break; }
+    }
+    int[] nameOffs = [];
+    for (int i = 0; i < names.length; i++) {
+        nameOffs.add(ds.out.length);
+        ds.rawStr(names[i]);
+        ds.u8(0);
+    }
+    plan.dynstr = ds.out;
+    plan.libcOff = libcOff;
+    int dynstrLen = plan.dynstr.length;
+    ObjWriter dy = new ObjWriter();
+    for (int z = 0; z < 24; z++) { dy.u8(0); }
+    for (int i = 0; i < names.length; i++) {
+        dy.u32(nameOffs[i]);
+        dy.u8(18);
+        dy.u8(0);
+        dy.u16(0);
+        dy.u64(0);
+        dy.u64(0);
+    }
+    plan.dynsym = dy.out;
+    int n = names.length;
+    plan.nImports = n;
+    ObjWriter hh = new ObjWriter();
+    hh.u32(1);
+    hh.u32(n + 1);
+    if (n > 0) { hh.u32(1); }
+    else { hh.u32(0); }
+    hh.u32(0);
+    for (int hi = 1; hi <= n; hi++) {
+        int cv = 0;
+        if (hi < n) { cv = hi + 1; }
+        hh.u32(cv);
+    }
+    plan.hash = hh.out;
+    int relaLen = n * 24;
+    int dynsymLen = 24 * (n + 1);
+    int dynamicLen = (14 + neededLibs.length) * 16;
+    int hashLen = 16 + n * 4;
+    plan.offInterp = TABLES_OFF;
+    plan.offHash = plan.offInterp + interpLen;
+    plan.offDynstr = plan.offHash + hashLen;
+    plan.offDynsym = plan.offDynstr + dynstrLen;
+    plan.offRela = plan.offDynsym + dynsymLen;
+    plan.offDynamic = plan.offRela + relaLen;
+    plan.rFilesz = plan.offDynamic + dynamicLen;
+    plan.codeLen = codeLen;
+    plan.dataLen = dataLen;
+    plan.rxFilesz = elfPad(codeLen, PAGE);
+    plan.rxOff = elfPad(plan.rFilesz, PAGE);
+    if (plan.rxOff < TEXT_RVA) { plan.rxOff = TEXT_RVA; }
+    plan.rxVaddr = int64(BASE + plan.rxOff);
+    plan.dataFilesz = elfPad(dataLen, PAGE);
+    plan.dataOff = plan.rxOff + plan.rxFilesz;
+    plan.dataVaddr = plan.rxVaddr + plan.rxFilesz;
+    plan.rwOff = plan.dataOff + plan.dataFilesz;
+    plan.rwVaddr = plan.dataVaddr + plan.dataFilesz;
+    plan.gotAddrs = [];
+    for (int i = 0; i < n; i++) {
+        plan.gotAddrs.add(plan.rwVaddr + 24 + i * 8);
+    }
+    ObjWriter rl = new ObjWriter();
+    for (int i = 0; i < n; i++) {
+        rl.u64(plan.gotAddrs[i]);
+        rl.u64((int64(i + 1) << 32) | 7);
+        rl.u64(0);
+    }
+    plan.rela = rl.out;
+    ObjWriter dn = new ObjWriter();
+    dn.u64(1);
+    dn.u64(libcOff);
+    for (int li = 0; li < neededLibs.length; li++) {
+        if (neededLibs[li] != libcName) {
+            dn.u64(1);
+            dn.u64(libOffs[li]);
+        }
+    }
+    dn.u64(4);
+    dn.u64(BASE + plan.offHash);
+    dn.u64(3);
+    dn.u64(plan.rwVaddr);
+    dn.u64(30);
+    dn.u64(8);
+    dn.u64(5);
+    dn.u64(BASE + plan.offDynstr);
+    dn.u64(10);
+    dn.u64(dynstrLen);
+    dn.u64(6);
+    dn.u64(BASE + plan.offDynsym);
+    dn.u64(11);
+    dn.u64(24);
+    dn.u64(7);
+    dn.u64(BASE + plan.offRela);
+    dn.u64(8);
+    dn.u64(relaLen);
+    dn.u64(9);
+    dn.u64(24);
+    dn.u64(23);
+    dn.u64(BASE + plan.offRela);
+    dn.u64(2);
+    dn.u64(relaLen);
+    dn.u64(20);
+    dn.u64(7);
+    dn.u64(0);
+    dn.u64(0);
+    plan.dynamic = dn.out;
+    plan.entryVaddr = int64(BASE + entryOff);
+}
+
+// Serialize the complete ELF ET_EXEC file: blob holds codeLen code bytes
+// then dataLen data bytes. Mirrors silverc-rs elf.rs emit().
+private int[] elfEmit(ElfPlan plan, int[] blob) {
+    int BASE = 0x400000;
+    int PAGE = 0x1000;
+    ObjWriter w = new ObjWriter();
+    w.u8(127);
+    w.rawStr("ELF");
+    w.u8(2);
+    w.u8(1);
+    w.u8(1);
+    w.u8(0);
+    for (int i = 0; i < 8; i++) { w.u8(0); }
+    w.u16(2);
+    w.u16(62);
+    w.u32(1);
+    w.u64(plan.entryVaddr);
+    w.u64(64);
+    w.u64(0);
+    w.u32(0);
+    w.u16(64);
+    w.u16(56);
+    w.u16(7);
+    w.u16(0);
+    w.u16(0);
+    w.u16(0);
+    int64 interpVaddr = BASE + plan.offInterp;
+    int64 dynVaddr = BASE + plan.offDynamic;
+    objWritePh(w, 3, 4, plan.offInterp, interpVaddr, plan.interpLen, plan.interpLen, 1);
+    objWritePh(w, 1, 4, 0, BASE, plan.rFilesz, plan.rFilesz, PAGE);
+    objWritePh(w, 1, 5, plan.rxOff, plan.rxVaddr, plan.rxFilesz, plan.rxFilesz, PAGE);
+    objWritePh(w, 1, 6, plan.dataOff, plan.dataVaddr, plan.dataFilesz, plan.dataFilesz, PAGE);
+    objWritePh(w, 1, 6, plan.rwOff, plan.rwVaddr, 24 + plan.nImports * 8, 24 + plan.nImports * 8, PAGE);
+    objWritePh(w, 2, 4, plan.offDynamic, dynVaddr, plan.dynamic.length, plan.dynamic.length, 8);
+    objWritePh(w, 0x6474e551, 6, 0, 0, 0, 0, 16);
+    // R metadata tables (headers already end at TABLES_OFF).
+    string interpStr = "/lib64/ld-linux-x86-64.so.2";
+    for (int k = 0; k < interpStr.length; k++) { w.u8(int64(interpStr[k]) & 0xFF); }
+    w.u8(0);
+    w.rawBytes(plan.hash);
+    w.rawBytes(plan.dynstr);
+    w.rawBytes(plan.dynsym);
+    w.rawBytes(plan.rela);
+    w.rawBytes(plan.dynamic);
+    while (w.out.length < plan.rxOff) { w.u8(0); }
+    for (int i = 0; i < plan.codeLen; i++) { w.u8(blob[i]); }
+    while (w.out.length < plan.rxOff + plan.rxFilesz) { w.u8(0); }
+    for (int i = 0; i < plan.dataLen; i++) { w.u8(blob[plan.codeLen + i]); }
+    while (w.out.length < plan.dataOff + plan.dataFilesz) { w.u8(0); }
+    for (int i = 0; i < 24 + plan.nImports * 8; i++) { w.u8(0); }
+    return w.out;
+}
+
+// Link parsed objects into a final Linux binary: resolve symbols across
+// the set, lay out code/data/GOT segments, apply relocations, and emit
+// through the built-in ET_EXEC writer above (mirrors silverc-rs link_linux
+// byte-exactly). Units sort by file key first so the layout is
+// deterministic. Any unresolvable or duplicate symbol is a hard link error
+// — never a silent mislink. Fills link (err "" on success).
+//
+// The data image is data slices, then the linker-owned singleton blocks
+// (16-byte exception state, 16+512-byte tray state, the globals block),
+// mirroring the reference layout. `gas` is a byte count here (the
+// self-host note semantics); the reference counts slots, so mixed-toolchain
+// links fail loudly at the agreement check below instead of mislinking.
+public void linkUnitsElf(ParsedObj[] unitsIn, ObjLinkResult link) {
+    link.err = "";
+    link.bytes = [];
+    if (unitsIn.length == 0) {
+        link.err = "object cache: nothing to link (no objects)";
+        return;
+    }
+    ParsedObj[] units = [];
+    for (int i = 0; i < unitsIn.length; i++) { units.add(unitsIn[i]); }
+    for (int i = 1; i < units.length; i++) {
+        ParsedObj k = units[i];
+        int j = i - 1;
+        while (j >= 0 && k.filekey < units[j].filekey) {
+            units[j + 1] = units[j];
+            j--;
+        }
+        units[j + 1] = k;
+    }
+    string[] defNames = [];
+    int[] defUnits = [];
+    int[] defOffs = [];
+    for (int ui = 0; ui < units.length; ui++) {
+        ParsedObj u = units[ui];
+        for (int s = 0; s < u.symNames.length; s++) {
+            if (u.symSects[s] == 1 && u.symIsFunc[s] == 1) {
+                bool dup = false;
+                for (int d = 0; d < defNames.length; d++) {
+                    if (defNames[d] == u.symNames[s]) { dup = true; break; }
+                }
+                if (dup) {
+                    link.err = "object cache: duplicate symbol '" + u.symNames[s] + "' (in '" + u.filekey + "' and elsewhere)";
+                    return;
+                }
+                defNames.add(u.symNames[s]);
+                defUnits.add(ui);
+                defOffs.add(u.symVals[s]);
+            }
+        }
+    }
+    int gas = units[0].gas;
+    for (int ui = 1; ui < units.length; ui++) {
+        if (units[ui].gas != gas) {
+            link.err = "object cache: globals-block mismatch ('" + units[0].filekey + "' vs '" + units[ui].filekey + "') — re-emit required";
+            return;
+        }
+    }
+    string[] unionDlls = [];
+    string[] unionNames = [];
+    for (int ui = 0; ui < units.length; ui++) {
+        ParsedObj u = units[ui];
+        for (int i = 0; i < u.impDlls.length; i++) {
+            bool seen = false;
+            for (int k = 0; k < unionDlls.length; k++) {
+                if (unionDlls[k] == u.impDlls[i] && unionNames[k] == u.impNames[i]) { seen = true; break; }
+            }
+            if (!seen) {
+                unionDlls.add(u.impDlls[i]);
+                unionNames.add(u.impNames[i]);
+            }
+        }
+    }
+    for (int i = 1; i < unionDlls.length; i++) {
+        string kd = unionDlls[i];
+        string kn = unionNames[i];
+        int j = i - 1;
+        while (j >= 0 && (kd < unionDlls[j] || (kd == unionDlls[j] && kn < unionNames[j]))) {
+            unionDlls[j + 1] = unionDlls[j];
+            unionNames[j + 1] = unionNames[j];
+            j--;
+        }
+        unionDlls[j + 1] = kd;
+        unionNames[j + 1] = kn;
+    }
+    int[] codeOffs = [];
+    int totalCode = 0;
+    for (int ui = 0; ui < units.length; ui++) {
+        codeOffs.add(totalCode);
+        totalCode += units[ui].code.length;
+    }
+    int[] dataOffs = [];
+    int totalData = 0;
+    for (int ui = 0; ui < units.length; ui++) {
+        dataOffs.add(totalData);
+        totalData += units[ui].data.length;
+    }
+    int dataTotal = totalData + 16 + (16 + 512) + gas;
+    int[] code = [];
+    for (int ui = 0; ui < units.length; ui++) {
+        for (int i = 0; i < units[ui].code.length; i++) { code.add(units[ui].code[i]); }
+    }
+    int[] data = [];
+    for (int ui = 0; ui < units.length; ui++) {
+        for (int i = 0; i < units[ui].data.length; i++) { data.add(units[ui].data[i]); }
+    }
+    while (data.length < dataTotal) { data.add(0); }
+    // RX-aware entry: probe the layout once for the RX base, then plan for
+    // real with the entry offset (mirrors the reference double-plan).
+    ElfPlan probe = new ElfPlan();
+    elfPlanLayout(totalCode, dataTotal, unionDlls, unionNames, 0, probe);
+    int entryRel = 0;
+    int ei = objFindDef(defNames, objEntrySym());
+    if (ei >= 0) {
+        entryRel = codeOffs[defUnits[ei]] + defOffs[ei];
+    } else {
+        int mi = objFindDef(defNames, "main");
+        if (mi >= 0) {
+            entryRel = codeOffs[defUnits[mi]] + defOffs[mi];
+        }
+    }
+    int entryOff = int(probe.rxVaddr - 0x400000) + entryRel;
+    ElfPlan plan = new ElfPlan();
+    elfPlanLayout(totalCode, dataTotal, unionDlls, unionNames, entryOff, plan);
+    int64 codeVa = plan.rxVaddr;
+    int64 dataVa = plan.dataVaddr;
+    for (int ui = 0; ui < units.length; ui++) {
+        ParsedObj u = units[ui];
+        for (int ri = 0; ri < u.relSites.length; ri++) {
+            int site = codeOffs[ui] + u.relSites[ri];
+            int sni = u.relSyms[ri];
+            if (sni < 0 || sni >= u.symNames.length) {
+                link.err = "object cache: bad symbol index in '" + u.filekey + "'";
+                return;
+            }
+            string sname = u.symNames[sni];
+            int ssect = u.symSects[sni];
+            int sisfunc = u.symIsFunc[sni];
+            int64 addend = u.relAddends[ri];
+            int64 target = 0;
+            bool resolved = false;
+            if (ssect == 1 && sisfunc == 1) {
+                int di = objFindDef(defNames, sname);
+                if (di < 0) {
+                    link.err = "object cache: undefined symbol '" + sname + "' (referenced by '" + u.filekey + "')";
+                    return;
+                }
+                target = codeVa + codeOffs[defUnits[di]] + defOffs[di] + addend;
+                resolved = true;
+            } else if (ssect == 2 && sisfunc == 0) {
+                if (!objOwnDataSym(u, sname)) {
+                    link.err = "object cache: cross-unit data reference to '" + sname + "' from '" + u.filekey + "'";
+                    return;
+                }
+                target = dataVa + dataOffs[ui] + addend;
+                resolved = true;
+            } else if (ssect == 0) {
+                if (objStartsWith(sname, objImportPrefix())) {
+                    int idx = objParseDec(sname[objImportPrefix().length..sname.length]);
+                    if (idx < 0 || idx >= u.impDlls.length) {
+                        link.err = "object cache: import symbol '" + sname + "' out of range";
+                        return;
+                    }
+                    int ii = objFindImport(unionDlls, unionNames, u.impDlls[idx], u.impNames[idx]);
+                    if (ii < 0) {
+                        link.err = "object cache: import '" + u.impDlls[idx] + "!" + u.impNames[idx] + "' lost in union";
+                        return;
+                    }
+                    if (ii >= plan.gotAddrs.length) {
+                        link.err = "object cache: import '" + u.impDlls[idx] + "!" + u.impNames[idx] + "' has no GOT slot";
+                        return;
+                    }
+                    target = plan.gotAddrs[ii];
+                    resolved = true;
+                } else if (sname == objSingletonExc()) {
+                    target = dataVa + totalData;
+                    resolved = true;
+                } else if (sname == objSingletonTray()) {
+                    target = dataVa + totalData + 16;
+                    resolved = true;
+                } else if (sname == objSingletonGlobals()) {
+                    target = dataVa + totalData + 16 + (16 + 512) + addend;
+                    resolved = true;
+                } else {
+                    int di = objFindDef(defNames, sname);
+                    if (di < 0) {
+                        link.err = "object cache: undefined symbol '" + sname + "' (referenced by '" + u.filekey + "')";
+                        return;
+                    }
+                    target = codeVa + codeOffs[defUnits[di]] + defOffs[di] + addend;
+                    resolved = true;
+                }
+            }
+            if (!resolved) {
+                link.err = "object cache: relocation against unexpected symbol '" + sname + "' in '" + u.filekey + "'";
+                return;
+            }
+            if (u.relKinds[ri] == 0) {
+                int64 fieldVa = codeVa + site;
+                int64 disp = target - (fieldVa + 4);
+                if (disp < -2147483648 || disp > 2147483647) {
+                    link.err = "object cache: call displacement overflow in '" + u.filekey + "'";
+                    return;
+                }
+                int d = int(disp);
+                code[site] = d & 0xFF;
+                code[site + 1] = (d >> 8) & 0xFF;
+                code[site + 2] = (d >> 16) & 0xFF;
+                code[site + 3] = (d >> 24) & 0xFF;
+            } else if (u.relKinds[ri] == 1) {
+                for (int b = 0; b < 8; b++) { code[site + b] = (target >> (b * 8)) & 0xFF; }
+            } else {
+                link.err = "object cache: unexpected relocation kind in '" + u.filekey + "'";
+                return;
+            }
+        }
+    }
+    int[] blob = [];
+    for (int i = 0; i < code.length; i++) { blob.add(code[i]); }
+    for (int i = 0; i < data.length; i++) { blob.add(data[i]); }
+    link.bytes = elfEmit(plan, blob);
+}
+
 private int objFindDef(string[] defNames, string name) {
     for (int i = 0; i < defNames.length; i++) {
         if (defNames[i] == name) { return i; }
@@ -2002,7 +2885,9 @@ class ObjSession {
                     if (raw.length > 0) {
                         ObjReader r = new ObjReader(raw);
                         ObjNote note = new ObjNote();
-                        string perr = objPeekCoffNote(r, note);
+                        string perr = "";
+                        if (this.targetOs == "LINUX") { perr = objPeekElfNote(r, note); }
+                        else { perr = objPeekCoffNote(r, note); }
                         if (perr.length == 0 && note.flags == this.flags && note.hash == this.notedH[n]) {
                             ok = true;
                         }
@@ -2040,6 +2925,7 @@ class ObjSession {
             return "object cache: corrupt COFF object";
         }
         ObjReader r = new ObjReader(raw);
+        if (this.targetOs == "LINUX") { return objParseElf(r, obj); }
         return objParseCoff(r, obj);
     }
 
