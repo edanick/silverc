@@ -895,7 +895,7 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
     int[] empty = [];
     if (osess == null) { return empty; }
     string target = ppTargetOsFor(flags.targetOs);
-    if (target != "WINDOWS") {
+    if (target != "WINDOWS" && target != "LINUX") {
         flags.errLine("cache-object: " + objTargetDirName(target) + " target is outside the v1 object tier; full monolithic compile, objects not updated");
         return empty;
     }
@@ -958,7 +958,7 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
         MiniCg ocg = new MiniCg(oasm);
         ocg.threadCount = flags.threadCount;
         ocg.runtimeMode = false;
-        ocg.targetOs = "WINDOWS";
+        ocg.targetOs = target;
         if (inputIsProject) {
             NativeModules ocgNm = projectParseNativeModules(manifest);
             ocg.customNative = ocgNm;
@@ -988,7 +988,7 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
             flags.errLine("object cache: '" + rel + "' was never noted");
             exit(1);
         }
-        int[] obytes = emitObject(unit, osess.flags, hOut[0], sOut[0]);
+        int[] obytes = emitObject(unit, osess.flags, hOut[0], sOut[0], target);
         string werr = osess.writeUnit(rel, obytes);
         if (werr.length > 0) {
             flags.errLine(werr);
@@ -1006,7 +1006,9 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
             exit(1);
         }
         ObjReader orr = new ObjReader(raw);
-        string perr = objParseCoff(orr, pu);
+        string perr = "";
+        if (target == "LINUX") { perr = objParseElf(orr, pu); }
+        else { perr = objParseCoff(orr, pu); }
         if (perr.length > 0) {
             flags.errLine(perr);
             exit(1);
@@ -1014,7 +1016,11 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
         parsed.add(pu);
     }
     ObjLinkResult link = new ObjLinkResult();
-    linkUnits(parsed, subsystem, verKeys, verVals, link);
+    if (target == "LINUX") {
+        linkUnitsElf(parsed, link);
+    } else {
+        linkUnits(parsed, subsystem, verKeys, verVals, link);
+    }
     if (link.err.length > 0) {
         flags.errLine(link.err);
         exit(1);
