@@ -20,6 +20,7 @@ import * from node;
 import * from cli_flags;
 import * from optimizer;
 import * from bcache;
+import * from objcache;
 import * from watcher;
 import * from progress;
 import * from visibility;
@@ -97,9 +98,10 @@ void printHelp() {
 #on MAC
     printline("  --cache-bytecode  Persistent bytecode cache (/Library/Caches/Silver)");
 #off
+    printline("  --cache-object   Persistent per-target object cache (<os>-<arch> under the same root)");
     printline("  --watch           Predictive precompilation watcher");
-    printline("  --threads <N>     Explicit worker count (default: 90% of system threads)");
-    printline("  --os windows|linux|mac  Target OS (default: host; WINDOWS, LINUX, MAC also accepted)");
+    printline("  --threads <N>     Explicit worker count (default: total threads - 2)");
+    printline("  --os windows|linux|mac  Target OS (default: host; WINDOWS, LINUX, MAC)");
     printline("  --debug           Debug build-mode: feeds `#on DEBUG` regions (default is release)");
     printline("  --release         Not a flag: prints a notice (default mode is release) and exits");
     printline("");
@@ -184,12 +186,12 @@ string drvFileStem(string path) {
 // Map dots in `name` to `sep` (`mini_cg.windows` -> `mini_cg/windows.sr`
 // with sep "/").
 string drvDottedPath(string name, string sep) {
-    string out = "";
+    string[] parts = [];
     for (int i = 0; i < name.length; i++) {
-        if (name[i] == '.') { out += sep; }
-        else { out += name[i]; }
+        if (name[i] == '.') { parts.add(sep); }
+        else { parts.add((string)name[i]); }
     }
-    return out;
+    return parts.join("");
 }
 
 // True when `name` is a dotted child of the baked-in `root` module
@@ -343,40 +345,96 @@ string findModulePath(string name, string inputFile) {
     return "";
 }
 
-// Locate a source-level module by name, returning its full source text (or
-// "" when the module is native/builtin or cannot be found).
-string findModuleSource(string name, string inputFile) {
-    string path = findModulePath(name, inputFile);
-    if (path.length == 0) { return ""; }
-    return tryReadFile(path);
-}
-
 string cacheMarkerLine(string path) {
     return cacheMarkerPrefix() + path.normalize(path) + "\n";
 }
 
-// Recursively collect the sources of every non-builtin module imported by
-// `source`, prepending each module's own dependencies first. A module is
-// collected once (by name). The result is the concatenation of all module
-// sources (with the leading `mod export` line and inner import lines intact:
-// the parser ignores import statements and `mod export` at the top level).
-// With emitMarkers set, one cache-marker comment line precedes each file's
-// content so the aggregate can be split per file again (--cache-bytecode).
-// When progress is non-null, one progress line is printed per module.
-string collectModule(string name, string inputFile, string[] visited, bool emitMarkers, ProgressReporter progress, bool debugBuild) {
-    for (int i = 0; i < visited.length; i++) {
-        if (visited[i] == name) { return ""; }
+// One output buffer for standalone import collection: per-module texts are
+// appended here and joined once by collectImports. The old per-module
+// `result += collectModule(...)` recursion left quadratic never-freed
+// intermediates behind (one abandoned buffer per collected module).
+class DrvSourcePieces {
+    public prop string[] parts;
+
+    construct {
+        this.parts = [];
     }
+
+    public void add(string s) {
+        this.parts.add(s);
+    }
+
+    public string joinAll() {
+        return this.parts.join("");
+    }
+}
+
+// Module-resolution cache: each module name resolves to its path once per
+// compile instead of being re-probed (dozens of file reads) per importer,
+// per pass, and per probe. The stored path is the findModulePath hit itself,
+// so progress lines and cache markers read byte-identically; the file text
+// is read once and passed through to collectModuleInto, never re-read.
+class DrvModuleCache {
+    public prop string[] names;
+    public prop string[] paths;
+
+    construct {
+        this.names = [];
+        this.paths = [];
+    }
+
+    public int find(string name) {
+        for (int i = 0; i < this.names.length; i++) {
+            if (this.names[i] == name) { return i; }
+        }
+        return -1;
+    }
+
+    public string pathFor(string name) {
+        int idx = this.find(name);
+        if (idx < 0) { return ""; }
+        return this.paths[idx];
+    }
+
+    public void store(string name, string path) {
+        int idx = this.find(name);
+        if (idx < 0) {
+            this.names.add(name);
+            this.paths.add(path);
+            return;
+        }
+        this.paths[idx] = path;
+    }
+}
+
+// Resolve one module name to its path, once per name per compile ("" when
+// native/builtin/missing). Misses stay uncached: an unknown module aborts
+// the compile, so no second probe ever happens.
+string drvCachedModulePath(string name, string inputFile, DrvModuleCache cache) {
+    string hit = cache.pathFor(name);
+    if (hit.length > 0) { return hit; }
+    string resolved = findModulePath(name, inputFile);
+    if (resolved.length > 0) { cache.store(name, resolved); }
+    return resolved;
+}
+
+// Recursively collect the sources of every non-builtin module imported by
+// the module whose path and text are given, appending each module's own
+// dependencies first into `out` (with the leading `mod export` line and
+// inner import lines intact: the parser ignores import statements and
+// `mod export` at the top level). A module is collected once (by name in
+// `visited`, a ProjectVisited so growth past 8 modules stays visible to the
+// caller). The pieces join once in collectImports. With emitMarkers set, one
+// cache-marker comment line precedes each file's content so the aggregate
+// can be split per file again (--cache-bytecode).
+// When progress is non-null, one progress line is printed per module.
+void collectModuleInto(string name, string inputFile, string modPath, string modSrc, ProjectVisited visited, DrvModuleCache cache, bool emitMarkers, ProgressReporter progress, bool debugBuild, DrvSourcePieces out) {
+    if (visited.contains(name)) { return; }
     visited.add(name);
-    string modPath = findModulePath(name, inputFile);
-    if (modPath.length == 0) { return ""; }
-    string modSrc = tryReadFile(modPath);
-    if (modSrc.length == 0) { return ""; }
     // DOCS/260 — filter the module BEFORE its imports are scanned so imports
     // inside non-matching regions are never resolved.
     string modFiltered = drvPreprocessOrDie(modSrc, debugBuild);
     modSrc = modFiltered;
-    string result = "";
     int cursor = 0;
     while (cursor < modSrc.length) {
         int importPos = projectFind(modSrc, "import", cursor);
@@ -406,10 +464,13 @@ string collectModule(string name, string inputFile, string[] visited, bool emitM
         if (semi < 0) { break; }
         string statement = projectSlice(modSrc, importPos + 6, semi);
         string depName = projectImportModule(statement);
-        if (depName.length > 0) {
-            string depPath = findModulePath(depName, inputFile);
+        if (depName.length > 0 && !visited.contains(depName)) {
+            string depPath = drvCachedModulePath(depName, inputFile, cache);
             if (depPath.length > 0) {
-                result += collectModule(depName, inputFile, visited, emitMarkers, progress, debugBuild);
+                string depText = tryReadFile(depPath);
+                if (depText.length > 0) {
+                    collectModuleInto(depName, inputFile, depPath, depText, visited, cache, emitMarkers, progress, debugBuild, out);
+                }
             }
         }
         cursor = semi + 1;
@@ -417,59 +478,9 @@ string collectModule(string name, string inputFile, string[] visited, bool emitM
     string marker = "";
     if (emitMarkers) { marker = cacheMarkerLine(modPath); }
     if (progress != null) { progress.moduleDone(modPath); }
-    return result + marker + modSrc + "\n";
-}
-
-// Count how many non-builtin modules `collectModule` would collect for a given
-// module name (1 for the module itself plus its transitive imports). Mirrors
-// `collectModule`'s resolution logic exactly so the total is precise.
-int countModule(string name, string inputFile, string[] visited, bool debugBuild) {
-    for (int i = 0; i < visited.length; i++) {
-        if (visited[i] == name) { return 0; }
-    }
-    visited.add(name);
-    string modPath = findModulePath(name, inputFile);
-    if (modPath.length == 0) { return 0; }
-    string countRaw = tryReadFile(modPath);
-    string modSrc = drvPreprocessOrDie(countRaw, debugBuild);
-    if (modSrc.length == 0) { return 0; }
-    int sub = 0;
-    int cursor = 0;
-    while (cursor < modSrc.length) {
-        int importPos = projectFind(modSrc, "import", cursor);
-        if (importPos < 0) { break; }
-        // Same line-leading + whole-word guard as collectModule so the
-        // count stays in lockstep with the real collection.
-        bool lineLeading = true;
-        for (int bi = importPos - 1; bi >= 0; bi--) {
-            char bc = modSrc[bi];
-            if (bc == '\n') { break; }
-            if (bc != ' ' && bc != '\t' && bc != '\r') { lineLeading = false; break; }
-        }
-        if (!lineLeading) {
-            cursor = importPos + 6;
-            continue;
-        }
-        if (importPos + 6 < modSrc.length) {
-            char ic = modSrc[importPos + 6];
-            if (ic != ' ' && ic != '\t' && ic != '\r' && ic != '\n' && ic != '{' && ic != '*') {
-                cursor = importPos + 6;
-                continue;
-            }
-        }
-        int semi = projectFind(modSrc, ";", importPos + 6);
-        if (semi < 0) { break; }
-        string statement = projectSlice(modSrc, importPos + 6, semi);
-        string depName = projectImportModule(statement);
-        if (depName.length > 0) {
-            string depPath = findModulePath(depName, inputFile);
-            if (depPath.length > 0) {
-                sub += countModule(depName, inputFile, visited, debugBuild);
-            }
-        }
-        cursor = semi + 1;
-    }
-    return 1 + sub;
+    out.add(marker);
+    out.add(modSrc);
+    out.add("\n");
 }
 
 // Known built-in module names used for did-you-mean suggestions on imports.
@@ -518,8 +529,9 @@ bool importIsMac(string name) {
 }
 
 string collectImports(string source, string inputFile, string ignored, string[] errs, bool emitMarkers, ProgressReporter progress, bool debugBuild) {
-    string[] visited = [];
-    string result = "";
+    ProjectVisited visited = new ProjectVisited();
+    DrvModuleCache cache = new DrvModuleCache();
+    DrvSourcePieces pieces = new DrvSourcePieces();
     int cursor = 0;
     while (cursor < source.length) {
         int importPos = projectFind(source, "import", cursor);
@@ -563,91 +575,49 @@ string collectImports(string source, string inputFile, string ignored, string[] 
                 || moduleName == "hash" || moduleName == "path"
                 || moduleName == "console" || moduleName == "math"
                 || moduleName == "http" || moduleName == "os";
-            string depProbe = "";
-            if (!prepended) { depProbe = findModuleSource(moduleName, inputFile); }
-            if (!prepended && depProbe.length == 0) {
-                // SYNTAX_EXCEPTIONS.md — unknown module, with a did-you-mean
-                // suggestion when it resembles a known one.
-                int rel = projectFind(statement, moduleName, 0);
-                int absOff = importPos + 6;
-                if (rel >= 0) { absOff = importPos + 6 + rel; }
-                int[] loc = []; loc.add(0); loc.add(0);
-                diagLocateOffset(source, absOff, loc);
-                string sugg = array.findBestMatch(diagKnownModules(), moduleName);
-                if (sugg.length > 0) {
-                    errs.add("did you mean to import the module \"" + sugg + "\"?, unknown module \"" + moduleName + "\" was found at line " + (string)loc[0] + " column " + (string)loc[1]);
+            if (!prepended && !visited.contains(moduleName)) {
+                string depPath = drvCachedModulePath(moduleName, inputFile, cache);
+                string depText = "";
+                if (depPath.length > 0) { depText = tryReadFile(depPath); }
+                if (depText.length == 0) {
+                    // SYNTAX_EXCEPTIONS.md — unknown module, with a did-you-mean
+                    // suggestion when it resembles a known one.
+                    int rel = projectFind(statement, moduleName, 0);
+                    int absOff = importPos + 6;
+                    if (rel >= 0) { absOff = importPos + 6 + rel; }
+                    int[] loc = []; loc.add(0); loc.add(0);
+                    diagLocateOffset(source, absOff, loc);
+                    string sugg = array.findBestMatch(diagKnownModules(), moduleName);
+                    if (sugg.length > 0) {
+                        errs.add("did you mean to import the module \"" + sugg + "\"?, unknown module \"" + moduleName + "\" was found at line " + (string)loc[0] + " column " + (string)loc[1]);
+                    } else {
+                        errs.add("unknown module \"" + moduleName + "\" was found at line " + (string)loc[0] + ", column " + (string)loc[1] + ". module either doesn't exist or not installed.");
+                    }
                 } else {
-                    errs.add("unknown module \"" + moduleName + "\" was found at line " + (string)loc[0] + ", column " + (string)loc[1] + ". module either doesn't exist or not installed.");
+                    collectModuleInto(moduleName, inputFile, depPath, depText, visited, cache, emitMarkers, progress, debugBuild, pieces);
                 }
-            } else {
-                result += collectModule(moduleName, inputFile, visited, emitMarkers, progress, debugBuild);
+            } else if (prepended && !visited.contains(moduleName)) {
+                // Hand-prepended or native-backed modules (llmai, exception,
+                // env, math, ...): never an unknown-module error, but their
+                // source-level bodies (e.g. std/env.sr's set/keys, which the
+                // self-host dispatches to as globals) still collect from disk
+                // exactly like the old unconditional collectModule call did.
+                string prePath = drvCachedModulePath(moduleName, inputFile, cache);
+                if (prePath.length > 0) {
+                    string preText = tryReadFile(prePath);
+                    if (preText.length > 0) {
+                        collectModuleInto(moduleName, inputFile, prePath, preText, visited, cache, emitMarkers, progress, debugBuild, pieces);
+                    }
+                }
             }
         }
         cursor = semi + 1;
     }
     if (emitMarkers) {
-        if (result.length > 0) { return result + cacheMarkerLine(inputFile) + source; }
-        return cacheMarkerLine(inputFile) + source;
+        pieces.add(cacheMarkerLine(inputFile));
     }
-    if (result.length > 0) { return result + source; }
-    return source;
-}
-
-// Count how many modules (1 entry + all transitively resolved imports)
-// `collectImports` would collect, using the same resolution logic so the
-// total is exact. The counting pass never builds source strings; it only
-// walks the import graph.
-int countModuleImports(string source, string inputFile, string ignored, bool debugBuild) {
-    string[] visited = [];
-    int count = 1;
-    int cursor = 0;
-    while (cursor < source.length) {
-        int importPos = projectFind(source, "import", cursor);
-        if (importPos < 0) { break; }
-        // Only treat a line-leading `import` as an import statement.
-        bool lineLeading = true;
-        for (int bi = importPos - 1; bi >= 0; bi--) {
-            char bc = source[bi];
-            if (bc == '\n') { break; }
-            if (bc != ' ' && bc != '\t' && bc != '\r') { lineLeading = false; break; }
-        }
-        if (!lineLeading) {
-            cursor = importPos + 6;
-            continue;
-        }
-        // Whole-word check: reject matches glued to identifier characters.
-        // Structured as a direct continue (no flag variable) for robustness.
-        if (importPos + 6 < source.length) {
-            char inc = source[importPos + 6];
-            if (inc != ' ' && inc != '\t' && inc != '\r' && inc != '\n' && inc != '{' && inc != '*') {
-                cursor = importPos + 6;
-                continue;
-            }
-        }
-        int semi = projectFind(source, ";", importPos + 6);
-        if (semi < 0) { break; }
-        string statement = projectSlice(source, importPos + 6, semi);
-        string moduleName = projectImportModule(statement);
-        if (moduleName.length > 0 && !projectBuiltin(moduleName) && !importIsWin32(moduleName) && !importIsLinux(moduleName) && !importIsMac(moduleName) && moduleName != "project") {
-            bool prepended = moduleName == "llmai" || moduleName == "LLMAI"
-                || moduleName == "exception" || moduleName == "bom"
-                || moduleName == "process" || moduleName == "notifications"
-                || moduleName == "env" || moduleName == "url"
-                || moduleName == "hash" || moduleName == "path"
-                || moduleName == "console" || moduleName == "math"
-                || moduleName == "http" || moduleName == "os";
-            string depProbe = "";
-            if (!prepended) { depProbe = findModuleSource(moduleName, inputFile); }
-            if (!prepended && depProbe.length == 0) {
-                // Unknown module: the real collectImports pass reports it and
-                // aborts; the count is irrelevant when the compile fails.
-            } else {
-                count += countModule(moduleName, inputFile, visited, debugBuild);
-            }
-        }
-        cursor = semi + 1;
-    }
-    return count;
+    pieces.add(source);
+    return pieces.joinAll();
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,14 +1006,13 @@ int compileOnce(CliFlags flags, string outputFile) {
         string projectType = projectManifestValue(manifest, "type");
         if (projectType == "quicksilver") {
             // `type: quicksilver` (DOCS/226): emit a QuickSilver (.qs) library
-            // bundle instead of an executable. Count the modules from the
-            // manifest entries for the success line.
-            string root = projectDirname(inputFile);
-            string qEntry = projectManifestValue(manifest, "entry");
-            string[] qSources = projectManifestSources(manifest);
-            ProjectVisited qVisited = new ProjectVisited();
-            moduleCount = projectCountCollect(projectJoin(root, qEntry), root, qSources, qVisited, flags.debugBuild);
-            int[] bundle = projectBuildBundle(inputFile);
+            // bundle instead of an executable. The module count for the
+            // success line comes back from the single bundle walk (no counting
+            // pre-pass: it re-read and re-filtered every file).
+            int[] qsCount = [];
+            qsCount.add(0);
+            int[] bundle = projectBuildBundle(inputFile, qsCount);
+            moduleCount = qsCount[0];
             file.writeBytes(outputFile, bundle);
             drvReportSuccess(outputFile, moduleCount, startTick);
             return 0;
@@ -1052,18 +1021,19 @@ int compileOnce(CliFlags flags, string outputFile) {
 
     string source = file.readString(inputFile);
     if (inputIsProject) {
-        // Count the project modules (entry + transitively collected imports)
-        // for the final success line; projectBuildSource runs the same pass.
-        string pRoot = projectDirname(inputFile);
-        string pEntry = projectManifestValue(manifest, "entry");
-        string[] pSources = projectManifestSources(manifest);
-        ProjectVisited pVisited = new ProjectVisited();
-        moduleCount = projectCountCollect(projectJoin(pRoot, pEntry), pRoot, pSources, pVisited, flags.debugBuild);
-        progress = new ProgressReporter(moduleCount);
+        // No counting pre-pass (it re-read and re-filtered every file just
+        // for the progress total). Collection reports indeterminate `[N/N]`
+        // lines while running; the exact success-line count comes back from
+        // the single projectBuildSource pass in buildCount.
+        progress = new ProgressReporter(1);
+        int[] buildCount = [];
+        buildCount.add(0);
         // DOCS/260 — the .srp aggregate (markers + per-file sources) was
         // already filtered per file inside projectCollect; this pass is a
         // no-op safety net (files with no directives return unchanged).
-        string builtSource = projectBuildSource(inputFile, flags.cacheBytecode, flags.debugBuild);
+        string builtSource = projectBuildSource(inputFile, flags.cacheBytecode || flags.cacheObject, flags.debugBuild, buildCount);
+        moduleCount = buildCount[0];
+        progress.setTotal(moduleCount);
         source = drvPreprocessOrDie(builtSource, flags.debugBuild);
     } else {
         // `.col` declarations require a project manifest with a configured
@@ -1177,14 +1147,14 @@ int compileOnce(CliFlags flags, string outputFile) {
         // file next to the input, under std/, or under silveri/src is
         // collected the same way. Native modules (fs/json/yaml/os + the
         // special-cased std libs above) are never read from disk.
-        // Progress (STDERR): pre-count the modules (entry + imports) so the
-        // lines show an exact `[processed/total]` and a real ETA.
+        // Progress (STDERR): no counting pre-pass (it re-read and
+        // re-filtered every file just for the total). Collection reports
+        // indeterminate `[N/N]` lines while running; the exact total is
+        // pinned once the single pass below finishes.
         string[] moduleErrors = [];
-        int moduleCountImports = countModuleImports(source, inputFile, "", flags.debugBuild);
-        moduleCount = moduleCountImports;
-        progress = new ProgressReporter(moduleCountImports);
+        progress = new ProgressReporter(1);
         progress.moduleDone(inputFile);
-        source = collectImports(source, inputFile, "", moduleErrors, flags.cacheBytecode, progress, flags.debugBuild);
+        source = collectImports(source, inputFile, "", moduleErrors, flags.cacheBytecode || flags.cacheObject, progress, flags.debugBuild);
         if (moduleErrors.length > 0) {
             // Unknown-module diagnostics are reported against the entry
             // source (pre-collection lines), so they always belong to the
@@ -1195,6 +1165,8 @@ int compileOnce(CliFlags flags, string outputFile) {
             }
             exit(1);
         }
+        progress.setTotal(progress.processedCount());
+        moduleCount = progress.processedCount();
         progress.finish();
     }
 
@@ -1214,6 +1186,15 @@ int compileOnce(CliFlags flags, string outputFile) {
 
     Token[] tokens = [];
     CacheSession? sess = null;
+    // OVERHAUL.md --cache-object: per-target object session over the same
+    // root/name as the bytecode session. Null unless requested (or when the
+    // per-host cache root is unavailable) — callers fall back to the
+    // uncached pipeline.
+    ObjSession? osess = null;
+    if (flags.cacheObject) {
+        osess = new ObjSession(path.dirname(inputFile), cacheSessionName(inputFile, inputIsProject), ppTargetOsFor(flags.targetOs), flags.modeName(), flags.optimize);
+        if (!osess.ok) { osess = null; }
+    }
     if (!flags.cacheBytecode) {
         Lexer lexer = new Lexer(source);
         tokens = lexer.tokenize();
@@ -1223,6 +1204,18 @@ int compileOnce(CliFlags flags, string outputFile) {
         if (lexer.lexErrors.length > 0) {
             drvPrintDiagnostics(lexer.lexErrors, source, inputFile, flags.cacheBytecode);
             exit(1);
+        }
+        // OVERHAUL.md --cache-object without --cache-bytecode: the aggregate
+        // lexed whole above; observe each collected file for per-target .o
+        // emission from its source slice.
+        if (osess != null) {
+            MarkedChunks objChunks = new MarkedChunks();
+            objChunks.split(source);
+            for (int oi = 0; oi < objChunks.paths.length; oi++) {
+                string objAbs = objChunks.paths[oi].replaceAll("/", "\\");
+                int objMtime = file.modification(objAbs).milliseconds();
+                osess.noteFile(objAbs, source, objChunks.starts[oi], objChunks.ends[oi], "", objMtime);
+            }
         }
     } else {
         // OVERHAUL.md --cache-bytecode: lex each collected file separately,
@@ -1250,6 +1243,14 @@ int compileOnce(CliFlags flags, string outputFile) {
                 Token[] part = sess.tokensForRange(
                     chunks.paths[ci2].replaceAll("/", "\\"),
                     source, chunks.starts[ci2], chunks.ends[ci2], hopPath);
+                // OVERHAUL.md --cache-object two-tier flow: object emission
+                // packs the synced .srbc text when the bytecode tier hit and
+                // falls back to source otherwise — never re-lexes.
+                if (osess != null) {
+                    string objAbs = chunks.paths[ci2].replaceAll("/", "\\");
+                    int objMtime = file.modification(objAbs).milliseconds();
+                    osess.noteFile(objAbs, source, chunks.starts[ci2], chunks.ends[ci2], sess.lastPayload, objMtime);
+                }
                 int off = chunks.startLines[ci2];
                 for (int tj = 0; tj < part.length; tj++) {
                     Token t = part[tj];
@@ -1358,7 +1359,6 @@ int compileOnce(CliFlags flags, string outputFile) {
     cg.progress = progress;
 
     cg.genProgram(ast);
-    cg.getStringData();
 
     // OVERHAUL.md --optimize: behavior-preserving peephole pass over the
     // emitted machine code (in-place NOP rewrites only; DISABLED — see
@@ -1445,6 +1445,18 @@ int compileOnce(CliFlags flags, string outputFile) {
     pe.globalAreaSize = cg.globalAreaSize;
     int[] peData = pe.build(finalCode, stringData, versionData);
 
+    // OVERHAUL.md --cache-object: link gate. Re-emit changed objects, then
+    // unify (validate) the cached + refreshed .o files with the built-in
+    // unifier BEFORE the final binary is written — a corrupt or stale
+    // object fails the build loudly instead of being linked silently.
+    if (osess != null) {
+        string objErr = osess.finish();
+        if (objErr.length > 0) {
+            flags.errLine(objErr);
+            exit(1);
+        }
+    }
+
     if (flags.mode == 1) {
         // OVERHAUL.md --jit: run the emitted image as a direct child process
         // and propagate its exit code. Standalone outputs keep the requested
@@ -1488,6 +1500,12 @@ int compileOnce(CliFlags flags, string outputFile) {
 // ---------------------------------------------------------------------------
 
 void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, string outputFile) {
+    // Memory note: every rebuild runs in-process, so each tick's full working
+    // set (aggregate + tokens + AST) stays resident in the never-free runtime.
+    // Reclaiming it fully would need each rebuild to run in a fresh child
+    // process — deliberately not restructured here. What IS bounded cheaply:
+    // the poll snapshot buffers below are drained and refilled in place
+    // instead of reallocated per tick.
     string root = ".";
     string[] files = [];
     bool multiFile = false;
@@ -1556,10 +1574,11 @@ void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, stri
             if (!known) { changed = true; }
         }
         if (changed) {
-            // Re-sync the snapshot so newly added files gain entries.
-            sigPaths = [];
-            sigMtimes = [];
-            sigSizes = [];
+            // Re-sync the snapshot so newly added files gain entries. The
+            // buffers drain in place (capacity reused) instead of reallocating.
+            while (sigPaths.length > 0) { sigPaths.pop(); }
+            while (sigMtimes.length > 0) { sigMtimes.pop(); }
+            while (sigSizes.length > 0) { sigSizes.pop(); }
             for (int r = 0; r < current.length; r++) {
                 sigPaths.add(current[r]);
                 sigMtimes.add(file.modification(current[r]).milliseconds());
@@ -1595,10 +1614,10 @@ void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, stri
             flags.errLine("watch: precompilation failed");
         }
 
-        // Re-sync state after the tick.
-        sigPaths = [];
-        sigMtimes = [];
-        sigSizes = [];
+        // Re-sync state after the tick (same in-place drain as above).
+        while (sigPaths.length > 0) { sigPaths.pop(); }
+        while (sigMtimes.length > 0) { sigMtimes.pop(); }
+        while (sigSizes.length > 0) { sigSizes.pop(); }
         string[] post = files;
         if (inputIsProject) { post = watchScanSources(root); }
         for (int q = 0; q < post.length; q++) {
