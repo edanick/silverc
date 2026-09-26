@@ -2057,12 +2057,14 @@ int strIdx = this.stringPatchIndices[i];
                 }
             }
         }
-        // WINDOWS-TARGET: the exception-state globals of the cooperative
-        // throw/catch model (__exc_active flag + __exc_value object slot).
-        #on WINDOWS
-        // Reserve two writable global slots for the exception state: an
-        // active flag and the thrown value. Registered after user globals so
-        // their indices are stable and the init stub zeroes them.
+        // Exception-state globals of the cooperative throw/catch model
+        // (__exc_active flag + __exc_value object slot): two writable slots
+        // registered after user globals so their indices are stable and the
+        // init stub zeroes them. Target-selected at runtime (not a region):
+        // the running binary always carries every backend, so --os cross
+        // builds resolve alike on any host; the Linux target additionally
+        // reserves __linux_stack_top (the entry stub captures the _start RSP
+        // there, and the backend's findGlobal must resolve it).
         this.globalNames.add("__exc_active");
         this.globalTypes.add("int");
         this.globalOffsets.add(this.globalOffsets.length * 8);
@@ -2073,28 +2075,13 @@ int strIdx = this.stringPatchIndices[i];
         this.globalOffsets.add(this.globalOffsets.length * 8);
         Node excMissing2 = new Node(); excMissing2.kind = 255;
         this.globalInits.add(excMissing2);
-        #on LINUX
-        // Linux backend: the same two exception-state slots (the cooperative
-        // label-dispatch model is OS-independent; the woven throw/catch
-        // emitters resolve these names via findGlobal). Plus
-        // __linux_stack_top: the entry stub captures the _start RSP here so
-        // genCargsCall rebuilds argc/argv from it. Same shapes as WINDOWS.
-        this.globalNames.add("__exc_active");
-        this.globalTypes.add("int");
-        this.globalOffsets.add(this.globalOffsets.length * 8);
-        Node excMissing1 = new Node(); excMissing1.kind = 255;
-        this.globalInits.add(excMissing1);
-        this.globalNames.add("__exc_value");
-        this.globalTypes.add("int");
-        this.globalOffsets.add(this.globalOffsets.length * 8);
-        Node excMissing2 = new Node(); excMissing2.kind = 255;
-        this.globalInits.add(excMissing2);
-        this.globalNames.add("__linux_stack_top");
-        this.globalTypes.add("int");
-        this.globalOffsets.add(this.globalOffsets.length * 8);
-        Node stkMissing = new Node(); stkMissing.kind = 255;
-        this.globalInits.add(stkMissing);
-        #off
+        if (this.isLinuxTarget()) {
+            this.globalNames.add("__linux_stack_top");
+            this.globalTypes.add("int");
+            this.globalOffsets.add(this.globalOffsets.length * 8);
+            Node stkMissing = new Node(); stkMissing.kind = 255;
+            this.globalInits.add(stkMissing);
+        }
         if (this.globalNames.length > 0) {
             this.globalAreaSize = this.globalNames.length * 8;
         }
@@ -2238,29 +2225,29 @@ int strIdx = this.stringPatchIndices[i];
             // executable: synthesize an entry that exits with status 0.
             this.beginOwnedStub();
             this.mainLabelOffset = this.asm.buf.length;
-            #on WINDOWS
-            this.asm.xorRR64(0, 0);
-            this.asm.movRR64(1, 0);
-            this.addImportPatch("kernel32.dll", "ExitProcess");
-            int sSyn = 0xDEADBEEFCAFEBABE;
-            this.asm.emitImm64(0, sSyn);
-            this.asm.movRMBase(0, 0, 0);
-            this.asm.emitCallSetup(0);
-            this.asm.callR64(0);
-            this.asm.emitCallTeardown();
-            #on LINUX
-            // Linux backend: exit(0) through libc. RDI is the first SysV
-            // argument register; Direct (no shuffle: RDI preset here).
-            // mainLabelOffset stays assigned above so driver entry plumbing
-            // is intact.
-            this.asm.xorRR64(7, 7);
-            this.addImportPatchDirect("libc.so.6", "exit");
-            this.asm.emitImm64(0, 0);
-            this.asm.movRMBase(0, 0, 0);
-            this.emitAbiCallSetup(0);
-            this.asm.callR64(0);
-            this.emitAbiCallTeardown();
-            #off
+            // Exit stub: target-selected at runtime (see the genProgram
+            // globals note). Linux exits through libc (RDI is the first SysV
+            // argument register); mainLabelOffset stays assigned above so
+            // driver entry plumbing is intact.
+            if (this.isLinuxTarget()) {
+                this.asm.xorRR64(7, 7);
+                this.addImportPatchDirect("libc.so.6", "exit");
+                this.asm.emitImm64(0, 0);
+                this.asm.movRMBase(0, 0, 0);
+                this.emitAbiCallSetup(0);
+                this.asm.callR64(0);
+                this.emitAbiCallTeardown();
+            } else {
+                this.asm.xorRR64(0, 0);
+                this.asm.movRR64(1, 0);
+                this.addImportPatch("kernel32.dll", "ExitProcess");
+                int sSyn = 0xDEADBEEFCAFEBABE;
+                this.asm.emitImm64(0, sSyn);
+                this.asm.movRMBase(0, 0, 0);
+                this.asm.emitCallSetup(0);
+                this.asm.callR64(0);
+                this.asm.emitCallTeardown();
+            }
         }
         // OVERHAUL.md --runtime: append the embedded allocator + GC entry
         // points after all program code, then an entry trampoline that brings
@@ -2922,28 +2909,28 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.xorRR64(0, 0);
             this.asm.movRR64(1, 0);
         }
-        #on WINDOWS
-        this.addImportPatch("kernel32.dll", "ExitProcess");
+        // Exit through the target console: target-selected at runtime (see
+        // the genProgram globals note). Linux exits through libc (the
+        // shared Win64-shaped path above staged the status in RCX; move it
+        // to RDI and call the mapped exit import, Direct: no shuffle).
+        if (this.isLinuxTarget()) {
+            this.asm.movRR64(7, 1);
+            this.addImportPatchDirect("libc.so.6", "exit");
+            this.asm.emitImm64(0, 0);
+            this.asm.movRMBase(0, 0, 0);
+            this.emitAbiCallSetup(0);
+            this.asm.callR64(0);
+            this.emitAbiCallTeardown();
+        } else {
+            this.addImportPatch("kernel32.dll", "ExitProcess");
 
-        int sEx = 0xDEADBEEFCAFEBABF;
-        this.asm.emitImm64(0, sEx);
-        this.asm.movRMBase(0, 0, 0);
-        this.asm.emitCallSetup(0);
-        this.asm.callR64(0);
-        this.asm.emitCallTeardown();
-        #on LINUX
-        // Linux backend: exit(main's status) through libc. The branches
-        // above staged the status in RCX (the shared Win64-shaped path);
-        // move it to RDI and call the mapped exit import (Direct: no
-        // shuffle, args already SysV).
-        this.asm.movRR64(7, 1);
-        this.addImportPatchDirect("libc.so.6", "exit");
-        this.asm.emitImm64(0, 0);
-        this.asm.movRMBase(0, 0, 0);
-        this.emitAbiCallSetup(0);
-        this.asm.callR64(0);
-        this.emitAbiCallTeardown();
-        #off
+            int sEx = 0xDEADBEEFCAFEBABF;
+            this.asm.emitImm64(0, sEx);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+        }
     }
 
     // LINUX SysV backend (additive): save the entry RSP into the
