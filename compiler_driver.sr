@@ -895,7 +895,7 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
     int[] empty = [];
     if (osess == null) { return empty; }
     string target = ppTargetOsFor(flags.targetOs);
-    if (target != "WINDOWS" && target != "LINUX") {
+    if (target != "WINDOWS" && target != "LINUX" && target != "MAC") {
         flags.errLine("cache-object: " + objTargetDirName(target) + " target is outside the v1 object tier; full monolithic compile, objects not updated");
         return empty;
     }
@@ -933,6 +933,17 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
         }
         owners.add(owner);
     }
+    // macOS object tier: only in-tier programs lower to ARM64 objects.
+    // Anything else compiles monolithically with a loud reason — never a
+    // stub object — and the cache on disk is left untouched (the fallback
+    // returns before plan/records are touched, same posture as --runtime).
+    if (target == "MAC") {
+        string tierReason = macTierReason(ast);
+        if (tierReason.length > 0) {
+            flags.errLine("cache-object: mac target is outside the v1 ARM64 object tier (" + tierReason + "); full monolithic compile, objects not updated");
+            return empty;
+        }
+    }
     bool debugObj = objDebugEnabled();
     ObjPlan p = new ObjPlan();
     osess.plan(p);
@@ -954,6 +965,16 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
     for (int si = 0; si < p.stale.length; si++) {
         string rel = p.stale[si];
         if (debugObj) { eprintln("[objcache] emit " + rel + " (codegen)"); }
+        ObjUnit unit = new ObjUnit();
+        if (target == "MAC") {
+            // Genuine per-file ARM64 machine code via the mac lowering
+            // (whole-program emission sliced to this file's unit).
+            string merr = macLowerOwned(ast, owners, entryKey, rel, unit);
+            if (merr.length > 0) {
+                flags.errLine(merr);
+                exit(1);
+            }
+        } else {
         MiniAsm oasm = new MiniAsm();
         MiniCg ocg = new MiniCg(oasm);
         ocg.threadCount = flags.threadCount;
@@ -972,11 +993,11 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
             return empty;
         }
         int[] fullCode = oasm.getBytes();
-        ObjUnit unit = new ObjUnit();
         string xerr = extractUnit(ocg, rel, unit);
         if (xerr.length > 0) {
             flags.errLine(xerr);
             exit(1);
+        }
         }
         if (objTooManyRelocs(unit)) {
             flags.errLine("cache-object: too many relocations in '" + rel + "' for one COFF section (v1 boundary); full monolithic compile, objects not updated");
@@ -1007,7 +1028,8 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
         }
         ObjReader orr = new ObjReader(raw);
         string perr = "";
-        if (target == "LINUX") { perr = objParseElf(orr, pu); }
+        if (target == "MAC") { perr = objParseMacho(orr, pu); }
+        else if (target == "LINUX") { perr = objParseElf(orr, pu); }
         else { perr = objParseCoff(orr, pu); }
         if (perr.length > 0) {
             flags.errLine(perr);
@@ -1016,7 +1038,9 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
         parsed.add(pu);
     }
     ObjLinkResult link = new ObjLinkResult();
-    if (target == "LINUX") {
+    if (target == "MAC") {
+        linkUnitsMac(parsed, link);
+    } else if (target == "LINUX") {
         linkUnitsElf(parsed, link);
     } else {
         linkUnits(parsed, subsystem, verKeys, verVals, link);
