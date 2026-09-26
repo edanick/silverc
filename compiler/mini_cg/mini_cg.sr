@@ -246,6 +246,54 @@ class MiniCg {
     // entries patch to their own body instead of the last declaration's.
     public prop int[] forwardCallFuncIdxs;
 
+    // OVERHAUL.md --cache-object ownership recording (off unless an
+    // object-unit run is open): while objRecord is set, every
+    // function-emission start pushes a mark attributing the following bytes
+    // to one source file, so a per-file relocatable object slices out of
+    // this shared emission later. The monolithic path never sets it, so its
+    // bytes are unaffected (every recording call below no-ops when false).
+    public prop bool objRecord;
+    // Owner key of the function currently being emitted (a session-relative
+    // path from the object session, or the entry key). Only meaningful while
+    // objRecord is set.
+    public prop string objCurOwner;
+    // Owner of synthesized regions (entry stub, global-init stub) and of
+    // unattributed items: the entry file's session key.
+    public prop string objEntryOwner;
+    // Owner per top-level program item (parallel to the program array the
+    // driver passes in); class items own all their methods.
+    public prop string[] objOwners;
+    // Emission-start marks: code/data offsets plus owner and defined symbol
+    // ("" for regular functions resolved through the function table, the
+    // anonymous name for anonymous bodies, "__slv_entry" for the entry stub).
+    public prop int[] markCodeOff;
+    public prop int[] markDataOff;
+    public prop string[] markOwner;
+    public prop string[] markSymbol;
+    // Owner recorded when an anonymous body was queued (parallel arrays):
+    // the drain loop emits each body under its own owner, so nested queues
+    // inherit the enclosing body's owner.
+    public prop int[] objAnonLabels;
+    public prop string[] objAnonNames;
+    public prop string[] objAnonOwners;
+    // Owning file per interned string (parallel to strings): with
+    // de-duplication disabled under objRecord, bytes and site always share
+    // an owner, exactly like the reference backend.
+    public prop string[] stringOwners;
+    // Owning file per function-table entry (parallel to funcNames).
+    public prop string[] funcOwners;
+    // Direct (already-resolved) call sites: the baked-rel32 emissions record
+    // the same identity the forward-call path would have carried, so the
+    // extractor converts them to relocations without rescanning bytes.
+    public prop int[] directCallOffsets;
+    public prop int[] directCallFuncIdxs;
+    public prop string[] directCallNames;
+    public prop string[] directCallClasses;
+    // Set while recording when inline assembly emits a raw rel32
+    // displacement (genAsmCall callRel32): no symbol attribution exists, so
+    // the unit cannot be extracted — the driver falls back monolithically.
+    public prop bool objHasRawRel32;
+
     // Source-module names seen in
     // `import * from X;` / `import { n } from X;` statements. Dotted-new
     // (`new mod.Class(...)`) resolves through these.
@@ -345,6 +393,24 @@ class MiniCg {
         this.forwardCallNames = [];
         this.forwardCallClasses = [];
         this.forwardCallFuncIdxs = [];
+        this.objRecord = false;
+        this.objCurOwner = "";
+        this.objEntryOwner = "";
+        this.objOwners = [];
+        this.markCodeOff = [];
+        this.markDataOff = [];
+        this.markOwner = [];
+        this.markSymbol = [];
+        this.objAnonLabels = [];
+        this.objAnonNames = [];
+        this.objAnonOwners = [];
+        this.stringOwners = [];
+        this.funcOwners = [];
+        this.directCallOffsets = [];
+        this.directCallFuncIdxs = [];
+        this.directCallNames = [];
+        this.directCallClasses = [];
+        this.objHasRawRel32 = false;
         this.globalNames = [];
         this.globalTypes = [];
         this.globalOffsets = [];
@@ -797,6 +863,61 @@ class MiniCg {
         return arrType;
     }
 
+    // Owner of top-level program item progIdx while recording (the
+    // driver's per-item owner); the current emission owner otherwise.
+    private string objOwnerFor(int progIdx) {
+        if (this.objRecord && progIdx >= 0 && progIdx < this.objOwners.length) { return this.objOwners[progIdx]; }
+        return this.objCurOwner;
+    }
+
+    // Push one ownership mark at the current emission point. No-op unless
+    // an object-unit run is recording, so monolithic bytes are unaffected.
+    public void pushObjMark(string symbol) {
+        if (!this.objRecord) { return; }
+        this.markCodeOff.add(this.asm.buf.length);
+        this.markDataOff.add(this.stringData.length);
+        this.markOwner.add(this.objCurOwner);
+        this.markSymbol.add(symbol);
+    }
+
+    // Attribute the function about to be emitted to progIdx's owner and
+    // mark its start. Only acts while recording; a no-op on the monolithic
+    // path.
+    public void beginOwnedFunction(int progIdx) {
+        if (!this.objRecord) { return; }
+        this.objCurOwner = this.objOwnerFor(progIdx);
+        this.pushObjMark("");
+    }
+
+    // Attribute the no-main synthetic stub to the entry file and mark it
+    // (a regular region; the link entry is the __slv_entry mark below).
+    public void beginOwnedStub() {
+        if (!this.objRecord) { return; }
+        this.objCurOwner = this.objEntryOwner;
+        this.pushObjMark("");
+    }
+
+    // Attribute the global-init entry-stub sequence (the image entry point
+    // whenever globals exist) to the entry file and mark it, defining the
+    // __slv_entry symbol the built-in linker prefers over main.
+    public void beginOwnedEntry() {
+        if (!this.objRecord) { return; }
+        this.objCurOwner = this.objEntryOwner;
+        this.pushObjMark("__slv_entry");
+    }
+
+    // Emit a resolved direct call and record it for the extractor, which
+    // converts cross-slice sites to relocations. Bytes are identical to
+    // the bare callRel32 emission this replaces.
+    public void emitDirectCall(int rel32, int funcIdx, string name, string cls) {
+        this.asm.callRel32(rel32);
+        if (!this.objRecord) { return; }
+        this.directCallOffsets.add(this.asm.buf.length - 4);
+        this.directCallFuncIdxs.add(funcIdx);
+        this.directCallNames.add(name);
+        this.directCallClasses.add(cls);
+    }
+
     public int newLabel() {
         int id = this.asm.labelPositions.length;
         this.asm.labelPositions.add(-1);
@@ -804,10 +925,16 @@ class MiniCg {
     }
 
     public int addString(string s) {
-        for (int i = 0; i < this.strings.length; i++) {
-            StrEntry se = this.strings[i];
-            if (se.text == s) {
-                return i;
+        // Under object-unit recording every use site interns its own bytes:
+        // cross-file de-duplication would split bytes from site, which the
+        // extractor forbids (mirrors the reference backend). The monolithic
+        // path keeps the shared scan byte-for-byte.
+        if (!this.objRecord) {
+            for (int i = 0; i < this.strings.length; i++) {
+                StrEntry se = this.strings[i];
+                if (se.text == s) {
+                    return i;
+                }
             }
         }
         int off = this.stringData.length;
@@ -820,6 +947,7 @@ class MiniCg {
         e = new StrEntry(s);
         e.dataOffset = off;
         this.strings.add(e);
+        this.stringOwners.add(this.objCurOwner);
         return this.strings.length - 1;
     }
 
@@ -1800,6 +1928,21 @@ int strIdx = this.stringPatchIndices[i];
         }
     }
 
+    // OVERHAUL.md --cache-object unit run: emit the shared full-program
+    // image with ownership recording (byte-identical to the monolithic
+    // path), so one file's machine code + data slice out afterwards.
+    // owners runs parallel to program (class items own their methods);
+    // entryOwner owns synthesized regions. The driver resolves branch
+    // displacements (asm.getBytes) and extracts each stale file in turn.
+    public void genProgramOwned(Node[] program, string[] owners, string entryOwner) {
+        this.objRecord = true;
+        this.objOwners = owners;
+        this.objEntryOwner = entryOwner;
+        this.objCurOwner = entryOwner;
+        this.genProgram(program);
+        this.objRecord = false;
+    }
+
     public void genProgram(Node[] program) {
         this.collectClassLayouts(program);
         for (int i = 0; i < program.length; i++) {
@@ -1963,6 +2106,7 @@ int strIdx = this.stringPatchIndices[i];
                 this.funcModules.add(pi.srcModule);
                 this.funcRetTypes.add(pi.typeHint);
                 this.funcOffsets.add(-1);
+                this.funcOwners.add(this.objOwnerFor(i));
                 int paramStart = this.funcParamDefaults.length;
                 int paramCount = 0;
                 bool hasVariadic = false;
@@ -1999,6 +2143,7 @@ int strIdx = this.stringPatchIndices[i];
                         this.funcModules.add(pi2.srcModule);
                         this.funcRetTypes.add(member.typeHint);
                         this.funcOffsets.add(-1);
+                        this.funcOwners.add(this.objOwnerFor(i));
                         int paramStart = this.funcParamDefaults.length;
                         int paramCount = 0;
                         bool hasVariadic = false;
@@ -2061,6 +2206,7 @@ int strIdx = this.stringPatchIndices[i];
         for (int i = 0; i < program.length; i++) {
             Node pi3 = program[i];
             if (pi3.kind == 100) {
+                this.beginOwnedFunction(i);
                 this.emitFunction(pi3);
                 fnDone++;
                 this.reportFnProgress(fnDone, fnTotal);
@@ -2073,6 +2219,7 @@ int strIdx = this.stringPatchIndices[i];
                 for (int j = 0; j < pi4.childCount(); j++) {
                     Node member = pi4.child(j);
                     if (member.kind == 100) {
+                        this.beginOwnedFunction(i);
                         this.emitMethod(member, pi4.name);
                         fnDone++;
                         this.reportFnProgress(fnDone, fnTotal);
@@ -2089,6 +2236,7 @@ int strIdx = this.stringPatchIndices[i];
         if (this.hasMain == false) {
             // Sources without a main function still produce a valid
             // executable: synthesize an entry that exits with status 0.
+            this.beginOwnedStub();
             this.mainLabelOffset = this.asm.buf.length;
             #on WINDOWS
             this.asm.xorRR64(0, 0);
@@ -2199,6 +2347,7 @@ int strIdx = this.stringPatchIndices[i];
             this.funcModules.add("");
             this.funcRetTypes.add("void");
             this.funcOffsets.add(off);
+            this.funcOwners.add(this.objEntryOwner);
         }
     }
 
@@ -2730,9 +2879,14 @@ int strIdx = this.stringPatchIndices[i];
         }
         initFunc.children.add(params);
         initFunc.children.add(body);
+        // The synthesized initializer is entry-owned machine code, exactly
+        // like the stub sequence that follows it.
+        this.objCurOwner = this.objEntryOwner;
+        this.pushObjMark("");
         this.emitFunction(initFunc);
 
         this.entryOffset = this.asm.buf.length;
+        this.beginOwnedEntry();
 
         // LINUX SysV backend (additive): capture the _start stack pointer
         // into __linux_stack_top before any push (entry runs with the kernel
@@ -2863,6 +3017,7 @@ int strIdx = this.stringPatchIndices[i];
         this.funcModules.add(func.srcModule);
         this.funcRetTypes.add(func.typeHint);
         this.funcOffsets.add(this.asm.buf.length);
+        this.funcOwners.add(this.objCurOwner);
     }
     this.localOffsets = [];
     this.localNames = [];
@@ -2870,7 +3025,6 @@ int strIdx = this.stringPatchIndices[i];
     this.dictValueNames = [];
     this.dictValueKinds = [];
     this.dictFieldVars = [];
-    this.dictFieldKeys = [];
     this.dictFieldKinds = [];
     this.objectVars = [];
     this.stackSize = 0;
@@ -2917,6 +3071,7 @@ int strIdx = this.stringPatchIndices[i];
         this.funcModules.add(func.srcModule);
         this.funcRetTypes.add(func.typeHint);
         this.funcOffsets.add(this.asm.buf.length);
+        this.funcOwners.add(this.objCurOwner);
     }
     this.localOffsets = [];
     this.localNames = [];
@@ -4374,10 +4529,33 @@ int strIdx = this.stringPatchIndices[i];
         this.pendingAnonNames.add(name);
         this.pendingAnonLabels.add(lbl);
         this.pendingAnonBodies.add(anon.child(0));
+        // Ownership for the object tier: the drain emits this body under the
+        // enclosing emission's owner. Recorded unconditionally (three small
+        // parallel arrays); only read while recording.
+        this.objAnonLabels.add(lbl);
+        this.objAnonNames.add(name);
+        this.objAnonOwners.add(this.objCurOwner);
         int sp = this.asm.buf.length;
         this.asm.emitImm64(0, 0xDEADBEEFCAFEF00D);
         this.anonRelocLabelIds.add(lbl);
         this.anonRelocPatchOffsets.add(sp + 2);
+    }
+
+    // Owner recorded for an anonymous label at queue time ("" when never
+    // queued under recording: the drain then keeps the current owner).
+    private string objAnonOwnerFor(int labelId) {
+        for (int i = 0; i < this.objAnonLabels.length; i++) {
+            if (this.objAnonLabels[i] == labelId) { return this.objAnonOwners[i]; }
+        }
+        return this.objCurOwner;
+    }
+
+    // Anonymous name recorded for a label id ("" when unknown).
+    public string objAnonNameFor(int labelId) {
+        for (int i = 0; i < this.objAnonLabels.length; i++) {
+            if (this.objAnonLabels[i] == labelId) { return this.objAnonNames[i]; }
+        }
+        return "";
     }
 
     // DOCS/259 -- emit every queued anonymous function body as a standalone
@@ -4395,6 +4573,14 @@ int strIdx = this.stringPatchIndices[i];
             this.pendingAnonLabels = [];
             this.pendingAnonBodies = [];
             for (int i = 0; i < names.length; i++) {
+                // Each body emits under its own owner (recorded at queue
+                // time), so nested queues inherit the enclosing body's owner.
+                // The mark carries the anonymous name: it is the body's
+                // defined symbol, resolved through marks, not the table.
+                if (this.objRecord) {
+                    this.objCurOwner = this.objAnonOwnerFor(labels[i]);
+                    this.pushObjMark(names[i]);
+                }
                 this.emitAnonFunction(names[i], labels[i], bodies[i]);
             }
         }
@@ -8486,7 +8672,7 @@ public void genNewCall(Node call) {
             int targetOff = this.funcOffsets[ctorIdx];
             int callPos = this.asm.buf.length;
             int rel32 = targetOff - (callPos + 5);
-            this.asm.callRel32(rel32);
+            this.emitDirectCall(rel32, ctorIdx, "construct", this.funcClasses[ctorIdx]);
         } else {
             this.asm.callRel32(0);
             this.forwardCalls.add(this.asm.buf.length - 4);
@@ -8565,17 +8751,17 @@ public void genNewCall(Node call) {
 
         // Call the parent constructor.
         int targetOff = this.funcOffsets[ctorIdx];
-        if (targetOff >= 0) {
-            int callPos = this.asm.buf.length;
-            int rel32 = targetOff - (callPos + 5);
-            this.asm.callRel32(rel32);
-        } else {
-            this.asm.callRel32(0);
-            this.forwardCalls.add(this.asm.buf.length - 4);
-            this.forwardCallFuncIdxs.add(-1);
-            this.forwardCallNames.add("construct");
-            this.forwardCallClasses.add(parentClass);
-        }
+            if (targetOff >= 0) {
+                int callPos = this.asm.buf.length;
+                int rel32 = targetOff - (callPos + 5);
+                this.emitDirectCall(rel32, funcIdx, name, lookupClass);
+            } else {
+                this.asm.callRel32(0);
+                this.forwardCalls.add(this.asm.buf.length - 4);
+                this.forwardCallFuncIdxs.add(funcIdx);
+                this.forwardCallNames.add(name);
+                this.forwardCallClasses.add(lookupClass);
+            }
         this.emitAbiCallTeardown();
     }
 
@@ -8685,7 +8871,13 @@ public void genNewCall(Node call) {
         else if (name == "jaLabel") { this.asm.jaLabel(this.asmArg(args, 0)); }
         else if (name == "jaeLabel") { this.asm.jaeLabel(this.asmArg(args, 0)); }
         else if (name == "movzxByteMBase") { this.asm.movzxByteMBase(this.asmArg(args, 0), this.asmArg(args, 1), this.asmArg(args, 2)); }
-        else if (name == "callRel32") { this.asm.callRel32(this.asmArg(args, 0)); }
+        else if (name == "callRel32") {
+            // Raw user displacement: unattributable to any function symbol,
+            // so the object tier cannot relocate it. Flag it while
+            // recording; the driver falls back to a monolithic compile.
+            if (this.objRecord) { this.objHasRawRel32 = true; }
+            this.asm.callRel32(this.asmArg(args, 0));
+        }
     }
 
     // WINDOWS-TARGET: the PE VERSIONINFO bridge. The self-hosted backend uses
@@ -9379,7 +9571,7 @@ public void genNewCall(Node call) {
             if (targetOff >= 0) {
                 int callPos = this.asm.buf.length;
                 int rel32 = targetOff - (callPos + 5);
-                this.asm.callRel32(rel32);
+                this.emitDirectCall(rel32, funcIdx, name, lookupClass);
             } else {
                 this.asm.callRel32(0);
                 this.forwardCalls.add(this.asm.buf.length - 4);
@@ -9881,7 +10073,7 @@ public void genNewCall(Node call) {
         if (targetOff >= 0) {
             int callPos = this.asm.buf.length;
             int rel32 = targetOff - (callPos + 5);
-            this.asm.callRel32(rel32);
+            this.emitDirectCall(rel32, funcIdx, name, "MiniAsm");
         } else {
             this.asm.callRel32(0);
             this.forwardCalls.add(this.asm.buf.length - 4);
@@ -11615,7 +11807,7 @@ public void genNewCall(Node call) {
             if (targetOff >= 0) {
                 int callPos = this.asm.buf.length;
                 int rel32 = targetOff - (callPos + 5);
-                this.asm.callRel32(rel32);
+                this.emitDirectCall(rel32, funcIdx, name, lookupClass);
             } else {
                 this.asm.callRel32(0);
                 this.forwardCalls.add(this.asm.buf.length - 4);
