@@ -882,6 +882,155 @@ string cacheSessionName(string inputFile, bool inputIsProject) {
     return drvFileStem(inputFile);
 }
 
+// OVERHAUL.md --cache-object (genuine object tier): compile the program
+// through per-file relocatable machine-code objects plus the built-in
+// static link, returning the linked image. Fresh objects are reused with no
+// codegen at all; only stale files go through the backend.
+//
+// Returns the linked bytes, or an empty array when the tier is off or a v1
+// boundary falls back loudly to the monolithic path (the message is
+// printed here; the object cache is left untouched). Link failures print
+// the exact reference error and exit — never a silent mislink.
+int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string source, string inputFile, bool inputIsProject, string manifest, ProgressReporter progress, int subsystem, string[] verKeys, string[] verVals) {
+    int[] empty = [];
+    if (osess == null) { return empty; }
+    string target = ppTargetOsFor(flags.targetOs);
+    if (target != "WINDOWS") {
+        flags.errLine("cache-object: " + objTargetDirName(target) + " target is outside the v1 object tier; full monolithic compile, objects not updated");
+        return empty;
+    }
+    if (flags.mode == 2) {
+        flags.errLine("cache-object: --runtime is outside the v1 object tier; full monolithic compile, objects not updated");
+        return empty;
+    }
+    MarkedChunks chunks = new MarkedChunks();
+    chunks.split(source);
+    if (chunks.paths.length == 0 || osess.notedKeys.length == 0) {
+        flags.errLine("cache-object: no cacheable files observed; full monolithic compile, objects not updated");
+        return empty;
+    }
+    // Ownership: every top-level item belongs to its chunk's file (class
+    // items own their methods); unattributed items belong to the entry
+    // file, mirroring the reference bundle-constant rule.
+    string entryPath = inputFile;
+    if (inputIsProject) {
+        string root = projectDirname(inputFile);
+        string entry = projectManifestValue(manifest, "entry");
+        if (entry.length > 0) { entryPath = projectJoin(root, entry); }
+    }
+    string entryKey = osess.relKeyFor(entryPath.replaceAll("/", "\\"));
+    bool entryNoted = false;
+    for (int i = 0; i < osess.notedKeys.length; i++) {
+        if (osess.notedKeys[i] == entryKey) { entryNoted = true; break; }
+    }
+    if (!entryNoted) { entryKey = osess.notedKeys[osess.notedKeys.length - 1]; }
+    string[] owners = [];
+    for (int i = 0; i < ast.length; i++) {
+        string owner = entryKey;
+        if (ast[i].line > 0) {
+            string hit = drvChunkOwner(chunks, ast[i].line);
+            if (hit.length > 0) { owner = osess.relKeyFor(hit.replaceAll("/", "\\")); }
+        }
+        owners.add(owner);
+    }
+    bool debugObj = objDebugEnabled();
+    ObjPlan p = new ObjPlan();
+    osess.plan(p);
+    if (debugObj) {
+        eprintln("[objcache] plan: " + (string)p.fresh.length + " fresh, " + (string)p.stale.length + " stale");
+    }
+    ParsedObj[] parsed = [];
+    for (int fi = 0; fi < p.fresh.length; fi++) {
+        string rel = p.fresh[fi];
+        if (debugObj) { eprintln("[objcache] reuse " + rel); }
+        ParsedObj u = new ParsedObj();
+        string rerr = osess.readUnit(rel, u);
+        if (rerr.length > 0) {
+            flags.errLine(rerr);
+            exit(1);
+        }
+        parsed.add(u);
+    }
+    for (int si = 0; si < p.stale.length; si++) {
+        string rel = p.stale[si];
+        if (debugObj) { eprintln("[objcache] emit " + rel + " (codegen)"); }
+        MiniAsm oasm = new MiniAsm();
+        MiniCg ocg = new MiniCg(oasm);
+        ocg.threadCount = flags.threadCount;
+        ocg.runtimeMode = false;
+        ocg.targetOs = "WINDOWS";
+        if (inputIsProject) {
+            NativeModules ocgNm = projectParseNativeModules(manifest);
+            ocg.customNative = ocgNm;
+        }
+        // Progress ticks mirror the monolithic shape (first run only, so a
+        // multi-stale rebuild does not multiply the totals).
+        if (si == 0) { ocg.progress = progress; }
+        ocg.genProgramOwned(ast, owners, entryKey);
+        if (ocg.objHasRawRel32) {
+            flags.errLine("cache-object: inline assembly is outside the v1 object tier; full monolithic compile, objects not updated");
+            return empty;
+        }
+        int[] fullCode = oasm.getBytes();
+        ObjUnit unit = new ObjUnit();
+        string xerr = extractUnit(ocg, rel, unit);
+        if (xerr.length > 0) {
+            flags.errLine(xerr);
+            exit(1);
+        }
+        if (objTooManyRelocs(unit)) {
+            flags.errLine("cache-object: too many relocations in '" + rel + "' for one COFF section (v1 boundary); full monolithic compile, objects not updated");
+            return empty;
+        }
+        int64[] hOut = [];
+        int[] sOut = [];
+        if (!osess.notedHashStamp(rel, hOut, sOut)) {
+            flags.errLine("object cache: '" + rel + "' was never noted");
+            exit(1);
+        }
+        int[] obytes = emitObject(unit, osess.flags, hOut[0], sOut[0]);
+        string werr = osess.writeUnit(rel, obytes);
+        if (werr.length > 0) {
+            flags.errLine(werr);
+            exit(1);
+        }
+        // Re-read what is on disk (like the reference parse-after-write):
+        // the linked unit is the parsed file, never a memory image.
+        ParsedObj pu = new ParsedObj();
+        string opath = osess.objectPathFor(rel);
+        byte[] raw = [];
+        try {
+            raw = file.read(opath);
+        } catch (int e) {
+            flags.errLine("object cache: cannot read " + opath + ": file not found");
+            exit(1);
+        }
+        ObjReader orr = new ObjReader(raw);
+        string perr = objParseCoff(orr, pu);
+        if (perr.length > 0) {
+            flags.errLine(perr);
+            exit(1);
+        }
+        parsed.add(pu);
+    }
+    ObjLinkResult link = new ObjLinkResult();
+    linkUnits(parsed, subsystem, verKeys, verVals, link);
+    if (link.err.length > 0) {
+        flags.errLine(link.err);
+        exit(1);
+    }
+    ObjFinish fin = new ObjFinish();
+    osess.finishRecords(fin);
+    if (fin.err.length > 0) {
+        flags.errLine(fin.err);
+        exit(1);
+    }
+    if (debugObj) {
+        eprintln("[objcache] link " + (string)parsed.length + " units (" + (string)p.fresh.length + " fresh, " + (string)p.stale.length + " emitted, " + (string)fin.dropped + " dropped) -> " + (string)link.bytes.length + " bytes");
+    }
+    return link.bytes;
+}
+
 void main() {
     string[] args = cargs;
 
@@ -1214,7 +1363,7 @@ int compileOnce(CliFlags flags, string outputFile) {
             for (int oi = 0; oi < objChunks.paths.length; oi++) {
                 string objAbs = objChunks.paths[oi].replaceAll("/", "\\");
                 int objMtime = file.modification(objAbs).milliseconds();
-                osess.noteFile(objAbs, source, objChunks.starts[oi], objChunks.ends[oi], "", objMtime);
+                osess.noteFile(objAbs, source, objChunks.starts[oi], objChunks.ends[oi], objMtime);
             }
         }
     } else {
@@ -1243,13 +1392,15 @@ int compileOnce(CliFlags flags, string outputFile) {
                 Token[] part = sess.tokensForRange(
                     chunks.paths[ci2].replaceAll("/", "\\"),
                     source, chunks.starts[ci2], chunks.ends[ci2], hopPath);
-                // OVERHAUL.md --cache-object two-tier flow: object emission
-                // packs the synced .srbc text when the bytecode tier hit and
-                // falls back to source otherwise — never re-lexes.
+                // OVERHAUL.md --cache-object two-tier flow: tokens come from
+                // the synced .srbc when the bytecode tier hit, otherwise
+                // from a fresh lex — never re-lexed for the object tier.
+                // Freshness keys on the source slice hash (reference: the
+                // exact lexed text), so noteFile hashes source here.
                 if (osess != null) {
                     string objAbs = chunks.paths[ci2].replaceAll("/", "\\");
                     int objMtime = file.modification(objAbs).milliseconds();
-                    osess.noteFile(objAbs, source, chunks.starts[ci2], chunks.ends[ci2], sess.lastPayload, objMtime);
+                    osess.noteFile(objAbs, source, chunks.starts[ci2], chunks.ends[ci2], objMtime);
                 }
                 int off = chunks.startLines[ci2];
                 for (int tj = 0; tj < part.length; tj++) {
@@ -1331,6 +1482,45 @@ int compileOnce(CliFlags flags, string outputFile) {
         opt.optimizeProgram(ast);
     }
 
+    // Version-metadata and subsystem inputs shared by the monolithic and
+    // object paths (the object tier links them into its image directly).
+    string projectType = "";
+    if (inputIsProject) {
+        projectType = projectManifestValue(file.readString(inputFile), "type");
+    }
+    int linkSubsystem = 3;
+    if (projectType == "app" || projectType == "service") {
+        linkSubsystem = 2;
+    }
+    string[] viKeys = [];
+    string[] viValues = [];
+    if (inputIsProject) {
+        string manifest2 = file.readString(inputFile);
+        string viName = projectManifestValue(manifest2, "name");
+        string viVers = projectManifestValue(manifest2, "version");
+        string viDesc = projectManifestValue(manifest2, "description");
+        string viProd = projectManifestValue(manifest2, "product");
+        string viCopy = projectManifestValue(manifest2, "copyright");
+        string viComp = projectManifestValue(manifest2, "company");
+        if (viName != "")   { viKeys.add("FileDescription");  viValues.add(viName); }
+        if (viProd != "")  { viKeys.add("ProductName");      viValues.add(viProd); }
+        if (viCopy != "")  { viKeys.add("LegalCopyright");   viValues.add(viCopy); }
+        if (viComp != "")  { viKeys.add("CompanyName");      viValues.add(viComp); }
+        if (viName != "")  { viKeys.add("InternalName");     viValues.add(viName); }
+        if (viName != "")  { viKeys.add("OriginalFilename"); viValues.add(viName + ".exe"); }
+        if (viVers != "")  { viKeys.add("FileVersion");      viValues.add(viVers); }
+        if (viVers != "")  { viKeys.add("ProductVersion");   viValues.add(viVers); }
+    }
+
+    // OVERHAUL.md --cache-object (genuine object tier): per-file
+    // machine-code objects plus the built-in static link, whose image
+    // replaces the monolithic one below. Empty when the tier is off or a
+    // v1 boundary falls back loudly; link failures exit inside.
+    int[] peData = [];
+    if (osess != null) {
+        peData = objCompileFlow(flags, osess, ast, source, inputFile, inputIsProject, manifest, progress, linkSubsystem, viKeys, viValues);
+    }
+    if (peData.length == 0) {
     MiniAsm asm = new MiniAsm();
 
     MiniCg cg = new MiniCg(asm);
@@ -1369,17 +1559,9 @@ int compileOnce(CliFlags flags, string outputFile) {
 
     MiniEf pe = new MiniEf();
 
-    // DOCS/253 -- project type selects the PE subsystem. `app` and `service`
-    // use the Windows GUI subsystem so the process starts with no attached
-    // console (no FreeConsole/hide-console boilerplate); `console` (the
-    // default) and standalone sources keep the console subsystem.
-    string projectType = "";
-    if (inputIsProject) {
-        projectType = projectManifestValue(file.readString(inputFile), "type");
-    }
-    if (projectType == "app" || projectType == "service") {
-        pe.subsystem = 2;
-    }
+    // DOCS/253 -- project type selects the PE subsystem (hoisted
+    // linkSubsystem above; the object tier consumes the same value).
+    pe.subsystem = linkSubsystem;
 
     // OVERHAUL.md --runtime: reserve the writable runtime state block and the
     // internal __silver_rt_alloc pointer slot inside the data area.
@@ -1417,25 +1599,8 @@ int compileOnce(CliFlags flags, string outputFile) {
     cg.patchRuntimeRefs(finalCode, stringsStart, rdataRva);
     cg.patchGlobalRefs(finalCode, stringsStart + stringData.length, rdataRva);
 
-    string[] viKeys = [];
-    string[] viValues = [];
-    if (inputIsProject) {
-        string manifest2 = file.readString(inputFile);
-        string viName = projectManifestValue(manifest2, "name");
-        string viVers = projectManifestValue(manifest2, "version");
-        string viDesc = projectManifestValue(manifest2, "description");
-        string viProd = projectManifestValue(manifest2, "product");
-        string viCopy = projectManifestValue(manifest2, "copyright");
-        string viComp = projectManifestValue(manifest2, "company");
-        if (viName != "")   { viKeys.add("FileDescription");  viValues.add(viName); }
-        if (viProd != "")  { viKeys.add("ProductName");      viValues.add(viProd); }
-        if (viCopy != "")  { viKeys.add("LegalCopyright");   viValues.add(viCopy); }
-        if (viComp != "")  { viKeys.add("CompanyName");      viValues.add(viComp); }
-        if (viName != "")  { viKeys.add("InternalName");     viValues.add(viName); }
-        if (viName != "")  { viKeys.add("OriginalFilename"); viValues.add(viName + ".exe"); }
-        if (viVers != "")  { viKeys.add("FileVersion");      viValues.add(viVers); }
-        if (viVers != "")  { viKeys.add("ProductVersion");   viValues.add(viVers); }
-    }
+    // Version pairs ride the hoisted viKeys/viValues (shared with the
+    // object tier above).
     string[] versionData = [];
     for (int vi = 0; vi < viKeys.length; vi++) {
         versionData.add(viKeys[vi]);
@@ -1443,18 +1608,7 @@ int compileOnce(CliFlags flags, string outputFile) {
     }
 
     pe.globalAreaSize = cg.globalAreaSize;
-    int[] peData = pe.build(finalCode, stringData, versionData);
-
-    // OVERHAUL.md --cache-object: link gate. Re-emit changed objects, then
-    // unify (validate) the cached + refreshed .o files with the built-in
-    // unifier BEFORE the final binary is written — a corrupt or stale
-    // object fails the build loudly instead of being linked silently.
-    if (osess != null) {
-        string objErr = osess.finish();
-        if (objErr.length > 0) {
-            flags.errLine(objErr);
-            exit(1);
-        }
+    peData = pe.build(finalCode, stringData, versionData);
     }
 
     if (flags.mode == 1) {
