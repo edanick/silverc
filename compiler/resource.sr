@@ -10,8 +10,9 @@ import * from sysinfo;
 // from live system state queried through the universal `sysinfo` std module
 // (sysinfo -> win32.kernel32 behind its own `#on WINDOWS` regions) — there
 // are no raw DLL calls or preprocessor regions here, no hardcoded
-// assumptions about machine size. Targets ~90% of system resources with a
-// 10% safety margin, never overcommitting.
+// assumptions about machine size. The worker default keeps a 2-thread
+// safety margin (total - 2, never below 1) so the system stays responsive;
+// memory budgets keep a 10% margin, never overcommitting.
 //
 // UNIFIED_CORE_LIBRARY.md §4 rule 6: this module is pure universal Silver —
 // the one OS layer lives inside sysinfo's public functions (cpuCores decodes
@@ -41,15 +42,13 @@ public int64 rsTotalRamBytes() {
     return sysinfo.memoryTotal() * 1024 * 1024;
 }
 
-// Default worker count: 90% of logical processors, never exceeding total
-// and never below 1. On very small machines (e.g. 2 threads → 1.8 → 2)
-// the clamp ensures total is never exceeded.
+// Default worker count (OVERHAUL.md): total - 2, the total logical
+// processor count minus a 2-thread safety/responsiveness margin, never
+// below 1 (tiny machines with 1-2 threads compile single-threaded).
 public int rsDefaultThreadCount() {
     int total = rsCpuThreadCount();
-    float scaled = float(total) * 0.9 + 0.5;
-    int n = int(scaled);
+    int n = total - 2;
     if (n < 1) { n = 1; }
-    if (n > total) { n = total; }
     return n;
 }
 
