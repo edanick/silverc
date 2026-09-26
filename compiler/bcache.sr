@@ -72,6 +72,11 @@ class CacheSession {
     public prop string oldIndexText;
     // Files whose .srbc was rewritten this run.
     public prop int dirtyCount;
+    // Raw .srbc.t companion text of the last tokensForRange call: the synced
+    // bytecode itself on a cache hit, "" on a miss. The --cache-object tier
+    // packs this as the object payload when present (two-tier flow) and
+    // falls back to source otherwise.
+    public prop string lastPayload;
 
     construct (string rootDir, string projName) {
         this.ok = false;
@@ -86,6 +91,7 @@ class CacheSession {
         this.createdStamp = 0;
         this.oldIndexText = "";
         this.dirtyCount = 0;
+        this.lastPayload = "";
         #on WINDOWS
         string appdata = env.get("APPDATA");
         if (appdata.length == 0) { return; }
@@ -124,6 +130,7 @@ class CacheSession {
         if (cs < 0) { cs = 0; }
         int ce = end;
         if (ce > aggSource.length) { ce = aggSource.length; }
+        this.lastPayload = "";
         if (!this.ok) { return bcLex(aggSource[cs..ce]); }
         string key = path.relative(this.root, absPath);
         if (key.length == 0) { return bcLex(aggSource[cs..ce]); }
@@ -467,6 +474,7 @@ class CacheSession {
         if (path.length == 0) { return []; }
         string text = tryReadText(path + ".t");
         if (text.length == 0) { return []; }
+        this.lastPayload = text;
         // Header line: <hash> <stamp> <count> — parsed in place, no slices.
         int he = 0;
         while (he < text.length && text[he] != '\n') { he++; }
@@ -477,7 +485,7 @@ class CacheSession {
             hp++;
         }
         int count = (int)text[hp..he];
-        if (count <= 0) { return []; }
+        if (count <= 0) { this.lastPayload = ""; return []; }
         int pos = he + 1;
         Token[] tokens = [];
         for (int i = 0; i < count && pos < text.length; i++) {
@@ -485,10 +493,10 @@ class CacheSession {
             while (le < text.length && text[le] != '\n') { le++; }
             Token t = tokenFromRange(text, pos, le);
             pos = le + 1;
-            if (t == null) { return []; }
+            if (t == null) { this.lastPayload = ""; return []; }
             tokens.add(t);
         }
-        if (tokens.length != count) { return []; }
+        if (tokens.length != count) { this.lastPayload = ""; return []; }
         return tokens;
     }
 
