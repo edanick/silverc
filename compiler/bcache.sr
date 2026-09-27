@@ -15,14 +15,24 @@ import * from win32.kernel32;
 
 // OVERHAUL.md --cache-bytecode — persistent bytecode cache.
 //
-// Cache layout under %APPDATA%\silver cache\<project>\ on WINDOWS
-// (unchanged), /var/cache/silver/<project>/ on LINUX (unchanged, same
-// .sbcr/.srbc formats, `/` separators), or /Library/Caches/Silver/<project>/
-// on MAC (MAC.md §5b, additive — machine-wide Library/Caches, capital
-// Silver; same formats, `/` separators, fixed root with no $HOME lookup):
+// Cache layout under %APPDATA%\silver cache\<project>\bytecode\ on WINDOWS
+// (unchanged root, bytecode\ tier), /var/cache/silver/<project>/bytecode/
+// on LINUX (unchanged root, same .sbcr/.srbc formats, `/` separators), or
+// /Library/Caches/Silver/<project>/bytecode/ on MAC (MAC.md §5b, additive —
+// machine-wide Library/Caches, capital Silver; same formats, `/`
+// separators, fixed root with no $HOME lookup):
 //
-//   project.sbcr            record file (one entry per .sr file, recursive)
-//   src/main.srbc           cached token stream mirroring the source tree
+//   bytecode\project.sbcr         record file (one entry per .sr file, recursive)
+//   bytecode\project.sbcri        NUL-free text companion of the record
+//   bytecode\src\main.srbc        cached token stream mirroring the source tree
+//   bytecode\src\main.srbc.t      NUL-free text companion per bytecode file
+//
+// Migration (OVERHAUL.md): caches written before this layout (record +
+// `.srbc` files directly under `<project>\`) are legacy. Tools read ONLY
+// the `bytecode\` location — legacy entries are treated as absent (full
+// re-sync into `bytecode\`) and never reused. Orphaned legacy files the
+// tool itself owns may be deleted best-effort, but a legacy layout must
+// never fail a build.
 //
 // Both artifacts are written in the reference binary formats so caches stay
 // toolchain-compatible:
@@ -92,15 +102,29 @@ class CacheSession {
         this.oldIndexText = "";
         this.dirtyCount = 0;
         this.lastPayload = "";
+        string legacyRecord = "";
+        string legacyIndex = "";
         #on WINDOWS
         string appdata = env.get("APPDATA");
         if (appdata.length == 0) { return; }
-        this.dir = appdata + "\\silver cache\\" + path.guardForWindows(projName);
+        this.dir = appdata + "\\silver cache\\" + path.guardForWindows(projName) + "\\bytecode";
+        legacyRecord = path.dirname(this.dir) + "\\project.sbcr";
+        legacyIndex = path.dirname(this.dir) + "\\project.sbcri";
         #on LINUX
-        this.dir = "/var/cache/silver/" + path.guardForWindows(projName);
+        this.dir = "/var/cache/silver/" + path.guardForWindows(projName) + "/bytecode";
+        legacyRecord = path.dirname(this.dir) + "/project.sbcr";
+        legacyIndex = path.dirname(this.dir) + "/project.sbcri";
         #on MAC
-        this.dir = "/Library/Caches/Silver/" + path.guardForWindows(projName);
+        this.dir = "/Library/Caches/Silver/" + path.guardForWindows(projName) + "/bytecode";
+        legacyRecord = path.dirname(this.dir) + "/project.sbcr";
+        legacyIndex = path.dirname(this.dir) + "/project.sbcri";
         #off
+        // Migration (OVERHAUL.md): legacy caches kept the record directly
+        // under <project>\ and are never read — this session treats them as
+        // absent. Best-effort orphan removal of the legacy record files this
+        // tool owns; guarded by exists so a legacy layout never fails a build.
+        if (file.exists(legacyRecord)) { file.delete(legacyRecord); }
+        if (file.exists(legacyIndex)) { file.delete(legacyIndex); }
         ensureDirTree(this.dir);
         this.loadRecords();
         this.ok = true;
@@ -417,6 +441,15 @@ class CacheSession {
             }
         }
         tw.close();
+        // Migration (OVERHAUL.md): best-effort removal of the orphaned
+        // legacy payload this tool owns (same relative file directly under
+        // <project>\). Derived by re-rooting the fresh path, so no path
+        // logic is cloned; guarded by exists so legacy never fails a build.
+        if (srbcPath.length > this.dir.length) {
+            string legacySrbc = path.dirname(this.dir) + srbcPath[this.dir.length..srbcPath.length];
+            if (file.exists(legacySrbc)) { file.delete(legacySrbc); }
+            if (file.exists(legacySrbc + ".t")) { file.delete(legacySrbc + ".t"); }
+        }
     }
 
     // One token as one companion line: <tag> <line> <col> <payload>

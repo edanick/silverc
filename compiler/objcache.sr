@@ -25,14 +25,21 @@ import * from mac.libsystem;
 // flags together is the fastest configuration, but --cache-object works
 // on its own too.
 //
-// Layout under the same per-host cache root as --cache-bytecode:
+// Layout under the same per-host cache root as --cache-bytecode.
+// Bytecode lives in <project>\bytecode\, objects live in
+// <project>\<os>-<arch>\ (both under that root):
 //
+//   <project>\bytecode\project.sbcr              # record for the bytecode tier
+//   <project>\bytecode\src\main.srbc             # bytecode mirrors the project tree
 //   <project>\windows-x86-64\project.sbcr     # record for THIS target only
 //   <project>\windows-x86-64\src\main.o       # objects mirror the project tree
 //   <project>\linux-x86-64\project.sbcr       # separate record per target
 //   <project>\mac-aarch64\project.sbcr        # separate record per target
 //
 // (On Linux/macOS the same tree applies with / separators.)
+//
+// Two-tier workflow: object emission reads the synced .srbc bytecode
+// (under bytecode\) when it exists and falls back to source otherwise.
 //
 // Object format (v5):
 //
@@ -104,7 +111,9 @@ import * from mac.libsystem;
 //
 // The per-file FNV-1 hash + mtime is compared against the per-target
 // project.sbcr record, which additionally keys on the emitting flag set, so
-// a mode/--optimize switch re-emits. Fresh objects are reused without
+// a mode/--optimize switch re-emits. When synced bytecode is available the
+// object payload packs the .srbc text (under bytecode\) instead of
+// re-lexing; otherwise it falls back to source. Fresh objects are reused without
 // running codegen at all; only stale files go through the backend; the
 // .sbcri text companion keeps working.
 //
