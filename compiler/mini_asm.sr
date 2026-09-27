@@ -871,7 +871,8 @@ class MiniAsm {
 // tables; where MAC.md and the manual disagree the manual wins). Covers the
 // v1 set: adrp/adr/add-imm12/sub-imm12 for addresses, ldr/str
 // (unsigned-offset plus pre/post-index), stp/ldp (X29/X30 frame chain),
-// movz/movk/movn, ldr-literal, b/bl/blr/ret, cbz/cbnz/b.cond, svc (reserved
+// movz/movk/movn, sdiv/msub/brk (guarded divide/modulo), ldr-literal,
+// b/bl/blr/ret, cbz/cbnz/b.cond, svc (reserved
 // -- v1 calls go through libSystem, never raw syscalls), nop. v1 emits
 // plain ret with no PAC/BTI (valid on Apple Silicon user-space ad-hoc).
 // Pure data: formulas are exact ports of the Rust enc_* helpers; range
@@ -1007,6 +1008,25 @@ public int a64EncMovk(int rd, int imm16, int hw) {
 // movn Xd, #imm16 {, lsl #hw*16} (move inverted).
 public int a64EncMovn(int rd, int imm16, int hw) {
     return 0x92800000 | (hw << 21) | (imm16 << 5) | rd;
+}
+
+// sdiv Xd, Xn, Xm: signed 64-bit divide (truncating, like x64 idiv).
+// Division by zero yields zero (no trap) and INT64_MIN / -1 yields
+// INT64_MIN (no overflow signal): callers guard both cases explicitly so
+// cached programs observe x64-identical behavior.
+public int a64EncSdiv(int rd, int rn, int rm) {
+    return 0x9AC00C00 | (rm << 16) | (rn << 5) | rd;
+}
+
+// msub Xd, Xn, Xm, Xa: Xd = Xa - Xn*Xm (64-bit, for % as a - (a/b)*b).
+public int a64EncMsub(int rd, int rn, int rm, int ra) {
+    return 0x9B008000 | (rm << 16) | (ra << 10) | (rn << 5) | rd;
+}
+
+// brk #imm16: breakpoint trap (for the INT64_MIN / -1 overflow case,
+// mirroring the x64 backend's loud hardware fault instead of sdiv's wrap).
+public int a64EncBrk(int imm16) {
+    return 0xD4200000 | (imm16 << 5);
 }
 
 // b <label>: unconditional PC-relative branch (+-128MB).
