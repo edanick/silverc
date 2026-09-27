@@ -324,6 +324,34 @@ public bool objDebugEnabled() {
     #off
 }
 
+// %APPDATA% lookup without env.get (STANDARDS.md: one home — bcache.sr
+// CacheSession shares this instead of env.get, which dispatches to the
+// native mini_cg builtin in compiler builds and returns garbage): the
+// compiler build excludes env.sr, so env.get returns the value pointer
+// without setting the string length (garbage past a few chars at HEAD).
+// Raw byte[] buffers cannot stand in either: Win32 receives the array
+// header, not the data (see the fs.sr readString note). A string buffer
+// carries the data pointer, so the value lands correctly — the same
+// carrier shape bcSliceViaFile uses for ReadFile. Linux/macOS never call
+// it (fixed cache roots there).
+public string cacheAppData() {
+    #on WINDOWS
+    int size = GetEnvironmentVariableA("APPDATA", null, 0);
+    if (size == 0) { return ""; }
+    string buf = " ".repeat(size);
+    int ret = GetEnvironmentVariableA("APPDATA", buf, size);
+    if (ret == 0) { return ""; }
+    string[] parts = [];
+    for (int i = 0; i < buf.length; i++) {
+        int b = int(int64(buf[i]) & 0xFF);
+        if (b != 0) { parts.add((string)char(b)); }
+    }
+    return parts.join("");
+    #else
+    return "";
+    #off
+}
+
 // In-memory byte sink for container emission. Methods grow the object's own
 // buffer; callers take the finished buffer out once.
 class ObjWriter {
@@ -3061,30 +3089,11 @@ class ObjSession {
         #off
     }
 
-    // %APPDATA% lookup without env.get: the compiler build excludes env.sr,
-    // so env.get dispatches to the native mini_cg builtin, which returns the
-    // value pointer without setting the string length (garbage past a few
-    // chars at HEAD). Raw byte[] buffers cannot stand in either: Win32
-    // receives the array header, not the data (see the fs.sr readString
-    // note). A string buffer carries the data pointer, so the value lands
-    // correctly — the same carrier shape bcSliceViaFile uses for ReadFile.
+    // %APPDATA% via the shared cacheAppData() above (one home — the raw
+    // carrier documented there, not env.get).
     // Linux/macOS never call it (fixed cache roots there).
     private string objAppData() {
-        #on WINDOWS
-        int size = GetEnvironmentVariableA("APPDATA", null, 0);
-        if (size == 0) { return ""; }
-        string buf = " ".repeat(size);
-        int ret = GetEnvironmentVariableA("APPDATA", buf, size);
-        if (ret == 0) { return ""; }
-        string[] parts = [];
-        for (int i = 0; i < buf.length; i++) {
-            int b = int(int64(buf[i]) & 0xFF);
-            if (b != 0) { parts.add((string)char(b)); }
-        }
-        return parts.join("");
-        #else
-        return "";
-        #off
+        return cacheAppData();
     }
 
     private void objMakeTree(string dir) {

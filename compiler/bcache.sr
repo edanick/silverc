@@ -8,6 +8,7 @@ import * from path;
 import * from string;
 import * from hash;
 import * from datetime;
+import * from objcache;
 
 #on WINDOWS
 import * from win32.kernel32;
@@ -87,8 +88,15 @@ class CacheSession {
     // packs this as the object payload when present (two-tier flow) and
     // falls back to source otherwise.
     public prop string lastPayload;
+    // OVERHAUL.md --cache-object case 2 (--cache-object alone with a
+    // populated bytecode tier): the tier is READ ONLY — hits decode the
+    // synced .srbc, misses lex fresh, and nothing is ever written back (no
+    // .srbc/.sbcr/companions, no record updates). The driver sets this when
+    // --cache-bytecode is absent; tokensForRange then stores nothing and
+    // flush is a no-op.
+    public prop bool readOnly;
 
-    construct (string rootDir, string projName) {
+    construct (string rootDir, string projName, bool ro = false) {
         this.ok = false;
         this.dir = "";
         this.root = rootDir;
@@ -102,10 +110,13 @@ class CacheSession {
         this.oldIndexText = "";
         this.dirtyCount = 0;
         this.lastPayload = "";
+        this.readOnly = ro;
         string legacyRecord = "";
         string legacyIndex = "";
         #on WINDOWS
-        string appdata = env.get("APPDATA");
+        // Shared raw lookup (objcache.sr cacheAppData): the compiler build
+        // excludes env.sr, so env.get would return garbage here.
+        string appdata = cacheAppData();
         if (appdata.length == 0) { return; }
         this.dir = appdata + "\\silver cache\\" + path.guardForWindows(projName) + "\\bytecode";
         legacyRecord = path.dirname(this.dir) + "\\project.sbcr";
@@ -123,9 +134,13 @@ class CacheSession {
         // under <project>\ and are never read — this session treats them as
         // absent. Best-effort orphan removal of the legacy record files this
         // tool owns; guarded by exists so a legacy layout never fails a build.
-        if (file.exists(legacyRecord)) { file.delete(legacyRecord); }
-        if (file.exists(legacyIndex)) { file.delete(legacyIndex); }
-        ensureDirTree(this.dir);
+        // Skipped entirely on a readOnly (--cache-object alone) session: the
+        // tier is strictly read-only, not even creating its directory.
+        if (!ro) {
+            if (file.exists(legacyRecord)) { file.delete(legacyRecord); }
+            if (file.exists(legacyIndex)) { file.delete(legacyIndex); }
+            ensureDirTree(this.dir);
+        }
         this.loadRecords();
         this.ok = true;
     }
@@ -144,8 +159,10 @@ class CacheSession {
     // when its contents are unchanged and the stored bytecode decodes;
     // otherwise materialize the body (hop file first, builtin-slice
     // fallback), lex it fresh, store the new bytecode, and return those
-    // tokens. Range hashing means full-project cache hits never slice the
-    // aggregate at all — the linear builtin slice is paid only per miss.
+    // tokens — unless readOnly (--cache-object alone: case 2 serves the hit
+    // from disk and case 1 lexes fresh, both storing nothing). Range hashing
+    // means full-project cache hits never slice the aggregate at all — the
+    // linear builtin slice is paid only per miss.
     public Token[] tokensForRange(string absPath, string aggSource, int start, int end, string hopPath) {
         // Slice clamps (old bcSliceSlow conditions): the bootstrap clamps
         // itself but the self-host reads OOB without them — clamped once
@@ -171,11 +188,15 @@ class CacheSession {
                 }
             }
         }
-        // Re-cache this file: materialize the body, lex, encode, mark dirty.
+        // Re-cache this file: materialize the body, lex, encode, mark dirty —
+        // skipped entirely on a readOnly (--cache-object alone) session, where
+        // a miss simply returns the fresh lex and stores nothing (case 1
+        // writes NOTHING to bytecode\ either way).
         string body = "";
         if (hopPath.length > 0) { body = bcSliceViaFile(hopPath, start, end - start); }
         if (body.length == 0) { body = aggSource[cs..ce]; }
         Token[] tokens = bcLex(body);
+        if (this.readOnly) { return tokens; }
         int stamp = datetime.now().milliseconds();
         if (this.encodable(tokens)) {
             this.storeSrbc(absPath, tokens, stamp, hashKey, sizeKey);
@@ -204,9 +225,12 @@ class CacheSession {
 
     // Drop records whose sources vanished and rewrite the record files once
     // after the whole import graph is resolved. Skips the rewrite when
-    // nothing changed (no-change reruns leave every artifact untouched).
+    // nothing changed (no-change reruns leave every artifact untouched), and
+    // is a full no-op on a readOnly (--cache-object alone) session (case 2:
+    // bytecode\ is READ ONLY — no writes, no record updates, no mtime changes).
     public void flush() {
         if (!this.ok) { return; }
+        if (this.readOnly) { return; }
         int w = 0;
         for (int i = 0; i < this.keys.length; i++) {
             string abs = resolveRel(this.root, this.keys[i]);

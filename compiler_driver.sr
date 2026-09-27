@@ -1374,7 +1374,12 @@ int compileOnce(CliFlags flags, string outputFile) {
         osess = new ObjSession(path.dirname(inputFile), cacheSessionName(inputFile, inputIsProject), ppTargetOsFor(flags.targetOs), flags.modeName(), flags.optimize);
         if (!osess.ok) { osess = null; }
     }
-    if (!flags.cacheBytecode) {
+    // OVERHAUL.md --cache-object alone (no --cache-bytecode) still routes
+    // through the chunked bytecode path below with a READ ONLY session: hits
+    // decode the synced .srbc per file (.sr fallback per file otherwise) and
+    // bytecode\ is never written. Only the fully uncached configuration
+    // (neither flag) lexes the aggregate whole here.
+    if (!flags.cacheBytecode && osess == null) {
         Lexer lexer = new Lexer(source);
         tokens = lexer.tokenize();
 
@@ -1384,28 +1389,23 @@ int compileOnce(CliFlags flags, string outputFile) {
             drvPrintDiagnostics(lexer.lexErrors, source, inputFile, flags.cacheBytecode);
             exit(1);
         }
-        // OVERHAUL.md --cache-object without --cache-bytecode: the aggregate
-        // lexed whole above; observe each collected file for per-target .o
-        // emission from its source slice.
-        if (osess != null) {
-            MarkedChunks objChunks = new MarkedChunks();
-            objChunks.split(source);
-            for (int oi = 0; oi < objChunks.paths.length; oi++) {
-                string objAbs = objChunks.paths[oi].replaceAll("/", "\\");
-                int objMtime = file.modification(objAbs).milliseconds();
-                osess.noteFile(objAbs, source, objChunks.starts[oi], objChunks.ends[oi], objMtime);
-            }
-        }
     } else {
         // OVERHAUL.md --cache-bytecode: lex each collected file separately,
         // going through the persistent bytecode cache; only files whose hash
-        // or mtime changed are re-lexed and re-cached. Chunk bodies are kept
+        // or mtime changed are re-lexed and re-cached. With --cache-object
+        // alone the same loop runs on a READ ONLY session instead (hits decode
+        // the synced .srbc, misses lex fresh, nothing re-cached). Chunk bodies are kept
         // as ranges into the aggregate and materialized lazily through a
         // temp hop copy of it (seek + ReadFile), so unchanged files are
         // never sliced out of the aggregate at all.
         MarkedChunks chunks = new MarkedChunks();
         chunks.split(source);
-        sess = new CacheSession(path.dirname(inputFile), cacheSessionName(inputFile, inputIsProject));
+        // OVERHAUL.md --cache-object alone (no --cache-bytecode): the third
+        // argument opens the bytecode tier READ ONLY — synced .srbc files
+        // decode on a hit, misses lex fresh, nothing is written back (flush
+        // below is a no-op for these sessions). Reached exactly when
+        // --cache-bytecode is absent (the outer branch guarantees osess).
+        sess = new CacheSession(path.dirname(inputFile), cacheSessionName(inputFile, inputIsProject), !flags.cacheBytecode);
         if (sess.ok && chunks.paths.length > 0) {
             string hopBase = env.get("TEMP");
             if (hopBase.length == 0) { hopBase = env.get("TMP"); }
@@ -1651,8 +1651,9 @@ int compileOnce(CliFlags flags, string outputFile) {
         }
         // OVERHAUL.md --cache-bytecode: flush the session before the success
         // line so the compile is only reported done once every artifact is on
-        // disk.
-        if (sess != null) {
+        // disk. Read-only --cache-object-alone sessions skip this entirely
+        // (the tier was only read, never synced — no report either).
+        if (sess != null && !sess.readOnly) {
             if (progress != null) { progress.phaseCache(); }
             sess.flush();
             if (progress != null) { progress.cacheDone(sess.statsDirty(), sess.statsTotal()); }
@@ -1668,7 +1669,8 @@ int compileOnce(CliFlags flags, string outputFile) {
     if (progress != null) { progress.phaseEmit(); }
     file.writeBytes(outputFile, peData);
     eprintln("Generated: " + outputFile);
-    if (sess != null) {
+    // Read-only --cache-object-alone sessions skip the sync report (see above).
+    if (sess != null && !sess.readOnly) {
         if (progress != null) { progress.phaseCache(); }
         sess.flush();
         if (progress != null) { progress.cacheDone(sess.statsDirty(), sess.statsTotal()); }
