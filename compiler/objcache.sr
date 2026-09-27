@@ -130,10 +130,11 @@ import * from mac.libsystem;
 // - --runtime mode (embedded allocator/GC entry points are appended
 //   globally, not attributable to one file).
 // - macOS target programs outside the ARM64 object tier (integer/bool/char
-//   free functions with calls, control flow, and print — anything else,
-//   such as heap strings, classes, exceptions, or division, compiles
-//   monolithically, so no object is ever a stub or an empty placeholder for
-//   code the backend could not express).
+//   free functions with calls, control flow (if/while/both for spellings),
+//   integer division/modulo (with the exact x64 divide-by-zero and overflow
+//   behavior), and print — anything else, such as heap strings, classes,
+//   or exceptions, compiles monolithically, so no object is ever a stub or
+//   an empty placeholder for code the backend could not express).
 // - Inline-assembly raw rel32 displacements (no symbol attribution).
 // - More than 65535 relocations in one object (COFF section limit).
 // - Shared-library outputs: this toolchain always emits PE executables,
@@ -3285,15 +3286,17 @@ class ObjSession {
 // - No user function is named print, printline, printf, or exit (those
 //   names are the tier's builtins/imports).
 // - Statements: local int/bool/char declarations with an initializer,
-//   plain/compound (+=, -=, *=) assignment to locals, if/else, while,
-//   break/continue inside while, return, ++/-- statements, calls, and
-//   print/printline with exactly one argument. No for/foreach,
-//   match/switch, exceptions, or destructuring.
+//   plain/compound (+=, -=, *=, /=, %=) assignment to locals, if/else,
+//   while, C-like for, break/continue inside loops, return, ++/--
+//   statements, calls, and print/printline with exactly one argument. No
+//   foreach, match/switch, exceptions, or destructuring.
 // - Expressions: integer/bool/char literals, const reads, local and
-//   parameter reads, +/-/* (no division or modulo), unary -, !,
-//   comparisons, short-circuit &&/||, parentheses, calls to program-defined
-//   functions with exact arity, and string literals ONLY as the direct
-//   argument of print/printline.
+//   parameter reads, +, -, *, /, % (division and modulo lower exactly like
+//   the x64 backend: a zero divisor takes the same uncaught-exception path
+//   and INT64_MIN / -1 traps with brk, mirroring idiv's loud hardware
+//   fault), unary -, !, comparisons, short-circuit &&/||, parentheses, calls to
+//   program-defined functions with exact arity, and string literals ONLY as
+//   the direct argument of print/printline.
 // - Total frame (parameters + locals + operand slots) fits in 500 8-byte
 //   slots, so every local is reachable with a single unsigned ldr/str
 //   offset and the frame allocates with one sub.
@@ -3382,6 +3385,27 @@ private int a64SubReg(int rd, int rn, int rm) {
 // mul Xd, Xn, Xm: 64-bit multiply.
 private int a64Mul(int rd, int rn, int rm) {
     return int(0x9B007C00 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31));
+}
+
+// sdiv Xd, Xn, Xm: signed 64-bit divide (truncating, like x64 idiv).
+// Division by zero yields zero (no trap) and INT64_MIN / -1 yields
+// INT64_MIN (no overflow signal): the guarded sequence below checks both
+// cases explicitly so cached programs observe x64-identical behavior.
+private int a64Sdiv(int rd, int rn, int rm) {
+    return int(0x9AC00C00 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31));
+}
+
+// msub Xd, Xn, Xm, Xa: Xd = Xa - Xn*Xm (64-bit). The tier uses it for %
+// (a - (a/b)*b, matching x64 idiv + mov rax, rdx).
+private int a64Msub(int rd, int rn, int rm, int ra) {
+    return int(0x9B008000 | ((rm & 31) << 16) | ((ra & 31) << 10) | ((rn & 31) << 5) | (rd & 31));
+}
+
+// brk #imm16: breakpoint trap. The tier emits brk #0 for the INT64_MIN / -1
+// overflow case, mirroring the x64 backend's loud hardware fault (idiv #DE)
+// instead of silently producing sdiv's wrapped result.
+private int a64Brk(int imm16) {
+    return int(0xD4200000 | ((imm16 & 0xFFFF) << 5));
 }
 
 // cmp Xn, Xm: compare (subs XZR, Xn, Xm). Base 0xEB00001F.
@@ -3635,6 +3659,11 @@ class MacWalk {
     public prop int nextSlot;
     public prop int maxDepth;
     public prop int loopDepth;
+    // Live names a for-loop body must not redeclare: a body declaration
+    // shadowing an outer (or loop-init) name would resolve uses to the
+    // wrong slot, while the x64 backend scopes them apart — so collisions
+    // fall back rather than diverge (mirrors the reference body_guard).
+    public prop string[] guardNames;
 
     construct (MacCtx c) {
         this.ctx = c;
@@ -3645,6 +3674,7 @@ class MacWalk {
         this.nextSlot = 0;
         this.maxDepth = 0;
         this.loopDepth = 0;
+        this.guardNames = [];
     }
 }
 
@@ -3861,6 +3891,47 @@ private string macWalkBlock(MacWalk w, Node block, int base) {
     return macWalkStmt(w, block, base);
 }
 
+// Check one local declaration and allocate its slot. Shared by the plain
+// statement path and the C-like for initializer, so they can never disagree
+// about the boundary. A declaration inside a for body that shadows a live
+// name (or collides with a const) falls back rather than diverging, exactly
+// like the reference body_guard.
+private string macWalkLocalDecl(MacWalk w, Node s, int base) {
+    if (s.childCount() == 0) {
+        return "uninitialized local '" + s.name + "' in '" + w.fname + "'";
+    }
+    MacVal v = new MacVal();
+    string err = macWalkExpr(w, s.child(0), false, base, v);
+    if (err.length > 0) { return err; }
+    if (v.kind == 3) {
+        return "string values in '" + w.fname + "'";
+    }
+    string vk = "";
+    if (v.kind == 0) { vk = "i"; }
+    else if (v.kind == 1) { vk = "b"; }
+    else { vk = "c"; }
+    if (s.typeHint != "" && s.typeHint != "var") {
+        vk = macScalarOf(s.typeHint);
+        if (vk.length == 0) {
+            return "local '" + s.name + "' has non-tier type in '" + w.fname + "'";
+        }
+    }
+    if (w.guardNames.contains(s.name)) {
+        return "shadowed variable '" + s.name + "' in '" + w.fname + "'";
+    }
+    if (w.guardNames.length > 0 && macFindConst(w.ctx, s.name) >= 0) {
+        return "loop variable '" + s.name + "' collides with a const in '" + w.fname + "'";
+    }
+    if (w.nextSlot >= 500) {
+        return "frame too large in '" + w.fname + "'";
+    }
+    w.varNames.add(s.name);
+    w.varKinds.add(vk);
+    w.nextSlot++;
+    w.maxDepth = macMax(w.maxDepth, base + v.depth);
+    return "";
+}
+
 private string macWalkStmt(MacWalk w, Node s, int base) {
     if (s.kind == 61) {
         if (s.childCount() == 0) { return ""; }
@@ -3871,33 +3942,7 @@ private string macWalkStmt(MacWalk w, Node s, int base) {
         return "";
     }
     if (s.kind == 50) {
-        if (s.childCount() == 0) {
-            return "uninitialized local '" + s.name + "' in '" + w.fname + "'";
-        }
-        MacVal v = new MacVal();
-        string err = macWalkExpr(w, s.child(0), false, base, v);
-        if (err.length > 0) { return err; }
-        if (v.kind == 3) {
-            return "string values in '" + w.fname + "'";
-        }
-        string vk = "";
-        if (v.kind == 0) { vk = "i"; }
-        else if (v.kind == 1) { vk = "b"; }
-        else { vk = "c"; }
-        if (s.typeHint != "" && s.typeHint != "var") {
-            vk = macScalarOf(s.typeHint);
-            if (vk.length == 0) {
-                return "local '" + s.name + "' has non-tier type in '" + w.fname + "'";
-            }
-        }
-        if (w.nextSlot >= 500) {
-            return "frame too large in '" + w.fname + "'";
-        }
-        w.varNames.add(s.name);
-        w.varKinds.add(vk);
-        w.nextSlot++;
-        w.maxDepth = macMax(w.maxDepth, base + v.depth);
-        return "";
+        return macWalkLocalDecl(w, s, base);
     }
     if (s.kind == 51) {
         if (s.childCount() == 0) {
@@ -3961,7 +4006,61 @@ private string macWalkStmt(MacWalk w, Node s, int base) {
         return "";
     }
     if (s.kind == 55) {
-        return "for loops in '" + w.fname + "'";
+        // C-like for (child(0)=init, child(1)=cond, child(2)=update,
+        // child(3)=body): exact desugar onto while — init once, then
+        // cond-check / body / update; continue runs the update, break
+        // leaves. The parser desugars range-for onto this same node, so the
+        // surface is accepted with the monolithic backend's C-for behavior.
+        if (s.childCount() < 4) {
+            return "unsupported statement in '" + w.fname + "'";
+        }
+        Node init = s.child(0);
+        if (init.kind == 50) {
+            if (init.childCount() == 0) {
+                return "uninitialized local '" + init.name + "' in '" + w.fname + "'";
+            }
+            if (macFindConst(w.ctx, init.name) >= 0) {
+                return "loop variable '" + init.name + "' collides with a const in '" + w.fname + "'";
+            }
+            if (macFindVar(w, init.name) >= 0) {
+                return "shadowed variable '" + init.name + "' in '" + w.fname + "'";
+            }
+            string derr = macWalkLocalDecl(w, init, base);
+            if (derr.length > 0) { return derr; }
+        } else if (init.kind == 61) {
+            if (init.childCount() > 0) {
+                MacVal iv = new MacVal();
+                string ierr = macWalkExpr(w, init.child(0), true, base, iv);
+                if (ierr.length > 0) { return ierr; }
+                w.maxDepth = macMax(w.maxDepth, base + iv.depth);
+            }
+        } else if (init.kind == 7) {
+            MacVal iv = new MacVal();
+            string ierr = macWalkExpr(w, init, true, base, iv);
+            if (ierr.length > 0) { return ierr; }
+            w.maxDepth = macMax(w.maxDepth, base + iv.depth);
+        } else {
+            return "unsupported for initializer in '" + w.fname + "'";
+        }
+        MacVal cv = new MacVal();
+        string cerr = macWalkExpr(w, s.child(1), false, base, cv);
+        if (cerr.length > 0) { return cerr; }
+        if (cv.kind == 3) {
+            return "string values in '" + w.fname + "'";
+        }
+        w.maxDepth = macMax(w.maxDepth, base + cv.depth);
+        MacVal uv = new MacVal();
+        string uerr = macWalkExpr(w, s.child(2), true, base, uv);
+        if (uerr.length > 0) { return uerr; }
+        w.maxDepth = macMax(w.maxDepth, base + uv.depth);
+        int guardBase = w.guardNames.length;
+        for (int gi = 0; gi < w.varNames.length; gi++) { w.guardNames.add(w.varNames[gi]); }
+        w.loopDepth++;
+        string berr = macWalkBlock(w, s.child(3), base);
+        w.loopDepth--;
+        while (w.guardNames.length > guardBase) { w.guardNames.pop(); }
+        if (berr.length > 0) { return berr; }
+        return "";
     }
     if (s.kind == 64) {
         return "foreach loops in '" + w.fname + "'";
@@ -4130,11 +4229,27 @@ private string macWalkBinary(MacWalk w, Node e, bool inStmt, int base, MacVal ou
         out.depth = macMax(l.depth, 1 + r.depth);
         return "";
     }
-    if (op == 4) {
-        return "division in '" + w.fname + "'";
-    }
-    if (op == 13) {
-        return "modulo in '" + w.fname + "'";
+    if (op == 4 || op == 13) {
+        // Division and modulo lower through the guarded sequence, which
+        // prints through printf on a zero divisor — so the import must
+        // exist even in programs that never call print (mirrors the
+        // reference depth math exactly).
+        if (e.childCount() < 2) {
+            return "unsupported expression in '" + w.fname + "'";
+        }
+        MacVal l = new MacVal();
+        MacVal r = new MacVal();
+        string err = macWalkExpr(w, e.child(0), false, base, l);
+        if (err.length > 0) { return err; }
+        err = macWalkExpr(w, e.child(1), false, base + 1, r);
+        if (err.length > 0) { return err; }
+        if (l.kind == 3 || r.kind == 3) {
+            return "string values in '" + w.fname + "'";
+        }
+        w.ctx.usesPrintf = true;
+        out.kind = 0;
+        out.depth = macMax(l.depth, 1 + r.depth);
+        return "";
     }
     if (op == 5 || op == 6 || op == 7 || op == 8 || op == 9 || op == 10) {
         if (e.childCount() < 2) {
@@ -4170,7 +4285,7 @@ private string macWalkBinary(MacWalk w, Node e, bool inStmt, int base, MacVal ou
         out.depth = macMax(l.depth, r.depth);
         return "";
     }
-    if (op == 20 || op == 14 || op == 15 || op == 16 || op == 28) {
+    if (op == 20 || op == 14 || op == 15 || op == 16 || op == 28 || op == 17 || op == 29) {
         if (e.childCount() < 2) {
             return "unsupported expression in '" + w.fname + "'";
         }
@@ -4187,15 +4302,14 @@ private string macWalkBinary(MacWalk w, Node e, bool inStmt, int base, MacVal ou
         if (v.kind == 3) {
             return "string values in '" + w.fname + "'";
         }
+        if (op == 17 || op == 29) {
+            // Compound division lowers through the guarded sequence, which
+            // prints on a zero divisor.
+            w.ctx.usesPrintf = true;
+        }
         out.kind = 0;
         out.depth = v.depth;
         return "";
-    }
-    if (op == 17) {
-        return "division in '" + w.fname + "'";
-    }
-    if (op == 29) {
-        return "modulo in '" + w.fname + "'";
     }
     if (op == 35 || op == 36) {
         if (e.childCount() < 1) {
@@ -4552,6 +4666,46 @@ private void macEpilogue(MacGen gen, int frame) {
     gen.asm.emitWord(a64Ret(30));
 }
 
+// Emit the guarded divide/modulo sequence: X9 holds the dividend and X10
+// the divisor on entry; X9 holds the result on exit (X11 scratched, X0
+// clobbered on the trap path only). A zero divisor takes the exact x64
+// uncaught-exception path (printf of "Unhandled exception\n", then
+// exit(1)); INT64_MIN / -1 (or %) traps with brk, mirroring x64 idiv's loud
+// hardware fault instead of sdiv's silent wrap.
+private void macEmitGuardedDivmod(MacGen gen, bool isMod) {
+    int okZero = gen.asm.createLabel();
+    gen.asm.cbnzLabel(10, okZero);
+    string msg = "Unhandled exception\n";
+    int[] bytes = [];
+    for (int i = 0; i < msg.length; i++) {
+        int c = msg[i];
+        bytes.add(c);
+    }
+    bytes.add(0);
+    int off = macIntern(gen, bytes);
+    macEmitDataAddr(gen, 0, off);
+    macEmitCall(gen, "", 1, 1);
+    gen.asm.emitWord(a64Movz(0, 1, 0));
+    macEmitCall(gen, "", 1, 0);
+    gen.asm.bindLabel(okZero);
+    int ok = gen.asm.createLabel();
+    gen.asm.emitWord(a64Movz(11, 32768, 3));
+    gen.asm.emitWord(a64CmpReg(9, 11));
+    gen.asm.bcondLabel(1, ok);
+    macMov64(gen, 11, -1);
+    gen.asm.emitWord(a64CmpReg(10, 11));
+    gen.asm.bcondLabel(1, ok);
+    gen.asm.emitWord(a64Brk(0));
+    gen.asm.bindLabel(ok);
+    if (isMod) {
+        gen.asm.emitWord(a64Sdiv(11, 9, 10));
+        gen.asm.emitWord(a64Msub(11, 11, 10, 9));
+        gen.asm.emitWord(a64MovReg(9, 11));
+    } else {
+        gen.asm.emitWord(a64Sdiv(9, 9, 10));
+    }
+}
+
 // Emit one function: frame setup, parameter spills, body, and the
 // function-end sequence (exit for main, epilogue fall-through otherwise).
 private void macLowerFunc(MacGen gen, Node func, string owner, MacLayout layout) {
@@ -4676,6 +4830,42 @@ private void macEmitStmt(MacGen gen, Node func, MacLayout layout, Node s, bool i
     }
     if (s.kind == 63) {
         gen.asm.bLabel(gen.loopTops[gen.loopTops.length - 1]);
+        return;
+    }
+    if (s.kind == 55) {
+        // Mirrors the walker above statement-for-statement: init once, then
+        // cond-check / body / update; continue runs the update, break
+        // leaves.
+        Node init = s.child(0);
+        if (init.kind == 50) {
+            macEmitExpr(gen, func, layout, init.child(0), false);
+            int slot = macLayoutSlot(layout, init.name);
+            macPopTo(gen, 9, varSlots);
+            gen.asm.emitWord(a64StrImm(9, 31, slot * 8));
+        } else if (init.kind == 61) {
+            if (init.childCount() > 0) {
+                macEmitExpr(gen, func, layout, init.child(0), true);
+            }
+        } else {
+            macEmitExpr(gen, func, layout, init, true);
+        }
+        int top = gen.asm.createLabel();
+        int updateLbl = gen.asm.createLabel();
+        int end = gen.asm.createLabel();
+        gen.loopTops.add(updateLbl);
+        gen.loopEnds.add(end);
+        gen.asm.bindLabel(top);
+        macEmitExpr(gen, func, layout, s.child(1), false);
+        macPopTo(gen, 9, varSlots);
+        gen.asm.cbzLabel(9, end);
+        macEmitBlock(gen, func, layout, s.child(3), isVoid, mainEnd);
+        gen.loopTops.pop();
+        gen.loopEnds.pop();
+        gen.asm.bindLabel(updateLbl);
+        gen.depth = 0;
+        macEmitExpr(gen, func, layout, s.child(2), true);
+        gen.asm.bLabel(top);
+        gen.asm.bindLabel(end);
         return;
     }
     printline("object cache: mac lowering failed (predicate leak)");
@@ -4836,6 +5026,16 @@ private void macEmitBinary(MacGen gen, Node func, MacLayout layout, Node e, int 
         macPush(gen, varSlots);
         return;
     }
+    if (op == 4 || op == 13) {
+        macEmitExpr(gen, func, layout, e.child(0), false);
+        macEmitExpr(gen, func, layout, e.child(1), false);
+        macPopTo(gen, 10, varSlots);
+        macPopTo(gen, 9, varSlots);
+        bool isMod = op == 13;
+        macEmitGuardedDivmod(gen, isMod);
+        macPush(gen, varSlots);
+        return;
+    }
     if (op == 5 || op == 6 || op == 7 || op == 8 || op == 9 || op == 10) {
         int cond = 10;
         if (op == 5) { cond = 0; }
@@ -4893,13 +5093,19 @@ private void macEmitBinary(MacGen gen, Node func, MacLayout layout, Node e, int 
         macPush(gen, varSlots);
         return;
     }
-    if (op == 20 || op == 14 || op == 15 || op == 16 || op == 28) {
+    if (op == 20 || op == 14 || op == 15 || op == 16 || op == 28 || op == 17 || op == 29) {
         Node t = e.child(0);
         int slot = macLayoutSlot(layout, t.name);
         macEmitExpr(gen, func, layout, e.child(1), false);
         macPopTo(gen, 10, varSlots);
         if (op == 20 || op == 28) {
             gen.asm.emitWord(a64MovReg(9, 10));
+        } else if (op == 17 || op == 29) {
+            // X10 holds the divisor; the dividend loads straight into X9
+            // (X11 is free for the guarded sequence).
+            gen.asm.emitWord(a64LdrImm(9, 31, slot * 8));
+            bool isMod = op == 29;
+            macEmitGuardedDivmod(gen, isMod);
         } else {
             gen.asm.emitWord(a64LdrImm(9, 31, slot * 8));
             if (op == 14) { gen.asm.emitWord(a64AddReg(9, 9, 10)); }
