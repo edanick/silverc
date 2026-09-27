@@ -2800,6 +2800,9 @@ class ObjSession {
     public prop int[] notedM;
     public prop int[] notedH;
     public prop int[] notedStamps;
+    // Worker threads (the unified pipeline's multi-threaded mapping runs
+    // per-file emission under workerCount workers).
+    public prop int workers;
 
     // Open (or prepare) the object cache for `projName` rooted at `rootDir`,
     // targeting `targetOsName` with flag set (`modeName`, `optimize`).
@@ -2822,6 +2825,7 @@ class ObjSession {
         this.notedM = [];
         this.notedH = [];
         this.notedStamps = [];
+        this.workers = 1;
         string guarded = path.guardForWindows(projName);
         string target = objTargetDirName(targetOsName);
         string appdata = "";
@@ -2851,6 +2855,28 @@ class ObjSession {
             if (this.notedKeys[i] == key) { return i; }
         }
         return -1;
+    }
+
+    // Session-relative keys observed this run in CANONICAL unit order (the
+    // collection order the aggregate was built in: dependencies first, entry
+    // last). The unified pipeline joins every per-file buffer back into this
+    // order before the single downstream link, so output never depends on
+    // which tier each file came from.
+    public string[] notedOrder() {
+        string[] order = [];
+        for (int i = 0; i < this.notedKeys.length; i++) { order.add(this.notedKeys[i]); }
+        return order;
+    }
+
+    // Worker threads for the unified pipeline's multi-threaded mapping
+    // (resolved count: default `total - 2`, or explicit `--threads`).
+    public void setWorkers(int n) {
+        this.workers = n;
+    }
+
+    public int workerCount() {
+        if (this.workers < 1) { return 1; }
+        return this.workers;
     }
 
     // Session-relative key (/-separated) for a collected path. Mirrors the
@@ -2928,7 +2954,6 @@ class ObjSession {
     public void plan(ObjPlan plan) {
         plan.fresh = [];
         plan.stale = [];
-        this.sortNoted();
         for (int n = 0; n < this.notedKeys.length; n++) {
             bool ok = false;
             int idx = this.findRecord(this.notedKeys[n]);
@@ -2957,6 +2982,11 @@ class ObjSession {
             if (ok) { plan.fresh.add(this.notedKeys[n]); }
             else { plan.stale.add(this.notedKeys[n]); }
         }
+        // Deterministic emission order (matches the reference plan): the
+        // noted observation order stays canonical for the downstream link,
+        // while the fresh/stale work lists sort by key.
+        this.sortPlanKeys(plan.fresh);
+        this.sortPlanKeys(plan.stale);
     }
 
     // Freshness hash + emission stamp for a noted file (for object emission).
@@ -3162,6 +3192,20 @@ class ObjSession {
             this.notedM[j + 1] = m;
             this.notedH[j + 1] = h;
             this.notedStamps[j + 1] = lc;
+        }
+    }
+
+    // Deterministic work-list order for one plan key array (insertion sort
+    // by key, mirroring sortRecords above).
+    private void sortPlanKeys(string[] keys) {
+        for (int i = 1; i < keys.length; i++) {
+            string k = keys[i];
+            int j = i - 1;
+            while (j >= 0 && k < keys[j]) {
+                keys[j + 1] = keys[j];
+                j--;
+            }
+            keys[j + 1] = k;
         }
     }
 

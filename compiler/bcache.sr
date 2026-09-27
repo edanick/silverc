@@ -2,6 +2,7 @@ mod export bcache;
 
 import * from token;
 import * from lexer;
+import * from pipeline;
 import * from env;
 import * from fs;
 import * from path;
@@ -95,6 +96,12 @@ class CacheSession {
     // --cache-bytecode is absent; tokensForRange then stores nothing and
     // flush is a no-op.
     public prop bool readOnly;
+    // Relative keys that decoded from a synced `.srbc` this run
+    // (bytecode-tier hits). Read by the unified pipeline
+    // (pipeClassifyUnit) to classify each unit's single input kind exactly
+    // once; misses remove their key. Never persisted — classification is
+    // per-build.
+    public prop string[] hits;
 
     construct (string rootDir, string projName, bool ro = false) {
         this.ok = false;
@@ -111,6 +118,7 @@ class CacheSession {
         this.dirtyCount = 0;
         this.lastPayload = "";
         this.readOnly = ro;
+        this.hits = [];
         string legacyRecord = "";
         string legacyIndex = "";
         #on WINDOWS
@@ -172,9 +180,15 @@ class CacheSession {
         int ce = end;
         if (ce > aggSource.length) { ce = aggSource.length; }
         this.lastPayload = "";
-        if (!this.ok) { return bcLex(aggSource[cs..ce]); }
+        if (!this.ok) {
+            string[] noSessErrs = [];
+            return pipeLexUnit(aggSource[cs..ce], noSessErrs);
+        }
         string key = path.relative(this.root, absPath);
-        if (key.length == 0) { return bcLex(aggSource[cs..ce]); }
+        if (key.length == 0) {
+            string[] noKeyErrs = [];
+            return pipeLexUnit(aggSource[cs..ce], noKeyErrs);
+        }
         int64 rangeHash = hash.fnv1(aggSource, start, end);
         int size = file.size(absPath);
         string hashKey = (string)rangeHash;
@@ -184,18 +198,24 @@ class CacheSession {
             if (this.hashesStr[idx] == hashKey && this.mTimesStr[idx] == sizeKey) {
                 Token[] cached = this.loadSrbcText(absPath);
                 if (cached.length > 0) {
+                    // Bytecode-tier hit: this unit skipped re-lexing (the
+                    // unified pipeline classifies it as synced-bytecode).
+                    this.noteHit(key);
                     return cached;
                 }
             }
         }
-        // Re-cache this file: materialize the body, lex, encode, mark dirty —
+        this.dropHit(key);
+        // Re-cache this file: materialize the body, lex through the
+        // pipeline's single lex entry, encode, mark dirty —
         // skipped entirely on a readOnly (--cache-object alone) session, where
         // a miss simply returns the fresh lex and stores nothing (case 1
         // writes NOTHING to bytecode\ either way).
         string body = "";
         if (hopPath.length > 0) { body = bcSliceViaFile(hopPath, start, end - start); }
         if (body.length == 0) { body = aggSource[cs..ce]; }
-        Token[] tokens = bcLex(body);
+        string[] missErrs = [];
+        Token[] tokens = pipeLexUnit(body, missErrs);
         if (this.readOnly) { return tokens; }
         int stamp = datetime.now().milliseconds();
         if (this.encodable(tokens)) {
@@ -221,6 +241,45 @@ class CacheSession {
     // Whole-string variant kept for direct callers with an in-memory file.
     public Token[] tokensFor(string absPath, string source) {
         return this.tokensForRange(absPath, source, 0, source.length, "");
+    }
+
+    // True when `absPath` decoded from a synced `.srbc` during this session
+    // (bytecode-tier hit — the unit skipped re-lexing). Used by the unified
+    // pipeline to classify the unit's single input kind. False on misses, on
+    // sessions that never saw the file, and when there is no session.
+    public bool wasHit(string absPath) {
+        if (!this.ok) { return false; }
+        return this.wasHitKey(path.relative(this.root, absPath));
+    }
+
+    // Key-spelling variant of wasHit for callers holding a session-relative
+    // key (the object tier's noted keys): same normalization, same answer.
+    public bool wasHitKey(string key) {
+        string k = bcNormKey(key);
+        for (int i = 0; i < this.hits.length; i++) {
+            if (this.hits[i] == k) { return true; }
+        }
+        return false;
+    }
+
+    private void noteHit(string key) {
+        string k = bcNormKey(key);
+        for (int i = 0; i < this.hits.length; i++) {
+            if (this.hits[i] == k) { return; }
+        }
+        this.hits.add(k);
+    }
+
+    private void dropHit(string key) {
+        string k = bcNormKey(key);
+        int w = 0;
+        for (int i = 0; i < this.hits.length; i++) {
+            if (this.hits[i] != k) {
+                this.hits[w] = this.hits[i];
+                w++;
+            }
+        }
+        while (this.hits.length > w) { this.hits.pop(); }
     }
 
     // Drop records whose sources vanished and rewrite the record files once
@@ -1077,8 +1136,11 @@ private Token? tokenFromRange(string text, int start, int end) {
     return t;
 }
 
-// Lex source text fresh (cache-miss path).
-public Token[] bcLex(string source) {
-    Lexer lx = new Lexer(source);
-    return lx.tokenize();
+// Session-key normalization shared by the hit set: `/`-separated with no
+// leading `./` segments, so intake spellings (`.\util.sr`) and noted keys
+// (`util.sr`) answer identically.
+string bcNormKey(string key) {
+    string k = key.replaceAll("\\", "/");
+    while (k.startsWith("./")) { k = projectSlice(k, 2, k.length); }
+    return k;
 }

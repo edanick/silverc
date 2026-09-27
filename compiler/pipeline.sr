@@ -1,0 +1,143 @@
+mod export pipeline;
+
+import * from token;
+import * from lexer;
+import * from parser;
+import * from node;
+import * from project;
+
+// OVERHAUL.md "The unified generation pipeline (one factory line)".
+//
+// Code generation and executable-format generation run as ONE pipeline,
+// regardless of input shape or flags — one file or many, single `.sr` or
+// `.srp` project, small or big, cached or not. Many units enter, they are
+// mapped into one unified order, and one executable leaves.
+//
+// This module is the single home of the line's shared pieces:
+// - pipeKind* / pipeKindName / PipeUnit — the one normalized per-file unit
+//   record (origin + content hash + kind). Every compilation unit enters as
+//   exactly one of three kinds: a cached `.o` (object-tier hit — already
+//   native, straight to link), a synced `.srbc` (bytecode-tier hit — skipped
+//   re-lexing), or an `.sr` source file (no cache — lexed and parsed
+//   directly). A unit is never two kinds at once and never processed twice.
+//   (Token streams ride the single aggregate stream: chunks join in canonical
+//   unit order before the one lex below, so the record carries origin + hash
+//   + kind while the stream stays whole.)
+// - pipeLexUnit — the exactly-one lex entry. Every fresh lex in the pipeline
+//   funnels through it (the cache tiers compute through it, the driver calls
+//   it directly on a miss).
+// - pipeParseUnit — the exactly-one parse entry. Every token stream in the
+//   pipeline funnels through it.
+// - pipeClassifyUnit — one unit's final input kind for `[pipe]`
+//   diagnostics: fresh object-tier units go straight to link; the rest keep
+//   the frontend tier (synced bytecode when the `.srbc` decoded, source
+//   otherwise).
+//
+// Flags never duplicate a stage — they only select, per unit and per stage,
+// whether to read from cache or compute fresh. Mode (`--aot`/`--jit`/
+// `--runtime`) and `--optimize` select backend variants inside the same
+// stages, not parallel pipelines.
+//
+// Multi-file mapping without duplication: Silver runs the workers
+// sequentially (no threads comparable to the reference), so the driver maps
+// each stale file through its ONE mapping function into its OWN separate
+// buffer and joins back into canonical unit order before the single
+// downstream link — order in = order out for every worker count, and
+// single- vs multi-worker builds produce identical binaries.
+
+// One input kind per unit (mirrors the reference UnitKind): a cached `.o`
+// (object-tier hit), a synced `.srbc` (bytecode-tier hit), or `.sr` source.
+int pipeKindCachedObject = 0;
+int pipeKindSyncedBytecode = 1;
+int pipeKindSource = 2;
+
+// Stable lowercase name for `[pipe]` diagnostics (mirrors UnitKind::name).
+public string pipeKindName(int kind) {
+    if (kind == pipeKindCachedObject) { return "cached-object"; }
+    if (kind == pipeKindSyncedBytecode) { return "synced-bytecode"; }
+    return "source";
+}
+
+// One unit's final input kind: an object-tier hit goes straight to link,
+// otherwise the unit keeps the frontend tier (synced `.srbc` when it
+// decoded, `.sr` source otherwise). Object wins over bytecode — a unit is
+// never two kinds at once.
+public int pipeClassifyUnit(bool objectFresh, bool bytecodeHit) {
+    if (objectFresh) { return pipeKindCachedObject; }
+    if (bytecodeHit) { return pipeKindSyncedBytecode; }
+    return pipeKindSource;
+}
+
+// One normalized per-file unit record: canonical origin key plus the FNV-1
+// content hash of the exact source text observed, and the unit's single
+// input kind (finalized to cached-object by the object-tier plan for
+// reusable units).
+class PipeUnit {
+    public prop string origin;
+    public prop int64 hash;
+    public prop int kind;
+
+    construct (string origin, int64 hash, int kind) {
+        this.origin = origin;
+        this.hash = hash;
+        this.kind = kind;
+    }
+
+    public string kindName() {
+        return pipeKindName(this.kind);
+    }
+}
+
+// Program + diagnostics from the single parse entry. `modExportNames` and
+// `modExportInternal` ride along: the visibility pass reads them off the
+// same parse instead of constructing its own parser.
+class PipeParseOut {
+    public prop Node[] program;
+    public prop string[] errors;
+    public prop string[] modExportNames;
+    public prop bool[] modExportInternal;
+
+    construct {
+        this.program = [];
+        this.errors = [];
+        this.modExportNames = [];
+        this.modExportInternal = [];
+    }
+}
+
+// THE lex entry of the unified pipeline: lex one source text into its token
+// stream, collecting lexical diagnostics into lexErrs (mirrors the
+// reference lex_unit Result: callers that fail on any diagnostic report
+// lexErrs and drop the stream). Every fresh lex — driver misses, the cache
+// tiers' own compute — funnels through here, so there is exactly one place
+// that turns source text into tokens.
+public Token[] pipeLexUnit(string source, string[] lexErrs) {
+    Lexer lx = new Lexer(source);
+    Token[] toks = lx.tokenize();
+    for (int i = 0; i < lx.lexErrors.length; i++) { lexErrs.add(lx.lexErrors[i]); }
+    return toks;
+}
+
+// THE parse entry of the unified pipeline: parse one token stream into its
+// program, collecting recoverable diagnostics into out.errors (callers that
+// fail on any diagnostic report them and drop the program). lineLens carries
+// the per-line character lengths of the lexed source so diagnostics stay
+// exact (pass useLens=false on paths that never computed them — only the
+// entry aggregate sets them). customNative carries the manifest's declared
+// custom grants (null when the build declares none — standalone compiles);
+// targetOs is the resolved codegen target. checkCalls runs the post-parse
+// call diagnostics over the program (driver path); visibility parses without
+// it, exactly as before.
+public void pipeParseUnit(Token[] tokens, int[] lineLens, bool useLens, NativeModules? customNative, string targetOs, bool checkCalls, PipeParseOut out) {
+    Parser p = new Parser(tokens);
+    if (useLens) { p.setLineLengths(lineLens); }
+    if (customNative != null) { p.customNative = customNative; }
+    p.customTargetOs = targetOs;
+    out.program = p.parseProgram();
+    if (checkCalls) { p.checkCallDiagnostics(out.program); }
+    out.errors = p.diagErrors;
+    for (int i = 0; i < p.modExportNames.length; i++) {
+        out.modExportNames.add(p.modExportNames[i]);
+        out.modExportInternal.add(p.modExportInternal[i]);
+    }
+}

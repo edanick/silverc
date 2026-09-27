@@ -4,6 +4,7 @@ import * from lexer;
 import * from token;
 import * from parser;
 import * from node;
+import * from pipeline;
 import * from string;
 import * from path;
 import * from preprocess;
@@ -174,14 +175,19 @@ class VisibilityChecker {
         if (rawSrc.length == 0) { return null; }
         string src = visPreprocess(path, rawSrc, this.debugBuild);
         this.visitedPaths.add(path);
-        Lexer lexer = new Lexer(src + "\n");
-        Token[] toks = lexer.tokenize();
-        Parser parser = new Parser(toks);
+        // Single lex + parse entries of the unified pipeline (lexical
+        // diagnostics stay dropped here, call diagnostics stay off, and no
+        // line lengths are set — exactly the old direct construction).
+        string[] visLexErrs = [];
+        Token[] toks = pipeLexUnit(src + "\n", visLexErrs);
+        PipeParseOut vout = new PipeParseOut();
+        int[] noLens = [];
+        pipeParseUnit(toks, noLens, false, null, "", false, vout);
         VisFile f = new VisFile(path);
-        f.items = parser.parseProgram();
-        for (int i = 0; i < parser.modExportNames.length; i++) {
-            f.exportNames.add(parser.modExportNames[i]);
-            f.exportInternal.add(parser.modExportInternal[i]);
+        f.items = vout.program;
+        for (int i = 0; i < vout.modExportNames.length; i++) {
+            f.exportNames.add(vout.modExportNames[i]);
+            f.exportInternal.add(vout.modExportInternal[i]);
         }
         this.loadedFiles.add(f);
         return f;

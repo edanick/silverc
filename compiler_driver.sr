@@ -17,6 +17,7 @@ import * from lexer;
 import * from token;
 import * from parser;
 import * from node;
+import * from pipeline;
 import * from cli_flags;
 import * from optimizer;
 import * from bcache;
@@ -891,7 +892,7 @@ string cacheSessionName(string inputFile, bool inputIsProject) {
 // boundary falls back loudly to the monolithic path (the message is
 // printed here; the object cache is left untouched). Link failures print
 // the exact reference error and exit — never a silent mislink.
-int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string source, string inputFile, bool inputIsProject, string manifest, ProgressReporter progress, int subsystem, string[] verKeys, string[] verVals) {
+int[] objCompileFlow(CliFlags flags, ObjSession? osess, CacheSession? sess, Node[] ast, string source, string inputFile, bool inputIsProject, string manifest, ProgressReporter progress, int subsystem, string[] verKeys, string[] verVals) {
     int[] empty = [];
     if (osess == null) { return empty; }
     string target = ppTargetOsFor(flags.targetOs);
@@ -950,21 +951,39 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
     if (debugObj) {
         eprintln("[objcache] plan: " + (string)p.fresh.length + " fresh, " + (string)p.stale.length + " stale");
     }
-    ParsedObj[] parsed = [];
-    for (int fi = 0; fi < p.fresh.length; fi++) {
-        string rel = p.fresh[fi];
-        if (debugObj) { eprintln("[objcache] reuse " + rel); }
-        ParsedObj u = new ParsedObj();
-        string rerr = osess.readUnit(rel, u);
-        if (rerr.length > 0) {
-            flags.errLine(rerr);
-            exit(1);
+    // Finalize every unit's SINGLE input kind in canonical noted order (the
+    // collection order the aggregate was built in): an object-tier hit goes
+    // straight to link, otherwise the unit keeps the frontend tier (synced
+    // `.srbc` when it decoded, `.sr` source otherwise). Each unit logs
+    // exactly once, proving no unit is two kinds at once and none is
+    // processed twice.
+    bool debugPipe = env.get("SILVERC_DEBUG_PIPE").length > 0;
+    string[] noted = osess.notedOrder();
+    for (int ni = 0; ni < noted.length; ni++) {
+        string nrel = noted[ni];
+        bool isFresh = p.fresh.indexOf(nrel) >= 0;
+        bool hit = false;
+        if (!isFresh && sess != null) { hit = sess.wasHitKey(nrel); }
+        int64[] hOut = [];
+        int[] sOut = [];
+        osess.notedHashStamp(nrel, hOut, sOut);
+        int64 hval = 0;
+        if (hOut.length > 0) { hval = hOut[0]; }
+        PipeUnit punit = new PipeUnit(nrel, hval, pipeClassifyUnit(isFresh, hit));
+        if (debugPipe || debugObj) {
+            eprintln("[pipe] " + nrel + " " + punit.kindName());
         }
-        parsed.add(u);
     }
+    // ONE mapping function over the stale units in plan order: each file
+    // emits into its OWN separate buffer (a fresh per-unit backend below —
+    // no shared mutable state between workers). Silver runs the workers
+    // sequentially under the same resolved worker count, so order in =
+    // order out for every count; session writes stay post-join and
+    // sequential — workers never touch shared state.
+    int workers = osess.workerCount();
+    ObjUnit[] emitUnits = [];
     for (int si = 0; si < p.stale.length; si++) {
         string rel = p.stale[si];
-        if (debugObj) { eprintln("[objcache] emit " + rel + " (codegen)"); }
         ObjUnit unit = new ObjUnit();
         if (target == "MAC") {
             // Genuine per-file ARM64 machine code via the mac lowering
@@ -984,9 +1003,8 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
             NativeModules ocgNm = projectParseNativeModules(manifest);
             ocg.customNative = ocgNm;
         }
-        // Progress ticks mirror the monolithic shape (first run only, so a
-        // multi-stale rebuild does not multiply the totals).
-        if (si == 0) { ocg.progress = progress; }
+        // Progress ticks stay on the monolithic path: the mapped per-unit
+        // emission runs without progress (mirrors the reference workers).
         ocg.genProgramOwned(ast, owners, entryKey);
         if (ocg.objHasRawRel32) {
             flags.errLine("cache-object: inline assembly is outside the v1 object tier; full monolithic compile, objects not updated");
@@ -1003,22 +1021,35 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
             flags.errLine("cache-object: too many relocations in '" + rel + "' for one COFF section (v1 boundary); full monolithic compile, objects not updated");
             return empty;
         }
-        int64[] hOut = [];
-        int[] sOut = [];
-        if (!osess.notedHashStamp(rel, hOut, sOut)) {
-            flags.errLine("object cache: '" + rel + "' was never noted");
+        emitUnits.add(unit);
+    }
+    // Ordered join in canonical noted order (never inside workers): write +
+    // re-parse each emitted unit sequentially. The linked unit is the parsed
+    // file, never a memory image (like the reference parse-after-write).
+    string[] wroteRels = [];
+    ParsedObj[] wroteParsed = [];
+    for (int wi = 0; wi < noted.length; wi++) {
+        string wrel = noted[wi];
+        int widx = p.stale.indexOf(wrel);
+        if (widx < 0) { continue; }
+        if (debugObj) { eprintln("[objcache] emit " + wrel + " (codegen)"); }
+        ObjUnit wunit = emitUnits[widx];
+        int64[] whOut = [];
+        int[] wsOut = [];
+        if (!osess.notedHashStamp(wrel, whOut, wsOut)) {
+            flags.errLine("object cache: '" + wrel + "' was never noted");
             exit(1);
         }
-        int[] obytes = emitObject(unit, osess.flags, hOut[0], sOut[0], target);
-        string werr = osess.writeUnit(rel, obytes);
+        int[] obytes = emitObject(wunit, osess.flags, whOut[0], wsOut[0], target);
+        string werr = osess.writeUnit(wrel, obytes);
         if (werr.length > 0) {
             flags.errLine(werr);
             exit(1);
         }
-        // Re-read what is on disk (like the reference parse-after-write):
-        // the linked unit is the parsed file, never a memory image.
+        // Re-read what is on disk: the linked unit is the parsed file, never
+        // a memory image.
         ParsedObj pu = new ParsedObj();
-        string opath = osess.objectPathFor(rel);
+        string opath = osess.objectPathFor(wrel);
         byte[] raw = [];
         try {
             raw = file.read(opath);
@@ -1035,7 +1066,32 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, Node[] ast, string sourc
             flags.errLine(perr);
             exit(1);
         }
-        parsed.add(pu);
+        wroteRels.add(wrel);
+        wroteParsed.add(pu);
+    }
+    // Single downstream link over units in canonical noted order — identical
+    // consumption regardless of tier mix or file count. (Fresh units read
+    // straight from cache: no codegen ran for them at all.)
+    ParsedObj[] parsed = [];
+    for (int li = 0; li < noted.length; li++) {
+        string lrel = noted[li];
+        if (p.fresh.indexOf(lrel) >= 0) {
+            if (debugObj) { eprintln("[objcache] reuse " + lrel); }
+            ParsedObj u = new ParsedObj();
+            string rerr = osess.readUnit(lrel, u);
+            if (rerr.length > 0) {
+                flags.errLine(rerr);
+                exit(1);
+            }
+            parsed.add(u);
+        } else {
+            int sidx = wroteRels.indexOf(lrel);
+            if (sidx < 0) {
+                flags.errLine("object cache: '" + lrel + "' was noted but never emitted");
+                exit(1);
+            }
+            parsed.add(wroteParsed[sidx]);
+        }
     }
     ObjLinkResult link = new ObjLinkResult();
     if (target == "MAC") {
@@ -1374,19 +1430,25 @@ int compileOnce(CliFlags flags, string outputFile) {
         osess = new ObjSession(path.dirname(inputFile), cacheSessionName(inputFile, inputIsProject), ppTargetOsFor(flags.targetOs), flags.modeName(), flags.optimize);
         if (!osess.ok) { osess = null; }
     }
+    // OVERHAUL.md threading model: the unified pipeline maps per-file
+    // emission under this resolved count (default `total - 2`, or explicit
+    // `--threads`).
+    if (osess != null) { osess.setWorkers(flags.threadCount); }
     // OVERHAUL.md --cache-object alone (no --cache-bytecode) still routes
     // through the chunked bytecode path below with a READ ONLY session: hits
     // decode the synced .srbc per file (.sr fallback per file otherwise) and
     // bytecode\ is never written. Only the fully uncached configuration
     // (neither flag) lexes the aggregate whole here.
     if (!flags.cacheBytecode && osess == null) {
-        Lexer lexer = new Lexer(source);
-        tokens = lexer.tokenize();
+        // No-cache builds use the SAME line: a plain fresh lex through the
+        // pipeline's single lex entry.
+        string[] lexErrs = [];
+        tokens = pipeLexUnit(source, lexErrs);
 
         // Lexical diagnostics print grouped under `[file]` headers and abort
         // before parsing (unmarked builds: single `[input-as-given]` header).
-        if (lexer.lexErrors.length > 0) {
-            drvPrintDiagnostics(lexer.lexErrors, source, inputFile, flags.cacheBytecode);
+        if (lexErrs.length > 0) {
+            drvPrintDiagnostics(lexErrs, source, inputFile, flags.cacheBytecode);
             exit(1);
         }
     } else {
@@ -1445,38 +1507,39 @@ int compileOnce(CliFlags flags, string outputFile) {
             tokens.add(new Token(0, "", 1, 1));
             if (file.exists(hopPath)) { file.delete(hopPath); }
         } else {
-            Lexer lexer = new Lexer(source);
-            tokens = lexer.tokenize();
-            if (lexer.lexErrors.length > 0) {
-                drvPrintDiagnostics(lexer.lexErrors, source, inputFile, flags.cacheBytecode);
+            // Cache tiers off and no chunk split: same line, fresh lex
+            // through the single lex entry.
+            string[] fbErrs = [];
+            tokens = pipeLexUnit(source, fbErrs);
+            if (fbErrs.length > 0) {
+                drvPrintDiagnostics(fbErrs, source, inputFile, flags.cacheBytecode);
                 exit(1);
             }
         }
     }
 
-    Parser parser = new Parser(tokens);
-    parser.setLineLengths(lineLens);
+    // Every token stream parses through the pipeline's single parse entry.
     // DOCS/261 custom native modules: the manifest map lets declared custom
-    // grants resolve (standalone compiles keep the empty default). Bare
-    // customs resolve the manifest side matching `--os`.
+    // grants resolve (standalone compiles keep the empty default — a null
+    // custom set). Bare customs resolve the manifest side matching `--os`.
+    NativeModules? drvNm = null;
     if (inputIsProject) {
-        NativeModules drvNm = projectParseNativeModules(manifest);
-        parser.customNative = drvNm;
+        drvNm = projectParseNativeModules(manifest);
     }
-    parser.customTargetOs = ppTargetOsFor(flags.targetOs);
-
-    Node[] ast = parser.parseProgram();
+    PipeParseOut pout = new PipeParseOut();
+    pipeParseUnit(tokens, lineLens, true, drvNm, ppTargetOsFor(flags.targetOs), true, pout);
+    Node[] ast = pout.program;
 
     // Post-parse call diagnostics (EXCEPTIONS/*.md): unknown-method /
     // did-you-mean over the fully collected symbol table, and filesystem
-    // ValueException checks over literal path arguments.
-    parser.checkCallDiagnostics(ast);
+    // ValueException checks over literal path arguments. Runs inside the
+    // single parse entry above, over the same parser state.
 
     // Syntax diagnostics grouped under `[file]` headers, in source order
     // within each file (SYNTAX_EXCEPTIONS.md #4). Bodies are byte-identical;
     // only the headers are added.
-    if (parser.diagErrors.length > 0) {
-        drvPrintDiagnostics(parser.diagErrors, source, inputFile, flags.cacheBytecode);
+    if (pout.errors.length > 0) {
+        drvPrintDiagnostics(pout.errors, source, inputFile, flags.cacheBytecode);
         exit(1);
     }
 
@@ -1548,7 +1611,7 @@ int compileOnce(CliFlags flags, string outputFile) {
     // v1 boundary falls back loudly; link failures exit inside.
     int[] peData = [];
     if (osess != null) {
-        peData = objCompileFlow(flags, osess, ast, source, inputFile, inputIsProject, manifest, progress, linkSubsystem, viKeys, viValues);
+        peData = objCompileFlow(flags, osess, sess, ast, source, inputFile, inputIsProject, manifest, progress, linkSubsystem, viKeys, viValues);
     }
     if (peData.length == 0) {
     MiniAsm asm = new MiniAsm();
