@@ -1992,8 +1992,11 @@ private void objSortRelocs(ObjUnit unit) {
 
 // Link parsed objects into a final Windows binary: resolve symbols across
 // the set, lay out sections, apply relocations, and emit through the
-// existing MiniEf writer. Units sort by file key first so the layout is
-// deterministic. Any unresolvable or duplicate symbol is a hard link error
+// existing MiniEf writer. Units lay out in unitsIn order — the caller passes
+// canonical program order (the collection order the aggregate was built in:
+// dependencies first, entry last), which is the monolithic backend's
+// emission order, so the linked image is byte-identical to the no-cache
+// build. Any unresolvable or duplicate symbol is a hard link error
 // — never a silent mislink. Fills link (err "" on success).
 public void linkUnits(ParsedObj[] unitsIn, int subsystem, string[] verKeys, string[] verVals, ObjLinkResult link) {
     link.err = "";
@@ -2002,18 +2005,8 @@ public void linkUnits(ParsedObj[] unitsIn, int subsystem, string[] verKeys, stri
         link.err = "object cache: nothing to link (no objects)";
         return;
     }
-    // Deterministic order: sort units by file key.
     ParsedObj[] units = [];
     for (int i = 0; i < unitsIn.length; i++) { units.add(unitsIn[i]); }
-    for (int i = 1; i < units.length; i++) {
-        ParsedObj k = units[i];
-        int j = i - 1;
-        while (j >= 0 && k.filekey < units[j].filekey) {
-            units[j + 1] = units[j];
-            j--;
-        }
-        units[j + 1] = k;
-    }
     // Definitions: Silver function -> (unit, offset, size). Duplicates are
     // a hard error (the backend never emits the same symbol twice).
     string[] defNames = [];
@@ -2046,33 +2039,26 @@ public void linkUnits(ParsedObj[] unitsIn, int subsystem, string[] verKeys, stri
             return;
         }
     }
-    // Import union, sorted for a deterministic table order.
+    // Single shared import list: every unit carries the full fixed
+    // emission-block list (order and duplicates included), so the link
+    // consumes the first unit's list verbatim — byte-identical to the
+    // monolithic backend's table. Any disagreement (cross-version cache
+    // skew) is a loud error, never a silent reindex.
     string[] unionDlls = [];
     string[] unionNames = [];
-    for (int ui = 0; ui < units.length; ui++) {
-        ParsedObj u = units[ui];
-        for (int i = 0; i < u.impDlls.length; i++) {
-            bool seen = false;
-            for (int k = 0; k < unionDlls.length; k++) {
-                if (unionDlls[k] == u.impDlls[i] && unionNames[k] == u.impNames[i]) { seen = true; break; }
-            }
-            if (!seen) {
-                unionDlls.add(u.impDlls[i]);
-                unionNames.add(u.impNames[i]);
-            }
-        }
+    for (int i = 0; i < units[0].impDlls.length; i++) {
+        unionDlls.add(units[0].impDlls[i]);
+        unionNames.add(units[0].impNames[i]);
     }
-    for (int i = 1; i < unionDlls.length; i++) {
-        string kd = unionDlls[i];
-        string kn = unionNames[i];
-        int j = i - 1;
-        while (j >= 0 && (kd < unionDlls[j] || (kd == unionDlls[j] && kn < unionNames[j]))) {
-            unionDlls[j + 1] = unionDlls[j];
-            unionNames[j + 1] = unionNames[j];
-            j--;
+    for (int ui = 1; ui < units.length; ui++) {
+        bool impSame = units[ui].impDlls.length == unionDlls.length && units[ui].impNames.length == unionNames.length;
+        for (int i = 0; impSame && i < unionDlls.length; i++) {
+            if (units[ui].impDlls[i] != unionDlls[i] || units[ui].impNames[i] != unionNames[i]) { impSame = false; }
         }
-        unionDlls[j + 1] = kd;
-        unionNames[j + 1] = kn;
+        if (!impSame) {
+            link.err = "object cache: import-table mismatch ('" + units[ui].filekey + "' vs '" + units[0].filekey + "') — re-emit required";
+            return;
+        }
     }
     // Section layout: code slices, then data slices, then the linker-owned
     // singleton blocks (exception state, tray state, globals) inside the
@@ -2527,9 +2513,9 @@ private int[] elfEmit(ElfPlan plan, int[] blob) {
 // Link parsed objects into a final Linux binary: resolve symbols across
 // the set, lay out code/data/GOT segments, apply relocations, and emit
 // through the built-in ET_EXEC writer above (mirrors silverc-rs link_linux
-// byte-exactly). Units sort by file key first so the layout is
-// deterministic. Any unresolvable or duplicate symbol is a hard link error
-// — never a silent mislink. Fills link (err "" on success).
+// byte-exactly). Units lay out in input order — the caller passes canonical
+// program order (see linkUnits). Any unresolvable or duplicate symbol is a
+// hard link error — never a silent mislink. Fills link (err "" on success).
 //
 // The data image is data slices, then the linker-owned singleton blocks
 // (16-byte exception state, 16+512-byte tray state, the globals block),
@@ -2543,17 +2529,11 @@ public void linkUnitsElf(ParsedObj[] unitsIn, ObjLinkResult link) {
         link.err = "object cache: nothing to link (no objects)";
         return;
     }
+    // Canonical program order in, same order out (see linkUnits): the
+    // caller passes the collection order the aggregate was built in, which
+    // is the monolithic backend's emission order.
     ParsedObj[] units = [];
     for (int i = 0; i < unitsIn.length; i++) { units.add(unitsIn[i]); }
-    for (int i = 1; i < units.length; i++) {
-        ParsedObj k = units[i];
-        int j = i - 1;
-        while (j >= 0 && k.filekey < units[j].filekey) {
-            units[j + 1] = units[j];
-            j--;
-        }
-        units[j + 1] = k;
-    }
     string[] defNames = [];
     int[] defUnits = [];
     int[] defOffs = [];
@@ -2582,32 +2562,26 @@ public void linkUnitsElf(ParsedObj[] unitsIn, ObjLinkResult link) {
             return;
         }
     }
+    // Single shared import list: every unit carries the full fixed
+    // emission-block list (order and duplicates included), so the link
+    // consumes the first unit's list verbatim — byte-identical to the
+    // monolithic backend's table. Any disagreement (cross-version cache
+    // skew) is a loud error, never a silent reindex.
     string[] unionDlls = [];
     string[] unionNames = [];
-    for (int ui = 0; ui < units.length; ui++) {
-        ParsedObj u = units[ui];
-        for (int i = 0; i < u.impDlls.length; i++) {
-            bool seen = false;
-            for (int k = 0; k < unionDlls.length; k++) {
-                if (unionDlls[k] == u.impDlls[i] && unionNames[k] == u.impNames[i]) { seen = true; break; }
-            }
-            if (!seen) {
-                unionDlls.add(u.impDlls[i]);
-                unionNames.add(u.impNames[i]);
-            }
-        }
+    for (int i = 0; i < units[0].impDlls.length; i++) {
+        unionDlls.add(units[0].impDlls[i]);
+        unionNames.add(units[0].impNames[i]);
     }
-    for (int i = 1; i < unionDlls.length; i++) {
-        string kd = unionDlls[i];
-        string kn = unionNames[i];
-        int j = i - 1;
-        while (j >= 0 && (kd < unionDlls[j] || (kd == unionDlls[j] && kn < unionNames[j]))) {
-            unionDlls[j + 1] = unionDlls[j];
-            unionNames[j + 1] = unionNames[j];
-            j--;
+    for (int ui = 1; ui < units.length; ui++) {
+        bool impSame = units[ui].impDlls.length == unionDlls.length && units[ui].impNames.length == unionNames.length;
+        for (int i = 0; impSame && i < unionDlls.length; i++) {
+            if (units[ui].impDlls[i] != unionDlls[i] || units[ui].impNames[i] != unionNames[i]) { impSame = false; }
         }
-        unionDlls[j + 1] = kd;
-        unionNames[j + 1] = kn;
+        if (!impSame) {
+            link.err = "object cache: import-table mismatch ('" + units[ui].filekey + "' vs '" + units[0].filekey + "') — re-emit required";
+            return;
+        }
     }
     int[] codeOffs = [];
     int totalCode = 0;
@@ -2949,13 +2923,23 @@ class ObjSession {
     // Split the observed files into fresh (reusable without codegen) and
     // stale (must be re-emitted). Fresh means: the record matches (hash +
     // mtime), the .o exists, and its v5 note parses with the expected flag
-    // set + hash. Anything else — including a v4-era object whose note no
-    // longer parses — is stale, never a hard error here. Fills plan.
+    // set + hash. Fresh candidates must also share one import list (the
+    // link consumes it verbatim); any disagreement is cross-version skew,
+    // so every candidate goes stale and the tier re-emits instead of
+    // failing loudly at link time. Anything else — including a v4-era
+    // object whose note no longer parses — is stale, never a hard error
+    // here. Fills plan.
     public void plan(ObjPlan plan) {
         plan.fresh = [];
         plan.stale = [];
+        bool impDiverge = false;
+        string[] firstImpDlls = [];
+        string[] firstImpNames = [];
+        bool haveFirstImp = false;
         for (int n = 0; n < this.notedKeys.length; n++) {
             bool ok = false;
+            string[] noteImpDlls = [];
+            string[] noteImpNames = [];
             int idx = this.findRecord(this.notedKeys[n]);
             if (idx >= 0 && this.hashes[idx] == this.notedH[n] && this.mTimes[idx] == this.notedM[n]) {
                 string probe = this.objectPathFor(this.notedKeys[n]);
@@ -2975,12 +2959,31 @@ class ObjSession {
                         else { perr = objPeekCoffNote(r, note); }
                         if (perr.length == 0 && note.flags == this.flags && note.hash == this.notedH[n]) {
                             ok = true;
+                            noteImpDlls = note.impDlls;
+                            noteImpNames = note.impNames;
                         }
                     }
                 }
             }
-            if (ok) { plan.fresh.add(this.notedKeys[n]); }
+            if (ok) {
+                if (!haveFirstImp) {
+                    firstImpDlls = noteImpDlls;
+                    firstImpNames = noteImpNames;
+                    haveFirstImp = true;
+                } else {
+                    bool impSame = noteImpDlls.length == firstImpDlls.length && noteImpNames.length == firstImpNames.length;
+                    for (int i = 0; impSame && i < firstImpDlls.length; i++) {
+                        if (noteImpDlls[i] != firstImpDlls[i] || noteImpNames[i] != firstImpNames[i]) { impSame = false; }
+                    }
+                    if (!impSame) { impDiverge = true; }
+                }
+                plan.fresh.add(this.notedKeys[n]);
+            }
             else { plan.stale.add(this.notedKeys[n]); }
+        }
+        if (impDiverge) {
+            for (int f = 0; f < plan.fresh.length; f++) { plan.stale.add(plan.fresh[f]); }
+            plan.fresh = [];
         }
         // Deterministic emission order (matches the reference plan): the
         // noted observation order stays canonical for the downstream link,
@@ -6502,8 +6505,8 @@ private int[] macEmitExec(MacPlan plan, int[] blob) {
 // Link parsed objects into a final macOS binary: resolve symbols across
 // the set, lay out code/data/GOT segments, apply relocations, and emit
 // through the built-in MH_EXECUTE writer above (mirrors silverc-rs
-// link_mac byte-exactly). Units sort by file key first so the layout is
-// deterministic. Entry is main. Any unresolvable symbol, singleton
+// link_mac byte-exactly). Units lay out in input order — the caller passes
+// canonical program order (see linkUnits). Entry is main. Any unresolvable symbol, singleton
 // reference (the tier lays out no linker-owned blocks), or out-of-range
 // displacement is a hard link error — never a silent mislink. Fills link
 // (err "" on success).
@@ -6514,17 +6517,11 @@ public void linkUnitsMac(ParsedObj[] unitsIn, ObjLinkResult link) {
         link.err = "object cache: nothing to link (no objects)";
         return;
     }
+    // Canonical program order in, same order out (see linkUnits): the
+    // caller passes the collection order the aggregate was built in, which
+    // is the monolithic backend's emission order.
     ParsedObj[] units = [];
     for (int i = 0; i < unitsIn.length; i++) { units.add(unitsIn[i]); }
-    for (int i = 1; i < units.length; i++) {
-        ParsedObj k = units[i];
-        int j = i - 1;
-        while (j >= 0 && k.filekey < units[j].filekey) {
-            units[j + 1] = units[j];
-            j--;
-        }
-        units[j + 1] = k;
-    }
     string[] defNames = [];
     int[] defUnits = [];
     int[] defOffs = [];
@@ -6546,32 +6543,26 @@ public void linkUnitsMac(ParsedObj[] unitsIn, ObjLinkResult link) {
             }
         }
     }
+    // Single shared import list: every unit carries the full fixed
+    // emission-block list (order and duplicates included), so the link
+    // consumes the first unit's list verbatim — byte-identical to the
+    // monolithic backend's table. Any disagreement (cross-version cache
+    // skew) is a loud error, never a silent reindex.
     string[] unionDlls = [];
     string[] unionNames = [];
-    for (int ui = 0; ui < units.length; ui++) {
-        ParsedObj u = units[ui];
-        for (int i = 0; i < u.impDlls.length; i++) {
-            bool seen = false;
-            for (int kk = 0; kk < unionDlls.length; kk++) {
-                if (unionDlls[kk] == u.impDlls[i] && unionNames[kk] == u.impNames[i]) { seen = true; break; }
-            }
-            if (!seen) {
-                unionDlls.add(u.impDlls[i]);
-                unionNames.add(u.impNames[i]);
-            }
-        }
+    for (int i = 0; i < units[0].impDlls.length; i++) {
+        unionDlls.add(units[0].impDlls[i]);
+        unionNames.add(units[0].impNames[i]);
     }
-    for (int i = 1; i < unionDlls.length; i++) {
-        string kd = unionDlls[i];
-        string kn = unionNames[i];
-        int j = i - 1;
-        while (j >= 0 && (kd < unionDlls[j] || (kd == unionDlls[j] && kn < unionNames[j]))) {
-            unionDlls[j + 1] = unionDlls[j];
-            unionNames[j + 1] = unionNames[j];
-            j--;
+    for (int ui = 1; ui < units.length; ui++) {
+        bool impSame = units[ui].impDlls.length == unionDlls.length && units[ui].impNames.length == unionNames.length;
+        for (int i = 0; impSame && i < unionDlls.length; i++) {
+            if (units[ui].impDlls[i] != unionDlls[i] || units[ui].impNames[i] != unionNames[i]) { impSame = false; }
         }
-        unionDlls[j + 1] = kd;
-        unionNames[j + 1] = kn;
+        if (!impSame) {
+            link.err = "object cache: import-table mismatch ('" + units[ui].filekey + "' vs '" + units[0].filekey + "') — re-emit required";
+            return;
+        }
     }
     int[] codeOffs = [];
     int totalCode = 0;
