@@ -276,9 +276,9 @@ class MiniCg {
     public prop int[] objAnonLabels;
     public prop string[] objAnonNames;
     public prop string[] objAnonOwners;
-    // Owning file per interned string (parallel to strings): with
-    // de-duplication disabled under objRecord, bytes and site always share
-    // an owner, exactly like the reference backend.
+    // Owning file per interned string (parallel to strings): with per-site
+    // interning, bytes and site always share an owner, exactly like the
+    // reference backend.
     public prop string[] stringOwners;
     // Owning file per function-table entry (parallel to funcNames).
     public prop string[] funcOwners;
@@ -925,18 +925,12 @@ class MiniCg {
     }
 
     public int addString(string s) {
-        // Under object-unit recording every use site interns its own bytes:
-        // cross-file de-duplication would split bytes from site, which the
-        // extractor forbids (mirrors the reference backend). The monolithic
-        // path keeps the shared scan byte-for-byte.
-        if (!this.objRecord) {
-            for (int i = 0; i < this.strings.length; i++) {
-                StrEntry se = this.strings[i];
-                if (se.text == s) {
-                    return i;
-                }
-            }
-        }
+        // Unified-pipeline interning: every use site interns its own bytes
+        // on every path — no shared scan. Cross-file de-duplication would
+        // split bytes from site, which the object extractor forbids (bytes
+        // and site must share one owner), and the reference backend never
+        // dedups either — so the monolithic and object tiers emit identical
+        // bytes.
         int off = this.stringData.length;
         for (int i = 0; i < s.length; i++) {
             int ch = s[i];
