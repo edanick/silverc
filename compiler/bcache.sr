@@ -72,6 +72,18 @@ class CacheSession {
     public prop string dir;
     public prop string root;
     public prop string projectName;
+    // Per-run memo of session-relative keys: the same collected path is
+    // keyed several times per build (hit check, payload path, hit
+    // classification) and path.relative renormalizes both spellings on
+    // every call. Spellings cannot change mid-compile, so memoizing per
+    // session is sound; distinct spellings memoize separately. The memo IS
+    // the fast path here: path.relative is already a zero-syscall pure
+    // prefix strip (std/path.sr, the §6 home — never cloned), so no second
+    // strip spelling exists. A wrong guess could only miss, never
+    // stale-hit, since the record still gates on hash + size and the
+    // payload path derives from the same key.
+    public prop string[] relMemoIns;
+    public prop string[] relMemoOuts;
     // Parallel record arrays keyed by '/'-separated relative path.
     public prop string[] keys;
     public prop string[] cTimesStr;
@@ -116,6 +128,8 @@ class CacheSession {
         this.createdStamp = 0;
         this.oldIndexText = "";
         this.dirtyCount = 0;
+        this.relMemoIns = [];
+        this.relMemoOuts = [];
         this.lastPayload = "";
         this.readOnly = ro;
         this.hits = [];
@@ -168,10 +182,14 @@ class CacheSession {
     // otherwise materialize the body (hop file first, builtin-slice
     // fallback), lex it fresh, store the new bytecode, and return those
     // tokens — unless readOnly (--cache-object alone: case 2 serves the hit
-    // from disk and case 1 lexes fresh, both storing nothing). Range hashing
-    // means full-project cache hits never slice the aggregate at all — the
-    // linear builtin slice is paid only per miss.
-    public Token[] tokensForRange(string absPath, string aggSource, int start, int end, string hopPath) {
+    // from disk and case 1 lexes fresh, both storing nothing). The caller
+    // supplies the range's FNV-1 hash plus the file size: the driver hashes
+    // and stats each file once and reuses both for the unit record and the
+    // object-tier note, so the same bytes are never hashed or stat-ed twice
+    // on the hot path. Range hashing means full-project cache hits never
+    // slice the aggregate at all — the linear builtin slice is paid only
+    // per miss.
+    public Token[] tokensForRange(string absPath, string aggSource, int start, int end, string hopPath, int64 rangeHash, int sizeVal) {
         // Slice clamps (old bcSliceSlow conditions): the bootstrap clamps
         // itself but the self-host reads OOB without them — clamped once
         // here so every site below stays in range on both backends.
@@ -184,15 +202,13 @@ class CacheSession {
             string[] noSessErrs = [];
             return pipeLexUnit(aggSource[cs..ce], noSessErrs);
         }
-        string key = path.relative(this.root, absPath);
+        string key = this.relOf(absPath);
         if (key.length == 0) {
             string[] noKeyErrs = [];
             return pipeLexUnit(aggSource[cs..ce], noKeyErrs);
         }
-        int64 rangeHash = hash.fnv1(aggSource, start, end);
-        int size = file.size(absPath);
         string hashKey = (string)rangeHash;
-        string sizeKey = (string)size;
+        string sizeKey = (string)sizeVal;
         int idx = this.keys.indexOf(key);
         if (idx >= 0) {
             if (this.hashesStr[idx] == hashKey && this.mTimesStr[idx] == sizeKey) {
@@ -240,7 +256,20 @@ class CacheSession {
 
     // Whole-string variant kept for direct callers with an in-memory file.
     public Token[] tokensFor(string absPath, string source) {
-        return this.tokensForRange(absPath, source, 0, source.length, "");
+        return this.tokensForRange(absPath, source, 0, source.length, "", hash.fnv1(source, 0, source.length), file.size(absPath));
+    }
+
+    // Session-relative key with per-run memo (see relMemoIns). Byte-identical
+    // to path.relative(this.root, absPath) on every input — records persist
+    // across runs, so the spelling must never fork.
+    private string relOf(string absPath) {
+        for (int i = 0; i < this.relMemoIns.length; i++) {
+            if (this.relMemoIns[i] == absPath) { return this.relMemoOuts[i]; }
+        }
+        string key = path.relative(this.root, absPath);
+        this.relMemoIns.add(absPath);
+        this.relMemoOuts.add(key);
+        return key;
     }
 
     // True when `absPath` decoded from a synced `.srbc` during this session
@@ -249,7 +278,7 @@ class CacheSession {
     // sessions that never saw the file, and when there is no session.
     public bool wasHit(string absPath) {
         if (!this.ok) { return false; }
-        return this.wasHitKey(path.relative(this.root, absPath));
+        return this.wasHitKey(this.relOf(absPath));
     }
 
     // Key-spelling variant of wasHit for callers holding a session-relative
@@ -293,19 +322,21 @@ class CacheSession {
         int w = 0;
         for (int i = 0; i < this.keys.length; i++) {
             string abs = resolveRel(this.root, this.keys[i]);
-            if (file.exists(abs)) {
+            // A key that decoded a hit this run was read from disk moments
+            // ago — it exists; skip the stat. Only misses pay the check.
+            if (this.wasHitKey(this.keys[i]) || file.exists(abs)) {
                 this.keys[w] = this.keys[i];
                 this.cTimesStr[w] = this.cTimesStr[i];
                 this.mTimesStr[w] = this.mTimesStr[i];
                 this.hashesStr[w] = this.hashesStr[i];
                 this.cachedAtStr[w] = this.cachedAtStr[i];
                 w++;
-            } else {
-                string srbcPath = this.srbcPathFor(this.keys[i]);
-                if (srbcPath.length > 0 && file.exists(srbcPath)) {
-                    file.delete(srbcPath);
-                    file.delete(srbcPath + ".t");
-                }
+                continue;
+            }
+            string srbcPath = this.srbcPathFor(this.keys[i]);
+            if (srbcPath.length > 0 && file.exists(srbcPath)) {
+                file.delete(srbcPath);
+                file.delete(srbcPath + ".t");
             }
         }
         while (this.keys.length > w) { this.keys.pop(); }
@@ -325,13 +356,20 @@ class CacheSession {
             idxParts.add("f " + this.keyOf(r) + "\n");
         }
         string indexText = idxParts.join("");
-        if (indexText == this.oldIndexText) { return; }
-
-        ensureDirTree(this.dir);
         string sbcriOut = this.dir + "\\project.sbcri";
         #on LINUX or MAC
         sbcriOut = this.dir + "/project.sbcri";
         #off
+        if (indexText == this.oldIndexText) {
+            // Records unchanged: the binary on disk is already identical, so
+            // only a missing companion is rewritten (compare-before-write on
+            // both artifacts, one existence stat on the single record file).
+            if (file.exists(sbcriOut)) { return; }
+            file.writeString(sbcriOut, indexText);
+            return;
+        }
+
+        ensureDirTree(this.dir);
         file.writeString(sbcriOut, indexText);
 
         // Reference-format binary record (little-endian, see module docs),
@@ -450,7 +488,7 @@ class CacheSession {
     // ------------------------------------------------------------------
 
     private string srbcPathFor(string keyOrAbs) {
-        string rel = path.relative(this.root, keyOrAbs);
+        string rel = this.relOf(keyOrAbs);
         if (rel.length == 0) { return ""; }
         string dotted = rel;
         if (dotted.length >= 3 && dotted[dotted.length - 1] == 'r'

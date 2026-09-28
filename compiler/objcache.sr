@@ -2774,6 +2774,16 @@ class ObjSession {
     public prop int[] notedM;
     public prop int[] notedH;
     public prop int[] notedStamps;
+    // Per-run memo of session-relative keys: the link path derives one key
+    // per program item, so the same chunk paths would recompute dozens of
+    // times per build without it (same rationale as bcache.sr relMemoIns).
+    public prop string[] keyMemoIns;
+    public prop string[] keyMemoOuts;
+    // Validated .o bytes staged by plan() for fresh files: readUnit consumes
+    // them instead of reading the same file a second time (peek note, then
+    // full parse). Per-build, never persisted.
+    public prop string[] stagedKeys;
+    public prop byte[][] stagedVals;
     // Worker threads (the unified pipeline's multi-threaded mapping runs
     // per-file emission under workerCount workers).
     public prop int workers;
@@ -2799,6 +2809,10 @@ class ObjSession {
         this.notedM = [];
         this.notedH = [];
         this.notedStamps = [];
+        this.keyMemoIns = [];
+        this.keyMemoOuts = [];
+        this.stagedKeys = [];
+        this.stagedVals = [];
         this.workers = 1;
         string guarded = path.guardForWindows(projName);
         string target = objTargetDirName(targetOsName);
@@ -2861,24 +2875,24 @@ class ObjSession {
     // paths with their sources prefix (`.\util.sr`), which path.relative
     // preserves. `..` segments are left untouched.
     public string relKeyFor(string p) {
+        for (int i = 0; i < this.keyMemoIns.length; i++) {
+            if (this.keyMemoIns[i] == p) { return this.keyMemoOuts[i]; }
+        }
         string key = path.relative(this.root, p);
-        return objCleanDots(normObjKey(key));
+        string out = objCleanDots(normObjKey(key));
+        this.keyMemoIns.add(p);
+        this.keyMemoOuts.add(out);
+        return out;
     }
 
-    // Observe one source file. `agg` is the aggregate the file was collected
-    // into and [start, end) its chunk range. `mtimeMs` is the file's
-    // last-write time. The FNV-1 hash of the range is the freshness source
-    // of truth.
-    public void noteFile(string absPath, string agg, int start, int end, int mtimeMs) {
+    // Observe one source file with its PRECOMPUTED content hash (the same
+    // range bytes the bytecode tier hashed): the driver hashes each file
+    // once and shares it across the unit record, the bytecode lookup and
+    // this note, so the same bytes are never hashed twice on the hot path.
+    public void noteFileHashed(string absPath, int64 rangeHash, int mtimeMs) {
         if (!this.ok) { return; }
-        int cs = start;
-        if (cs < 0) { cs = 0; }
-        int ce = end;
-        if (ce > agg.length) { ce = agg.length; }
-        if (ce < cs) { ce = cs; }
         string key = this.relKeyFor(absPath);
         if (key.length == 0) { return; }
-        int64 rangeHash = hash.fnv1(agg, cs, ce);
         int stamp = datetime.now().milliseconds();
         int idx = this.findNoted(key);
         if (idx >= 0) {
@@ -2932,6 +2946,8 @@ class ObjSession {
     public void plan(ObjPlan plan) {
         plan.fresh = [];
         plan.stale = [];
+        this.stagedKeys = [];
+        this.stagedVals = [];
         bool impDiverge = false;
         string[] firstImpDlls = [];
         string[] firstImpNames = [];
@@ -2943,25 +2959,37 @@ class ObjSession {
             int idx = this.findRecord(this.notedKeys[n]);
             if (idx >= 0 && this.hashes[idx] == this.notedH[n] && this.mTimes[idx] == this.notedM[n]) {
                 string probe = this.objectPathFor(this.notedKeys[n]);
-                if (probe.length > 0 && file.exists(probe)) {
-                    byte[] raw = [];
+                // One syscall, not two: read directly instead of
+                // exists + read. A missing object lands on the stale path,
+                // exactly as before.
+                byte[] raw = [];
+                if (probe.length > 0) {
                     try {
                         raw = file.read(probe);
                     } catch (int e) {
                         raw = [];
                     }
-                    if (raw.length > 0) {
-                        ObjReader r = new ObjReader(raw);
-                        ObjNote note = new ObjNote();
-                        string perr = "";
-                        if (this.targetOs == "MAC") { perr = objPeekMachoNote(r, note); }
-                        else if (this.targetOs == "LINUX") { perr = objPeekElfNote(r, note); }
-                        else { perr = objPeekCoffNote(r, note); }
-                        if (perr.length == 0 && note.flags == this.flags && note.hash == this.notedH[n]) {
-                            ok = true;
-                            noteImpDlls = note.impDlls;
-                            noteImpNames = note.impNames;
-                        }
+                }
+                if (raw.length > 0) {
+                    ObjReader r = new ObjReader(raw);
+                    ObjNote note = new ObjNote();
+                    string perr = "";
+                    if (this.targetOs == "MAC") { perr = objPeekMachoNote(r, note); }
+                    else if (this.targetOs == "LINUX") { perr = objPeekElfNote(r, note); }
+                    else { perr = objPeekCoffNote(r, note); }
+                    if (perr.length == 0 && note.flags == this.flags && note.hash == this.notedH[n]) {
+                        ok = true;
+                        noteImpDlls = note.impDlls;
+                        noteImpNames = note.impNames;
+                        // Stage the bytes just read: readUnit consumes them
+                        // instead of reading the same file a second time.
+                        // Freshness was JUST validated above (record hash +
+                        // mtime, note flags + hash), so staging changes no
+                        // decision — only the I/O count. A file that
+                        // validates here but fails the full parse in
+                        // readUnit still errors loudly there, as before.
+                        this.stagedKeys.add(this.notedKeys[n]);
+                        this.stagedVals.add(raw);
                     }
                 }
             }
@@ -2984,6 +3012,11 @@ class ObjSession {
         if (impDiverge) {
             for (int f = 0; f < plan.fresh.length; f++) { plan.stale.add(plan.fresh[f]); }
             plan.fresh = [];
+            // Skew demotes every candidate to stale: staged bytes no longer
+            // back a fresh plan, so drop them rather than serve objects the
+            // link would reject.
+            this.stagedKeys = [];
+            this.stagedVals = [];
         }
         // Deterministic emission order (matches the reference plan): the
         // noted observation order stays canonical for the downstream link,
@@ -3003,14 +3036,31 @@ class ObjSession {
 
     // Load + fully parse a cached object (hard errors: a fresh-planned file
     // whose object is corrupt fails the build loudly instead of linking
-    // silently). Fills obj, returns "" or the exact reference error.
+    // silently). Bytes staged by plan() are consumed first; otherwise the
+    // object is read from disk. Fills obj, returns "" or the exact reference
+    // error.
     public string readUnit(string rel, ParsedObj obj) {
-        string objPath = this.objectPathFor(rel);
+        // Staged validated bytes first: each unit links once, so the entry
+        // drains here (swap-with-last removal, order irrelevant).
         byte[] raw = [];
-        try {
-            raw = file.read(objPath);
-        } catch (int e) {
-            return "object cache: cannot read " + objPath + ": file not found";
+        for (int i = 0; i < this.stagedKeys.length; i++) {
+            if (this.stagedKeys[i] == rel) {
+                raw = this.stagedVals[i];
+                int last = this.stagedKeys.length - 1;
+                this.stagedKeys[i] = this.stagedKeys[last];
+                this.stagedVals[i] = this.stagedVals[last];
+                this.stagedKeys.pop();
+                this.stagedVals.pop();
+                break;
+            }
+        }
+        if (raw.length == 0) {
+            string objPath = this.objectPathFor(rel);
+            try {
+                raw = file.read(objPath);
+            } catch (int e) {
+                return "object cache: cannot read " + objPath + ": file not found";
+            }
         }
         if (raw.length == 0) {
             if (this.targetOs == "LINUX") { return "object cache: corrupt ELF object"; }
@@ -3095,7 +3145,6 @@ class ObjSession {
         sbcriPath = this.dir + "/project.sbcri";
         #off
         this.objMakeTree(this.dir);
-        file.writeBytes(sbcrPath, w.out);
         // NUL-free text companion (authoritative read side): the SBCRI v2
         // shape plus the flag-set line the object record keys on.
         string[] lines = [];
@@ -3106,7 +3155,29 @@ class ObjSession {
         for (int re = 0; re < this.keys.length; re++) {
             lines.add(objEscapeText(this.keys[re]) + " " + (string)this.cTimes[re] + " " + (string)this.mTimes[re] + " " + objHex16(int64(this.hashes[re])) + " " + (string)this.cachedAt[re] + "\n");
         }
-        file.writeString(sbcriPath, lines.join(""));
+        string sbcriText = lines.join("");
+        // Compare-before-write on both artifacts (warm full-hit builds leave
+        // every byte on disk untouched): the binary compares byte-exact, the
+        // companion compares as text (also repairing a missing companion).
+        byte[] oldBin = [];
+        try {
+            oldBin = file.read(sbcrPath);
+        } catch (int e) {
+            oldBin = [];
+        }
+        bool binSame = oldBin.length == w.out.length;
+        for (int b = 0; binSame && b < oldBin.length; b++) {
+            if (int(oldBin[b] & 0xFF) != w.out[b]) { binSame = false; }
+        }
+        string oldText = "";
+        try {
+            oldText = file.readString(sbcriPath);
+        } catch (int e) {
+            oldText = "";
+        }
+        if (binSame && oldText == sbcriText) { return; }
+        if (!binSame) { file.writeBytes(sbcrPath, w.out); }
+        file.writeString(sbcriPath, sbcriText);
     }
 
     // Directory creation without fs.createDir / folder.create: those std
