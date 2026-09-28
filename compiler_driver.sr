@@ -1069,14 +1069,35 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, CacheSession? sess, Node
             eprintln("[pipe] " + nrel + " " + punit.kindName());
         }
     }
-    // ONE mapping function over the stale units in plan order: each file
-    // emits into its OWN separate buffer (a fresh per-unit backend below —
-    // no shared mutable state between workers). Silver runs the workers
-    // sequentially under the same resolved worker count, so order in =
-    // order out for every count; session writes stay post-join and
-    // sequential — workers never touch shared state.
-    int workers = osess.workerCount();
+    // ONE recorded full-program emission serves every stale unit: the
+    // emission is identical whichever unit is extracted, so each stale file
+    // slices its OWN separate unit buffer out of the same run, in plan order
+    // (mirrors silverc-rs generate_object_units). Re-running the whole
+    // backend once per stale file made a cold build of N files pay N full
+    // emissions — slower than no cache at all. Fresh units run no codegen;
+    // session writes stay post-join and sequential.
     ObjUnit[] emitUnits = [];
+    MiniAsm oasm = new MiniAsm();
+    MiniCg ocg = new MiniCg(oasm);
+    if (target != "MAC" && p.stale.length > 0) {
+        ocg.threadCount = flags.threadCount;
+        ocg.runtimeMode = false;
+        ocg.targetOs = target;
+        if (inputIsProject) {
+            NativeModules ocgNm = projectParseNativeModules(manifest);
+            ocg.customNative = ocgNm;
+        }
+        // Progress ticks stay on the monolithic path: the recorded
+        // emission runs without progress (mirrors the reference).
+        ocg.genProgramOwned(ast, owners, entryKey);
+        if (ocg.objHasRawRel32) {
+            flags.errLine("cache-object: inline assembly is outside the v1 object tier; full monolithic compile, objects not updated");
+            return empty;
+        }
+        // Load-bearing: getBytes() resolves the assembler's label
+        // relocations into buf, which extractUnit slices — once for all units.
+        int[] fullCode = oasm.getBytes();
+    }
     for (int si = 0; si < p.stale.length; si++) {
         string rel = p.stale[si];
         ObjUnit unit = new ObjUnit();
@@ -1089,28 +1110,11 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, CacheSession? sess, Node
                 exit(1);
             }
         } else {
-        MiniAsm oasm = new MiniAsm();
-        MiniCg ocg = new MiniCg(oasm);
-        ocg.threadCount = flags.threadCount;
-        ocg.runtimeMode = false;
-        ocg.targetOs = target;
-        if (inputIsProject) {
-            NativeModules ocgNm = projectParseNativeModules(manifest);
-            ocg.customNative = ocgNm;
-        }
-        // Progress ticks stay on the monolithic path: the mapped per-unit
-        // emission runs without progress (mirrors the reference workers).
-        ocg.genProgramOwned(ast, owners, entryKey);
-        if (ocg.objHasRawRel32) {
-            flags.errLine("cache-object: inline assembly is outside the v1 object tier; full monolithic compile, objects not updated");
-            return empty;
-        }
-        int[] fullCode = oasm.getBytes();
-        string xerr = extractUnit(ocg, rel, unit);
-        if (xerr.length > 0) {
-            flags.errLine(xerr);
-            exit(1);
-        }
+            string xerr = extractUnit(ocg, rel, unit);
+            if (xerr.length > 0) {
+                flags.errLine(xerr);
+                exit(1);
+            }
         }
         if (objTooManyRelocs(unit)) {
             flags.errLine("cache-object: too many relocations in '" + rel + "' for one COFF section (v1 boundary); full monolithic compile, objects not updated");
@@ -1141,18 +1145,13 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, CacheSession? sess, Node
             flags.errLine(werr);
             exit(1);
         }
-        // Re-read what is on disk: the linked unit is the parsed file, never
-        // a memory image.
+        // Parse the exact bytes just written, from memory (like the
+        // reference parse_object over its written bytes): the linked unit
+        // is still the parsed object file, but it is never read back from
+        // disk inside the same run (OVERHAUL.md RAM residency — and reading
+        // a just-written file waits on the on-access scanner).
         ParsedObj pu = new ParsedObj();
-        string opath = osess.objectPathFor(wrel);
-        byte[] raw = [];
-        try {
-            raw = file.read(opath);
-        } catch (int e) {
-            flags.errLine("object cache: cannot read " + opath + ": file not found");
-            exit(1);
-        }
-        ObjReader orr = new ObjReader(raw);
+        ObjReader orr = new ObjReader(objBytesOf(obytes));
         string perr = "";
         if (target == "MAC") { perr = objParseMacho(orr, pu); }
         else if (target == "LINUX") { perr = objParseElf(orr, pu); }

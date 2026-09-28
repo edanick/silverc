@@ -665,6 +665,17 @@ class ObjReader {
     }
 }
 
+// Exact byte view of freshly emitted object bytes (values 0..255), so a unit
+// just written parses from memory: re-reading it from disk would open a file
+// the on-access scanner is still checking (~6 ms per object) and break the
+// OVERHAUL.md RAM-residency rule (nothing is written only to be read back).
+public byte[] objBytesOf(int[] data) {
+    byte[] out = [];
+    int n = data.length;
+    for (int i = 0; i < n; i++) { out.add(data[i] & 0xFF); }
+    return out;
+}
+
 // Silver object note (v6): SLVOBJ4 + flag-set string + source FNV-1 hash +
 // emission stamp + globals-block size + import list + owner file key.
 public int[] objEncodeNote(ObjUnit unit, string flags, int64 srcHash, int stamp) {
@@ -1592,19 +1603,34 @@ public string extractUnit(MiniCg cg, string extract, ObjUnit unit) {
     // entry is not owned here or never emitted).
     string[] entrySym = [];
     for (int i = 0; i < cg.funcNames.length; i++) { entrySym.add(""); }
+    // Per-entry base symbol and start mark, computed once per extraction
+    // ("" / -1 for entries never emitted): the overload passes below compare
+    // these instead of re-concatenating every base symbol and re-scanning the
+    // marks for every candidate pair.
+    string[] baseOf = [];
+    int[] markOf = [];
+    for (int i = 0; i < cg.funcNames.length; i++) {
+        if (cg.funcOffsets[i] < 0) {
+            baseOf.add("");
+            markOf.add(-1);
+            continue;
+        }
+        baseOf.add(objBaseSymbol(cg.funcNames[i], cg.funcClasses[i]));
+        markOf.add(objMarkExact(cg, cg.funcOffsets[i]));
+    }
     // Overload groups: same base symbol, table order (globally
     // deterministic: every unit extracts from the same full emission).
     for (int i = 0; i < cg.funcNames.length; i++) {
         if (cg.funcOffsets[i] < 0) { continue; }
-        int mi = objMarkExact(cg, cg.funcOffsets[i]);
+        int mi = markOf[i];
         if (mi < 0) { return failPrefix + "function '" + cg.funcNames[i] + "' starts outside any region"; }
         if (cg.markOwner[mi] != extract) { continue; }
-        string base = objBaseSymbol(cg.funcNames[i], cg.funcClasses[i]);
+        string base = baseOf[i];
         int group = 0;
         int seen = 0;
         for (int j = 0; j < cg.funcNames.length; j++) {
             if (cg.funcOffsets[j] < 0) { continue; }
-            if (objBaseSymbol(cg.funcNames[j], cg.funcClasses[j]) == base) {
+            if (baseOf[j] == base) {
                 if (j < i) { seen++; }
                 group++;
             }
@@ -1622,15 +1648,15 @@ public string extractUnit(MiniCg cg, string extract, ObjUnit unit) {
     // backend and the monolithic patcher).
     for (int i = 0; i < cg.funcNames.length; i++) {
         if (cg.funcOffsets[i] < 0) { continue; }
-        int mi = objMarkExact(cg, cg.funcOffsets[i]);
+        int mi = markOf[i];
         if (mi < 0 || cg.markOwner[mi] != extract) { continue; }
-        string base = objBaseSymbol(cg.funcNames[i], cg.funcClasses[i]);
+        string base = baseOf[i];
         int group = 0;
         int last = -1;
         for (int j = 0; j < cg.funcNames.length; j++) {
             if (cg.funcOffsets[j] < 0) { continue; }
-            if (objBaseSymbol(cg.funcNames[j], cg.funcClasses[j]) == base) {
-                int mj = objMarkExact(cg, cg.funcOffsets[j]);
+            if (baseOf[j] == base) {
+                int mj = markOf[j];
                 if (mj >= 0 && cg.markOwner[mj] == extract) {
                     group++;
                     last = j;
@@ -1653,7 +1679,7 @@ public string extractUnit(MiniCg cg, string extract, ObjUnit unit) {
         if (i >= cg.funcModules.length) { continue; }
         string mod = cg.funcModules[i];
         if (mod.length == 0) { continue; }
-        int mi = objMarkExact(cg, cg.funcOffsets[i]);
+        int mi = markOf[i];
         if (mi < 0 || cg.markOwner[mi] != extract) { continue; }
         string modAlias = mod + "." + cg.funcNames[i];
         int group = 0;
@@ -1854,19 +1880,38 @@ private int objMarkAt(MiniCg cg, int[] codeEnds, int off) {
     return -1;
 }
 
-// Mark whose region starts exactly at off, or -1.
+// Mark whose region starts exactly at off, or -1. Binary search: extractUnit
+// validates the code marks strictly increasing before any lookup, so a start
+// offset names at most one mark (the old linear scan ran per function, and
+// again per overload candidate — quadratic on big units).
 private int objMarkExact(MiniCg cg, int off) {
-    for (int i = 0; i < cg.markCodeOff.length; i++) {
-        if (cg.markCodeOff[i] == off) { return i; }
+    int lo = 0;
+    int hi = cg.markCodeOff.length - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int v = cg.markCodeOff[mid];
+        if (v == off) { return mid; }
+        if (v < off) { lo = mid + 1; }
+        else { hi = mid - 1; }
     }
     return -1;
 }
 
-// Mark whose data range contains off, or -1.
+// Mark whose data range contains off, or -1. extractUnit validates the data
+// marks non-decreasing and each range ends where the next begins, so the
+// ranges tile in order: the only candidate is the LAST mark starting at or
+// before off (earlier ties are empty ranges) — found by binary search
+// instead of a linear scan per string site.
 private int objDataMarkAt(MiniCg cg, int[] dataEnds, int off) {
-    for (int i = 0; i < cg.markCodeOff.length; i++) {
-        if (cg.markDataOff[i] <= off && off < dataEnds[i]) { return i; }
+    int lo = 0;
+    int hi = cg.markDataOff.length;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (cg.markDataOff[mid] <= off) { lo = mid + 1; }
+        else { hi = mid; }
     }
+    int i = lo - 1;
+    if (i >= 0 && off < dataEnds[i]) { return i; }
     return -1;
 }
 
@@ -1972,27 +2017,68 @@ private void objSortUndefs(ObjUnit unit) {
     }
 }
 
+// Stable sort of the parallel relocation arrays by site. Relocations arrive
+// as several already-sorted runs (one per site category), which made the old
+// insertion sort quadratic in moves on large units; this bottom-up merge sort
+// of an index permutation is stable exactly like it was (ties keep their
+// push order), so the resulting order is identical.
 private void objSortRelocs(ObjUnit unit) {
-    for (int i = 1; i < unit.relSites.length; i++) {
-        int s = unit.relSites[i];
-        int k = unit.relKinds[i];
-        int t = unit.relTargets[i];
-        int x = unit.relIdx[i];
-        string n = unit.relNames[i];
-        int j = i - 1;
-        while (j >= 0 && s < unit.relSites[j]) {
-            unit.relSites[j + 1] = unit.relSites[j];
-            unit.relKinds[j + 1] = unit.relKinds[j];
-            unit.relTargets[j + 1] = unit.relTargets[j];
-            unit.relIdx[j + 1] = unit.relIdx[j];
-            unit.relNames[j + 1] = unit.relNames[j];
-            j--;
+    int n = unit.relSites.length;
+    if (n < 2) { return; }
+    int[] ord = [];
+    int[] tmp = [];
+    for (int i = 0; i < n; i++) {
+        ord.add(i);
+        tmp.add(0);
+    }
+    int width = 1;
+    while (width < n) {
+        int lo = 0;
+        while (lo < n) {
+            int mid = lo + width;
+            if (mid > n) { mid = n; }
+            int hi = lo + width * 2;
+            if (hi > n) { hi = n; }
+            int a = lo;
+            int b = mid;
+            int w = lo;
+            while (a < mid && b < hi) {
+                // `<=` takes the left run first on ties: stable.
+                if (unit.relSites[ord[a]] <= unit.relSites[ord[b]]) {
+                    tmp[w] = ord[a];
+                    a++;
+                } else {
+                    tmp[w] = ord[b];
+                    b++;
+                }
+                w++;
+            }
+            while (a < mid) { tmp[w] = ord[a]; a++; w++; }
+            while (b < hi) { tmp[w] = ord[b]; b++; w++; }
+            lo = hi;
         }
-        unit.relSites[j + 1] = s;
-        unit.relKinds[j + 1] = k;
-        unit.relTargets[j + 1] = t;
-        unit.relIdx[j + 1] = x;
-        unit.relNames[j + 1] = n;
+        for (int c = 0; c < n; c++) { ord[c] = tmp[c]; }
+        width = width * 2;
+    }
+    int[] sSites = [];
+    int[] sKinds = [];
+    int[] sTargets = [];
+    int[] sIdx = [];
+    string[] sNames = [];
+    for (int i = 0; i < n; i++) {
+        int o = ord[i];
+        sSites.add(unit.relSites[o]);
+        sKinds.add(unit.relKinds[o]);
+        sTargets.add(unit.relTargets[o]);
+        sIdx.add(unit.relIdx[o]);
+        sNames.add(unit.relNames[o]);
+    }
+    for (int i = 0; i < n; i++) {
+        unit.relSites[i] = sSites[i];
+        unit.relKinds[i] = sKinds[i];
+        unit.relTargets[i] = sTargets[i];
+        unit.relIdx[i] = sIdx[i];
+        unit.relNames[i] = sNames[i];
     }
 }
 
@@ -3102,7 +3188,11 @@ class ObjSession {
         }
         this.objMakeTree(path.dirname(objPath));
         file.writeBytes(objPath, bytes);
-        if (!file.exists(objPath) || file.size(objPath) != bytes.length) {
+        // Existence only: a size stat opens the file, and opening one the
+        // on-access scanner is still checking blocks (~6 ms per object). A
+        // short write can never be reused silently either way — its note
+        // fails validation on the next plan and the unit re-emits.
+        if (!file.exists(objPath)) {
             return "object cache: cannot write " + objPath + ": verification failed";
         }
         if (idx >= 0) {
