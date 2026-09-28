@@ -41,7 +41,7 @@ import * from mac.libsystem;
 // Two-tier workflow: object emission reads the synced .srbc bytecode
 // (under bytecode\) when it exists and falls back to source otherwise.
 //
-// Object format (v5):
+// Object format (v6):
 //
 // The extension is always .o (never .obj); the contents are the proper
 // relocatable object format for the target, emitted by the built-in writers
@@ -60,7 +60,7 @@ import * from mac.libsystem;
 //   Cross-slice references are left as relocations.
 // - .rdata — the owning file's data bytes (string literals pushed while its
 //   functions were emitted). May be empty.
-// - .slvnote — the Silver note (magic SLVOBJ3, emitting flag set, source
+// - .slvnote — the Silver note (magic SLVOBJ4, emitting flag set, source
 //   FNV-1 hash, emission stamp, globals-block size, the full import list,
 //   and the owning file key). The planner reads this for freshness; the
 //   linker reads the import list from it.
@@ -121,9 +121,15 @@ import * from mac.libsystem;
 //
 // - Record format: still v3 (unchanged fields), so existing per-target
 //   records are reused.
-// - Note/object format: v5 (SLVOBJ3). v4 objects (SLVOBJ2 — the COFF and ELF
-//   genuine tiers) fail the v5 note parse and are treated as stale
-//   (re-emitted), never as a hard error.
+// - Note/object format: v6 (SLVOBJ4). v5 objects (SLVOBJ3) fail the v6
+//   note parse and are treated as stale (re-emitted), never as a hard
+//   error. The bump retires pre-fix objects that may have been sliced
+//   empty under a mismatched session key (bare-filename invocations split
+//   the raw and canonical key paths on the reference toolchain, so a unit
+//   could own no bytes while carrying a valid hash — shared caches may
+//   hold such objects, and both tools re-emit them instead of relinking).
+//   Older notes (SLVOBJ1, SLVOBJ2 — the COFF and ELF genuine tiers) stay
+//   stale as before.
 //
 // v1 boundaries (loud fallback to a full monolithic compile):
 //
@@ -548,7 +554,7 @@ class ParsedObj {
     }
 }
 
-// Decoded v4 note: emitting flag set, source hash, emission stamp,
+// Decoded v6 note: emitting flag set, source hash, emission stamp,
 // globals-block size, full import list, and owner file key.
 class ObjNote {
     public prop string flags;
@@ -659,11 +665,11 @@ class ObjReader {
     }
 }
 
-// Silver object note (v5): SLVOBJ3 + flag-set string + source FNV-1 hash +
+// Silver object note (v6): SLVOBJ4 + flag-set string + source FNV-1 hash +
 // emission stamp + globals-block size + import list + owner file key.
 public int[] objEncodeNote(ObjUnit unit, string flags, int64 srcHash, int stamp) {
     ObjWriter w = new ObjWriter();
-    w.rawStr("SLVOBJ3");
+    w.rawStr("SLVOBJ4");
     w.strField(flags);
     w.u64(srcHash);
     w.u64(stamp);
@@ -678,12 +684,12 @@ public int[] objEncodeNote(ObjUnit unit, string flags, int64 srcHash, int stamp)
 }
 
 // Decode one note span into note. Returns "" when valid, else the exact
-// reference error. A v4-era (SLVOBJ2) note fails here and the planner
-// treats the object as stale — never a hard error.
+// reference error. A pre-v6 (SLVOBJ1/SLVOBJ2/SLVOBJ3) note fails here and
+// the planner treats the object as stale — never a hard error.
 private string objDecodeNote(ObjReader r, int noteOff, int noteLen, ObjNote note) {
     string badNote = "object cache: corrupt Silver note section";
     if (noteOff < 0 || noteLen <= 0 || noteOff + noteLen > r.size) { return badNote; }
-    if (r.bytesAt(noteOff, 7) != "SLVOBJ3") { return badNote; }
+    if (r.bytesAt(noteOff, 7) != "SLVOBJ4") { return badNote; }
     int pos = noteOff + 7;
     int flagLen = int(r.u32At(pos));
     pos += 4;
@@ -775,7 +781,7 @@ private string objSplitCoff(ObjReader r, int[] out) {
 }
 
 // Parse just the Silver note (cheap freshness probe). Returns "" and fills
-// note when the container and note are valid v5 — including v4-era objects,
+// note when the container and note are valid v6 — pre-v6 objects,
 // which fail here and the planner treats as stale.
 public string objPeekCoffNote(ObjReader r, ObjNote note) {
     int[] spans = [];
@@ -935,7 +941,7 @@ private string objSplitElf(ObjReader r, int[] out) {
 }
 
 // Parse just the Silver note (cheap freshness probe). Returns "" and fills
-// note when the container and note are valid v5 — including v4-era objects,
+// note when the container and note are valid v6 — pre-v6 objects,
 // which fail here and the planner treats as stale.
 public string objPeekElfNote(ObjReader r, ObjNote note) {
     int[] spans = [];
@@ -2799,6 +2805,14 @@ class ObjSession {
     construct (string rootDir, string projName, string targetOsName, string modeName, bool optimize) {
         this.ok = false;
         this.root = rootDir;
+        // Bare CLI spellings (`silverc main.sr`, `silverc proj.srp`) carry
+        // no parent directory: anchor an empty session root at the working
+        // directory so the note-time and link-time key paths derive the
+        // same relative keys (mirrors the reference normalize_root;
+        // path.dirname already yields "." at every call site, so this
+        // hardens the contract for single-file, multi-file, and .srp
+        // builds in every mode).
+        if (this.root.length == 0) { this.root = "."; }
         this.projectName = projName;
         this.targetOs = targetOsName;
         this.flags = objFlagKey(modeName, optimize);
@@ -2941,11 +2955,11 @@ class ObjSession {
 
     // Split the observed files into fresh (reusable without codegen) and
     // stale (must be re-emitted). Fresh means: the record matches (hash +
-    // mtime), the .o exists, and its v5 note parses with the expected flag
+    // mtime), the .o exists, and its v6 note parses with the expected flag
     // set + hash. Fresh candidates must also share one import list (the
     // link consumes it verbatim); any disagreement is cross-version skew,
     // so every candidate goes stale and the tier re-emits instead of
-    // failing loudly at link time. Anything else — including a v4-era
+    // failing loudly at link time. Anything else — including a pre-v6
     // object whose note no longer parses — is stale, never a hard error
     // here. Fills plan.
     public void plan(ObjPlan plan) {
@@ -5880,7 +5894,7 @@ private string objSplitMacho(ObjReader r, int[] out) {
 }
 
 // Parse just the Silver note (cheap freshness probe). Returns "" and fills
-// note when the container and note are valid v5 — including v4-era objects,
+// note when the container and note are valid v6 — pre-v6 objects,
 // which fail here and the planner treats as stale.
 public string objPeekMachoNote(ObjReader r, ObjNote note) {
     int[] spans = [];
