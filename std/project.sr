@@ -764,13 +764,29 @@ bool projectIsStdModule(string name) {
     return false;
 }
 
-string[] projectQsStems(string content) {
-    string[] out = [];
+// One-pass `.qs` bundle split: stems and minified sources extracted in a
+// single walk, so each bundle is read and scanned once (the old stems pass
+// plus sources pass read every bundle twice and held both full parses).
+class QsParts {
+    public prop string[] stems;
+    public prop string[] sources;
+
+    construct {
+        this.stems = [];
+        this.sources = [];
+    }
+}
+
+// Extract the stems and minified module sources of a `.qs` bundle, in order.
+// Stems feed membership checks only (empty stems skipped, as before);
+// sources append to the aggregate in order. Empty when not a bundle.
+QsParts projectQsSplit(string content) {
+    QsParts out = new QsParts();
     if (!projectQsBundle(content)) { return out; }
     int pos = 6;
-    pos += 4;
+    pos += 4;              // flags (reserved)
     int metaLen = projectQsU32(content, pos);
-    pos += 4 + metaLen;
+    pos += 4 + metaLen;    // metadata payload
     int count = projectQsU32(content, pos);
     pos += 4;
     for (int i = 0; i < count; i++) {
@@ -779,9 +795,11 @@ string[] projectQsStems(string content) {
         string filename = projectSlice(content, pos, pos + nameLen);
         pos += nameLen;
         int srcLen = projectQsU32(content, pos);
-        pos += 4 + srcLen;
+        pos += 4;
+        out.sources.add(projectSlice(content, pos, pos + srcLen));
+        pos += srcLen;
         string stem = path.stem(filename);
-        if (stem.length > 0) { out.add(stem); }
+        if (stem.length > 0) { out.stems.add(stem); }
     }
     return out;
 }
@@ -817,30 +835,8 @@ int projectQsU32(string content, int pos) {
 // stage-2 backend truncates caller arrays grown inside helpers at 8
 // elements, so all growth happens inline in the caller below.
 
-// Extract the minified module sources of a `.qs` bundle, in order. Returns an
-// empty array when the content is not a bundle.
-string[] projectQsSources(string content) {
-    string[] result = [];
-    if (!projectQsBundle(content)) { return result; }
-    int pos = 6;
-    pos += 4;              // flags (reserved)
-    int metaLen = projectQsU32(content, pos);
-    pos += 4 + metaLen;    // metadata payload
-    int count = projectQsU32(content, pos);
-    pos += 4;
-    for (int i = 0; i < count; i++) {
-        int nameLen = projectQsU32(content, pos);
-        pos += 4 + nameLen;
-        int srcLen = projectQsU32(content, pos);
-        pos += 4;
-        result.add(projectSlice(content, pos, pos + srcLen));
-        pos += srcLen;
-    }
-    return result;
-}
-
 // Locate a shipped std SOURCE file for a `.qs` bundle bare import name
-// (`net` -> `std/net.sr`), mirroring where the driver's findModuleSource
+// (`net` -> `std/net.sr`), mirroring where the driver's module resolution
 // would find it. Probes the cwd-relative std candidates; returns "" when
 // no file exists. Names with separators or parent references are never
 // files (a bundle must not escape the std directory).
@@ -1119,7 +1115,7 @@ string projectCacheMarker(string path) {
 // The self-hosted stage-2 backend has a code-generation edge case where a
 // mutable array passed into a helper and grown there leaves the caller's
 // length slot stale (silently truncating growth at 8 elements), which broke
-// module dedup in `projectCollect`/`projectCountCollect` and re-collected the
+// module dedup in `projectCollect` and re-collected the
 // same files over and over. Class property arrays grow correctly, so the
 // visited set is held in an object and mutated through methods instead of
 // being passed as a bare `string[]` parameter.
@@ -1142,21 +1138,46 @@ class ProjectVisited {
     }
 }
 
+// One output buffer for project source collection: per-file texts are
+// appended here and joined once by the caller. The old per-module
+// `result += projectCollect(...)` recursion left quadratic never-freed
+// intermediates behind (one abandoned buffer per collected file).
+class ProjectPieces {
+    public prop string[] parts;
+
+    construct {
+        this.parts = [];
+    }
+
+    public void add(string s) {
+        this.parts.add(s);
+    }
+
+    public string joinAll() {
+        return this.parts.join("");
+    }
+}
+
 string projectCollect(string path, string root, string[] sourceDirs, ProjectVisited visited, bool emitMarkers, ProgressReporter progress, bool debugBuild) {
-    if (visited.contains(path)) { return ""; }
+    ProjectPieces out = new ProjectPieces();
+    projectCollectInto(path, root, sourceDirs, visited, emitMarkers, progress, debugBuild, out);
+    return out.joinAll();
+}
+
+void projectCollectInto(string path, string root, string[] sourceDirs, ProjectVisited visited, bool emitMarkers, ProgressReporter progress, bool debugBuild, ProjectPieces out) {
+    if (visited.contains(path)) { return; }
     visited.add(path);
     // DOCS/260 — filter each project source BEFORE its imports are scanned
     // and its text joins the aggregate, so every file's `#on` regions resolve
     // independently and non-matching regions never reach the parser.
     string rawSource = file.readString(path);
     string source = preprocessOrProjectFail(rawSource, debugBuild);
-    string result = "";
     int cursor = 0;
     while (cursor < source.length) {
         int importPos = projectFind(source, "import", cursor);
         if (importPos < 0) { break; }
-        // Same line-leading + whole-word guard as projectCollect so the
-        // count stays in lockstep with the real collection.
+        // Same line-leading + whole-word guard as the driver's collectImports:
+        // only a real statement may resolve a dependency.
         bool lineLeading = true;
         for (int bi = importPos - 1; bi >= 0; bi--) {
             char bc = source[bi];
@@ -1181,7 +1202,8 @@ string projectCollect(string path, string root, string[] sourceDirs, ProjectVisi
         if (moduleName.length > 0 && !projectBuiltin(moduleName)) {
             string importPath = projectSourcePath(root, sourceDirs, moduleName);
             if (importPath != "") {
-                result += projectCollect(importPath, root, sourceDirs, visited, emitMarkers, progress, debugBuild) + "\n";
+                projectCollectInto(importPath, root, sourceDirs, visited, emitMarkers, progress, debugBuild, out);
+                out.add("\n");
             }
         }
         cursor = semi + 1;
@@ -1189,62 +1211,9 @@ string projectCollect(string path, string root, string[] sourceDirs, ProjectVisi
     string marker = "";
     if (emitMarkers) { marker = projectCacheMarker(path); }
     if (progress != null) { progress.moduleDone(path); }
-    return result + marker + source + "\n";
-}
-
-// Count how many project source files `projectCollect` would collect for the
-// given entry (1 for the entry plus its transitive imports). Mirrors
-// `projectCollect`'s resolution logic exactly so the total is precise.
-int projectCountCollect(string path, string root, string[] sourceDirs, ProjectVisited visited, bool debugBuild) {
-    if (visited.contains(path)) { return 0; }
-    visited.add(path);
-    // DOCS/260 — mirror projectCollect's filter so counts stay in lockstep
-    // (a region error aborts during collection, before the aggregate builds).
-    string rawSource = file.readString(path);
-    string source = preprocessOrProjectFail(rawSource, debugBuild);
-    int sub = 0;
-    int cursor = 0;
-    while (cursor < source.length) {
-        int importPos = projectFind(source, "import", cursor);
-        if (importPos < 0) { break; }
-        // Only a line-leading `import` starts an import statement: the
-        // aggregate sources contain the literal word "import" in comments,
-        // string literals and identifiers (e.g. `importPath`), and scanning
-        // those resolves bogus modules (a driver comment names `math`, the
-        // `importPath` local below reads as `Path` on case-insensitive
-        // filesystems, duplicating path.sr). Mirrors collectImports.
-        bool lineLeading = true;
-        for (int bi = importPos - 1; bi >= 0; bi--) {
-            char bc = source[bi];
-            if (bc == '\n') { break; }
-            if (bc != ' ' && bc != '\t' && bc != '\r') { lineLeading = false; break; }
-        }
-        if (!lineLeading) {
-            cursor = importPos + 6;
-            continue;
-        }
-        // Whole-word check: reject matches glued to identifier characters
-        // (e.g. `importPath`, `importGroupIdx`).
-        if (importPos + 6 < source.length) {
-            char ic = source[importPos + 6];
-            if (ic != ' ' && ic != '\t' && ic != '\r' && ic != '\n' && ic != '{' && ic != '*') {
-                cursor = importPos + 6;
-                continue;
-            }
-        }
-        int semi = projectFind(source, ";", importPos + 6);
-        if (semi < 0) { break; }
-        string statement = projectSlice(source, importPos + 6, semi);
-        string moduleName = projectImportModule(statement);
-        if (moduleName.length > 0 && !projectBuiltin(moduleName)) {
-            string importPath = projectSourcePath(root, sourceDirs, moduleName);
-            if (importPath != "") {
-                sub += projectCountCollect(importPath, root, sourceDirs, visited, debugBuild);
-            }
-        }
-        cursor = semi + 1;
-    }
-    return 1 + sub;
+    out.add(marker);
+    out.add(source);
+    out.add("\n");
 }
 
 string projectCollectionEscape(string value) {
@@ -1325,7 +1294,9 @@ string projectExpandCollections(string source, string root, string collections) 
         if (!projectHasRealCollectDecl(source)) { return source; }
     }
     int markerLen = 8;
-    string result = "";
+    // Linear accumulation like projectStripDirectives: per-line `+=` left
+    // quadratic never-freed garbage on large aggregates.
+    string[] lineParts = [];
     int cursor = 0;
     int line = 1;
     while (cursor < source.length) {
@@ -1360,15 +1331,15 @@ string projectExpandCollections(string source, string root, string collections) 
             if (!file.exists(fullPath)) {
                 projectCollectionFail(path, line);
             }
-            result += prefix + " = " + projectCollectionLiteral(fullPath) + projectSlice(path, semi, path.length);
+            lineParts.add(prefix + " = " + projectCollectionLiteral(fullPath) + projectSlice(path, semi, path.length));
         } else {
-            result += text;
+            lineParts.add(text);
         }
-        if (end < source.length) { result += "\n"; }
+        if (end < source.length) { lineParts.add("\n"); }
         cursor = end + 1;
         line++;
     }
-    return result;
+    return lineParts.join("");
 }
 
 string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild, int[] countOut) {
@@ -1380,23 +1351,32 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild,
     string collections = projectManifestValue(manifest, "collections");
 
     string entryPath = projectJoin(root, entry);
-    // Progress (STDERR): pre-count the module files (entry + transitive
-    // imports) so the lines show an exact `[processed/total]` and a real ETA.
-    ProjectVisited countVisited = new ProjectVisited();
-    int moduleCount = projectCountCollect(entryPath, root, sources, countVisited, debugBuild);
-    ProgressReporter progress = new ProgressReporter(moduleCount);
+    // Progress (STDERR): no counting pre-pass (it re-read and re-filtered
+    // every file just for the total). Collection reports indeterminate
+    // `[N/N]` lines while running; the exact total is pinned below, and the
+    // success-line count returns in countOut.
+    ProgressReporter progress = new ProgressReporter(1);
     ProjectVisited visited = new ProjectVisited();
     string collected = projectCollect(entryPath, root, sources, visited, emitMarkers, progress, debugBuild);
+    progress.setTotal(progress.processedCount());
     progress.finish();
     eprintln("TRC nm begin");
     NativeModules nmBuild = projectParseNativeModules(manifest);
-    string body = projectStripDirectivesCustom(collected, nmBuild);
-    eprintln("TRC strip done " + (string)body.length);
+    string stripped = projectStripDirectivesCustom(collected, nmBuild);
+    eprintln("TRC strip done " + (string)stripped.length);
+    // One pieces buffer for the remaining stages (stripped aggregate, shipped
+    // std inlines, library sources): a single terminal join replaces the old
+    // chain of whole-aggregate `+=` copies. aggLen tracks the joined length
+    // for the TRC traces below.
+    ProjectPieces agg = new ProjectPieces();
+    agg.add(stripped);
+    int aggLen = stripped.length;
 
     // `.qs` libraries listed under `imports` are not auto-imported; declaring
-    // one only makes it available. Extract each module's source from the
-    // bundle and compile it alongside the project sources so that
-    // `import * from X;` statements in the code resolve to the library.
+    // one only makes it available. Each bundle is read and split once (stems
+    // plus sources in a single pass) and every module's source compiles
+    // alongside the project sources so that `import * from X;` statements in
+    // the code resolve to the library.
     string[] imports = projectManifestArray(manifest, "imports");
     string[] allBundleStems = [];
     eprintln("TRC stems begin " + (string)imports.length);
@@ -1404,31 +1384,33 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild,
     // (keyed by module name, so every spelling dedups): two libraries
     // needing `net` inline it once.
     string[] qsStdDone = [];
-    for (int qi = 0; qi < imports.length; qi++) {
-        string qsPath0 = projectJoin(root, imports[qi]);
-        string qsContent0 = file.readString(qsPath0);
-        if (qsContent0.length > 0) {
-            string[] stems0 = projectQsStems(qsContent0);
-            for (int sj = 0; sj < stems0.length; sj++) {
-                allBundleStems.add(stems0[sj]);
-            }
-        }
-    }
+    // Each bundle is read and split once (stems plus sources in a single
+    // pass). Stems accumulate up front so a bundle importing a sibling
+    // bundle's module resolves independently of manifest order; sources
+    // append below in manifest order.
+    QsParts[] bundleParts = [];
     for (int ki = 0; ki < imports.length; ki++) {
         string qsPath = projectJoin(root, imports[ki]);
         string qsContent = file.readString(qsPath);
         eprintln("TRC libsrc begin " + (string)ki + " " + (string)qsContent.length);
-        if (qsContent.length > 0) {
-            string[] libSources = projectQsSources(qsContent);
-            eprintln("TRC libsrc extracted " + (string)libSources.length);
-            for (int si = 0; si < libSources.length; si++) {
-                eprintln("TRC scan " + (string)ki + "." + (string)si + " len " + (string)libSources[si].length + " body " + (string)body.length);
+        QsParts qsFirst = projectQsSplit(qsContent);
+        for (int sj = 0; sj < qsFirst.stems.length; sj++) {
+            allBundleStems.add(qsFirst.stems[sj]);
+        }
+        eprintln("TRC libsrc extracted " + (string)qsFirst.sources.length);
+        bundleParts.add(qsFirst);
+    }
+    for (int bi2 = 0; bi2 < bundleParts.length; bi2++) {
+        QsParts qsParts = bundleParts[bi2];
+        if (qsParts.sources.length > 0) {
+            for (int si = 0; si < qsParts.sources.length; si++) {
+                eprintln("TRC scan " + (string)bi2 + "." + (string)si + " len " + (string)qsParts.sources[si].length + " body " + (string)aggLen);
                 // DOCS/261 v1: a bundle needing an undeclared custom module
                 // fails naming the declaration. Bare sources naming project
                 // files, sibling bundle modules, or std modules are Silver
                 // (dropped downstream); declared customs are kept for the
                 // target-side verification in parser/codegen.
-                string libSrc = libSources[si];
+                string libSrc = qsParts.sources[si];
                 int cur = 0;
                 while (cur < libSrc.length) {
                     int impPos = projectFind(libSrc, "import", cur);
@@ -1474,7 +1456,9 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild,
                                         string[] stdDirs = [];
                                         stdDirs.add("");
                                         string stdText = projectCollect(stdPath, stdRoot, stdDirs, visited, emitMarkers, progress, debugBuild);
-                                        body += stdText + "\n";
+                                        agg.add(stdText);
+                                        agg.add("\n");
+                                        aggLen += stdText.length + 1;
                                     }
                                 }
                             }
@@ -1486,13 +1470,15 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild,
                     }
                     cur = semi + 1;
                 }
-                body += libSources[si] + "\n";
+                agg.add(libSrc);
+                agg.add("\n");
+                aggLen += libSrc.length + 1;
             }
         }
     }
 
+    string body = agg.joinAll();
     body = projectExpandCollections(body, root, collections);
-    file.writeString("project_dump.txt", body);
 
     string metadata = "";
     string name = projectManifestValue(manifest, "name");

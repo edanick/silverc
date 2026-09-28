@@ -236,6 +236,22 @@ public string ppNormalizePaths(string source, string targetOs, string[] errs) {
     return pieces.join("");
 }
 
+// Normalize the path literals of one kept splice run [start, end) whose
+// first line is the absolute 1-based `baseLine`. A whole-text normalize
+// would keep the filtered aggregate twice (once filtered, once renormalized);
+// fusing it into the splice keeps a single output buffer. Absolute line
+// numbers in literal errors are preserved by padding the run with its elided
+// leading newlines first (normalization never adds or removes newlines, and
+// on error returns its input verbatim, so stripping the pad is exact).
+private string ppNormalizeRun(string source, int start, int end, string targetOs, int baseLine, string[] errs) {
+    string slice = projectSlice(source, start, end);
+    if (baseLine <= 1) { return ppNormalizePaths(slice, targetOs, errs); }
+    string[] padParts = [];
+    for (int p = 1; p < baseLine; p++) { padParts.add("\n"); }
+    string norm = ppNormalizePaths(padParts.join("") + slice, targetOs, errs);
+    return projectSlice(norm, baseLine - 1, norm.length);
+}
+
 // First non-whitespace (space/tab) offset at or after `start`, bounded by
 // `end` (exclusive). Returns `end` when the range holds only whitespace.
 private int ppSkipBlanks(string s, int start, int end) {
@@ -413,24 +429,29 @@ public string ppPreprocess(string source, string targetOs, bool debugBuild, stri
         return ppNormalizePaths(source, targetOs, errs);
     }
 
-    // Pass 2: splice — one slice per kept run, one terminator per blanked
-    // line, so a directive-heavy file costs a handful of concatenations.
-    string result = "";
+    // Pass 2: splice — one piece per kept run (path literals rewritten inline
+    // per run, so only one output buffer exists instead of a filtered copy
+    // plus a renormalized copy), one terminator per blanked line, joined once
+    // at the end. runLine tracks each run's absolute first line (every drop
+    // entry consumes exactly one line) for ppNormalizeRun.
+    string[] outParts = [];
+    int runLine = 1;
     int copyStart = 0;
     for (int d = 0; d < dropAt.length; d++) {
         if (dropAt[d] > copyStart) {
-            result += projectSlice(source, copyStart, dropAt[d]);
+            outParts.add(ppNormalizeRun(source, copyStart, dropAt[d], targetOs, runLine, errs));
         }
         if (dropNl[d] >= 0) {
-            if (dropCr[d] == 1) { result += "\r\n"; }
-            else { result += "\n"; }
+            if (dropCr[d] == 1) { outParts.add("\r\n"); }
+            else { outParts.add("\n"); }
+            runLine++;
         }
         copyStart = (dropNl[d] >= 0) ? dropNl[d] + 1 : source.length;
     }
     if (copyStart < source.length) {
-        result += projectSlice(source, copyStart, source.length);
+        outParts.add(ppNormalizeRun(source, copyStart, source.length, targetOs, runLine, errs));
     }
-    // DOCS/257 — path literals rewrite on the kept text, after region
+    // DOCS/257 — path literals rewrite on the kept text, during region
     // filtering, so stripped regions never see the scan.
-    return ppNormalizePaths(result, targetOs, errs);
+    return outParts.join("");
 }
