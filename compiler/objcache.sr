@@ -2784,6 +2784,10 @@ class ObjSession {
     // full parse). Per-build, never persisted.
     public prop string[] stagedKeys;
     public prop byte[][] stagedVals;
+    // True once this run wrote an object or dropped a record: finishRecords
+    // then rewrites the record files directly (they changed), skipping the
+    // compare reads a clean full-hit run uses to leave disk untouched.
+    public prop bool recDirty;
     // Worker threads (the unified pipeline's multi-threaded mapping runs
     // per-file emission under workerCount workers).
     public prop int workers;
@@ -2813,6 +2817,7 @@ class ObjSession {
         this.keyMemoOuts = [];
         this.stagedKeys = [];
         this.stagedVals = [];
+        this.recDirty = false;
         this.workers = 1;
         string guarded = path.guardForWindows(projName);
         string target = objTargetDirName(targetOsName);
@@ -3099,6 +3104,7 @@ class ObjSession {
                 this.hashes.add(this.notedH[idx]);
                 this.cachedAt.add(this.notedStamps[idx]);
             }
+            this.recDirty = true;
         }
         return "";
     }
@@ -3156,9 +3162,16 @@ class ObjSession {
             lines.add(objEscapeText(this.keys[re]) + " " + (string)this.cTimes[re] + " " + (string)this.mTimes[re] + " " + objHex16(int64(this.hashes[re])) + " " + (string)this.cachedAt[re] + "\n");
         }
         string sbcriText = lines.join("");
-        // Compare-before-write on both artifacts (warm full-hit builds leave
-        // every byte on disk untouched): the binary compares byte-exact, the
-        // companion compares as text (also repairing a missing companion).
+        // Dirty runs (objects written or records dropped) rewrite both
+        // artifacts directly — they changed, so no compare reads are spent.
+        // Clean full-hit runs compare before writing and leave every byte on
+        // disk untouched: the binary compares byte-exact, the companion
+        // compares as text (also repairing a missing companion).
+        if (this.recDirty || stale.length > 0) {
+            file.writeBytes(sbcrPath, w.out);
+            file.writeString(sbcriPath, sbcriText);
+            return;
+        }
         byte[] oldBin = [];
         try {
             oldBin = file.read(sbcrPath);
