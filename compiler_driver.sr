@@ -888,6 +888,16 @@ void drvPrintDiagnostics(string[] msgs, string source, string entryName, bool us
     }
 }
 
+// The single executable writer. An existing output is removed before the
+// write: truncating an executable the on-access scanner is still checking
+// (the previous build's output, seconds old) blocks until that scan ends —
+// ~250 ms per rebuild, larger than a whole warm cached build — while
+// removing it returns at once and the new file is written fresh.
+void drvWriteOutput(string outputFile, int[] peData) {
+    if (file.exists(outputFile)) { file.delete(outputFile); }
+    file.writeBytes(outputFile, peData);
+}
+
 // Session naming mirrors silverc-rs: projects key the cache by their
 // manifest name (or manifest stem), standalone files by the source stem.
 string cacheSessionName(string inputFile, bool inputIsProject) {
@@ -1845,7 +1855,7 @@ int compileOnce(CliFlags flags, string outputFile) {
         // binary on disk (legacy parity); projects leave nothing behind.
         if (progress != null) { progress.phaseEmit(); }
         if (!inputIsProject) {
-            file.writeBytes(outputFile, peData);
+            drvWriteOutput(outputFile, peData);
         }
         // OVERHAUL.md --cache-bytecode: flush the session before the success
         // line so the compile is only reported done once every artifact is on
@@ -1865,7 +1875,7 @@ int compileOnce(CliFlags flags, string outputFile) {
     // entries dropped too) BEFORE the success line so the compile is only
     // reported done once every artifact is on disk.
     if (progress != null) { progress.phaseEmit(); }
-    file.writeBytes(outputFile, peData);
+    drvWriteOutput(outputFile, peData);
     eprintln("Generated: " + outputFile);
     // Read-only --cache-object-alone sessions skip the sync report (see above).
     if (sess != null && !sess.readOnly) {
