@@ -65,11 +65,13 @@ import * from win32.kernel32;
 // 207 interpolation segments: u32 count, then per segment u8 kind (0 text,
 // 1 hole) + u32 len + bytes + (hole only) u32 line + u32 col).
 //
-// Because the compiled Silver runtime cannot re-read NUL-containing binaries
-// safely (strings are strlen-based and managed arrays are not byte-dense),
-// each binary artifact has a NUL-free text companion ("*.sbcri"/"*.srbc.t")
-// that carries the same information. The companions are the authoritative
-// read side; the binaries are written byte-exactly for other toolchains.
+// Because Silver strings are strlen-based, each binary artifact keeps a
+// NUL-free text companion ("*.sbcri"/"*.srbc.t") carrying the same
+// information. The record companion stays the authoritative read side for
+// `.sbcr`; bytecode payloads decode from the `.srbc` binary itself first
+// (byte[] reads carry NULs exactly) and fall back to the companion for old
+// files and spellings the binary cannot carry exactly. The binaries are
+// written byte-exactly for other toolchains either way.
 //
 // Workflow: compare current files against the records; re-cache only files
 // whose FNV-1 hash / size changed; compile from the refreshed cache.
@@ -121,6 +123,12 @@ class CacheSession {
     // once; misses remove their key. Never persisted — classification is
     // per-build.
     public prop string[] hits;
+    // Temp hop copy already staged this run ("" when none): the miss path
+    // writes it once on the first miss, so full-hit warm runs pay no hop
+    // I/O at all. A stale hop from a dead pid-reused build is always
+    // overwritten whole before any read, and the memory slice below covers
+    // every hop failure — so laziness can only skip I/O, never reuse bytes.
+    public prop string hopDone;
 
     construct (string rootDir, string projName, bool ro = false) {
         this.ok = false;
@@ -140,6 +148,7 @@ class CacheSession {
         this.lastPayload = "";
         this.readOnly = ro;
         this.hits = [];
+        this.hopDone = "";
         string legacyRecord = "";
         string legacyIndex = "";
         #on WINDOWS
@@ -217,7 +226,12 @@ class CacheSession {
             // header hash+stamp is re-validated on load); anything else
             // syncs below.
             if (this.mTimesStr[idx] == mtimeKey && this.hashesStr[idx] == hashKey) {
-                Token[] cached = this.loadSrbcText(absPath, hashKey, this.cachedAtStr[idx]);
+                // Warm fast path: the reference binary decodes with pure
+                // arithmetic over the staged bytes (no substrings, no hex) —
+                // the text companion below stays as the fallback for old
+                // files and spellings the binary cannot carry exactly.
+                Token[] cached = this.loadSrbcBin(absPath, hashKey, this.cachedAtStr[idx]);
+                if (cached.length == 0) { cached = this.loadSrbcText(absPath, hashKey, this.cachedAtStr[idx]); }
                 if (cached.length > 0) {
                     // Bytecode-tier hit: this unit skipped re-lexing (the
                     // unified pipeline classifies it as synced-bytecode).
@@ -231,9 +245,18 @@ class CacheSession {
         // pipeline's single lex entry, encode, mark dirty —
         // skipped entirely on a readOnly (--cache-object alone) session, where
         // a miss simply returns the fresh lex and stores nothing (case 1
-        // writes NOTHING to bytecode\ either way).
+        // writes NOTHING to bytecode\ either way). The hop copy is staged on
+        // the first miss only (see hopDone): hits never slice the aggregate,
+        // so full-hit warm runs skip the whole-aggregate write entirely.
         string body = "";
-        if (hopPath.length > 0) { body = bcSliceViaFile(hopPath, start, end - start); }
+        if (hopPath.length > 0) {
+            if (this.hopDone != hopPath) {
+                ensureDirTree(path.dirname(hopPath));
+                file.writeString(hopPath, aggSource);
+                this.hopDone = hopPath;
+            }
+            body = bcSliceViaFile(hopPath, start, end - start);
+        }
         if (body.length == 0) { body = aggSource[cs..ce]; }
         string[] missErrs = [];
         Token[] tokens = pipeLexUnit(body, missErrs);
@@ -676,6 +699,113 @@ class CacheSession {
             return;
         }
         t.put(" -\n");
+    }
+
+    // Binary fast path for the hit branch above: decode the reference
+    // `.srbc` bytes straight through ObjReader (the §6 home — never
+    // cloned) instead of parsing the text companion. One read syscall, not
+    // two: the file is read directly, and a missing/corrupt payload falls
+    // through to the text companion below, exactly as before. Any failure
+    // returns empty (a miss — the caller re-lexes and re-syncs), so a stale
+    // entry is never reused: the header hash+stamp is re-validated against
+    // the record entry that gated this load, the token count must match,
+    // and tags the binary cannot carry exactly (201 float spellings live
+    // only in the companion — the parser scans the spelling for `.`/`e`;
+    // unknown future tags) bail to the companion instead of guessing.
+    // Unit tags rebuild through tokenFromParts, so both readers agree
+    // token-for-token; the 207 interpolation shape is rebuilt inline (never
+    // through a helper taking the segment arrays: arrays received as
+    // function parameters silently stop growing past 8 entries in this
+    // toolchain, while prop arrays on a local object keep growing).
+    private Token[] loadSrbcBin(string absPath, string hashKey, string stampKey) {
+        string path = this.srbcPathFor(absPath);
+        if (path.length == 0) { return []; }
+        byte[] raw = [];
+        try {
+            raw = file.read(path);
+        } catch (int e) {
+            return [];
+        }
+        ObjReader r = new ObjReader(raw);
+        if (r.size < 26) { return []; }
+        if (r.bytesAt(0, 4) != "SRBC") { return []; }
+        if (r.u16At(4) != 2) { return []; }
+        if (r.u64At(6) != int64(hashKey) || r.u64At(14) != int64(stampKey)) { return []; }
+        int count = int(r.u32At(22));
+        if (count <= 0) { return []; }
+        int pos = 26;
+        Token[] tokens = [];
+        for (int i = 0; i < count; i++) {
+            if (pos + 2 > r.size) { return []; }
+            int tag = int(r.u16At(pos));
+            pos += 2;
+            if (tag == 201) { return []; }
+            string payload = "";
+            int64 iv = 0;
+            int cv = 32;
+            if (tag == 200) {
+                if (pos + 8 > r.size) { return []; }
+                iv = r.u64At(pos);
+                pos += 8;
+            } else if (tag == 203) {
+                if (pos + 4 > r.size) { return []; }
+                cv = int(r.u32At(pos));
+                pos += 4;
+            } else if (tag == 202 || tag == 204) {
+                if (pos + 4 > r.size) { return []; }
+                int blen = int(r.u32At(pos));
+                pos += 4;
+                if (blen < 0 || pos + blen > r.size) { return []; }
+                payload = r.bytesAt(pos, blen);
+                pos += blen;
+            } else if (tag == 207) {
+                if (pos + 4 > r.size) { return []; }
+                int scount = int(r.u32At(pos));
+                pos += 4;
+                if (scount < 0) { return []; }
+                Token gt = new Token(168, "$", 1, 1);
+                for (int gi2 = 0; gi2 < scount; gi2++) {
+                    if (pos + 5 > r.size) { return []; }
+                    int gk = int(r.u8At(pos));
+                    pos++;
+                    int glen = int(r.u32At(pos));
+                    pos += 4;
+                    if (glen < 0 || pos + glen > r.size) { return []; }
+                    string gpayload = r.bytesAt(pos, glen);
+                    pos += glen;
+                    int gln = 0;
+                    int gcl = 0;
+                    if (gk == 1) {
+                        if (pos + 8 > r.size) { return []; }
+                        gln = int(r.u32At(pos));
+                        gcl = int(r.u32At(pos + 4));
+                        pos += 8;
+                        gt.ipKinds.add(1);
+                    } else if (gk == 0) {
+                        gt.ipKinds.add(0);
+                    } else { return []; }
+                    gt.ipTexts.add(gpayload);
+                    gt.ipLines.add(gln);
+                    gt.ipCols.add(gcl);
+                }
+                if (pos + 8 > r.size) { return []; }
+                gt.line = int(r.u32At(pos));
+                gt.col = int(r.u32At(pos + 4));
+                pos += 8;
+                tokens.add(gt);
+                continue;
+            } else if (tag != 206 && tag > 125) { return []; }
+            if (pos + 8 > r.size) { return []; }
+            int ln = int(r.u32At(pos));
+            int cl = int(r.u32At(pos + 4));
+            pos += 8;
+            Token t = tokenFromParts(tag, payload, iv, cv);
+            if (t == null) { return []; }
+            t.line = ln;
+            t.col = cl;
+            tokens.add(t);
+        }
+        return tokens;
     }
 
     private Token[] loadSrbcText(string absPath, string hashKey, string stampKey) {
