@@ -123,12 +123,6 @@ class CacheSession {
     // once; misses remove their key. Never persisted — classification is
     // per-build.
     public prop string[] hits;
-    // Temp hop copy already staged this run ("" when none): the miss path
-    // writes it once on the first miss, so full-hit warm runs pay no hop
-    // I/O at all. A stale hop from a dead pid-reused build is always
-    // overwritten whole before any read, and the memory slice below covers
-    // every hop failure — so laziness can only skip I/O, never reuse bytes.
-    public prop string hopDone;
 
     construct (string rootDir, string projName, bool ro = false) {
         this.ok = false;
@@ -148,7 +142,6 @@ class CacheSession {
         this.lastPayload = "";
         this.readOnly = ro;
         this.hits = [];
-        this.hopDone = "";
         string legacyRecord = "";
         string legacyIndex = "";
         #on WINDOWS
@@ -189,17 +182,16 @@ class CacheSession {
 
     // Return cached tokens for the source range [start, end) of aggSource
     // when its contents are unchanged and the stored bytecode decodes;
-    // otherwise materialize the body (hop file first, builtin-slice
-    // fallback), lex it fresh, store the new bytecode, and return those
-    // tokens — unless readOnly (--cache-object alone: case 2 serves the hit
+    // otherwise materialize the body (one O(len) slice), lex it fresh, store
+    // the new bytecode, and return those tokens — unless readOnly (--cache-object alone: case 2 serves the hit
     // from disk and case 1 lexes fresh, both storing nothing). The caller
     // supplies the range's FNV-1 hash plus the `.sr` modification time (ms):
     // the driver stats + hashes each file once (OVERHAUL.md freshness steps
     // 1-2) and reuses both for the unit record and the object-tier note, so
     // the same bytes are never hashed or stat-ed twice on the hot path.
     // Range hashing means full-project cache hits never slice the aggregate
-    // at all — the linear builtin slice is paid only per miss.
-    public Token[] tokensForRange(string absPath, string aggSource, int start, int end, string hopPath, int64 rangeHash, int mtimeVal) {
+    // at all — the linear slice is paid only per miss.
+    public Token[] tokensForRange(string absPath, string aggSource, int start, int end, int64 rangeHash, int mtimeVal) {
         // Slice clamps (old bcSliceSlow conditions): the bootstrap clamps
         // itself but the self-host reads OOB without them — clamped once
         // here so every site below stays in range on both backends.
@@ -245,19 +237,12 @@ class CacheSession {
         // pipeline's single lex entry, encode, mark dirty —
         // skipped entirely on a readOnly (--cache-object alone) session, where
         // a miss simply returns the fresh lex and stores nothing (case 1
-        // writes NOTHING to bytecode\ either way). The hop copy is staged on
-        // the first miss only (see hopDone): hits never slice the aggregate,
-        // so full-hit warm runs skip the whole-aggregate write entirely.
-        string body = "";
-        if (hopPath.length > 0) {
-            if (this.hopDone != hopPath) {
-                ensureDirTree(path.dirname(hopPath));
-                file.writeString(hopPath, aggSource);
-                this.hopDone = hopPath;
-            }
-            body = bcSliceViaFile(hopPath, start, end - start);
-        }
-        if (body.length == 0) { body = aggSource[cs..ce]; }
+        // writes NOTHING to bytecode\ either way). The body is one O(len)
+        // substring slice (projectSlice): the old temp "hop" copy of the whole
+        // aggregate (write it out, then seek + ReadFile per miss) predates
+        // that slice and only added file I/O — including an open of a
+        // just-written file, which waits on the on-access scanner.
+        string body = projectSlice(aggSource, cs, ce);
         string[] missErrs = [];
         Token[] tokens = pipeLexUnit(body, missErrs);
         if (this.readOnly) { return tokens; }
@@ -284,7 +269,7 @@ class CacheSession {
 
     // Whole-string variant kept for direct callers with an in-memory file.
     public Token[] tokensFor(string absPath, string source) {
-        return this.tokensForRange(absPath, source, 0, source.length, "", hash.fnv1(source, 0, source.length), file.modification(absPath).milliseconds());
+        return this.tokensForRange(absPath, source, 0, source.length, hash.fnv1(source, 0, source.length), file.modification(absPath).milliseconds());
     }
 
     // Session-relative key with per-run memo (see relMemoIns). Byte-identical
@@ -464,9 +449,11 @@ class CacheSession {
         if (text.length == 0) { return; }
         this.oldIndexText = text;
         int pos = 0;
-        while (pos < text.length) {
+        // Length read once (strlen is O(n)), never per character.
+        int textLen = text.length;
+        while (pos < textLen) {
             int eol = pos;
-            while (eol < text.length && text[eol] != '\n') { eol++; }
+            while (eol < textLen && text[eol] != '\n') { eol++; }
             string line = projectSlice(text, pos, eol);
             pos = eol + 1;
             if (line == "SBCRI v2" || line.startsWith("project ") || line.startsWith("name ")) {
@@ -818,9 +805,14 @@ class CacheSession {
         // against the record entry that gated this load (OVERHAUL.md: the
         // payload on disk must agree with the entry pointing at it).
         // Parsed in place, no slices; any mismatch returns empty (a miss —
-        // the caller re-lexes and re-syncs).
+        // the caller re-lexes and re-syncs). The length is read once:
+        // `string.length` lowers to strlen (O(n)), and re-reading it per
+        // character made decoding a multi-MB companion quadratic (minutes
+        // per warm build for any file holding a float literal, which always
+        // decodes through this text path).
+        int textLen = text.length;
         int he = 0;
-        while (he < text.length && text[he] != '\n') { he++; }
+        while (he < textLen && text[he] != '\n') { he++; }
         int hh = 0;
         while (hh < he && text[hh] != ' ') { hh++; }
         if (hh != hashKey.length) { this.lastPayload = ""; return []; }
@@ -834,13 +826,13 @@ class CacheSession {
         for (int sc = 0; sc < s1 - s0; sc++) {
             if (text[s0 + sc] != stampKey[sc]) { this.lastPayload = ""; return []; }
         }
-        int count = -1; if (s1 + 1 < he && text[s1 + 1] >= '0' && text[s1 + 1] <= '9') { count = (int)text[s1 + 1..he]; }
+        int count = -1; if (s1 + 1 < he && text[s1 + 1] >= '0' && text[s1 + 1] <= '9') { count = int(bcDecAt(text, s1 + 1, he)); }
         if (count <= 0) { this.lastPayload = ""; return []; }
         int pos = he + 1;
         Token[] tokens = [];
-        for (int i = 0; i < count && pos < text.length; i++) {
+        for (int i = 0; i < count && pos < textLen; i++) {
             int le = pos;
-            while (le < text.length && text[le] != '\n') { le++; }
+            while (le < textLen && text[le] != '\n') { le++; }
             Token t = tokenFromRange(text, pos, le);
             pos = le + 1;
             if (t == null) { this.lastPayload = ""; return []; }
@@ -870,17 +862,19 @@ class CacheSession {
 // keep only a bounded chunk resident and push bytes to disk with direct
 // kernel32 writes:
 //
-//   BcBinWriter  — .srbc/.sbcr bytes: a bounded int[] chunk staged through
-//                  a scratch file (file.writeBytes) and appended to the
+//   BcBinWriter  — .srbc/.sbcr bytes: a bounded int[] chunk (256K bytes).
+//                  An artifact that fits one chunk — nearly all of them —
+//                  is written whole by close() with a single
+//                  file.writeBytes. Larger ones spill each full chunk
+//                  through a scratch file (file.writeBytes) appended to the
 //                  artifact with a direct WriteFile of the exact byte
-//                  count. The full stream never exists as one string or
-//                  one whole-file array.
-//   BcTextWriter — NUL-free text (.srbc.t / project.sbcri): a preallocated
-//                  writable string buffer appended in place with lstrcatA
-//                  and flushed with WriteFile, reset in place with
-//                  lstrcpyA("") — no per-piece allocation at all. The raw
-//                  calls sit in #on WINDOWS regions; there is no std
-//                  equivalent for in-place buffer append.
+//                  count, so the stream never exceeds one bounded chunk.
+//   BcTextWriter — NUL-free text (.srbc.t / project.sbcri): pieces gathered
+//                  with an int byte count and written by one join + one
+//                  WriteFile per 64K window, so resident text stays bounded
+//                  and no put ever re-measures a buffer (strlen is O(n)).
+//                  The raw calls sit in #on WINDOWS regions; there is no
+//                  std equivalent for streamed appends.
 // ---------------------------------------------------------------------------
 
 class BcBinWriter {
@@ -889,22 +883,23 @@ class BcBinWriter {
     public prop int[] buf;
     public prop string scratch;
     public prop int failed;
+    // True once a chunk went to disk through the streamed handle path.
+    public prop bool streamed;
 
     construct (string outPath) {
         this.path = outPath;
         this.buf = [];
         this.failed = 0;
         this.handle = 0;
+        this.streamed = false;
         this.scratch = outPath + ".part";
         ensureDirTree(path.dirname(outPath));
-        #on WINDOWS
-        // CREATE_ALWAYS: every artifact is rewritten whole on change.
-        this.handle = CreateFileA(outPath, 0x40000000, 0, null, 2, 0x80, 0);
-        #off
-        if (this.handle == -1 || this.handle == 0) {
-            this.handle = 0;
-            this.failed = 1;
-        }
+        // The handle opens lazily on the first bounded-chunk spill: an
+        // artifact that fits one staged chunk (nearly every .srbc) is written
+        // whole by close() with ONE file.writeBytes — no handle, no scratch
+        // round trip. The per-chunk scratch staging (write + stat + read back
+        // + WriteFile, several file opens per 8K bytes) dominated cold
+        // --cache-bytecode builds.
     }
 
     public bool ok() {
@@ -913,7 +908,7 @@ class BcBinWriter {
 
     public void b8(int64 v) {
         this.buf.add(v & 0xFF);
-        if (this.buf.length >= 8192) { this.flush(); }
+        if (this.buf.length >= 262144) { this.flush(); }
     }
 
     public void b16(int64 v) {
@@ -931,7 +926,18 @@ class BcBinWriter {
 
     public void flush() {
         int n = this.buf.length;
+        if (n > 0 && this.failed == 0 && this.handle == 0) {
+            #on WINDOWS
+            // CREATE_ALWAYS: every artifact is rewritten whole on change.
+            this.handle = CreateFileA(this.path, 0x40000000, 0, null, 2, 0x80, 0);
+            #off
+            if (this.handle == -1 || this.handle == 0) {
+                this.handle = 0;
+                this.failed = 1;
+            }
+        }
         if (n > 0 && this.failed == 0) {
+            this.streamed = true;
             // Chunk staging through a scratch file keeps this portable
             // across bootstrap stages: file.writeBytes compacts the array's
             // low bytes in place on the self-hosted backend but copies to a
@@ -958,6 +964,18 @@ class BcBinWriter {
     }
 
     public void close() {
+        if (!this.streamed && this.failed == 0) {
+            // Whole artifact still staged: one direct write (an empty
+            // artifact still truncates, like CREATE_ALWAYS did).
+            // No size re-stat: opening a just-written file waits on the
+            // on-access scanner (~6 ms per artifact). A short payload can
+            // never be reused — its header/count fail validation on load and
+            // the file re-syncs.
+            file.writeBytes(this.path, this.buf);
+            if (!file.exists(this.path)) { this.failed = 1; }
+            while (this.buf.length > 0) { this.buf.pop(); }
+            return;
+        }
         this.flush();
         #on WINDOWS
         if (this.handle != 0) {
@@ -972,21 +990,22 @@ class BcBinWriter {
 class BcTextWriter {
     public prop string path;
     public prop int handle;
-    public prop string buf;
+    // Pending pieces and their total byte count, tracked as an int: the old
+    // in-place lstrcatA buffer paid a strlen of the whole buffer on every
+    // put (`.length` plus lstrcatA's own end scan), per token field.
+    public prop string[] parts;
+    public prop int pending;
 
     construct (string outPath) {
         this.path = outPath;
         this.handle = 0;
-        this.buf = "";
+        this.parts = [];
+        this.pending = 0;
         ensureDirTree(path.dirname(outPath));
         #on WINDOWS
         int h = CreateFileA(outPath, 0x40000000, 0, null, 2, 0x80, 0);
         if (h == -1 || h == 0) { return; }
         this.handle = h;
-        // Heap-allocated capacity buffer (never a literal: lstrcatA writes
-        // through the pointer), emptied in place so appends stay within it.
-        this.buf = " ".repeat(4096);
-        lstrcpyA(this.buf, "");
         #off
     }
 
@@ -994,31 +1013,28 @@ class BcTextWriter {
         return this.handle != 0;
     }
 
-    // NUL-free text only: the buffer is a plain C string, so lstrcatA
-    // appends in place and .length stays truthful.
+    // NUL-free text only: pieces are plain C strings joined once per flush,
+    // so every .length stays truthful.
     public void put(string s) {
-        if (s.length == 0 || this.handle == 0) { return; }
-        if (s.length >= 4000) {
-            this.flush();
-            #on WINDOWS
-            int w2 = 0;
-            WriteFile(this.handle, s, s.length, &w2, null);
-            #off
-            return;
-        }
-        if (this.buf.length + s.length > 4000) { this.flush(); }
-        #on WINDOWS
-        lstrcatA(this.buf, s);
-        #off
+        if (this.handle == 0) { return; }
+        int n = s.length;
+        if (n == 0) { return; }
+        this.parts.add(s);
+        this.pending += n;
+        if (this.pending >= 65536) { this.flush(); }
     }
 
+    // One join + one WriteFile per bounded window (the join is the only
+    // allocation; its size is the window, so resident text stays bounded).
     public void flush() {
-        if (this.handle == 0 || this.buf.length == 0) { return; }
+        if (this.handle == 0 || this.pending == 0) { return; }
+        string chunk = this.parts.join("");
         #on WINDOWS
         int w = 0;
-        WriteFile(this.handle, this.buf, this.buf.length, &w, null);
-        lstrcpyA(this.buf, "");
+        WriteFile(this.handle, chunk, this.pending, &w, null);
         #off
+        while (this.parts.length > 0) { this.parts.pop(); }
+        this.pending = 0;
     }
 
     public void close() {
@@ -1044,29 +1060,6 @@ class BcTextWriter {
 // to its native FNV-1 loop and never compiles hash.sr source, so a bare
 // fnv1(...) would trap at runtime there.
 
-// Byte-range slice through a temp copy of the aggregate: seek + ReadFile
-// into a preallocated buffer sized exactly for the range, so the buffer's
-// own NUL terminator lands right after the bytes read. The whole body is
-// raw kernel32 file I/O (no std equivalent offers seek-into-range with an
-// exact-length read), so the region spans the body.
-public string bcSliceViaFile(string hopPath, int start, int len) {
-    if (len <= 0 || hopPath.length == 0) { return ""; }
-    #on WINDOWS
-    int h = CreateFileA(hopPath, 0x80000000, 3, null, 3, 0x80, 0);
-    if (h == -1 || h == 0) { return ""; }
-    string r = "";
-    int seeked = SetFilePointer(h, start, null, 0);
-    if (seeked != -1) {
-        string buf = " ".repeat(len);
-        int got = 0;
-        int okR = ReadFile(h, buf, len, &got, null);
-        if (okR != 0 && got == len) { r = buf; }
-    }
-    CloseHandle(h);
-    return r;
-    #off
-    return "";
-}
 
 // Whole-string FNV-1 needs no wrapper here: hash.sr's hash.fnv1(data)
 // is the home (§6); this module keeps no hash clones.
@@ -1343,7 +1336,7 @@ private Token? tokenFromRange(string text, int start, int end) {
     int cl = 0;
     int f = 0;
     while (f < 3) {
-        int v = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { v = (int)text[p..end]; }
+        int v = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { v = int(bcDecAt(text, p, end)); }
         if (v < 0) { return null; }
         if (f == 0) { tag = v; }
         else if (f == 1) { ln = v; }
@@ -1357,9 +1350,9 @@ private Token? tokenFromRange(string text, int start, int end) {
     int64 iv = 0;
     int cv = 32;
     if (tag == 200) {
-        iv = (int)text[p..end];
+        iv = int(bcDecAt(text, p, end));
     } else if (tag == 203) {
-        cv = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { cv = (int)text[p..end]; }
+        cv = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { cv = int(bcDecAt(text, p, end)); }
         if (cv < 0) { return null; }
     } else if (tag == 202 || tag == 204 || tag == 205 || tag == 201) {
         // <byteLen>:<hex> — decoded into an exact-size buffer appended in
@@ -1369,7 +1362,7 @@ private Token? tokenFromRange(string text, int start, int end) {
         int colon = p;
         while (colon < end && text[colon] != ':') { colon++; }
         if (colon >= end) { return null; }
-        int blen = -1; if (p < colon && text[p] >= '0' && text[p] <= '9') { blen = (int)text[p..colon]; }
+        int blen = -1; if (p < colon && text[p] >= '0' && text[p] <= '9') { blen = int(bcDecAt(text, p, colon)); }
         if (blen < 0 || end - (colon + 1) < blen * 2) { return null; }
         int hexStart = colon + 1;
         if (blen > 0) {
@@ -1394,7 +1387,7 @@ private Token? tokenFromRange(string text, int start, int end) {
         // as function parameters silently stop growing past 8 entries in
         // this toolchain, while prop arrays on a local object keep growing).
         // Any malformation returns null, forcing a re-lex.
-        int scount = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { scount = (int)text[p..end]; }
+        int scount = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { scount = int(bcDecAt(text, p, end)); }
         if (scount < 0) { return null; }
         while (p < end && text[p] >= '0' && text[p] <= '9') { p++; }
         while (p < end && text[p] == ' ') { p++; }
@@ -1404,7 +1397,7 @@ private Token? tokenFromRange(string text, int start, int end) {
             if (p >= end) { return null; }
             char gk = text[p]; p++;
             if (gk != 'T' && gk != 'H') { return null; }
-            int glen = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { glen = (int)text[p..end]; }
+            int glen = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { glen = int(bcDecAt(text, p, end)); }
             if (glen < 0) { return null; }
             while (p < end && text[p] >= '0' && text[p] <= '9') { p++; }
             if (p >= end || text[p] != ':') { return null; }
@@ -1431,12 +1424,12 @@ private Token? tokenFromRange(string text, int start, int end) {
             if (gk == 'H') {
                 if (p >= end || text[p] != '@') { return null; }
                 p++;
-                gln = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { gln = (int)text[p..end]; }
+                gln = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { gln = int(bcDecAt(text, p, end)); }
                 if (gln < 0) { return null; }
                 while (p < end && text[p] >= '0' && text[p] <= '9') { p++; }
                 if (p >= end || text[p] != ':') { return null; }
                 p++;
-                gcl = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { gcl = (int)text[p..end]; }
+                gcl = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { gcl = int(bcDecAt(text, p, end)); }
                 if (gcl < 0) { return null; }
                 while (p < end && text[p] >= '0' && text[p] <= '9') { p++; }
                 gt.ipKinds.add(1);
@@ -1456,6 +1449,24 @@ private Token? tokenFromRange(string text, int start, int end) {
     t.line = ln;
     t.col = cl;
     return t;
+}
+
+// Leading decimal integer (optional '-') of text[start, end), parsed in
+// place — the same value the `(int)` cast of the slice reads. Slicing
+// `text[a..b]` first bounds-checked against the WHOLE companion text
+// (strlen, O(n)) several times per token, which made decoding a large
+// .srbc.t quadratic.
+int64 bcDecAt(string text, int start, int end) {
+    int p = start;
+    bool neg = false;
+    if (p < end && text[p] == '-') { neg = true; p++; }
+    int64 v = 0;
+    while (p < end && text[p] >= '0' && text[p] <= '9') {
+        v = v * 10 + int64(text[p] - '0');
+        p++;
+    }
+    if (neg) { return -v; }
+    return v;
 }
 
 // Session-key normalization shared by the hit set: `/`-separated with no

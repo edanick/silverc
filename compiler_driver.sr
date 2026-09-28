@@ -1588,9 +1588,8 @@ int compileOnce(CliFlags flags, string outputFile) {
         // or mtime changed are re-lexed and re-cached. With --cache-object
         // alone the same loop runs on a READ ONLY session instead (hits decode
         // the synced .srbc, misses lex fresh, nothing re-cached). Chunk bodies are kept
-        // as ranges into the aggregate and materialized lazily through a
-        // temp hop copy of it (seek + ReadFile), so unchanged files are
-        // never sliced out of the aggregate at all.
+        // as ranges into the aggregate and sliced only on a miss, so
+        // unchanged files are never sliced out of the aggregate at all.
         MarkedChunks chunks = new MarkedChunks();
         chunks.split(source);
         // OVERHAUL.md freshness steps 1-2, shared once: one stat plus one
@@ -1637,18 +1636,8 @@ int compileOnce(CliFlags flags, string outputFile) {
         // --cache-bytecode is absent (the outer branch guarantees osess).
         sess = new CacheSession(path.dirname(inputFile), cacheSessionName(inputFile, inputIsProject), !flags.cacheBytecode);
         if (sess.ok && chunks.paths.length > 0) {
-            string hopBase = env.get("TEMP");
-            if (hopBase.length == 0) { hopBase = env.get("TMP"); }
-            if (hopBase.length == 0) { hopBase = "."; }
-            string hopPath = hopBase + "\\silverc-hop\\hop_" + (string)sysinfo.pid() + ".tmp";
-            #on LINUX
-            hopBase = env.get("TMPDIR");
-            if (hopBase.length == 0) { hopBase = "/tmp"; }
-            hopPath = hopBase + "/silverc-hop/hop_" + (string)sysinfo.pid() + ".tmp";
-            #off
-            // The hop copy is staged by the cache session on the first miss
-            // (see CacheSession.hopDone): full-hit warm runs never materialize
-            // a chunk, so the whole-aggregate write is skipped entirely here.
+            // Misses slice their chunk straight out of the aggregate (one
+            // O(len) substring); hits never materialize a chunk at all.
             for (int ci2 = 0; ci2 < chunks.paths.length; ci2++) {
                 // Shared hashes above (no re-hash/re-stat, no second note —
                 // the unit record, both tiers, and the fast-link check all
@@ -1658,7 +1647,7 @@ int compileOnce(CliFlags flags, string outputFile) {
                 int chunkMtime = preMtimes[ci2];
                 Token[] part = sess.tokensForRange(
                     chunkAbs,
-                    source, chunks.starts[ci2], chunks.ends[ci2], hopPath, chunkHash, chunkMtime);
+                    source, chunks.starts[ci2], chunks.ends[ci2], chunkHash, chunkMtime);
                 // OVERHAUL.md --cache-object two-tier flow: tokens come from
                 // the synced .srbc when the bytecode tier hit, otherwise
                 // from a fresh lex — never re-lexed for the object tier.
@@ -1675,7 +1664,6 @@ int compileOnce(CliFlags flags, string outputFile) {
                 }
             }
             tokens.add(new Token(0, "", 1, 1));
-            if (file.exists(hopPath)) { file.delete(hopPath); }
         } else {
             // Cache tiers off and no chunk split: same line, fresh lex
             // through the single lex entry.
