@@ -39,24 +39,31 @@ import * from win32.kernel32;
 // Both artifacts are written in the reference binary formats so caches stay
 // toolchain-compatible:
 //
-// **.sbcr (Silver ByteCode Record) v1** — little-endian:
-//   magic "SBCR" | u16 version=1 | u64 created (ms since epoch)
+// **.sbcr (Silver ByteCode Record) v2** — little-endian (OVERHAUL.md
+// "Freshness check and record layout", byte-identical to silverc-rs):
+//   magic "SBCR" | u16 version=2 | u64 created (ms since epoch)
 //   u32 name_len + UTF-8 project name
 //   u32 entry_count
 //   per entry: u32 rel_path_len + UTF-8 '/'-separated path,
 //              u64 creation_millis u64 modified_millis
 //              u64 fnv1_hash       u64 last_cached_millis
 //
-// **.srbc (Silver ByteCode) v1** — the linear token stream of one file:
-//   magic "SRBC" | u16 version=1
+// `modified_millis` IS the `.sr` file's modification time (ms since epoch):
+// the freshness gate compares it first, then the FNV-1 content hash.
+//
+// **.srbc (Silver ByteCode) v2** — the linear token stream of one file:
+//   magic "SRBC" | u16 version=2
 //   u64 fnv1_hash   u64 last_cached_millis
 //   u32 token_count
 //   per token: u16 kind_tag, payload, u32 line, u32 col
 //
-// Tag space: 0..119 unit kinds in reference declaration order, 200+ payload
-// kinds (200 int literal i64 LE, 201 float literal f64 bits, 202 string
-// u32len+bytes, 203 char u32 codepoint, 204 identifier, 205 annotation,
-// 206 EOF).
+// Tag space: 0..125 unit kinds in reference declaration order (0..120 shared
+// with silverc-rs, 121 `internal`, 122..125 self-hosted-only spellings),
+// 200+ payload kinds (200 int literal i64 LE, 201 float literal f64 bits,
+// 202 string u32len+bytes, 203 char u32 codepoint, 204 identifier,
+// 205 annotation (reference-only, never produced here), 206 EOF,
+// 207 interpolation segments: u32 count, then per segment u8 kind (0 text,
+// 1 hole) + u32 len + bytes + (hole only) u32 line + u32 col).
 //
 // Because the compiled Silver runtime cannot re-read NUL-containing binaries
 // safely (strings are strlen-based and managed arrays are not byte-dense),
@@ -508,17 +515,18 @@ class CacheSession {
 
         // Reference-format binary stream (see module docs), flushed in
         // bounded chunks straight to disk — never materialized as one
-        // string or one whole-file array. Float literals carry all-zero
-        // bits: the self-hosted front end materializes float literals as
-        // 0.0 today.
+        // string or one whole-file array. Number spellings ride their
+        // reference tags (200 int with the value, 201 float with the f64
+        // bits the reference decodes); interpolation segments ride tag 207
+        // in the reference segment shape.
         BcBinWriter bw = new BcBinWriter(srbcPath);
         if (bw.ok()) {
             bw.b8(83);
             bw.b8(82);
             bw.b8(66);
             bw.b8(67);
-            bw.b16(1);
-            bw.b64((int)hashKey);
+            bw.b16(2);
+            bw.b64(int64(hashKey));
             int64 sv = stamp;
             bw.b64(sv);
             bw.b32(tokens.length);
@@ -526,10 +534,8 @@ class CacheSession {
                 Token tb = tokens[ib];
                 int tag = tagOf(tb);
                 bw.b16(tag);
-                if (tag == 200) {
+                if (tag == 200 || tag == 201) {
                     bw.b64(tb.intVal);
-                } else if (tag == 201) {
-                    bw.b64(0);
                 } else if (tag == 203) {
                     int ccv = int64(tb.charVal);
                     bw.b32(ccv);
@@ -538,6 +544,20 @@ class CacheSession {
                     bw.b32(sv2.length);
                     for (int si3 = 0; si3 < sv2.length; si3++) {
                         bw.b8(sv2[si3] & 0xFF);
+                    }
+                } else if (tag == 207) {
+                    bw.b32(tb.ipKinds.length);
+                    for (int gi3 = 0; gi3 < tb.ipKinds.length; gi3++) {
+                        bw.b8(tb.ipKinds[gi3]);
+                        string gtext2 = tb.ipTexts[gi3];
+                        bw.b32(gtext2.length);
+                        for (int gj2 = 0; gj2 < gtext2.length; gj2++) {
+                            bw.b8(gtext2[gj2] & 0xFF);
+                        }
+                        if (tb.ipKinds[gi3] != 0) {
+                            bw.b32(tb.ipLines[gi3]);
+                            bw.b32(tb.ipCols[gi3]);
+                        }
                     }
                 }
                 bw.b32(tb.line);
@@ -591,7 +611,12 @@ class CacheSession {
             return;
         }
         if (tag == 201) {
-            t.put(" 0\n");
+            // Float spelling as <byteLen>:<hex> (NUL-free like every string
+            // payload): the parser scans the spelling for `.`/`e`, so only
+            // the exact text round-trips — never the decimal of the bits.
+            t.put(" ");
+            bcPutHex(t, tok.text);
+            t.put("\n");
             return;
         }
         if (tag == 203) {
@@ -603,20 +628,25 @@ class CacheSession {
         }
         if (tag == 202 || tag == 204 || tag == 205) {
             t.put(" ");
-            string s = tok.strVal;
-            t.put((string)s.length);
-            t.put(":");
-            string hex = "";
-            for (int i = 0; i < s.length; i++) {
-                string h = (s[i] & 0xFF).toString("x");
-                if (h.length < 2) { h = "0" + h; }
-                hex += h;
-                if (hex.length >= 64) {
-                    t.put(hex);
-                    hex = "";
+            bcPutHex(t, tok.strVal);
+            t.put("\n");
+            return;
+        }
+        if (tag == 207) {
+            // Interpolation segments: <segCount>, then per segment a
+            // T<textLen>:<hex> literal run or a
+            // H<holeLen>:<hex>@<line>:<col> hole — the lexer's four arrays,
+            // verbatim. Hex keeps every payload NUL-free.
+            t.put(" ");
+            t.put((string)tok.ipKinds.length);
+            for (int gi = 0; gi < tok.ipKinds.length; gi++) {
+                if (tok.ipKinds[gi] == 0) { t.put(" T"); }
+                else { t.put(" H"); }
+                bcPutHex(t, tok.ipTexts[gi]);
+                if (tok.ipKinds[gi] != 0) {
+                    t.put("@" + (string)tok.ipLines[gi] + ":" + (string)tok.ipCols[gi]);
                 }
             }
-            t.put(hex);
             t.put("\n");
             return;
         }
@@ -939,7 +969,19 @@ private string tryReadText(string path) {
 private int tagOf(Token t) {
     int k = t.kind;
     if (k == 0) { return 206; }
-    if (k == 1) { return 200; }
+    if (k == 1) {
+        // Number literal: a float spelling rides tag 201 with the float-bits
+        // payload (reference shape, decoded by silverc-rs as FloatLiteral),
+        // ints stay 200. The spelling scan mirrors the parser's own float
+        // test exactly (`.`/`e`/`E`), so encode and parse can never disagree.
+        if (t.text.length > 0) {
+            for (int fi = 0; fi < t.text.length; fi++) {
+                int fcc = t.text[fi];
+                if (fcc == 46 || fcc == 101 || fcc == 69) { return 201; }
+            }
+        }
+        return 200;
+    }
     if (k == 2) { return 201; }
     if (k == 3) { return 202; }
     if (k == 4) { return 203; }
@@ -987,6 +1029,27 @@ private int tagOf(Token t) {
     if (k == 47) { return 38; }
     if (k == 48) { return 39; }
     if (k == 49) { return 40; }
+    // Appended unit kinds (reference declaration order): local..shared ride
+    // the shared tags 41..46, `internal` rides the appended tag 121, and the
+    // self-hosted-only spellings (`?.`, `protected`, `typealias`, `loop`)
+    // ride appended tags 122..125. Appended, never inserted: existing tags
+    // stay stable, and readers that predate a tag re-lex it (a missing slot
+    // here means files using the spelling never cache — every warm run
+    // re-lexes and re-syncs them instead of hitting).
+    if (k == 150) { return 41; }
+    if (k == 151) { return 42; }
+    if (k == 152) { return 43; }
+    if (k == 153) { return 44; }
+    if (k == 154) { return 45; }
+    if (k == 155) { return 46; }
+    if (k == 167) { return 121; }
+    if (k == 163) { return 122; }
+    if (k == 164) { return 123; }
+    if (k == 165) { return 124; }
+    if (k == 166) { return 125; }
+    // Interpolation-string token (SPEC 12.2): segments ride tag 207 in the
+    // reference shape (decoded by silverc-rs as InterpString).
+    if (k == 168) { return 207; }
     if (k == 50) { return 47; }
     if (k == 51) { return 48; }
     if (k == 52) { return 49; }
@@ -1055,14 +1118,15 @@ private int tagOf(Token t) {
     return -1;
 }
 
-// Unit-kind table indexed by reference tag 0..120 (keywords / true / false /
-// null, then punctuation and operators, with uint64 appended at the end).
+// Unit-kind table indexed by reference tag 0..125 (keywords / true / false /
+// null, then punctuation and operators, with uint64 appended at 120,
+// `internal` at 121 and the self-hosted-only spellings at 122..125).
 // -1 marks spellings this toolchain never emits; those tags are neither
 // produced nor consumed here. Index 119 is the bootstrap-only
 // RightShiftExpr tag: never produced here, always re-lexed on read.
-int[] bcUnitKinds = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, -1, 22, 23, -1, 25, -1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 5, 5, 6, 44, 45, 46, 47, 48, 49, 150, 151, 152, 153, 154, 155, 50, 51, 52, 53, 65, 64, 55, 59, 60, 56, 54, -1, -1, -1, -1, -1, -1, 57, 58, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 148, 149, 156, 125, -1, 130, 131, 132, 133, 157, 158, 159, 160, 161, 162, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 147, 145, 146, -1, 21];
+int[] bcUnitKinds = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, -1, 22, 23, -1, 25, -1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 5, 5, 6, 44, 45, 46, 47, 48, 49, 150, 151, 152, 153, 154, 155, 50, 51, 52, 53, 65, 64, 55, 59, 60, 56, 54, -1, -1, -1, -1, -1, -1, 57, 58, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 148, 149, 156, 125, -1, 130, 131, 132, 133, 157, 158, 159, 160, 161, 162, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 147, 145, 146, -1, 21, 167, 163, 164, 165, 166];
 
-string[] bcUnitTexts = ["if", "else", "while", "for", "foreach", "return", "match", "void", "int", "int32", "int64", "uint", "float", "float64", "double", "bool", "byte", "char", "string", "var", "struct", "class", "enum", "def", "found", "collect", "mod", "import", "from", "as", "new", "const", "true", "false", "null", "public", "private", "static", "prop", "construct", "unset", "local", "alias", "fixed", "live", "once", "shared", "mut", "ref", "try", "catch", "finally", "throw", "to", "export", "extends", "elif", "in", "async", "await", "override", "virtual", "printline", "print", "break", "continue", "(", ")", "{", "}", "[", "]", ";", ",", ".", ":", "=", "+", "-", "*", "/", "%", "&", "|", "^", "~", "<", ">", "!", "?", "??", "$", "@", "#", "_", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "==", "!=", "<=", ">=", "&&", "||", "<<", ">>", "++", "--", "..", "...", "->", "=>", "", "uint64"];
+string[] bcUnitTexts = ["if", "else", "while", "for", "foreach", "return", "match", "void", "int", "int32", "int64", "uint", "float", "float64", "double", "bool", "byte", "char", "string", "var", "struct", "class", "enum", "def", "found", "collect", "mod", "import", "from", "as", "new", "const", "true", "false", "null", "public", "private", "static", "prop", "construct", "unset", "local", "alias", "fixed", "live", "once", "shared", "mut", "ref", "try", "catch", "finally", "throw", "to", "export", "extends", "elif", "in", "async", "await", "override", "virtual", "printline", "print", "break", "continue", "(", ")", "{", "}", "[", "]", ";", ",", ".", ":", "=", "+", "-", "*", "/", "%", "&", "|", "^", "~", "<", ">", "!", "?", "??", "$", "@", "#", "_", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "==", "!=", "<=", ">=", "&&", "||", "<<", ">>", "++", "--", "..", "...", "->", "=>", "", "uint64", "internal", "?.", "protected", "typealias", "loop"];
 
 // Rebuild a token from its reference tag. Returns null for tags this
 // toolchain never emits (unknown future variants), which forces a re-lex.
@@ -1079,8 +1143,13 @@ private Token? tokenFromParts(int tag, string payload, int64 iv, int cv) {
         return t;
     }
     if (tag == 201) {
-        t.kind = 2;
-        t.floatVal = 0.0;
+        // Float-spelled number literal (tagOf classified it by spelling, and
+        // the reference decodes this tag as a float from the same bits): the
+        // text IS the spelling the parser scans for `.`/`e`, the value is
+        // its float bits — the same pair the lexer produced.
+        t.kind = 1;
+        t.text = payload;
+        t.intVal = payload.toFloatBits();
         return t;
     }
     if (tag == 202) {
@@ -1102,7 +1171,7 @@ private Token? tokenFromParts(int tag, string payload, int64 iv, int cv) {
         t.text = payload;
         return t;
     }
-    if (tag >= 0 && tag <= 120 && tag != 119) {
+    if (tag >= 0 && tag <= 125 && tag != 119) {
         int k = bcUnitKinds[tag];
         if (k < 0) { return null; }
         t.kind = k;
@@ -1138,14 +1207,14 @@ private Token? tokenFromRange(string text, int start, int end) {
     int cv = 32;
     if (tag == 200) {
         iv = (int)text[p..end];
-    } else if (tag == 201) {
-        iv = 0;
     } else if (tag == 203) {
         cv = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { cv = (int)text[p..end]; }
         if (cv < 0) { return null; }
-    } else if (tag == 202 || tag == 204 || tag == 205) {
+    } else if (tag == 202 || tag == 204 || tag == 205 || tag == 201) {
         // <byteLen>:<hex> — decoded into an exact-size buffer appended in
         // place, so payload cost is linear with no per-char quadratic copy.
+        // Tag 201 carries the float SPELLING here (the value is re-derived
+        // from it in tokenFromParts, exactly like the lexer derived it).
         int colon = p;
         while (colon < end && text[colon] != ':') { colon++; }
         if (colon >= end) { return null; }
@@ -1166,6 +1235,70 @@ private Token? tokenFromRange(string text, int start, int end) {
                 #off
             }
         }
+    } else if (tag == 207) {
+        // Interpolation segments: <segCount>, then per segment a
+        // T<textLen>:<hex> literal run or a
+        // H<holeLen>:<hex>@<line>:<col> hole. The token is built inline
+        // (never through a helper taking the segment arrays: arrays received
+        // as function parameters silently stop growing past 8 entries in
+        // this toolchain, while prop arrays on a local object keep growing).
+        // Any malformation returns null, forcing a re-lex.
+        int scount = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { scount = (int)text[p..end]; }
+        if (scount < 0) { return null; }
+        while (p < end && text[p] >= '0' && text[p] <= '9') { p++; }
+        while (p < end && text[p] == ' ') { p++; }
+        Token gt = new Token(168, "$", ln, cl);
+        for (int gi2 = 0; gi2 < scount; gi2++) {
+            while (p < end && text[p] == ' ') { p++; }
+            if (p >= end) { return null; }
+            char gk = text[p]; p++;
+            if (gk != 'T' && gk != 'H') { return null; }
+            int glen = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { glen = (int)text[p..end]; }
+            if (glen < 0) { return null; }
+            while (p < end && text[p] >= '0' && text[p] <= '9') { p++; }
+            if (p >= end || text[p] != ':') { return null; }
+            p++;
+            if (end - p < glen * 2) { return null; }
+            string gpayload = "";
+            if (glen > 0) {
+                gpayload = " ".repeat(glen);
+                #on WINDOWS
+                lstrcpyA(gpayload, "");
+                #off
+                for (int gb = 0; gb < glen; gb++) {
+                    int ghi = int(text[p + gb * 2], 16);
+                    int glo = int(text[p + gb * 2 + 1], 16);
+                    if (ghi < 0 || glo < 0) { return null; }
+                    #on WINDOWS
+                    lstrcatA(gpayload, (string)(char)(ghi * 16 + glo));
+                    #off
+                }
+            }
+            p += glen * 2;
+            int gln = 0;
+            int gcl = 0;
+            if (gk == 'H') {
+                if (p >= end || text[p] != '@') { return null; }
+                p++;
+                gln = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { gln = (int)text[p..end]; }
+                if (gln < 0) { return null; }
+                while (p < end && text[p] >= '0' && text[p] <= '9') { p++; }
+                if (p >= end || text[p] != ':') { return null; }
+                p++;
+                gcl = -1; if (p < end && text[p] >= '0' && text[p] <= '9') { gcl = (int)text[p..end]; }
+                if (gcl < 0) { return null; }
+                while (p < end && text[p] >= '0' && text[p] <= '9') { p++; }
+                gt.ipKinds.add(1);
+            } else {
+                gt.ipKinds.add(0);
+            }
+            gt.ipTexts.add(gpayload);
+            gt.ipLines.add(gln);
+            gt.ipCols.add(gcl);
+        }
+        gt.line = ln;
+        gt.col = cl;
+        return gt;
     }
     Token t = tokenFromParts(tag, payload, iv, cv);
     if (t == null) { return null; }
@@ -1181,4 +1314,25 @@ string bcNormKey(string key) {
     string k = key.replaceAll("\\", "/");
     while (k.startsWith("./")) { k = projectSlice(k, 2, k.length); }
     return k;
+}
+
+// One hex payload into the streaming text writer: <byteLen>:<hex>, the hex
+// spilling in bounded windows so no line is ever built with per-char
+// concatenation. The single home for every text-companion hex payload
+// (strings, float spellings, interpolation segments) — hex keeps every
+// payload NUL-free.
+void bcPutHex(BcTextWriter t, string s) {
+    t.put((string)s.length);
+    t.put(":");
+    string hex = "";
+    for (int i = 0; i < s.length; i++) {
+        string h = (s[i] & 0xFF).toString("x");
+        if (h.length < 2) { h = "0" + h; }
+        hex += h;
+        if (hex.length >= 64) {
+            t.put(hex);
+            hex = "";
+        }
+    }
+    t.put(hex);
 }
