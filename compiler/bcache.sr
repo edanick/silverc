@@ -174,12 +174,6 @@ class CacheSession {
         this.ok = true;
     }
 
-    private string keyOf(int i) {
-        string sep = "|";
-        return this.keys[i] + sep + this.cTimesStr[i] + sep + this.mTimesStr[i]
-            + sep + this.hashesStr[i] + sep + this.cachedAtStr[i];
-    }
-
     // ------------------------------------------------------------------
     // Public API
     // ------------------------------------------------------------------
@@ -359,12 +353,17 @@ class CacheSession {
         this.sortRecords();
 
         // Linear index build: one small string per line, joined once
-        // (per-line concatenation was quadratic in the record count).
+        // (per-line concatenation was quadratic in the record count). The
+        // SBCRI v2 shape (OVERHAUL.md record layout — the same text the
+        // reference companion and the object tier write): escaped paths
+        // (spaces survive via right-cut parsing on load), decimal stamps,
+        // hashes as 16 hex digits of the exact bits.
         string[] idxParts = [];
+        idxParts.add("SBCRI v2\n");
+        idxParts.add("project " + objEscapeText(this.projectName) + "\n");
         idxParts.add("created " + (string)this.createdStamp + "\n");
-        idxParts.add("name " + this.projectName + "\n");
         for (int r = 0; r < this.keys.length; r++) {
-            idxParts.add("f " + this.keyOf(r) + "\n");
+            idxParts.add(objEscapeText(this.keys[r]) + " " + this.cTimesStr[r] + " " + this.mTimesStr[r] + " " + objHex16(int64(this.hashesStr[r])) + " " + this.cachedAtStr[r] + "\n");
         }
         string indexText = idxParts.join("");
         string sbcriOut = this.dir + "\\project.sbcri";
@@ -395,7 +394,7 @@ class CacheSession {
             bw.b8(66);
             bw.b8(67);
             bw.b8(82);
-            bw.b16(1);
+            bw.b16(2);
             bw.b64(this.createdStamp);
             string pn = this.projectName;
             bw.b32(pn.length);
@@ -409,10 +408,13 @@ class CacheSession {
                 for (int pi = 0; pi < kp.length; pi++) {
                     bw.b8(kp[pi] & 0xFF);
                 }
-                bw.b64((int)this.cTimesStr[rb]);
-                bw.b64((int)this.mTimesStr[rb]);
-                bw.b64((int)this.hashesStr[rb]);
-                bw.b64((int)this.cachedAtStr[rb]);
+                // Full 64-bit values (int64 parses the whole decimal,
+                // including negative hash spellings): the binary stays
+                // bit-identical to the reference record.
+                bw.b64(int64(this.cTimesStr[rb]));
+                bw.b64(int64(this.mTimesStr[rb]));
+                bw.b64(int64(this.hashesStr[rb]));
+                bw.b64(int64(this.cachedAtStr[rb]));
             }
         }
         bw.close();
@@ -444,25 +446,44 @@ class CacheSession {
             while (eol < text.length && text[eol] != '\n') { eol++; }
             string line = projectSlice(text, pos, eol);
             pos = eol + 1;
-            if (line.startsWith("created ")) {
-                this.createdStamp = (int)projectSlice(line, 8, line.length);
-            } else if (line.startsWith("f ")) {
-                // f <key> <created> <modified-token> <hash> <cachedAt>
-                // (fields joined with the unit separator so paths containing
-                // spaces survive the round trip)
-                string rest = projectSlice(line, 2, line.length);
-                string f1 = wordAtSep(rest, 0, '|');
-                string f2 = wordAtSep(rest, 1, '|');
-                string f3 = wordAtSep(rest, 2, '|');
-                string f4 = wordAtSep(rest, 3, '|');
-                string f5 = wordAtSep(rest, 4, '|');
-                if (f5.length > 0) {
-                    this.keys.add(f1);
-                    this.cTimesStr.add(f2);
-                    this.mTimesStr.add(f3);
-                    this.hashesStr.add(f4);
-                    this.cachedAtStr.add(f5);
+            if (line == "SBCRI v2" || line.startsWith("project ") || line.startsWith("name ")) {
+                continue;
+            } else if (line.startsWith("created ")) {
+                string num = projectSlice(line, 8, line.length);
+                if (num.isDigits()) { this.createdStamp = (int)num; }
+            } else if (line.length > 0) {
+                // Entry: <escaped-rel> <created> <modified> <hexhash> <cached>
+                // — the SBCRI v2 shape. The last four fields cut from the
+                // right so paths holding spaces survive; legacy `f ...`
+                // lines match no field count and stay absent (one re-sync,
+                // then the flush rewrites this shape).
+                int s1 = -1;
+                int s2 = -1;
+                int s3 = -1;
+                int s4 = -1;
+                int fieldCount = 0;
+                for (int i = 0; i < line.length; i++) {
+                    if (line[i] == ' ') {
+                        s1 = s2;
+                        s2 = s3;
+                        s3 = s4;
+                        s4 = i;
+                        fieldCount++;
+                    }
                 }
+                if (fieldCount < 4) { continue; }
+                string rel = objUnescapeText(projectSlice(line, 0, s1));
+                string created = projectSlice(line, s1 + 1, s2);
+                string modified = projectSlice(line, s2 + 1, s3);
+                string hex = projectSlice(line, s3 + 1, s4);
+                string cached = projectSlice(line, s4 + 1, line.length);
+                if (!created.isDigits() || !modified.isDigits() || !cached.isDigits()) { continue; }
+                if (!objIsHex(hex)) { continue; }
+                this.keys.add(rel);
+                this.cTimesStr.add(created);
+                this.mTimesStr.add(modified);
+                this.hashesStr.add((string)objParseHex(hex));
+                this.cachedAtStr.add(cached);
             }
         }
     }
@@ -950,21 +971,6 @@ public void ensureDirTree(string dir) {
         }
     }
     if (cur.length >= 2) { fs.createDir(cur); }
-}
-
-private string wordAtSep(string s, int which, char sep) {
-    int idx = 0;
-    int i = 0;
-    while (i < s.length) {
-        while (i < s.length && s[i] == sep) { i++; }
-        int start = i;
-        while (i < s.length && s[i] != sep) { i++; }
-        if (i > start) {
-            if (idx == which) { return projectSlice(s, start, i); }
-            idx++;
-        }
-    }
-    return "";
 }
 
 private string tryReadText(string path) {
