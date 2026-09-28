@@ -904,6 +904,69 @@ string cacheSessionName(string inputFile, bool inputIsProject) {
     return drvFileStem(inputFile);
 }
 
+// OVERHAUL.md --cache-object fast link for full-hit warm runs: every unit
+// is fresh (the plan holds no stale), so no codegen runs at all — the staged
+// validated .o bytes flow straight to link without re-reading the files
+// (the reference staged-bytes shape), and the record compare-before-write
+// below leaves disk untouched. Returns the linked image, or an empty array
+// when the tier is off or a v1 boundary falls back loudly (the message is
+// printed here; the cache is left untouched). Link failures exit loudly.
+// A fresh plan implies the emitting flag set already matched (a switch
+// clears the records without comparing hashes) and, for MAC, that the
+// program lowered natively before (out-of-tier programs emit no objects,
+// so a full-hit set cannot be out-of-tier) — no AST is needed to re-prove it.
+int[] objLinkFresh(CliFlags flags, ObjSession? osess, ObjPlan p, int subsystem, string[] verKeys, string[] verVals) {
+    int[] empty = [];
+    if (osess == null) { return empty; }
+    string target = ppTargetOsFor(flags.targetOs);
+    if (target != "WINDOWS" && target != "LINUX" && target != "MAC") {
+        flags.errLine("cache-object: " + objTargetDirName(target) + " target is outside the v1 object tier; full monolithic compile, objects not updated");
+        return empty;
+    }
+    if (flags.mode == 2) {
+        flags.errLine("cache-object: --runtime is outside the v1 object tier; full monolithic compile, objects not updated");
+        return empty;
+    }
+    if (p.stale.length > 0 || p.fresh.length == 0) { return empty; }
+    bool debugObj = objDebugEnabled();
+    string[] noted = osess.notedOrder();
+    ParsedObj[] parsed = [];
+    for (int li = 0; li < noted.length; li++) {
+        string lrel = noted[li];
+        if (p.fresh.indexOf(lrel) < 0) { return empty; }
+        if (debugObj) { eprintln("[objcache] reuse " + lrel); }
+        ParsedObj u = new ParsedObj();
+        string rerr = osess.readUnit(lrel, u);
+        if (rerr.length > 0) {
+            flags.errLine(rerr);
+            exit(1);
+        }
+        parsed.add(u);
+    }
+    ObjLinkResult link = new ObjLinkResult();
+    if (target == "MAC") {
+        linkUnitsMac(parsed, link);
+    } else if (target == "LINUX") {
+        linkUnitsElf(parsed, link);
+    } else {
+        linkUnits(parsed, subsystem, verKeys, verVals, link);
+    }
+    if (link.err.length > 0) {
+        flags.errLine(link.err);
+        exit(1);
+    }
+    ObjFinish fin = new ObjFinish();
+    osess.finishRecords(fin);
+    if (fin.err.length > 0) {
+        flags.errLine(fin.err);
+        exit(1);
+    }
+    if (debugObj) {
+        eprintln("[objcache] link " + (string)parsed.length + " units (" + (string)p.fresh.length + " fresh, 0 emitted, " + (string)fin.dropped + " dropped) -> " + (string)link.bytes.length + " bytes");
+    }
+    return link.bytes;
+}
+
 // OVERHAUL.md --cache-object (genuine object tier): compile the program
 // through per-file relocatable machine-code objects plus the built-in
 // static link, returning the linked image. Fresh objects are reused with no
@@ -1432,6 +1495,38 @@ int compileOnce(CliFlags flags, string outputFile) {
         progress.finish();
     }
 
+    // Version-metadata and subsystem inputs shared by the monolithic, object,
+    // and fast-link paths (the object tier links them into its image
+    // directly). Pure manifest reads hoisted here so the fast link below
+    // reuses the same values with no second computation.
+    string projectType = "";
+    if (inputIsProject) {
+        projectType = projectManifestValue(file.readString(inputFile), "type");
+    }
+    int linkSubsystem = 3;
+    if (projectType == "app" || projectType == "service") {
+        linkSubsystem = 2;
+    }
+    string[] viKeys = [];
+    string[] viValues = [];
+    if (inputIsProject) {
+        string manifest2 = file.readString(inputFile);
+        string viName = projectManifestValue(manifest2, "name");
+        string viVers = projectManifestValue(manifest2, "version");
+        string viDesc = projectManifestValue(manifest2, "description");
+        string viProd = projectManifestValue(manifest2, "product");
+        string viCopy = projectManifestValue(manifest2, "copyright");
+        string viComp = projectManifestValue(manifest2, "company");
+        if (viName != "")   { viKeys.add("FileDescription");  viValues.add(viName); }
+        if (viProd != "")  { viKeys.add("ProductName");      viValues.add(viProd); }
+        if (viCopy != "")  { viKeys.add("LegalCopyright");   viValues.add(viCopy); }
+        if (viComp != "")  { viKeys.add("CompanyName");      viValues.add(viComp); }
+        if (viName != "")  { viKeys.add("InternalName");     viValues.add(viName); }
+        if (viName != "")  { viKeys.add("OriginalFilename"); viValues.add(viName + ".exe"); }
+        if (viVers != "")  { viKeys.add("FileVersion");      viValues.add(viVers); }
+        if (viVers != "")  { viKeys.add("ProductVersion");   viValues.add(viVers); }
+    }
+
     // Per-line character lengths so bracket diagnostics can point just past
     // the end of a line (SYNTAX_EXCEPTIONS.md #3). Computed over the whole
     // aggregate either way; cached token streams get re-offset below so their
@@ -1447,6 +1542,10 @@ int compileOnce(CliFlags flags, string outputFile) {
     lineLens.add(lineCur);
 
     Token[] tokens = [];
+    Node[] ast = [];
+    int[] peData = [];
+    bool objFast = false;
+    ObjPlan fastPlan = new ObjPlan();
     CacheSession? sess = null;
     // OVERHAUL.md --cache-object: per-target object session over the same
     // root/name as the bytecode session. Null unless requested (or when the
@@ -1489,6 +1588,43 @@ int compileOnce(CliFlags flags, string outputFile) {
         // never sliced out of the aggregate at all.
         MarkedChunks chunks = new MarkedChunks();
         chunks.split(source);
+        // OVERHAUL.md freshness steps 1-2, shared once: one stat plus one
+        // hash per file for the unit record, both tiers, and the fast-link
+        // check below — bytes are never hashed or stat-ed twice on the hot
+        // path (the reference single-hash shape).
+        int64[] preHashes = [];
+        int[] preMtimes = [];
+        string[] preAbs = [];
+        for (int ci0 = 0; ci0 < chunks.paths.length; ci0++) {
+            string chunkAbs0 = chunks.paths[ci0].replaceAll("/", "\\");
+            int hashEnd0 = chunks.ends[ci0];
+            if (hashEnd0 > chunks.starts[ci0] && hashEnd0 < source.length && source[hashEnd0 - 1] == '\n') { hashEnd0--; }
+            int64 chunkHash0 = hash.fnv1(source, chunks.starts[ci0], hashEnd0);
+            int chunkMtime0 = file.modification(chunkAbs0).milliseconds();
+            preHashes.add(chunkHash0);
+            preMtimes.add(chunkMtime0);
+            preAbs.add(chunkAbs0);
+            if (osess != null) {
+                osess.noteFileHashed(chunkAbs0, chunkHash0, chunkMtime0);
+            }
+        }
+        // Fast-link check: when every unit is fresh, the staged validated .o
+        // bytes flow straight to link with no bytecode I/O, no lexing, and no
+        // parsing — the frontend below is skipped entirely (the interpreter
+        // trial shape: the object record is checked first, and an up-to-date
+        // set verifies straight from the staged bytes). A stale plan falls
+        // through to the full line, which reuses the shared hashes above.
+        if (osess != null && chunks.paths.length > 0) {
+            osess.plan(fastPlan);
+            if (fastPlan.stale.length == 0 && fastPlan.fresh.length == chunks.paths.length && fastPlan.fresh.length > 0) {
+                int[] fastPe = objLinkFresh(flags, osess, fastPlan, linkSubsystem, viKeys, viValues);
+                if (fastPe.length > 0) {
+                    peData = fastPe;
+                    objFast = true;
+                }
+            }
+        }
+        if (!objFast) {
         // OVERHAUL.md --cache-object alone (no --cache-bytecode): the third
         // argument opens the bytecode tier READ ONLY — synced .srbc files
         // decode on a hit, misses lex fresh, nothing is written back (flush
@@ -1509,21 +1645,12 @@ int compileOnce(CliFlags flags, string outputFile) {
             // (see CacheSession.hopDone): full-hit warm runs never materialize
             // a chunk, so the whole-aggregate write is skipped entirely here.
             for (int ci2 = 0; ci2 < chunks.paths.length; ci2++) {
-                // OVERHAUL.md freshness steps 1-2: one stat (the `.sr`
-                // mtime) + one hash per file, shared by both tiers — the
-                // bytecode lookup and the object-tier note below never
-                // re-hash or re-stat the same bytes.
-                string chunkAbs = chunks.paths[ci2].replaceAll("/", "\\");
-                // Hash exactly the file's own bytes: non-terminal chunks
-                // carry the one `"\n"` the collector appended after the
-                // module text, so it is trimmed for the hash (the lexed body
-                // keeps it — a trailing blank line lexes to nothing, and the
-                // reference hashes the file text the same way). Terminal
-                // chunks end at the aggregate end: nothing to trim.
-                int hashEnd = chunks.ends[ci2];
-                if (hashEnd > chunks.starts[ci2] && hashEnd < source.length && source[hashEnd - 1] == '\n') { hashEnd--; }
-                int64 chunkHash = hash.fnv1(source, chunks.starts[ci2], hashEnd);
-                int chunkMtime = file.modification(chunkAbs).milliseconds();
+                // Shared hashes above (no re-hash/re-stat, no second note —
+                // the unit record, both tiers, and the fast-link check all
+                // consume the one precomputed pair).
+                string chunkAbs = preAbs[ci2];
+                int64 chunkHash = preHashes[ci2];
+                int chunkMtime = preMtimes[ci2];
                 Token[] part = sess.tokensForRange(
                     chunkAbs,
                     source, chunks.starts[ci2], chunks.ends[ci2], hopPath, chunkHash, chunkMtime);
@@ -1532,9 +1659,6 @@ int compileOnce(CliFlags flags, string outputFile) {
                 // from a fresh lex — never re-lexed for the object tier.
                 // Freshness keys on the shared slice hash above (reference:
                 // the exact lexed text).
-                if (osess != null) {
-                    osess.noteFileHashed(chunkAbs, chunkHash, chunkMtime);
-                }
                 int off = chunks.startLines[ci2];
                 for (int tj = 0; tj < part.length; tj++) {
                     Token t = part[tj];
@@ -1557,8 +1681,10 @@ int compileOnce(CliFlags flags, string outputFile) {
                 exit(1);
             }
         }
+        } // end if (!objFast): fast-link warm hits skip the bytecode tier entirely
     }
 
+    if (!objFast) {
     // Every token stream parses through the pipeline's single parse entry.
     // DOCS/261 custom native modules: the manifest map lets declared custom
     // grants resolve (standalone compiles keep the empty default — a null
@@ -1569,7 +1695,7 @@ int compileOnce(CliFlags flags, string outputFile) {
     }
     PipeParseOut pout = new PipeParseOut();
     pipeParseUnit(tokens, lineLens, true, drvNm, ppTargetOsFor(flags.targetOs), true, pout);
-    Node[] ast = pout.program;
+    ast = pout.program;
 
     // Post-parse call diagnostics (EXCEPTIONS/*.md): unknown-method /
     // did-you-mean over the fully collected symbol table, and filesystem
@@ -1615,43 +1741,16 @@ int compileOnce(CliFlags flags, string outputFile) {
         Optimizer opt = new Optimizer();
         opt.optimizeProgram(ast);
     }
+    } // end if (!objFast): fast-link warm hits skip parse/guard/vis/optimize entirely
 
-    // Version-metadata and subsystem inputs shared by the monolithic and
-    // object paths (the object tier links them into its image directly).
-    string projectType = "";
-    if (inputIsProject) {
-        projectType = projectManifestValue(file.readString(inputFile), "type");
-    }
-    int linkSubsystem = 3;
-    if (projectType == "app" || projectType == "service") {
-        linkSubsystem = 2;
-    }
-    string[] viKeys = [];
-    string[] viValues = [];
-    if (inputIsProject) {
-        string manifest2 = file.readString(inputFile);
-        string viName = projectManifestValue(manifest2, "name");
-        string viVers = projectManifestValue(manifest2, "version");
-        string viDesc = projectManifestValue(manifest2, "description");
-        string viProd = projectManifestValue(manifest2, "product");
-        string viCopy = projectManifestValue(manifest2, "copyright");
-        string viComp = projectManifestValue(manifest2, "company");
-        if (viName != "")   { viKeys.add("FileDescription");  viValues.add(viName); }
-        if (viProd != "")  { viKeys.add("ProductName");      viValues.add(viProd); }
-        if (viCopy != "")  { viKeys.add("LegalCopyright");   viValues.add(viCopy); }
-        if (viComp != "")  { viKeys.add("CompanyName");      viValues.add(viComp); }
-        if (viName != "")  { viKeys.add("InternalName");     viValues.add(viName); }
-        if (viName != "")  { viKeys.add("OriginalFilename"); viValues.add(viName + ".exe"); }
-        if (viVers != "")  { viKeys.add("FileVersion");      viValues.add(viVers); }
-        if (viVers != "")  { viKeys.add("ProductVersion");   viValues.add(viVers); }
-    }
-
+    // Version-metadata and subsystem inputs hoisted above (shared with the
+    // fast link); the object tier consumes the same values.
     // OVERHAUL.md --cache-object (genuine object tier): per-file
     // machine-code objects plus the built-in static link, whose image
     // replaces the monolithic one below. Empty when the tier is off or a
-    // v1 boundary falls back loudly; link failures exit inside.
-    int[] peData = [];
-    if (osess != null) {
+    // v1 boundary falls back loudly; link failures exit inside. Fast-link
+    // warm hits already hold the linked image above, so the tier is skipped.
+    if (!objFast && osess != null) {
         peData = objCompileFlow(flags, osess, sess, ast, source, inputFile, inputIsProject, manifest, progress, linkSubsystem, viKeys, viValues);
     }
     if (peData.length == 0) {
