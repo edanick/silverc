@@ -438,7 +438,9 @@ void collectModuleInto(string name, string inputFile, string modPath, string mod
     string modFiltered = drvPreprocessOrDie(modSrc, debugBuild);
     modSrc = modFiltered;
     int cursor = 0;
-    while (cursor < modSrc.length) {
+    // Length read once (strlen is O(n)), not once per import occurrence.
+    int modLen = modSrc.length;
+    while (cursor < modLen) {
         int importPos = projectFind(modSrc, "import", cursor);
         if (importPos < 0) { break; }
         // Line-leading + whole-word guard: module sources contain the word
@@ -455,7 +457,7 @@ void collectModuleInto(string name, string inputFile, string modPath, string mod
             cursor = importPos + 6;
             continue;
         }
-        if (importPos + 6 < modSrc.length) {
+        if (importPos + 6 < modLen) {
             char ic = modSrc[importPos + 6];
             if (ic != ' ' && ic != '\t' && ic != '\r' && ic != '\n' && ic != '{' && ic != '*') {
                 cursor = importPos + 6;
@@ -535,7 +537,9 @@ string collectImports(string source, string inputFile, string ignored, string[] 
     DrvModuleCache cache = new DrvModuleCache();
     DrvSourcePieces pieces = new DrvSourcePieces();
     int cursor = 0;
-    while (cursor < source.length) {
+    // Length read once (strlen is O(n)), not once per import occurrence.
+    int srcLen = source.length;
+    while (cursor < srcLen) {
         int importPos = projectFind(source, "import", cursor);
         if (importPos < 0) { break; }
         // Only treat a line-leading `import` as an import statement: the
@@ -555,7 +559,7 @@ string collectImports(string source, string inputFile, string ignored, string[] 
         // Whole-word check: reject matches glued to identifier characters
         // (e.g. an identifier spelled `importGroupIdx`). Structured as a
         // direct continue (no flag variable) for robustness.
-        if (importPos + 6 < source.length) {
+        if (importPos + 6 < srcLen) {
             char inc = source[importPos + 6];
             if (inc != ' ' && inc != '\t' && inc != '\r' && inc != '\n' && inc != '{' && inc != '*') {
                 cursor = importPos + 6;
@@ -729,40 +733,30 @@ class MarkedChunks {
         bool havePath = false;
         int bodyStart = 0;
         int bodyLine = 0;
-        // Native-speed scan: jump marker to marker with indexOf instead of
-        // walking every character (the aggregate is re-scanned on every
-        // cached build, and the per-char walk dominated warm builds). The
-        // state machine is unchanged — only line iteration moved to native
-        // finds. aggLine counts the '\n' before the current marker line
-        // through chained finds, so every newline is visited exactly once.
-        // A prefix occurrence starts a marker line only at a line start,
-        // exactly like the old per-char check; anything else skips its line.
-        int counted = 0;
+        // One bounded line walk with the length read once. `.length` and
+        // `indexOf(needle, start)` both strlen the whole aggregate (O(n)), so
+        // the old per-line indexOf chain was quadratic in the aggregate size
+        // (the aggregate is re-split on every cached build). A marker line is
+        // a line STARTING with the prefix and carrying a path after it —
+        // exactly the lines the old indexOf scan accepted; aggLine is the
+        // 0-based index of the current line (every newline counted once).
+        int srcLen = source.length;
+        int lineStart = 0;
         int aggLine = 0;
-        int search = 0;
-        while (search <= source.length) {
-            int hit = source.indexOf(prefix, search);
-            if (hit < 0) { break; }
-            if (hit > 0 && source[hit - 1] != '\n') {
-                int skip = source.indexOf("\n", hit);
-                if (skip < 0) { break; }
-                search = skip + 1;
-                continue;
+        while (lineStart < srcLen) {
+            int lineEnd = lineStart;
+            while (lineEnd < srcLen && source[lineEnd] != '\n') { lineEnd++; }
+            bool isMarker = lineEnd - lineStart > prefixLen;
+            for (int pk = 0; isMarker && pk < prefixLen; pk++) {
+                if (source[lineStart + pk] != prefix[pk]) { isMarker = false; }
             }
-            int lineEnd = source.indexOf("\n", hit);
-            if (lineEnd < 0) { lineEnd = source.length; }
-            if (lineEnd - hit <= prefixLen) {
-                if (lineEnd >= source.length) { break; }
-                search = lineEnd + 1;
-                continue;
-            }
-            while (counted < hit) {
-                int nl = source.indexOf("\n", counted);
-                if (nl < 0 || nl >= hit) { break; }
+            if (!isMarker) {
+                if (lineEnd >= srcLen) { break; }
+                lineStart = lineEnd + 1;
                 aggLine++;
-                counted = nl + 1;
+                continue;
             }
-            counted = hit;
+            int hit = lineStart;
             if (havePath && lineEnd > bodyStart) {
                 this.paths.add(curPath);
                 this.startLines.add(bodyLine);
@@ -787,14 +781,15 @@ class MarkedChunks {
             // keep bodyStart = 0 so those leading lines are preserved
             // in the first chunk instead of being dropped.
             havePath = true;
-            if (lineEnd >= source.length) { break; }
-            search = lineEnd + 1;
+            if (lineEnd >= srcLen) { break; }
+            lineStart = lineEnd + 1;
+            aggLine++;
         }
-        if (havePath && source.length > bodyStart) {
+        if (havePath && srcLen > bodyStart) {
             this.paths.add(curPath);
             this.startLines.add(bodyLine);
             this.starts.add(bodyStart);
-            this.ends.add(source.length);
+            this.ends.add(srcLen);
         }
     }
 }

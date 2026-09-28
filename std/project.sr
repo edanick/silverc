@@ -1016,6 +1016,17 @@ string projectRelativePath(string root, string path) {
     return path;
 }
 
+// True when `word` appears in `text` at offset `at`, wholly before `end`.
+// In-place compare: nothing is sliced or allocated.
+bool projectWordAt(string text, int at, int end, string word) {
+    int n = word.length;
+    if (at < 0 || at + n > end) { return false; }
+    for (int k = 0; k < n; k++) {
+        if (text[at + k] != word[k]) { return false; }
+    }
+    return true;
+}
+
 string projectStripDirectivesCustom(string source, NativeModules nm) {
     // Same linear parts+join shape as projectStripDirectives (see its OOM
     // note), plus DOCS/261: keep declared bare custom lines
@@ -1023,44 +1034,62 @@ string projectStripDirectivesCustom(string source, NativeModules nm) {
     // win32/linux ones — they carry the custom grants codegen must see.
     // Undeclared bare lines stay dropped (Silver imports were already
     // collected; missing files report through the normal paths).
+    //
+    // A dropped line keeps its newline, so the result is the source with the
+    // dropped lines' text removed: kept text flows through as verbatim runs
+    // (one slice per run), and only a line whose first non-blank text is
+    // `mod export` / `import` (the only lines the checks below can drop) is
+    // materialized and checked — every other line costs a character walk, no
+    // allocation. The length is read once: `string.length` lowers to strlen
+    // (O(n)).
     string[] parts = [];
     int cursor = 0;
-    while (cursor < source.length) {
+    int runStart = 0;
+    int srcLen = source.length;
+    while (cursor < srcLen) {
         int end = cursor;
-        while (end < source.length && source[end] != '\n') { end++; }
-        string line = projectSlice(source, cursor, end);
-        string trimmed = projectTrim(line);
+        while (end < srcLen && source[end] != '\n') { end++; }
+        int first = cursor;
+        while (first < end && (source[first] == ' ' || source[first] == '\t' || source[first] == '\r')) { first++; }
         bool skip = false;
-        if (trimmed.length >= 10 && projectSlice(trimmed, 0, 10) == "mod export") { skip = true; }
-        // Whole-word `import`: a trimmed line starting with the identifier
-        // characters (e.g. `importGroupIdx.add(...);`) is code, not an
-        // import statement, and must survive stripping.
-        bool isImportLine = trimmed.length >= 6 && projectSlice(trimmed, 0, 6) == "import";
-        if (isImportLine && trimmed.length > 6) {
-            char c6 = trimmed[6];
-            if (c6 != ' ' && c6 != '\t' && c6 != '\r' && c6 != '\n' && c6 != '{' && c6 != '*') { isImportLine = false; }
-        }
-        bool isWin32Import = isImportLine && projectFind(trimmed, "win32", 0) >= 0;
-        bool isLinuxImport = isImportLine && projectFind(trimmed, "linux", 0) >= 0;
-        if (isImportLine && !isWin32Import && !isLinuxImport) {
-            bool keepCustom = false;
-            int impPos = projectFind(trimmed, "import", 0);
-            int semiPos = projectFind(trimmed, ";", 0);
-            if (impPos >= 0) {
-                int semiEnd = semiPos;
-                if (semiEnd < 0) { semiEnd = trimmed.length; }
-                string stmt = projectSlice(trimmed, impPos + 6, semiEnd);
-                if (projectFind(stmt, "from", 0) >= 0) {
-                    string mod = projectImportModule(stmt);
-                    if (mod.length > 0 && !projectIsStdModule(mod) && !projectBuiltin(mod) && nm.declared(mod)) { keepCustom = true; }
-                }
+        if (projectWordAt(source, first, end, "import") || projectWordAt(source, first, end, "mod export")) {
+            string line = projectSlice(source, cursor, end);
+            string trimmed = projectTrim(line);
+            if (trimmed.length >= 10 && projectSlice(trimmed, 0, 10) == "mod export") { skip = true; }
+            // Whole-word `import`: a trimmed line starting with the identifier
+            // characters (e.g. `importGroupIdx.add(...);`) is code, not an
+            // import statement, and must survive stripping.
+            bool isImportLine = trimmed.length >= 6 && projectSlice(trimmed, 0, 6) == "import";
+            if (isImportLine && trimmed.length > 6) {
+                char c6 = trimmed[6];
+                if (c6 != ' ' && c6 != '\t' && c6 != '\r' && c6 != '\n' && c6 != '{' && c6 != '*') { isImportLine = false; }
             }
-            if (!keepCustom) { skip = true; }
+            bool isWin32Import = isImportLine && projectFind(trimmed, "win32", 0) >= 0;
+            bool isLinuxImport = isImportLine && projectFind(trimmed, "linux", 0) >= 0;
+            if (isImportLine && !isWin32Import && !isLinuxImport) {
+                bool keepCustom = false;
+                int impPos = projectFind(trimmed, "import", 0);
+                int semiPos = projectFind(trimmed, ";", 0);
+                if (impPos >= 0) {
+                    int semiEnd = semiPos;
+                    if (semiEnd < 0) { semiEnd = trimmed.length; }
+                    string stmt = projectSlice(trimmed, impPos + 6, semiEnd);
+                    if (projectFind(stmt, "from", 0) >= 0) {
+                        string mod = projectImportModule(stmt);
+                        if (mod.length > 0 && !projectIsStdModule(mod) && !projectBuiltin(mod) && nm.declared(mod)) { keepCustom = true; }
+                    }
+                }
+                if (!keepCustom) { skip = true; }
+            }
         }
-        if (!skip) { parts.add(line); }
-        if (end < source.length) { parts.add("\n"); }
+        if (skip) {
+            if (cursor > runStart) { parts.add(projectSlice(source, runStart, cursor)); }
+            // The dropped line's newline (if any) opens the next run.
+            runStart = end;
+        }
         cursor = end + 1;
     }
+    if (srcLen > runStart) { parts.add(projectSlice(source, runStart, srcLen)); }
     return parts.join("");
 }
 
@@ -1071,9 +1100,11 @@ string projectStripDirectives(string source) {
     // the self-hosted build aggregate (~30K lines), OOM-killing the host.
     string[] parts = [];
     int cursor = 0;
-    while (cursor < source.length) {
+    // Length read once (strlen is O(n)); see projectStripDirectivesCustom.
+    int srcLen = source.length;
+    while (cursor < srcLen) {
         int end = cursor;
-        while (end < source.length && source[end] != '\n') { end++; }
+        while (end < srcLen && source[end] != '\n') { end++; }
         string line = projectSlice(source, cursor, end);
         string trimmed = projectTrim(line);
         bool skip = false;
@@ -1093,7 +1124,7 @@ string projectStripDirectives(string source) {
         bool isLinuxImport = isImportLine && projectFind(trimmed, "linux", 0) >= 0;
         if (isImportLine && !isWin32Import && !isLinuxImport) { skip = true; }
         if (!skip) { parts.add(line); }
-        if (end < source.length) { parts.add("\n"); }
+        if (end < srcLen) { parts.add("\n"); }
         cursor = end + 1;
     }
     return parts.join("");
@@ -1173,7 +1204,9 @@ void projectCollectInto(string path, string root, string[] sourceDirs, ProjectVi
     string rawSource = file.readString(path);
     string source = preprocessOrProjectFail(rawSource, debugBuild);
     int cursor = 0;
-    while (cursor < source.length) {
+    // Length read once (strlen is O(n)), not once per import occurrence.
+    int srcLen = source.length;
+    while (cursor < srcLen) {
         int importPos = projectFind(source, "import", cursor);
         if (importPos < 0) { break; }
         // Same line-leading + whole-word guard as the driver's collectImports:
@@ -1188,7 +1221,7 @@ void projectCollectInto(string path, string root, string[] sourceDirs, ProjectVi
             cursor = importPos + 6;
             continue;
         }
-        if (importPos + 6 < source.length) {
+        if (importPos + 6 < srcLen) {
             char ic = source[importPos + 6];
             if (ic != ' ' && ic != '\t' && ic != '\r' && ic != '\n' && ic != '{' && ic != '*') {
                 cursor = importPos + 6;
@@ -1264,20 +1297,28 @@ void projectCollectionFail(string path, int line) {
 // the per-line aggregate-rebuild path and leak its way out of memory on
 // large projects.
 bool projectHasRealCollectDecl(string source) {
-    int cursor = 0;
-    while (cursor < source.length) {
-        int end = cursor;
-        while (end < source.length && source[end] != '\n') { end++; }
-        string text = projectSlice(source, cursor, end);
-        int marker = projectFind(text, "collects", 0);
-        if (marker >= 0) {
-            int comment = projectFind(text, "//", 0);
-            int quote = projectFind(text, "\"", 0);
-            if ((comment < 0 || comment > marker) && (quote < 0 || quote > marker)) {
-                return true;
-            }
+    // Jump occurrence to occurrence instead of slicing every line: only the
+    // lines that actually mention `collects` are materialized, and the
+    // length is read once (strlen is O(n), so a per-character
+    // `source.length` made this scan quadratic in the aggregate). Each hit is
+    // the first occurrence on its line (the next search starts past the line
+    // end), exactly the marker the per-line scan checked.
+    int srcLen = source.length;
+    int hit = projectFind(source, "collects", 0);
+    while (hit >= 0) {
+        int lineStart = hit;
+        while (lineStart > 0 && source[lineStart - 1] != '\n') { lineStart--; }
+        int lineEnd = hit;
+        while (lineEnd < srcLen && source[lineEnd] != '\n') { lineEnd++; }
+        string text = projectSlice(source, lineStart, lineEnd);
+        int marker = hit - lineStart;
+        int comment = projectFind(text, "//", 0);
+        int quote = projectFind(text, "\"", 0);
+        if ((comment < 0 || comment > marker) && (quote < 0 || quote > marker)) {
+            return true;
         }
-        cursor = end + 1;
+        if (lineEnd >= srcLen) { break; }
+        hit = projectFind(source, "collects", lineEnd + 1);
     }
     return false;
 }
@@ -1299,9 +1340,11 @@ string projectExpandCollections(string source, string root, string collections) 
     string[] lineParts = [];
     int cursor = 0;
     int line = 1;
-    while (cursor < source.length) {
+    // Length read once (strlen is O(n)); see projectHasRealCollectDecl.
+    int srcLen = source.length;
+    while (cursor < srcLen) {
         int end = cursor;
-        while (end < source.length && source[end] != '\n') { end++; }
+        while (end < srcLen && source[end] != '\n') { end++; }
         string text = projectSlice(source, cursor, end);
         int marker = projectFind(text, "collects", 0);
         int comment = projectFind(text, "//", 0);
@@ -1335,7 +1378,7 @@ string projectExpandCollections(string source, string root, string collections) 
         } else {
             lineParts.add(text);
         }
-        if (end < source.length) { lineParts.add("\n"); }
+        if (end < srcLen) { lineParts.add("\n"); }
         cursor = end + 1;
         line++;
     }
