@@ -1488,25 +1488,23 @@ int compileOnce(CliFlags flags, string outputFile) {
             ensureDirTree(path.dirname(hopPath));
             file.writeString(hopPath, source);
             for (int ci2 = 0; ci2 < chunks.paths.length; ci2++) {
-                // One hash + one stat set per file, shared by both tiers
-                // (the bytecode lookup and the object-tier note below never
-                // re-hash or re-stat the same bytes). The size stat feeds the
-                // bytecode record, the mtime only the object tier — each is
-                // taken only when its tier is live.
+                // OVERHAUL.md freshness steps 1-2: one stat (the `.sr`
+                // mtime) + one hash per file, shared by both tiers — the
+                // bytecode lookup and the object-tier note below never
+                // re-hash or re-stat the same bytes.
                 string chunkAbs = chunks.paths[ci2].replaceAll("/", "\\");
                 int64 chunkHash = hash.fnv1(source, chunks.starts[ci2], chunks.ends[ci2]);
-                int chunkSize = file.size(chunkAbs);
+                int chunkMtime = file.modification(chunkAbs).milliseconds();
                 Token[] part = sess.tokensForRange(
                     chunkAbs,
-                    source, chunks.starts[ci2], chunks.ends[ci2], hopPath, chunkHash, chunkSize);
+                    source, chunks.starts[ci2], chunks.ends[ci2], hopPath, chunkHash, chunkMtime);
                 // OVERHAUL.md --cache-object two-tier flow: tokens come from
                 // the synced .srbc when the bytecode tier hit, otherwise
                 // from a fresh lex — never re-lexed for the object tier.
                 // Freshness keys on the shared slice hash above (reference:
                 // the exact lexed text).
                 if (osess != null) {
-                    int objMtime = file.modification(chunkAbs).milliseconds();
-                    osess.noteFileHashed(chunkAbs, chunkHash, objMtime);
+                    osess.noteFileHashed(chunkAbs, chunkHash, chunkMtime);
                 }
                 int off = chunks.startLines[ci2];
                 for (int tj = 0; tj < part.length; tj++) {

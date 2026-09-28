@@ -190,13 +190,13 @@ class CacheSession {
     // fallback), lex it fresh, store the new bytecode, and return those
     // tokens — unless readOnly (--cache-object alone: case 2 serves the hit
     // from disk and case 1 lexes fresh, both storing nothing). The caller
-    // supplies the range's FNV-1 hash plus the file size: the driver hashes
-    // and stats each file once and reuses both for the unit record and the
-    // object-tier note, so the same bytes are never hashed or stat-ed twice
-    // on the hot path. Range hashing means full-project cache hits never
-    // slice the aggregate at all — the linear builtin slice is paid only
-    // per miss.
-    public Token[] tokensForRange(string absPath, string aggSource, int start, int end, string hopPath, int64 rangeHash, int sizeVal) {
+    // supplies the range's FNV-1 hash plus the `.sr` modification time (ms):
+    // the driver stats + hashes each file once (OVERHAUL.md freshness steps
+    // 1-2) and reuses both for the unit record and the object-tier note, so
+    // the same bytes are never hashed or stat-ed twice on the hot path.
+    // Range hashing means full-project cache hits never slice the aggregate
+    // at all — the linear builtin slice is paid only per miss.
+    public Token[] tokensForRange(string absPath, string aggSource, int start, int end, string hopPath, int64 rangeHash, int mtimeVal) {
         // Slice clamps (old bcSliceSlow conditions): the bootstrap clamps
         // itself but the self-host reads OOB without them — clamped once
         // here so every site below stays in range on both backends.
@@ -215,11 +215,15 @@ class CacheSession {
             return pipeLexUnit(aggSource[cs..ce], noKeyErrs);
         }
         string hashKey = (string)rangeHash;
-        string sizeKey = (string)sizeVal;
+        string mtimeKey = (string)mtimeVal;
         int idx = this.keys.indexOf(key);
         if (idx >= 0) {
-            if (this.hashesStr[idx] == hashKey && this.mTimesStr[idx] == sizeKey) {
-                Token[] cached = this.loadSrbcText(absPath);
+            // OVERHAUL.md freshness gate, in order: the `.sr` mtime first,
+            // then the FNV-1 content hash. A HIT decodes the `.srbc` (its
+            // header hash+stamp is re-validated on load); anything else
+            // syncs below.
+            if (this.mTimesStr[idx] == mtimeKey && this.hashesStr[idx] == hashKey) {
+                Token[] cached = this.loadSrbcText(absPath, hashKey, this.cachedAtStr[idx]);
                 if (cached.length > 0) {
                     // Bytecode-tier hit: this unit skipped re-lexing (the
                     // unified pipeline classifies it as synced-bytecode).
@@ -242,17 +246,17 @@ class CacheSession {
         if (this.readOnly) { return tokens; }
         int stamp = datetime.now().milliseconds();
         if (this.encodable(tokens)) {
-            this.storeSrbc(absPath, tokens, stamp, hashKey, sizeKey);
+            this.storeSrbc(absPath, tokens, stamp, hashKey);
             string created = (string)stamp;
             if (idx >= 0) {
                 created = this.cTimesStr[idx];
-                this.mTimesStr[idx] = sizeKey;
+                this.mTimesStr[idx] = mtimeKey;
                 this.hashesStr[idx] = hashKey;
                 this.cachedAtStr[idx] = (string)stamp;
             } else {
                 this.keys.add(key);
                 this.cTimesStr.add(created);
-                this.mTimesStr.add(sizeKey);
+                this.mTimesStr.add(mtimeKey);
                 this.hashesStr.add(hashKey);
                 this.cachedAtStr.add((string)stamp);
             }
@@ -263,7 +267,7 @@ class CacheSession {
 
     // Whole-string variant kept for direct callers with an in-memory file.
     public Token[] tokensFor(string absPath, string source) {
-        return this.tokensForRange(absPath, source, 0, source.length, "", hash.fnv1(source, 0, source.length), file.size(absPath));
+        return this.tokensForRange(absPath, source, 0, source.length, "", hash.fnv1(source, 0, source.length), file.modification(absPath).milliseconds());
     }
 
     // Session-relative key with per-run memo (see relMemoIns). Byte-identical
@@ -508,7 +512,7 @@ class CacheSession {
         return this.dir + "\\" + dotted.replaceAll("/", "\\") + ".srbc";
     }
 
-    private void storeSrbc(string absPath, Token[] tokens, int stamp, string hashKey, string sizeKey) {
+    private void storeSrbc(string absPath, Token[] tokens, int stamp, string hashKey) {
         string srbcPath = this.srbcPathFor(absPath);
         if (srbcPath.length == 0) { return; }
         ensureDirTree(path.dirname(srbcPath));
@@ -653,22 +657,33 @@ class CacheSession {
         t.put(" -\n");
     }
 
-    private Token[] loadSrbcText(string absPath) {
+    private Token[] loadSrbcText(string absPath, string hashKey, string stampKey) {
         string path = this.srbcPathFor(absPath);
         if (path.length == 0) { return []; }
         string text = tryReadText(path + ".t");
         if (text.length == 0) { return []; }
         this.lastPayload = text;
-        // Header line: <hash> <stamp> <count> — parsed in place, no slices.
+        // Header line: <hash> <stamp> <count> — hash+stamp re-validated
+        // against the record entry that gated this load (OVERHAUL.md: the
+        // payload on disk must agree with the entry pointing at it).
+        // Parsed in place, no slices; any mismatch returns empty (a miss —
+        // the caller re-lexes and re-syncs).
         int he = 0;
         while (he < text.length && text[he] != '\n') { he++; }
-        int hp = 0;
-        int fieldsSeen = 0;
-        while (hp < he && fieldsSeen < 2) {
-            if (text[hp] == ' ') { fieldsSeen++; }
-            hp++;
+        int hh = 0;
+        while (hh < he && text[hh] != ' ') { hh++; }
+        if (hh != hashKey.length) { this.lastPayload = ""; return []; }
+        for (int hc = 0; hc < hh; hc++) {
+            if (text[hc] != hashKey[hc]) { this.lastPayload = ""; return []; }
         }
-        int count = (int)text[hp..he];
+        int s0 = hh + 1;
+        int s1 = s0;
+        while (s1 < he && text[s1] != ' ') { s1++; }
+        if (s1 - s0 != stampKey.length) { this.lastPayload = ""; return []; }
+        for (int sc = 0; sc < s1 - s0; sc++) {
+            if (text[s0 + sc] != stampKey[sc]) { this.lastPayload = ""; return []; }
+        }
+        int count = -1; if (s1 + 1 < he && text[s1 + 1] >= '0' && text[s1 + 1] <= '9') { count = (int)text[s1 + 1..he]; }
         if (count <= 0) { this.lastPayload = ""; return []; }
         int pos = he + 1;
         Token[] tokens = [];
