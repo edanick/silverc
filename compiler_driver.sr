@@ -725,55 +725,70 @@ class MarkedChunks {
         this.ends = [];
         string prefix = cacheMarkerPrefix();
         int prefixLen = prefix.length;
-        int pos = 0;
-        int lineStart = 0;
-        int aggLine = 0;
         string curPath = "";
         bool havePath = false;
         int bodyStart = 0;
         int bodyLine = 0;
-        while (pos <= source.length) {
-            bool atEnd = pos == source.length;
-            if (atEnd || source[pos] == '\n') {
-                // Marker check in place: only marker lines are ever sliced
-                // (short path strings), never whole file bodies.
-                bool isMarker = pos - lineStart > prefixLen;
-                if (isMarker) {
-                    for (int k = 0; k < prefixLen; k++) {
-                        if (source[lineStart + k] != prefix[k]) { isMarker = false; break; }
-                    }
-                }
-                if (isMarker) {
-                    if (havePath && pos > bodyStart) {
-                        this.paths.add(curPath);
-                        this.startLines.add(bodyLine);
-                        this.starts.add(bodyStart);
-                        // The chunk ends where the NEXT marker line starts:
-                        // marker lines are comments to every stage, but the
-                        // freshness hash must cover exactly the file's own
-                        // bytes (like the reference hashes the file text),
-                        // never the following marker.
-                        this.ends.add(lineStart);
-                    }
-                    curPath = projectSlice(source, lineStart + prefixLen, pos);
-                    if (havePath || lineStart == 0) {
-                        // Second-or-later marker, or a marker opening the very
-                        // first line: the chunk body starts right after it.
-                        bodyStart = pos + 1;
-                        bodyLine = aggLine + 1;
-                    }
-                    // First marker sitting below leading content (project
-                    // metadata like APP_VERSION / LANG_VERSION prepended by
-                    // projectBuildSource, or a prepended source-level stdlib):
-                    // keep bodyStart = 0 so those leading lines are preserved
-                    // in the first chunk instead of being dropped.
-                    havePath = true;
-                }
-                if (atEnd) { break; }
-                aggLine++;
-                lineStart = pos + 1;
+        // Native-speed scan: jump marker to marker with indexOf instead of
+        // walking every character (the aggregate is re-scanned on every
+        // cached build, and the per-char walk dominated warm builds). The
+        // state machine is unchanged — only line iteration moved to native
+        // finds. aggLine counts the '\n' before the current marker line
+        // through chained finds, so every newline is visited exactly once.
+        // A prefix occurrence starts a marker line only at a line start,
+        // exactly like the old per-char check; anything else skips its line.
+        int counted = 0;
+        int aggLine = 0;
+        int search = 0;
+        while (search <= source.length) {
+            int hit = source.indexOf(prefix, search);
+            if (hit < 0) { break; }
+            if (hit > 0 && source[hit - 1] != '\n') {
+                int skip = source.indexOf("\n", hit);
+                if (skip < 0) { break; }
+                search = skip + 1;
+                continue;
             }
-            pos++;
+            int lineEnd = source.indexOf("\n", hit);
+            if (lineEnd < 0) { lineEnd = source.length; }
+            if (lineEnd - hit <= prefixLen) {
+                if (lineEnd >= source.length) { break; }
+                search = lineEnd + 1;
+                continue;
+            }
+            while (counted < hit) {
+                int nl = source.indexOf("\n", counted);
+                if (nl < 0 || nl >= hit) { break; }
+                aggLine++;
+                counted = nl + 1;
+            }
+            counted = hit;
+            if (havePath && lineEnd > bodyStart) {
+                this.paths.add(curPath);
+                this.startLines.add(bodyLine);
+                this.starts.add(bodyStart);
+                // The chunk ends where the NEXT marker line starts:
+                // marker lines are comments to every stage, but the
+                // freshness hash must cover exactly the file's own
+                // bytes (like the reference hashes the file text),
+                // never the following marker.
+                this.ends.add(hit);
+            }
+            curPath = projectSlice(source, hit + prefixLen, lineEnd);
+            if (havePath || hit == 0) {
+                // Second-or-later marker, or a marker opening the very
+                // first line: the chunk body starts right after it.
+                bodyStart = lineEnd + 1;
+                bodyLine = aggLine + 1;
+            }
+            // First marker sitting below leading content (project
+            // metadata like APP_VERSION / LANG_VERSION prepended by
+            // projectBuildSource, or a prepended source-level stdlib):
+            // keep bodyStart = 0 so those leading lines are preserved
+            // in the first chunk instead of being dropped.
+            havePath = true;
+            if (lineEnd >= source.length) { break; }
+            search = lineEnd + 1;
         }
         if (havePath && source.length > bodyStart) {
             this.paths.add(curPath);
@@ -1490,8 +1505,9 @@ int compileOnce(CliFlags flags, string outputFile) {
             if (hopBase.length == 0) { hopBase = "/tmp"; }
             hopPath = hopBase + "/silverc-hop/hop_" + (string)sysinfo.pid() + ".tmp";
             #off
-            ensureDirTree(path.dirname(hopPath));
-            file.writeString(hopPath, source);
+            // The hop copy is staged by the cache session on the first miss
+            // (see CacheSession.hopDone): full-hit warm runs never materialize
+            // a chunk, so the whole-aggregate write is skipped entirely here.
             for (int ci2 = 0; ci2 < chunks.paths.length; ci2++) {
                 // OVERHAUL.md freshness steps 1-2: one stat (the `.sr`
                 // mtime) + one hash per file, shared by both tiers — the
