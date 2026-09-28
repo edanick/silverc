@@ -748,7 +748,12 @@ class MarkedChunks {
                         this.paths.add(curPath);
                         this.startLines.add(bodyLine);
                         this.starts.add(bodyStart);
-                        this.ends.add(pos);
+                        // The chunk ends where the NEXT marker line starts:
+                        // marker lines are comments to every stage, but the
+                        // freshness hash must cover exactly the file's own
+                        // bytes (like the reference hashes the file text),
+                        // never the following marker.
+                        this.ends.add(lineStart);
                     }
                     curPath = projectSlice(source, lineStart + prefixLen, pos);
                     if (havePath || lineStart == 0) {
@@ -1493,7 +1498,15 @@ int compileOnce(CliFlags flags, string outputFile) {
                 // bytecode lookup and the object-tier note below never
                 // re-hash or re-stat the same bytes.
                 string chunkAbs = chunks.paths[ci2].replaceAll("/", "\\");
-                int64 chunkHash = hash.fnv1(source, chunks.starts[ci2], chunks.ends[ci2]);
+                // Hash exactly the file's own bytes: non-terminal chunks
+                // carry the one `"\n"` the collector appended after the
+                // module text, so it is trimmed for the hash (the lexed body
+                // keeps it — a trailing blank line lexes to nothing, and the
+                // reference hashes the file text the same way). Terminal
+                // chunks end at the aggregate end: nothing to trim.
+                int hashEnd = chunks.ends[ci2];
+                if (hashEnd > chunks.starts[ci2] && hashEnd < source.length && source[hashEnd - 1] == '\n') { hashEnd--; }
+                int64 chunkHash = hash.fnv1(source, chunks.starts[ci2], hashEnd);
                 int chunkMtime = file.modification(chunkAbs).milliseconds();
                 Token[] part = sess.tokensForRange(
                     chunkAbs,
