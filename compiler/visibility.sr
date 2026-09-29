@@ -127,11 +127,17 @@ class VisibilityChecker {
     // Preprocessor build mode (--debug): forwarded so file filtering matches
     // the main pipeline exactly.
     private prop bool debugBuild;
+    // Directory holding the compiler binary, captured once in main() (where
+    // the bootstrap's RBP-based Linux cargs lowering is valid) and threaded
+    // down: reading cargs anywhere off main rebuilds argv from a dead frame
+    // and segfaults (silverc-rs emit_cargs_linux main-as-entry gap).
+    private prop string exeDir;
 
-    construct (string entry, bool debugBuild) {
+    construct (string entry, bool debugBuild, string exeDir) {
         this.errors = [];
         this.entryPath = entry;
         this.debugBuild = debugBuild;
+        this.exeDir = exeDir;
         this.declNames = [];
         this.declKinds = [];
         this.declInternal = [];
@@ -203,7 +209,7 @@ class VisibilityChecker {
             string moduleName = item.typeHint;
             if (moduleName.length == 0) { moduleName = item.name; }
             if (moduleName.length == 0 || moduleName.startsWith("win32") || moduleName.startsWith("linux") || moduleName.startsWith("mac") || visBuiltinModule(moduleName)) { continue; }
-            string path = visFindModulePath(moduleName, this.entryPath);
+            string path = visFindModulePath(moduleName, this.entryPath, this.exeDir);
             if (path.length == 0) { continue; }
             if (path == this.entryPath) { continue; }
             VisFile loaded = this.loadFile(path);
@@ -341,7 +347,7 @@ class VisibilityChecker {
                 // `import * from mod;` pulls every top-level name of mod into
                 // scope, so any internal declaration of an external mod is an
                 // error right at the import site.
-                string path = visFindModulePath(src, this.entryPath);
+                string path = visFindModulePath(src, this.entryPath, this.exeDir);
                 if (path.length == 0 || path == this.entryPath) { continue; }
                 for (int d = 0; d < this.declNames.length; d++) {
                     if (this.declInternal[d] && this.declOrigins[d] == path) {
@@ -359,14 +365,14 @@ class VisibilityChecker {
             } else {
                 // `import name;`: the name resolves as a module file; a module
                 // that self-declares `internal mod export name;` is off limits.
-                string barePath = visFindModulePath(item.name, this.entryPath);
+                string barePath = visFindModulePath(item.name, this.entryPath, this.exeDir);
                 if (barePath.length == 0 || barePath == this.entryPath) { continue; }
                 if (this.declaresInternalModule(item.name, barePath)) {
                     this.err(item.name, path.stem(barePath), item);
                 }
                 for (int c2 = 0; c2 < item.childCount(); c2++) {
                     string extra = item.child(c2).name;
-                    string extraPath = visFindModulePath(extra, this.entryPath);
+                    string extraPath = visFindModulePath(extra, this.entryPath, this.exeDir);
                     if (extraPath.length == 0 || extraPath == this.entryPath) { continue; }
                     if (this.declaresInternalModule(extra, extraPath)) {
                         this.err(extra, path.stem(extraPath), item);
@@ -662,22 +668,12 @@ bool visIsDottedChild(string name, string root) {
     return projectFind(name, root + ".", 0) == 0;
 }
 
-// Directory holding this compiler binary (from cargs[0]), or "" when the
-// executable name carries no path. The visibility pass must resolve the same
-// files as the driver, so it probes the exe-relative tree before any
-// cwd-relative tree exactly like findModulePath does (see drvExeDir).
-string visExeDir() {
-    if (cargs.length == 0) { return ""; }
-    string exe = cargs[0];
-    int last = -1;
-    for (int i = 0; i < exe.length; i++) {
-        if (exe[i] == '\\' || exe[i] == '/') { last = i; }
-    }
-    if (last < 0) { return ""; }
-    return projectSlice(exe, 0, last);
-}
-
-string visFindModulePath(string name, string inputFile) {
+// Module search for the visibility pass. `exeDir` is the compiler-binary
+// directory captured once in main() (see the VisibilityChecker.exeDir
+// field): the pass runs far off main, where the bootstrap's RBP-based Linux
+// cargs lowering rebuilds argv from a dead frame and segfaults, so the exe
+// tree must arrive as a parameter, never via a fresh cargs read.
+string visFindModulePath(string name, string inputFile, string exeDir) {
     if (visBuiltinModule(name)) { return ""; }
     // Dotted children of the compiler baked-ins resolve to internals on
     // disk; the driver excludes them too, so enforcement must match.
@@ -714,14 +710,13 @@ string visFindModulePath(string name, string inputFile) {
     // The compiler's own tree (exe-relative) beats every cwd-relative tree
     // below, mirroring findModulePath: a foreign cwd std/ must never shadow
     // the shipped library.
-    string visExe = visExeDir();
-    if (visExe.length > 0) {
-        candidates.add(visExe + *"/std/" + name + ".sr");
-        if (visHasDot) { candidates.add(visExe + *"/std/" + visDottedSlash + ".sr"); }
-        candidates.add(visExe + *"/std/" + name + *"/" + name + ".sr");
-        candidates.add(visExe + *"/compiler/" + name + ".sr");
-        if (visHasDot) { candidates.add(visExe + *"/compiler/" + visDottedSlash + ".sr"); }
-        candidates.add(visExe + *"/compiler/" + name + *"/" + name + ".sr");
+    if (exeDir.length > 0) {
+        candidates.add(exeDir + *"/std/" + name + ".sr");
+        if (visHasDot) { candidates.add(exeDir + *"/std/" + visDottedSlash + ".sr"); }
+        candidates.add(exeDir + *"/std/" + name + *"/" + name + ".sr");
+        candidates.add(exeDir + *"/compiler/" + name + ".sr");
+        if (visHasDot) { candidates.add(exeDir + *"/compiler/" + visDottedSlash + ".sr"); }
+        candidates.add(exeDir + *"/compiler/" + name + *"/" + name + ".sr");
     }
     candidates.add(*"std/" + name + ".sr");
     if (visHasDot) { candidates.add(*"std/" + visDottedSlash + ".sr"); }

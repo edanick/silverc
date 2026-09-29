@@ -204,35 +204,30 @@ bool drvIsDottedChild(string name, string root) {
 }
 
 // Directory holding this compiler binary (from cargs[0]), or "" when the
-// executable name carries no path (bare name on PATH). Module resolution
-// probes `<exeDir>\std\` and `<exeDir>\compiler\` before any cwd-relative
-// tree so a foreign cwd can never shadow the library the compiler shipped
-// with (mirrors silverc-rs exe-ancestor probing): e.g. running the test
-// suites from silverc-rs/ must not pick up its stale std stubs instead of
-// silverc/std. User files still win — input siblings and cwd-bare names are
-// probed before this tree.
-string drvExeDir() {
-    if (cargs.length == 0) { return ""; }
-    string exe = cargs[0];
-    int last = -1;
-    for (int i = 0; i < exe.length; i++) {
-        if (exe[i] == '\\' || exe[i] == '/') { last = i; }
-    }
-    if (last < 0) { return ""; }
-    return projectSlice(exe, 0, last);
-}
+// executable name carries no path (bare name on PATH). Captured INLINE in
+// main() from its already-rebuilt `args` copy: the bootstrap's Linux cargs
+// lowering rebuilds argv from RBP, which is only valid in main-as-entry
+// (silverc-rs emit_cargs_linux known gap) — reading cargs inside any called
+// helper segfaults, so no drvExeDir() helper may exist; every consumer below
+// receives the captured `exeDir` string as a parameter.
+// Module resolution probes `<exeDir>\std\` and `<exeDir>\compiler\` before
+// any cwd-relative tree so a foreign cwd can never shadow the library the
+// compiler shipped with (mirrors silverc-rs exe-ancestor probing): e.g.
+// running the test suites from silverc-rs/ must not pick up its stale std
+// stubs instead of silverc/std. User files still win — input siblings and
+// cwd-bare names are probed before this tree.
 
 // Read `rel` (a compiler-tree-relative path with a leading separator, spelled
 // as a `*"..."` path literal like `*"/std/llmai.sr"` so it normalizes per OS)
 // from the compiler's own directory; "" when unavailable so callers fall
-// through to the historical cwd-relative ladder.
-string drvTryExeTree(string rel) {
-    string exeDir = drvExeDir();
+// through to the historical cwd-relative ladder. `exeDir` arrives from main()
+// (captured inline there): this helper must never read cargs itself.
+string drvTryExeTree(string exeDir, string rel) {
     if (exeDir.length == 0) { return ""; }
     return tryReadFile(exeDir + rel);
 }
 
-string findModulePath(string name, string inputFile) {
+string findModulePath(string name, string inputFile, string exeDir) {
     if (projectBuiltin(name)) { return ""; }
     // Modules the driver already prepends above (llmai/exception/bom/process/
     // notifications) and the compiler's own baked-in modules must not be
@@ -279,10 +274,9 @@ string findModulePath(string name, string inputFile) {
         candidates.add(drvDottedSlash + ".sr");
     }
     candidates.add(name + *"/" + name + ".sr");
-    // The compiler's own tree (exe-relative, see drvExeDir) beats every
-    // cwd-relative tree below: a foreign cwd std/ (e.g. silverc-rs/std when
-    // the suites run from there) must never shadow silverc/std.
-    string exeDir = drvExeDir();
+    // The compiler's own tree (exe-relative, captured inline in main()) beats
+    // every cwd-relative tree below: a foreign cwd std/ (e.g. silverc-rs/std
+    // when the suites run from there) must never shadow silverc/std.
     if (exeDir.length > 0) {
         candidates.add(exeDir + *"/std/" + name + ".sr");
         if (drvHasDot) { candidates.add(exeDir + *"/std/" + drvDottedSlash + ".sr"); }
@@ -411,11 +405,12 @@ class DrvModuleCache {
 
 // Resolve one module name to its path, once per name per compile ("" when
 // native/builtin/missing). Misses stay uncached: an unknown module aborts
-// the compile, so no second probe ever happens.
-string drvCachedModulePath(string name, string inputFile, DrvModuleCache cache) {
+// the compile, so no second probe ever happens. `exeDir` arrives from main()
+// (captured inline there): this helper must never read cargs itself.
+string drvCachedModulePath(string name, string inputFile, DrvModuleCache cache, string exeDir) {
     string hit = cache.pathFor(name);
     if (hit.length > 0) { return hit; }
-    string resolved = findModulePath(name, inputFile);
+    string resolved = findModulePath(name, inputFile, exeDir);
     if (resolved.length > 0) { cache.store(name, resolved); }
     return resolved;
 }
@@ -430,7 +425,9 @@ string drvCachedModulePath(string name, string inputFile, DrvModuleCache cache) 
 // cache-marker comment line precedes each file's content so the aggregate
 // can be split per file again (--cache-bytecode).
 // When progress is non-null, one progress line is printed per module.
-void collectModuleInto(string name, string inputFile, string modPath, string modSrc, ProjectVisited visited, DrvModuleCache cache, bool emitMarkers, ProgressReporter progress, bool debugBuild, DrvSourcePieces out) {
+// `exeDir` arrives from main() (captured inline there): this helper must
+// never read cargs itself.
+void collectModuleInto(string name, string inputFile, string modPath, string modSrc, ProjectVisited visited, DrvModuleCache cache, bool emitMarkers, ProgressReporter progress, bool debugBuild, DrvSourcePieces out, string exeDir) {
     if (visited.contains(name)) { return; }
     visited.add(name);
     // DOCS/260 — filter the module BEFORE its imports are scanned so imports
@@ -469,11 +466,11 @@ void collectModuleInto(string name, string inputFile, string modPath, string mod
         string statement = projectSlice(modSrc, importPos + 6, semi);
         string depName = projectImportModule(statement);
         if (depName.length > 0 && !visited.contains(depName)) {
-            string depPath = drvCachedModulePath(depName, inputFile, cache);
+            string depPath = drvCachedModulePath(depName, inputFile, cache, exeDir);
             if (depPath.length > 0) {
                 string depText = tryReadFile(depPath);
                 if (depText.length > 0) {
-                    collectModuleInto(depName, inputFile, depPath, depText, visited, cache, emitMarkers, progress, debugBuild, out);
+                    collectModuleInto(depName, inputFile, depPath, depText, visited, cache, emitMarkers, progress, debugBuild, out, exeDir);
                 }
             }
         }
@@ -532,7 +529,7 @@ bool importIsMac(string name) {
     return name[0] == 'm' && name[1] == 'a' && name[2] == 'c';
 }
 
-string collectImports(string source, string inputFile, string ignored, string[] errs, bool emitMarkers, ProgressReporter progress, bool debugBuild) {
+string collectImports(string source, string inputFile, string ignored, string[] errs, bool emitMarkers, ProgressReporter progress, bool debugBuild, string exeDir) {
     ProjectVisited visited = new ProjectVisited();
     DrvModuleCache cache = new DrvModuleCache();
     DrvSourcePieces pieces = new DrvSourcePieces();
@@ -582,7 +579,7 @@ string collectImports(string source, string inputFile, string ignored, string[] 
                 || moduleName == "console" || moduleName == "math"
                 || moduleName == "http" || moduleName == "os";
             if (!prepended && !visited.contains(moduleName)) {
-                string depPath = drvCachedModulePath(moduleName, inputFile, cache);
+                string depPath = drvCachedModulePath(moduleName, inputFile, cache, exeDir);
                 string depText = "";
                 if (depPath.length > 0) { depText = tryReadFile(depPath); }
                 if (depText.length == 0) {
@@ -600,7 +597,7 @@ string collectImports(string source, string inputFile, string ignored, string[] 
                         errs.add("unknown module \"" + moduleName + "\" was found at line " + (string)loc[0] + ", column " + (string)loc[1] + ". module either doesn't exist or not installed.");
                     }
                 } else {
-                    collectModuleInto(moduleName, inputFile, depPath, depText, visited, cache, emitMarkers, progress, debugBuild, pieces);
+                    collectModuleInto(moduleName, inputFile, depPath, depText, visited, cache, emitMarkers, progress, debugBuild, pieces, exeDir);
                 }
             } else if (prepended && !visited.contains(moduleName)) {
                 // Hand-prepended or native-backed modules (llmai, exception,
@@ -608,11 +605,11 @@ string collectImports(string source, string inputFile, string ignored, string[] 
                 // source-level bodies (e.g. std/env.sr's set/keys, which the
                 // self-host dispatches to as globals) still collect from disk
                 // exactly like the old unconditional collectModule call did.
-                string prePath = drvCachedModulePath(moduleName, inputFile, cache);
+                string prePath = drvCachedModulePath(moduleName, inputFile, cache, exeDir);
                 if (prePath.length > 0) {
                     string preText = tryReadFile(prePath);
                     if (preText.length > 0) {
-                        collectModuleInto(moduleName, inputFile, prePath, preText, visited, cache, emitMarkers, progress, debugBuild, pieces);
+                        collectModuleInto(moduleName, inputFile, prePath, preText, visited, cache, emitMarkers, progress, debugBuild, pieces, exeDir);
                     }
                 }
             }
@@ -1306,19 +1303,33 @@ void main() {
     }
 
     // OVERHAUL.md --watch: idle-debounce precompilation loop.
+    // The compiler-binary directory, captured here inline in main() from the
+    // already-rebuilt `args` copy (main-as-entry: the only place the
+    // bootstrap's Linux cargs lowering is valid). Every helper below receives
+    // it as a parameter and never re-reads cargs.
+    string exeDir = "";
+    if (args.length > 0) {
+        string exeArg = args[0];
+        int exeLast = -1;
+        for (int exeI = 0; exeI < exeArg.length; exeI++) {
+            if (exeArg[exeI] == '\\' || exeArg[exeI] == '/') { exeLast = exeI; }
+        }
+        if (exeLast >= 0) { exeDir = projectSlice(exeArg, 0, exeLast); }
+    }
     if (flags.watch) {
-        runWatchLoop(flags, inputIsProject, manifestText, outputFile);
+        runWatchLoop(flags, inputIsProject, manifestText, outputFile, exeDir);
         exit(0);
     }
 
-    int code = compileOnce(flags, outputFile);
+    int code = compileOnce(flags, outputFile, exeDir);
     exit(code);
 }
 
 // One full pipeline pass. Returns the process exit code: 0 on success, 1 on
 // failure; in --jit mode the compiled program runs as a child and its exit
-// code propagates.
-int compileOnce(CliFlags flags, string outputFile) {
+// code propagates. `exeDir` arrives from main() (captured inline there):
+// this pass must never read cargs itself.
+int compileOnce(CliFlags flags, string outputFile, string exeDir) {
     float64 startTick = time.now();
     string inputFile = flags.input;
     bool inputIsProject = projectHasSuffix(inputFile, ".srp");
@@ -1390,7 +1401,7 @@ int compileOnce(CliFlags flags, string outputFile) {
             // to the process cwd and the test-suite directories. Every rung
             // is one `*"..."` path literal (DOCS/257): no OS regions, correct
             // separators on every target.
-            string llmaiSource = drvTryExeTree(*"/std/llmai.sr");
+            string llmaiSource = drvTryExeTree(exeDir, *"/std/llmai.sr");
             if (llmaiSource.length == 0) {
                 llmaiSource = tryReadFile(*"std/llmai.sr");
             }
@@ -1415,7 +1426,7 @@ int compileOnce(CliFlags flags, string outputFile) {
         // the shared fields to strings. Mirrors the llmai handling above.
         int excImport = projectFind(source, "from " + "exception", 0);
         if (excImport >= 0) {
-            string excSource = drvTryExeTree(*"/std/exception.sr");
+            string excSource = drvTryExeTree(exeDir, *"/std/exception.sr");
             if (excSource.length == 0) {
                 excSource = tryReadFile(*"std/exception.sr");
             }
@@ -1439,7 +1450,7 @@ int compileOnce(CliFlags flags, string outputFile) {
         // self-hosted import behavior used by llmai and exception.
         int bomImport = projectFind(source, "from " + "bom", 0);
         if (bomImport >= 0) {
-            string bomSource = drvTryExeTree(*"/std/bom.sr");
+            string bomSource = drvTryExeTree(exeDir, *"/std/bom.sr");
             if (bomSource.length == 0) { bomSource = tryReadFile(*"std/bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile(*"silverc/std/bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile(*"../std/bom.sr"); }
@@ -1449,7 +1460,7 @@ int compileOnce(CliFlags flags, string outputFile) {
         }
         int processImport = projectFind(source, "from " + "process", 0);
         if (processImport >= 0) {
-            string processSource = drvTryExeTree(*"/std/process.sr");
+            string processSource = drvTryExeTree(exeDir, *"/std/process.sr");
             if (processSource.length == 0) { processSource = tryReadFile(*"std/process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile(*"silverc/std/process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile(*"../std/process.sr"); }
@@ -1462,7 +1473,7 @@ int compileOnce(CliFlags flags, string outputFile) {
         // imports it, matching the self-hosted import behavior above.
         int notifImport = projectFind(source, "from " + "notifications", 0);
         if (notifImport >= 0) {
-            string notifSource = drvTryExeTree(*"/std/notifications.sr");
+            string notifSource = drvTryExeTree(exeDir, *"/std/notifications.sr");
             if (notifSource.length == 0) { notifSource = tryReadFile(*"std/notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile(*"silverc/std/notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile(*"../std/notifications.sr"); }
@@ -1483,7 +1494,7 @@ int compileOnce(CliFlags flags, string outputFile) {
         string[] moduleErrors = [];
         progress = new ProgressReporter(1);
         progress.moduleDone(inputFile);
-        source = collectImports(source, inputFile, "", moduleErrors, flags.cacheBytecode || flags.cacheObject, progress, flags.debugBuild);
+        source = collectImports(source, inputFile, "", moduleErrors, flags.cacheBytecode || flags.cacheObject, progress, flags.debugBuild, exeDir);
         if (moduleErrors.length > 0) {
             // Unknown-module diagnostics are reported against the entry
             // source (pre-collection lines), so they always belong to the
@@ -1709,7 +1720,7 @@ int compileOnce(CliFlags flags, string outputFile) {
     // project, so nothing external exists there and the pass is skipped
     // (mirrors silverc-rs, which enforces on the single-file path).
     if (!inputIsProject) {
-        VisibilityChecker vis = new VisibilityChecker(inputFile, flags.debugBuild);
+        VisibilityChecker vis = new VisibilityChecker(inputFile, flags.debugBuild, exeDir);
         vis.run();
         if (vis.errors.length > 0) {
             // Visibility diagnostics are reported against the entry file
@@ -1880,7 +1891,7 @@ int compileOnce(CliFlags flags, string outputFile) {
 // Polling goes through the fs builtins (mtime + size signatures every 500 ms).
 // ---------------------------------------------------------------------------
 
-void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, string outputFile) {
+void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, string outputFile, string exeDir) {
     // Memory note: every rebuild runs in-process, so each tick's full working
     // set (aggregate + tokens + AST) stays resident in the never-free runtime.
     // Reclaiming it fully would need each rebuild to run in a fresh child
@@ -1990,7 +2001,7 @@ void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, stri
         }
 
         flags.errLine("watch: idle timer expired, precompiling");
-        int code = compileOnce(flags, outputFile);
+        int code = compileOnce(flags, outputFile, exeDir);
         if (code != 0) {
             flags.errLine("watch: precompilation failed");
         }
