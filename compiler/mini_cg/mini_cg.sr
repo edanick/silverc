@@ -7554,17 +7554,16 @@ int strIdx = this.stringPatchIndices[i];
                 this.asm.xorRR64(0, 0);
             }
         } else if (isClass == 1 && call.isStatic) {
-            // Construction runs ONLY for parser-marked `new` nodes
-            // (isStatic): a bare or module-qualified call that merely shares
-            // a class's name resolves as an ordinary call below (free
-            // function, method, or DLL export), mirroring silverc-rs, which
-            // distinguishes `new T(...)` at parse level. Without the marker
-            // a qualified factory call like `datetime.now()` was hijacked
-            // here with the module identifier evaluated as construct arg 0
-            // (defaults shifted: y=0 in main frames, stack garbage in
-            // method frames), and a bare factory call skipped the free
-            // function's body entirely. UNIFIED_CORE_LIBRARY.md §4 rule 6
-            // still holds: a bare call that is also a win32 export (net.sr's
+            // Construction runs here ONLY for parser-marked `new` nodes
+            // (isStatic). Bare `ClassName(...)` constructs too, but at the
+            // late unresolvable-call arm below (after user-function/static
+            // resolution and the win32/linux/mac grant checks, mirroring
+            // silverc-rs gen_call order): routing it here would hijack
+            // granted DLL names sharing a class's name (net.sr's
+            // `socket(2,1,0)` under `class socket`) and member factories
+            // like `datetime.now()` (the module identifier would evaluate
+            // as construct arg 0). UNIFIED_CORE_LIBRARY.md §4 rule 6 still
+            // holds: a bare call that is also a win32 export (net.sr's
             // `socket(2,1,0)` under `class socket`) never carries isStatic
             // and keeps reaching the DLL path below.
             this.genNewCall(call);
@@ -9965,19 +9964,32 @@ public void genNewCall(Node call) {
             // forward call no definition will ever patch (rel32=0 faults at
             // runtime). Names declared anywhere still take the forward path
             // so later-defined functions link normally.
-            bool knownName = false;
-            for (int fi = 0; fi < this.funcNames.length; fi++) {
-                if (this.funcNames[fi] == name) { knownName = true; break; }
-            }
-            if (!knownName) {
-                this.asm.xorRR64(0, 0);
+            //
+            // Bare `ClassName(...)` constructs here (default-construct when
+            // the class declares no `construct`), mirroring silverc-rs
+            // gen_call: its bare-class route sits after user-function/static
+            // resolution AND after the win32/linux/mac grant checks above,
+            // so granted DLL names (net.sr's socket()) still reach their
+            // import while ungranted class-named calls allocate. The early
+            // isClass gate stays `new`-only so member factories
+            // (datetime.now()) never misroute into construction.
+            if (!call.isMember && this.isClassName(name)) {
+                this.genNewCall(call);
             } else {
-                this.asm.callRel32(0);
+                bool knownName = false;
+                for (int fi = 0; fi < this.funcNames.length; fi++) {
+                    if (this.funcNames[fi] == name) { knownName = true; break; }
+                }
+                if (!knownName) {
+                    this.asm.xorRR64(0, 0);
+                } else {
+                    this.asm.callRel32(0);
 
-                this.forwardCalls.add(this.asm.buf.length - 4);
-                this.forwardCallFuncIdxs.add(-1);
-                this.forwardCallNames.add(name);
-                this.forwardCallClasses.add("");
+                    this.forwardCalls.add(this.asm.buf.length - 4);
+                    this.forwardCallFuncIdxs.add(-1);
+                    this.forwardCallNames.add(name);
+                    this.forwardCallClasses.add("");
+                }
             }
         }
         this.emitAbiCallTeardown();
