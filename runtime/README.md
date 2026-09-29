@@ -6,9 +6,9 @@ exercises the implementation. Both are written in memory-safe Silver.
 
 ## API
 
-- `smFnv1_64(data)` computes the required 64-bit **FNV-1** name hash
+- `hash.hash(0, data)` computes the required 64-bit **FNV-1** name hash
   (multiply first, then XOR; it is intentionally not FNV-1a).
-- `smCrc32c(data)` computes CRC32C using the Castagnoli polynomial.
+- `hash.crc32c(data)` computes CRC32C using the Castagnoli polynomial.
 - `smHeaderEncode(header)` writes exactly 96 little-endian bytes and
   calculates the header checksum.
 - `smHeaderDecode(in, header)` checks magic, reserved bytes, the header
