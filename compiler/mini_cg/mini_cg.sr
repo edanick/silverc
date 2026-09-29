@@ -2967,9 +2967,20 @@ int strIdx = this.stringPatchIndices[i];
                     targetOff = this.funcOffsets[fi];
                 }
             } else {
+                // Prefer the recorded receiver class over any same-named
+                // method (a forward reference resolved only by name bound
+                // the LAST same-named method of ANY class). Globals
+                // (targetClass "") match first-phase exactly as before.
                 for (int j = 0; j < this.funcNames.length; j++) {
                     if (this.funcNames[j] == targetName && this.funcClasses[j] == targetClass) {
                         targetOff = this.funcOffsets[j];
+                    }
+                }
+                if (targetOff < 0) {
+                    for (int j = 0; j < this.funcNames.length; j++) {
+                        if (this.funcNames[j] == targetName) {
+                            targetOff = this.funcOffsets[j];
+                        }
                     }
                 }
             }
@@ -5207,6 +5218,9 @@ int strIdx = this.stringPatchIndices[i];
                     return "bool";
                 }
                 if ((cname == "indexOf" || cname == "find") && recvType == "string") {
+                    return "int";
+                }
+                if (cname == "charCodeAt" && recvType == "char") {
                     return "int";
                 }
                 if ((cname == "toLower" || cname == "lower") && recvType == "string") {
@@ -9523,10 +9537,22 @@ public void genNewCall(Node call) {
             // LINUX: spills cover every slot, so reserve all of them (see
             // emitAbiCallSetup slack note).
             if (this.isLinuxTarget()) { extraStack = slotTotal * 8; }
+            // LINUX SysV overflow: outgoing stack args must sit at [RSP+0]
+            // at call time (no shadow space), so register spills move above
+            // them. Without this, stack-arg spills at callBase=0 overwrite
+            // slots 0.. and the reload hands later args to early registers
+            // (an 8-arg call saw args 1-2 arrive as args 7-8). WINDOWS keeps
+            // base 0: the 32-byte shadow gap already separates the areas.
+            int spillBase = 0;
+            if (this.isLinuxTarget()) {
+                int nStack = slotTotal - callNreg;
+                if (nStack < 0) { nStack = 0; }
+                spillBase = nStack * 8;
+            }
             this.emitAbiCallSetup(extraStack);
             if (staticMethodCall) {
                 this.asm.xorRR64(0, 0);
-                this.asm.movMBaseR(4, 0, 0);
+                this.asm.movMBaseR(4, 0, spillBase);
             }
             // Evaluate every argument into RAX and spill it to the shadow
             // space / stack-arg slots BEFORE loading the argument registers.
@@ -9547,14 +9573,14 @@ public void genNewCall(Node call) {
                 }
                 int slot = i + slotBias;
                 if (slot < callNreg) {
-                    this.asm.movMBaseR(4, 0, slot * 8);
+                    this.asm.movMBaseR(4, 0, spillBase + slot * 8);
                 } else {
                     this.asm.movMBaseR(4, 0, callBase + (slot - callNreg) * 8);
                 }
             }
             for (int i = 0; i < slotTotal && i < callNreg; i++) {
                 if (this.isLinuxTarget()) {
-                    this.asm.movRMBase(this.sysvRegAt(i), 4, i * 8);
+                    this.asm.movRMBase(this.sysvRegAt(i), 4, spillBase + i * 8);
                 } else {
                     this.asm.movRMBase(argRegs[i], 4, i * 8);
                 }
@@ -10123,7 +10149,7 @@ public void genNewCall(Node call) {
             }
         }
         if (recvType == "char") {
-            if (name == "isDigit" || name == "isAlpha" || name == "isAlphaNum" || name == "isLower" || name == "isUpper" || name == "isWhiteSpace") {
+            if (name == "isDigit" || name == "isAlpha" || name == "isAlphaNum" || name == "isLower" || name == "isUpper" || name == "isWhiteSpace" || name == "charCodeAt") {
                 return true;
             }
         }
@@ -11296,6 +11322,12 @@ public void genNewCall(Node call) {
             this.asm.addRI32(0, 16);
             return;
         }
+        if (name == "charCodeAt") {
+            // A char value already is its code (mirrors silverc-rs, which
+            // lowers char.charCodeAt() to a bare reload of the operand).
+            this.genExpr(recv);
+            return;
+        }
         if (name == "isAlpha" || name == "isAlphaNum" || name == "isDigit" || name == "isLower" || name == "isUpper" || name == "isWhiteSpace") {
             this.genExpr(recv);
             this.asm.movRR64(1, 0);
@@ -11646,6 +11678,21 @@ public void genNewCall(Node call) {
         }
         if (haveExactClass) {
             funcIdx = this.selectOverloadIdx(name, recvClass, explicitUserArgs, null, null);
+            if (funcIdx < 0) {
+                // No same-class overload accepts the argument count (e.g. a
+                // 2-arg call to a 1-param method, which the bootstrap binds
+                // by its legacy single-declaration rule). Keep the class's
+                // own method instead of falling through to the any-class
+                // scan below, which would bind a same-named method of
+                // another class (CEmitter.emitPrintf bound
+                // CppEmitter.emitPrintf, faulting on first field access).
+                for (int ri = this.funcNames.length - 1; ri >= 0; ri--) {
+                    if (this.funcNames[ri] == name && (this.funcClasses[ri] == recvClass || recvClass == this.funcClasses[ri] + "?")) {
+                        funcIdx = ri;
+                        break;
+                    }
+                }
+            }
         }
         // Inheritance: an inherited method must resolve to the ancestor
         // that declares it, not to the any-class fallback below (which
@@ -11825,7 +11872,10 @@ public void genNewCall(Node call) {
             this.forwardCalls.add(this.asm.buf.length - 4);
             this.forwardCallFuncIdxs.add(-1);
             this.forwardCallNames.add(name);
-            this.forwardCallClasses.add(lookupClass);
+            // Record the receiver class (not the empty lookupClass) so the
+            // end-of-build patch prefers the receiver's own method over a
+            // same-named method of another class (see the any-class scan).
+            this.forwardCallClasses.add(recvClass);
         }
         this.emitAbiCallTeardown();
         this.funcCallArgCount = scratchBase;
@@ -12772,6 +12822,23 @@ public void genNewCall(Node call) {
                 int fieldOff = this.findFieldOffset(ownerType, fieldName);
                 if (fieldOff < 0) {
                     fieldOff = this.findFieldOffsetInAllClasses(fieldName);
+                }
+                string nestFieldT = this.findFieldType(ownerType, fieldName);
+                if (nestFieldT == "string" && op == 14 && fieldOff >= 0) {
+                    // Nested string field compound-assign (e.g.
+                    // this.buf.text += s): integer-add would combine heap
+                    // pointers and fault on next use. Spill the evaluated
+                    // receiver, run the concat machinery (fresh heap buffer
+                    // in rax), then store back through receiver + fieldOff
+                    // (mirrors the variable-receiver string arm above).
+                    int nestObjOff = this.allocLocal("__nstrassign_obj");
+                    this.genExpr(obj);
+                    this.asm.movMBaseR(5, 0, nestObjOff);
+                    this.genStringConcat(bin);
+                    this.asm.movRMBase(11, 5, nestObjOff);
+                    this.asm.addRI32(11, fieldOff);
+                    this.asm.movMBaseR(11, 0, 0);
+                    return;
                 }
                 if (fieldOff >= 0) {
                     this.assertWritableField(ownerType, fieldName, lhs);
