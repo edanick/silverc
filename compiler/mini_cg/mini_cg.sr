@@ -7688,6 +7688,18 @@ int strIdx = this.stringPatchIndices[i];
             // through genUserCall below, exactly like silverc-rs where only
             // the fs-dispatched form reaches gen_read.
             this.genReadBytesCall(call);
+        } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file" || call.child(0).name == "folder") && call.name == "write") {
+            // fs.write(path, bytes): legacy whole-file byte write. Mirrors
+            // silverc-rs gen_fs_call "write" => gen_write, which is a bare
+            // xor RAX (no-op returning 0) on every target: the blessed
+            // spellings are writeString/writeBytes/writeFile. Emitting a
+            // real write here would DIVERGE from the reference
+            // (bootstrap-built programs silently skip the write), and
+            // without this arm the call falls into the linux-export
+            // grant check below (`write` is a libc export) and fails the
+            // compile spuriously. Bare write(fd, buf, n) (POSIX, fs.sr
+            // LINUX bodies) is not a member call and keeps resolving below.
+            this.asm.xorRR64(0, 0);
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file" || call.child(0).name == "folder") && call.name == "isDriveRoot") {
             this.genIsDriveRootCall(call);
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "folder") && (call.name == "getEntries" || call.name == "entries" || call.name == "list" || call.name == "getFiles" || call.name == "files" || call.name == "getFolders" || call.name == "folders")) {
