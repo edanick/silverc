@@ -3826,6 +3826,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             res.children.add(ctor.child(ai));
         }
         this.advance();
+        string[] seenFields = [];
         while (!this.check(103) && !this.check(0)) {
             Token fname = this.expect(7);
             if (this.check(109)) {
@@ -3835,9 +3836,21 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 this.expect(110);
             }
             Node val = this.parseExpr(0);
-            Node key = new Node(); key.kind = 6; key.name = fname.text; key.line = fname.line; key.col = fname.col;
-            Node pair = new Node(); pair.kind = 18; pair.children.add(key); pair.children.add(val);
-            res.children.add(pair);
+            // DOCS/270: a collision — the same field twice in one brace
+            // list — is a compile error; the initializer has no ordering
+            // that could give one entry priority.
+            bool isDup = false;
+            for (int si = 0; si < seenFields.length; si++) {
+                if (seenFields[si] == fname.text) { isDup = true; break; }
+            }
+            if (isDup) {
+                this.recordError((string)fname.line + ":" + (string)fname.col + ": duplicate field '" + fname.text + "' in object initializer");
+            } else {
+                seenFields.add(fname.text);
+                Node key = new Node(); key.kind = 6; key.name = fname.text; key.line = fname.line; key.col = fname.col;
+                Node pair = new Node(); pair.kind = 18; pair.children.add(key); pair.children.add(val);
+                res.children.add(pair);
+            }
             if (this.check(107) || this.check(106)) { this.advance(); } else { break; }
         }
         this.expect(103);
