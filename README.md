@@ -10,7 +10,7 @@ one language for many possibilities.
 ## Credits
 
 - **Author:** Edan M.
-- **Version:** 0.7.9
+- **Version:** 0.7.9.4
 - **Copyright:** © 2025 Edan M.
 
 ## Quick start
