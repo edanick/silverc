@@ -715,7 +715,7 @@ class MiniCg {
             }
             return "";
         }
-        if (expr.kind == 10) {
+        if (expr.kind == 10 || expr.kind == 88) {
             string t = this.inferExprType(expr);
             if (this.isClassName(t)) { return t; }
             if (!expr.isMember) {
@@ -2272,14 +2272,30 @@ int strIdx = this.stringPatchIndices[i];
 
     public void scanRefTree(Node node) {
         // Check every call node for arguments that are `&expr` (kind 8, op 3).
-        if ((node.kind == 9 || node.kind == 10) && node.childCount() > 0) {
+        if ((node.kind == 9 || node.kind == 10 || node.kind == 88) && node.childCount() > 0) {
             int argStart = 0;
             if (node.isMember) { argStart = 1; }
-            for (int ai = argStart; ai < node.childCount(); ai++) {
+            int argEnd = node.childCount();
+            if (node.kind == 88 && node.op >= 0 && node.op < argEnd) { argEnd = node.op; }
+            for (int ai = argStart; ai < argEnd; ai++) {
                 Node arg = node.child(ai);
                 if (arg.kind == 8 && arg.op == 3) {
                     this.refCalleeNames.add(node.name);
                     this.refCalleeParams.add(ai - argStart);
+                }
+            }
+            if (node.kind == 88) {
+                // Init-pair values are not call arguments, but a `&expr`
+                // value still takes an address the callee table must know.
+                for (int pi = argEnd; pi < node.childCount(); pi++) {
+                    Node pair = node.child(pi);
+                    if (pair.kind == 18 && pair.childCount() > 1) {
+                        Node pv = pair.child(1);
+                        if (pv.kind == 8 && pv.op == 3) {
+                            this.refCalleeNames.add(node.name);
+                            this.refCalleeParams.add(pi - argEnd);
+                        }
+                    }
                 }
             }
         }
@@ -4384,6 +4400,9 @@ int strIdx = this.stringPatchIndices[i];
         }
         } else if (kind == 9 || kind == 10) {
             this.genCall(expr);
+        } else if (kind == 88) {
+            // DOCS/270: object initializer `new Type(args) { field = value }`.
+            this.genNewInitCall(expr);
         } else if (kind == 23) {
             if (expr.childCount() > 0) {
                 this.genExpr(expr.child(0));
@@ -5005,7 +5024,7 @@ int strIdx = this.stringPatchIndices[i];
             }
             return;
         }
-        if (obj.kind == 10) {
+        if (obj.kind == 10 || obj.kind == 88) {
             // Member access on a call result (e.g. this.advance().text):
             // evaluate the call, then load the field using the call's
             // inferred return type.  Falls back to a whole-program field
@@ -5142,11 +5161,14 @@ int strIdx = this.stringPatchIndices[i];
         if (expr.kind == 9) {
             return expr.name;
         }
-        if (expr.kind == 10) {
+        if (expr.kind == 10 || expr.kind == 88) {
             string cname = expr.name;
             // `new X(...)` parses as a non-member call whose name is the
             // class, and genCall lowers it to genNewCall. Infer the constructed
             // type so `new X(...).field` (and .method()) can resolve the field
+            // on the result instead of leaving it as an unknown type. A
+            // kind-88 object initializer carries the same class name (its
+            // `op` counts the constructor args, the rest are init pairs).
             // on the result instead of leaving it as an unknown type.
             if (!expr.isMember) {
                 // Dotted-new: `new mod.Class`
@@ -8690,6 +8712,60 @@ public void genNewCall(Node call) {
     }
     this.asm.movRMBase(0, 5, tmpOff);
 }
+
+    // DOCS/270: object initializer `new Type(args) { field = value, ... }`
+    // (kind 88; `op` counts the constructor args, the remaining children
+    // are kind-18 init pairs). Lowers through the shared constructor path
+    // with a trimmed kind-10 node, then applies the brace assignments in
+    // order — constructor first, inits after, mirroring silverc-rs.
+    public void genNewInitCall(Node call) {
+        string clsName = call.name;
+        if (clsName.contains(".")) {
+            string resolved = this.dottedNewClassName(clsName);
+            if (resolved.length > 0) {
+                clsName = resolved;
+            } else {
+                printline((string)call.line + ":" + (string)call.col + ": Unknown type '" + call.name + "'");
+                exit(1);
+            }
+        }
+        int nargs = call.op;
+        if (nargs < 0) { nargs = 0; }
+        if (nargs > call.childCount()) { nargs = call.childCount(); }
+        Node bare = new Node();
+        bare.kind = 10;
+        bare.name = clsName;
+        bare.line = call.line;
+        bare.col = call.col;
+        bare.isStatic = true;
+        for (int i = 0; i < nargs; i++) {
+            bare.children.add(call.child(i));
+        }
+        this.genNewCall(bare);
+        int objOff = this.allocLocal("__newinit_obj");
+        this.asm.movMBaseR(5, 0, objOff);
+        for (int i = nargs; i < call.childCount(); i++) {
+            Node pair = call.child(i);
+            if (pair.kind != 18 || pair.childCount() < 2) { continue; }
+            Node key = pair.child(0);
+            Node value = pair.child(1);
+            int fieldOff = this.findFieldOffset(clsName, key.name);
+            if (fieldOff < 0) {
+                printline("unknown field '" + key.name + "' for type '" + clsName + "' at line " + (string)call.line + ", column " + (string)call.col);
+                exit(1);
+            }
+            this.assertWritableField(clsName, key.name, call);
+            string fieldType = this.findFieldType(clsName, key.name);
+            if (value.kind == 74 && fieldType != "") {
+                this.genStructLiteral(value, fieldType);
+            } else {
+                this.genExpr(value);
+            }
+            this.asm.movRMBase(1, 5, objOff);
+            this.asm.movMBaseR(1, 0, fieldOff);
+        }
+        this.asm.movRMBase(0, 5, objOff);
+    }
 
     public void genSuperCall(Node call) {
         // super(arg0, arg1, ...) - call parent class constructor with `this`.

@@ -608,7 +608,7 @@ class Parser {
             this.fnPtrCallScope = savedScope;
             return;
         }
-        if (n.kind == 10 && n.line > 0) {
+        if ((n.kind == 10 || n.kind == 88) && n.line > 0) {
             // Recovery-built call nodes carry no source position and already
             // reported their own syntax error.
             if (!n.isMember) { this.checkPlainCallTarget(n); }
@@ -3559,12 +3559,20 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 }
                 return arr;
             }
+            if (this.check(102)) {
+                // DOCS/270: `new Type { field = value, ... }` — no
+                // constructor parens; zero ctor args plus brace inits.
+                return this.parseObjectInit(ctor, t);
+            }
             this.expect(100);
             while (!this.check(101) && !this.check(0)) {
                 ctor.children.add(this.parseExpr(0));
                 if (this.check(107)) { this.advance(); }
             }
             this.expect(101);
+            if (this.check(102)) {
+                return this.parseObjectInit(ctor, t);
+            }
             return ctor;
         }
 
@@ -3796,6 +3804,44 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
 
         Node ident = new Node(); ident.kind = 6; ident.name = t.text;
         return ident;
+    }
+
+    // DOCS/270: object initializer `{ field = value, ... }` after
+    // `new Type(args)` or `new Type`. Rewrites the kind-10 ctor node into a
+    // kind-88 new-init node: `name` stays the class, `op` records the
+    // constructor argument count, children are [args..., initPairs...]
+    // where each init pair is kind 18 holding (fieldIdent, value) — the
+    // same pair shape struct literals use. Entries use `=` (a `:` is a
+    // struct-literal separator, diagnosed here), are separated by `,` (a
+    // `;` is also accepted), and a trailing separator is allowed.
+    private Node parseObjectInit(Node ctor, Token t) {
+        Node res = new Node();
+        res.kind = 88;
+        res.name = ctor.name;
+        res.line = t.line;
+        res.col = t.col;
+        res.isStatic = true;
+        res.op = ctor.childCount();
+        for (int ai = 0; ai < ctor.childCount(); ai++) {
+            res.children.add(ctor.child(ai));
+        }
+        this.advance();
+        while (!this.check(103) && !this.check(0)) {
+            Token fname = this.expect(7);
+            if (this.check(109)) {
+                this.recordError((string)fname.line + ":" + (string)fname.col + ": object initializers use `field = value`; `{ field: value }` is a struct literal");
+                this.advance();
+            } else {
+                this.expect(110);
+            }
+            Node val = this.parseExpr(0);
+            Node key = new Node(); key.kind = 6; key.name = fname.text; key.line = fname.line; key.col = fname.col;
+            Node pair = new Node(); pair.kind = 18; pair.children.add(key); pair.children.add(val);
+            res.children.add(pair);
+            if (this.check(107) || this.check(106)) { this.advance(); } else { break; }
+        }
+        this.expect(103);
+        return res;
     }
 
     // Build the kind-69 interpolation node from a lexer InterpString token's
