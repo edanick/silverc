@@ -156,6 +156,8 @@ class MiniCg {
     public prop int[] classFieldOffsets;
     public prop string[] classFieldTypes;
     public prop bool[] classFieldReadOnly;
+    public prop bool[] classFieldVisible;
+    public prop string[] classFieldOwner;
     public prop Node[] classFieldInits;
     public prop string[] methodClassNames;
     public prop string[] methodNames;
@@ -374,6 +376,8 @@ class MiniCg {
         this.classFieldOffsets = [];
         this.classFieldTypes = [];
         this.classFieldReadOnly = [];
+        this.classFieldVisible = [];
+        this.classFieldOwner = [];
         this.classFieldInits = [];
         this.methodClassNames = [];
         this.methodNames = [];
@@ -492,6 +496,8 @@ class MiniCg {
                             this.classFieldOffsets.add(cnt * 8);
                             this.classFieldTypes.add(this.classFieldTypes[pStart + pj]);
                             this.classFieldReadOnly.add(this.classFieldReadOnly[pStart + pj]);
+                            this.classFieldVisible.add(this.classFieldVisible[pStart + pj]);
+                            this.classFieldOwner.add(this.classFieldOwner[pStart + pj]);
                             this.classFieldInits.add(this.classFieldInits[pStart + pj]);
                             cnt++;
                         }
@@ -504,6 +510,8 @@ class MiniCg {
                         this.classFieldOffsets.add(cnt * 8);
                         this.classFieldTypes.add(member.typeHint);
                         this.classFieldReadOnly.add(member.isReadOnly);
+                        this.classFieldVisible.add(member.isVisible);
+                        this.classFieldOwner.add(item.name);
                         if (member.isReadOnly && member.childCount() > 0) {
                             this.classFieldInits.add(member.child(0));
                         } else {
@@ -558,6 +566,8 @@ class MiniCg {
                     this.classFieldOffsets.add(cnt * 8);
                     this.classFieldTypes.add(member.typeHint);
                     this.classFieldReadOnly.add(false);
+                    this.classFieldVisible.add(false);
+                    this.classFieldOwner.add(item.name);
                     Node noInit = new Node();
                     this.classFieldInits.add(noInit);
                     cnt++;
@@ -781,6 +791,76 @@ class MiniCg {
             printline("cannot assign to read-only prop '" + className + "." + fieldName + "' at line " + (string)ln + ", column " + (string)cl);
             exit(1);
         }
+    }
+
+    public bool findFieldVisible(string className, string fieldName) {
+        int start = -1;
+        int cnt = 0;
+        for (int i = 0; i < this.classNames.length; i++) {
+            if ((this.classNames[i] == className || className == this.classNames[i] + "?")) {
+                start = this.classFieldStarts[i];
+                cnt = this.classFieldCounts[i];
+            }
+        }
+        if (start < 0) { return false; }
+        for (int i = 0; i < cnt; i++) {
+            if (this.classFieldNames[start + i] == fieldName) {
+                return this.classFieldVisible[start + i];
+            }
+        }
+        return false;
+    }
+
+    public string findFieldOwner(string className, string fieldName) {
+        int start = -1;
+        int cnt = 0;
+        for (int i = 0; i < this.classNames.length; i++) {
+            if ((this.classNames[i] == className || className == this.classNames[i] + "?")) {
+                start = this.classFieldStarts[i];
+                cnt = this.classFieldCounts[i];
+            }
+        }
+        if (start >= 0) {
+            for (int i = 0; i < cnt; i++) {
+                if (this.classFieldNames[start + i] == fieldName) {
+                    if (this.classFieldOwner[start + i] != "") {
+                        return this.classFieldOwner[start + i];
+                    }
+                }
+            }
+        }
+        string ancestor = this.parentClassName(className);
+        while (ancestor != "") {
+            int astart = -1;
+            int acnt = 0;
+            for (int i = 0; i < this.classNames.length; i++) {
+                if ((this.classNames[i] == ancestor || ancestor == this.classNames[i] + "?")) {
+                    astart = this.classFieldStarts[i];
+                    acnt = this.classFieldCounts[i];
+                }
+            }
+            if (astart >= 0) {
+                for (int i = 0; i < acnt; i++) {
+                    if (this.classFieldNames[astart + i] == fieldName) {
+                        if (this.classFieldOwner[astart + i] != "") {
+                            return this.classFieldOwner[astart + i];
+                        }
+                        return ancestor;
+                    }
+                }
+            }
+            ancestor = this.parentClassName(ancestor);
+        }
+        return className;
+    }
+
+    public bool checkVisibleStore(string receiverClass, string fieldName) {
+        if (!this.findFieldVisible(receiverClass, fieldName)) { return false; }
+        string owner = this.findFieldOwner(receiverClass, fieldName);
+        if (owner == "") { owner = receiverClass; }
+        if (this.currentClassName == owner) { return false; }
+        this.emitThrowException("cannot write to visible prop '" + owner + "." + fieldName + "' outside class '" + owner + "'");
+        return true;
     }
 
     public string findFieldType(string className, string fieldName) {
@@ -8755,6 +8835,7 @@ public void genNewCall(Node call) {
                 exit(1);
             }
             this.assertWritableField(clsName, key.name, call);
+            if (this.checkVisibleStore(clsName, key.name)) { return; }
             string fieldType = this.findFieldType(clsName, key.name);
             if (value.kind == 74 && fieldType != "") {
                 this.genStructLiteral(value, fieldType);
@@ -11954,6 +12035,7 @@ public void genNewCall(Node call) {
             this.forwardCallClasses.add(recvClass);
         }
         this.emitAbiCallTeardown();
+        this.emitExcCheck();
         this.funcCallArgCount = scratchBase;
     }
 
@@ -12361,6 +12443,7 @@ public void genNewCall(Node call) {
                 // `this.field += x` (parity with silverc-rs).
                 fieldOff = this.findFieldOffset(this.currentClassName, lhs.name);
                 this.assertWritableField(this.currentClassName, lhs.name, lhs);
+                if (this.checkVisibleStore(this.currentClassName, lhs.name)) { return; }
             }
             if (op == 14 && fieldOff >= 0) {
                 string bfT = this.findFieldType(this.currentClassName, lhs.name);
@@ -12718,6 +12801,7 @@ public void genNewCall(Node call) {
                 int fieldOff = this.findFieldOffset(this.currentClassName, fieldName);
                 if (fieldOff < 0) { this.genExpr(rhs); return; }
                 this.assertWritableField(this.currentClassName, fieldName, bin);
+                if (this.checkVisibleStore(this.currentClassName, fieldName)) { return; }
                 string fT = this.findFieldType(this.currentClassName, fieldName);
                 if ((fT == "float" || fT == "float64" || fT == "double")
                     && (op == 14 || op == 15 || op == 16 || op == 17)) {
@@ -12803,6 +12887,7 @@ public void genNewCall(Node call) {
                 }
                 string varFieldT = this.findFieldType(lookupType, fieldName);
                 this.assertWritableField(lookupType, fieldName, lhs);
+                if (this.checkVisibleStore(lookupType, fieldName)) { return; }
                 if ((varFieldT == "float" || varFieldT == "float64" || varFieldT == "double")
                     && (op == 14 || op == 15 || op == 16 || op == 17)
                     && fieldOff >= 0 && (off != 0 || gi >= 0)) {
@@ -12918,6 +13003,7 @@ public void genNewCall(Node call) {
                 }
                 if (fieldOff >= 0) {
                     this.assertWritableField(ownerType, fieldName, lhs);
+                    if (this.checkVisibleStore(ownerType, fieldName)) { return; }
                     this.genExpr(obj);
                     this.asm.pushR64(0);
                     this.genExpr(lhs);
@@ -13033,6 +13119,7 @@ public void genNewCall(Node call) {
                 int fieldOff = this.findFieldOffset(this.currentClassName, lhs.name);
                 if (fieldOff >= 0) {
                     this.assertWritableField(this.currentClassName, lhs.name, lhs);
+                    if (this.checkVisibleStore(this.currentClassName, lhs.name)) { return; }
                     int thisOff = this.findLocal("this");
                     if (thisOff != 0) {
                         this.asm.pushR64(0);
@@ -13082,6 +13169,7 @@ public void genNewCall(Node call) {
                 }
                 this.assertWritableField(this.currentClassName, fieldName, lhs);
 
+                if (this.checkVisibleStore(this.currentClassName, fieldName)) { return; }
                 this.genExpr(rhs);
                 this.coerceStoreToDouble(lhs, rhs);
                 this.asm.pushR64(0);
@@ -13104,6 +13192,7 @@ public void genNewCall(Node call) {
                     return;
                 }
                 this.assertWritableField(lookupType, fieldName, lhs);
+                if (this.checkVisibleStore(lookupType, fieldName)) { return; }
                 this.genExpr(rhs);
                 this.coerceStoreToDouble(lhs, rhs);
                 this.asm.pushR64(0);
@@ -13132,6 +13221,7 @@ public void genNewCall(Node call) {
                 }
                 if (fieldOff >= 0) {
                     this.assertWritableField(ownerType, fieldName, lhs);
+                    if (this.checkVisibleStore(ownerType, fieldName)) { return; }
                     this.genExpr(obj);
                     this.asm.pushR64(0);
                     this.genExpr(rhs);
@@ -13259,6 +13349,7 @@ public void genNewCall(Node call) {
                 int thisOff = this.findLocal("this");
                 if (fieldOff >= 0 && thisOff != 0) {
                     this.assertWritableField(this.currentClassName, lhs.name, lhs);
+                    if (this.checkVisibleStore(this.currentClassName, lhs.name)) { return; }
                     this.asm.movRMBase(0, 5, thisOff);
                     this.asm.movRMBase(0, 0, fieldOff);
                     this.asm.pushR64(0);
@@ -13297,6 +13388,7 @@ public void genNewCall(Node call) {
             }
             if (fieldOff >= 0 && objOff != 0) {
                 this.assertWritableField(incCls, lhs.name, lhs);
+                if (this.checkVisibleStore(incCls, lhs.name)) { return; }
                 this.asm.movRMBase(0, 5, objOff);
                 this.asm.movRMBase(0, 0, fieldOff);
                 this.asm.pushR64(0);

@@ -1907,21 +1907,43 @@ class Parser {
             return null;
         }
         bool memberInternal = false;
+        bool memberExplicitPrivate = false;
+        bool memberStatic = false;
         while (this.check(44) || this.check(45) || this.check(164) || this.check(46) || this.check(167)) {
             if (this.check(167)) { memberInternal = true; }
+            if (this.check(45)) { memberExplicitPrivate = true; }
+            if (this.check(44)) { memberExplicitPrivate = false; }
+            if (this.check(46)) { memberStatic = true; }
             this.advance();
         }
         if (this.classSectionInternal) { memberInternal = true; }
-        // `read only` contextual modifier pair directly before `prop`.
-        // `read`/`only` are not keywords (kind 7 identifiers) and stay
+        // `read only` / `visible` contextual modifiers directly before `prop`,
+        // in either order (`read only visible prop`, `visible read only prop`).
+        // `read`/`only`/`visible` are not keywords (kind 7 identifiers) and stay
         // usable as ordinary names everywhere else.
         bool memberReadOnly = false;
-        if (this.check(7) && this.peek().text == "read"
-            && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 7 && this.tokens[this.pos + 1].text == "only"
-            && this.pos + 2 < this.tokens.length && this.tokens[this.pos + 2].kind == 47) {
-            this.advance();
-            this.advance();
-            memberReadOnly = true;
+        bool memberVisible = false;
+        while (true) {
+            if (this.check(7) && this.peek().text == "read"
+                && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 7 && this.tokens[this.pos + 1].text == "only"
+                && this.pos + 2 < this.tokens.length && (this.tokens[this.pos + 2].kind == 47
+                    || (this.tokens[this.pos + 2].kind == 7 && this.tokens[this.pos + 2].text == "visible"
+                        && this.pos + 3 < this.tokens.length && this.tokens[this.pos + 3].kind == 47))) {
+                this.advance();
+                this.advance();
+                memberReadOnly = true;
+                continue;
+            }
+            if (this.check(7) && this.peek().text == "visible"
+                && this.pos + 1 < this.tokens.length && (this.tokens[this.pos + 1].kind == 47
+                    || (this.tokens[this.pos + 1].kind == 7 && this.tokens[this.pos + 1].text == "read"
+                        && this.pos + 2 < this.tokens.length && this.tokens[this.pos + 2].kind == 7 && this.tokens[this.pos + 2].text == "only"
+                        && this.pos + 3 < this.tokens.length && this.tokens[this.pos + 3].kind == 47))) {
+                this.advance();
+                memberVisible = true;
+                continue;
+            }
+            break;
         }
         // `def construct(...)` / `def construct { ... }` spells the
         // constructor with an explicit `def` (mirrors silverc-rs).
@@ -2039,11 +2061,33 @@ class Parser {
             if (this.check(123)) { this.advance(); ft += "?"; }
             field.typeHint = ft;
             field.name = this.advance().text;
+            // DOCS/271 `visible prop`: publicly readable, writable only inside
+            // the declaring class. Visible implies public; contradictory
+            // combinations are compile errors.
+            if (memberVisible) {
+                if (memberExplicitPrivate) {
+                    Token pvTok = this.peek();
+                    this.recordError((string)pvTok.line + ":" + (string)pvTok.col + ": visible prop \"" + field.name + "\" cannot be private");
+                }
+                if (memberInternal) {
+                    Token ivTok = this.peek();
+                    this.recordError((string)ivTok.line + ":" + (string)ivTok.col + ": visible prop \"" + field.name + "\" cannot be internal");
+                }
+                if (memberStatic) {
+                    Token svTok = this.peek();
+                    this.recordError((string)svTok.line + ":" + (string)svTok.col + ": visible prop \"" + field.name + "\" cannot be static");
+                }
+                if (memberReadOnly) {
+                    Token rvTok = this.peek();
+                    this.recordError((string)rvTok.line + ":" + (string)rvTok.col + ": visible prop \"" + field.name + "\" cannot be read only");
+                }
+            }
             field.isInternal = memberInternal;
             field.isReadOnly = memberReadOnly;
+            field.isVisible = memberVisible;
             // Read-only props are set exactly once, by the declaration
             // initializer (`=` is kind 110, like default values). Mutable
-            // props take no initializer.
+            // and visible props take no initializer.
             if (memberReadOnly) {
                 if (!this.check(110)) {
                     Token roTok = this.peek();
@@ -2053,10 +2097,17 @@ class Parser {
                     field.children.add(this.parseExpr(0));
                 }
             } else if (this.check(110)) {
-                Token mutTok = this.peek();
-                this.recordError((string)mutTok.line + ":" + (string)mutTok.col + ": prop \"" + field.name + "\" takes an initializer only as `read only prop`");
-                this.advance();
-                field.children.add(this.parseExpr(0));
+                if (memberVisible) {
+                    Token vvTok = this.peek();
+                    this.recordError((string)vvTok.line + ":" + (string)vvTok.col + ": visible prop \"" + field.name + "\" takes no initializer");
+                    this.advance();
+                    field.children.add(this.parseExpr(0));
+                } else {
+                    Token mutTok = this.peek();
+                    this.recordError((string)mutTok.line + ":" + (string)mutTok.col + ": prop \"" + field.name + "\" takes an initializer only as `read only prop`");
+                    this.advance();
+                    field.children.add(this.parseExpr(0));
+                }
             }
             this.expect(106);
             return field;
