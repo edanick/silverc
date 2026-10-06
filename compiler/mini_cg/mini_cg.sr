@@ -695,6 +695,10 @@ class MiniCg {
     // (which already resolves `new C(...)` - a non-member call named after
     // the class - to C).
     public string findClassForExpr(Node expr) {
+        if (expr.kind == 75) {
+            if (expr.childCount() > 0) { return this.findClassForExpr(expr.child(0)); }
+            return "";
+        }
         if (expr.kind == 6) {
             if (expr.name == "this") {
                 if (this.currentClassName != "") { return this.currentClassName; }
@@ -4368,16 +4372,46 @@ int strIdx = this.stringPatchIndices[i];
                 this.asm.addRI32(0, 16);
             }
         } else if (kind == 75) {
-            // Nullable-conditional member access `a?.b` / method call
-            // `a?.m(...)`: evaluate the receiver once; when it is null the
-            // whole expression yields 0 (null) without dereferencing.  The
-            // receiver is stashed in a scratch stack slot and the member
-            // expression is re-run against that slot so field access and
-            // member-call codegen reuse the value (no side-effect re-eval).
+            // DOCS/273 null-safe chain `a?.b` / `a?.m(...)` / `a?[i]`:
+            // evaluate the receiver once; when it is null the whole tail
+            // yields 0 (null) without evaluating args/indexes. The receiver
+            // is stashed in a scratch slot and the member/call/index lowering
+            // re-runs against that slot (no side-effect re-eval). Chains nest
+            // as `((a?.b)?.c)`: each level spills once, so the first null
+            // short-circuits only `?.`/`?[]` continuations — a plain `.`/`[]`
+            // after is the normal unsafe access and throws on null.
             if (expr.childCount() > 0) {
                 Node qmMember = expr.child(0);
                 if (qmMember.childCount() > 0) {
                     Node qmRecv = qmMember.child(0);
+                    // Modules, enums and builtin value namespaces are never
+                    // null: lower directly without a null check (their member
+                    // access never evaluates the receiver as a pointer).
+                    if (qmRecv.kind == 6 && qmRecv.name != "this") {
+                        bool directSafe = false;
+                        for (int dei = 0; dei < this.enumNames.length; dei++) {
+                            if (this.enumNames[dei] == qmRecv.name) { directSafe = true; }
+                        }
+                        if (this.hasUserModuleName(qmRecv.name)) { directSafe = true; }
+                        if (qmRecv.name == "console" || qmRecv.name == "math" || qmRecv.name == "threads") { directSafe = true; }
+                        if (this.findLocal(qmRecv.name) != 0) { directSafe = false; }
+                        if (this.findGlobal(qmRecv.name) >= 0) { directSafe = false; }
+                        if (this.getLocalType(qmRecv.name) != "") { directSafe = false; }
+                        if (directSafe) {
+                            if (qmMember.kind == 13) {
+                                this.genMemberAccess(qmMember);
+                                return;
+                            }
+                            if (qmMember.kind == 10) {
+                                this.genCall(qmMember);
+                                return;
+                            }
+                            if (qmMember.kind == 24) {
+                                this.genArrayIndex(qmMember);
+                                return;
+                            }
+                        }
+                    }
                     this.genExpr(qmRecv);
                     this.asm.pushR64(0);
                     int qmNull = this.newLabel();
@@ -4389,6 +4423,13 @@ int strIdx = this.stringPatchIndices[i];
                     this.qcTempCounter++;
                     int qcOff = this.allocLocal(qcName);
                     string qcType = this.inferReceiverType(qmRecv);
+                    // The spilled slot holds the live (non-null) value, so a
+                    // nullable `?` suffix reads through to the base type.
+                    // Without this `string?` temps missed the `string` builtin
+                    // dispatch (`?.length()` answered 0 on live strings).
+                    if (qcType.length >= 1 && qcType[qcType.length - 1] == '?') {
+                        qcType = qcType.substring(0, qcType.length - 1);
+                    }
                     this.setLocalType(qcName, qcType);
                     this.asm.movMBaseR(5, 0, qcOff);
                     Node qmTmp = new Node(); qmTmp.kind = 6; qmTmp.name = qcName;
@@ -4406,6 +4447,11 @@ int strIdx = this.stringPatchIndices[i];
                             fresh.children.add(qmMember.child(qai));
                         }
                         this.genCall(fresh);
+                    } else if (qmMember.kind == 24 && qmMember.childCount() >= 2) {
+                        Node freshIdx = new Node(); freshIdx.kind = 24;
+                        freshIdx.children.add(qmTmp);
+                        freshIdx.children.add(qmMember.child(1));
+                        this.genArrayIndex(freshIdx);
                     }
                     this.asm.jmpLabel(qmEnd);
                     this.asm.bindLabel(qmNull);
@@ -5104,6 +5150,22 @@ int strIdx = this.stringPatchIndices[i];
             }
             return;
         }
+        if (obj.kind == 75) {
+            // DOCS/273 plain `.` after a `?.` step is the normal unsafe
+            // access: evaluate the safe chain (null yields 0) then load the
+            // field without a null check, so a null tail faults instead of
+            // yielding null.
+            this.genExpr(obj);
+            string safeObjType = this.inferExprType(obj);
+            int safeFieldOff = this.findFieldOffset(safeObjType, fieldName);
+            if (safeFieldOff < 0) {
+                safeFieldOff = this.findFieldOffsetInAllClasses(fieldName);
+            }
+            if (safeFieldOff >= 0) {
+                this.asm.movRMBase(0, 0, safeFieldOff);
+            }
+            return;
+        }
         if (obj.kind == 10 || obj.kind == 88) {
             // Member access on a call result (e.g. this.advance().text):
             // evaluate the call, then load the field using the call's
@@ -5196,6 +5258,14 @@ int strIdx = this.stringPatchIndices[i];
         }
         if (expr.kind == 70) {
             return "tuple";
+        }
+        if (expr.kind == 75) {
+            // DOCS/273 safe chain yields null when any receiver is null, so
+            // the static type is the guarded access (like member/index).
+            if (expr.childCount() > 0) {
+                return this.inferExprType(expr.child(0));
+            }
+            return "";
         }
 
         if (expr.kind == 6) {
@@ -5468,6 +5538,15 @@ int strIdx = this.stringPatchIndices[i];
             // DOCS/261 / SPEC 15.6: membership test is a plain bool.
             if (expr.op == 37) {
                 return "bool";
+            }
+            // DOCS/273 `a ?? b` / `a ??= b` classify like either side being
+            // a string; otherwise the LHS type when known, else the RHS.
+            if (expr.op == 25 || expr.op == 38) {
+                string lt = this.inferExprType(expr.child(0));
+                string rt = this.inferExprType(expr.child(1));
+                if (lt == "string" || lt == "string?" || rt == "string" || rt == "string?") { return "string"; }
+                if (lt != "") { return lt; }
+                return rt;
             }
             return "int";
         }
@@ -12320,6 +12399,10 @@ public void genNewCall(Node call) {
             this.asm.bindLabel(done);
             return;
         }
+        if (op == 38) {
+            this.genCoalesceAssign(bin);
+            return;
+        }
         if (op == 20) {
             this.genAssign(bin);
             return;
@@ -13491,6 +13574,229 @@ public void genNewCall(Node call) {
         this.genExpr(rhs);
     }
 
+    public void genCoalesceAssign(Node bin) {
+        // DOCS/273 `lhs ??= rhs`: when `lhs` is null, `rhs` evaluates, stores
+        // to `lhs`, and yields the stored value; otherwise `lhs` yields
+        // untouched and `rhs` never evaluates. The result is the value.
+        // Field/elem addresses compute once; Safe* is never a target.
+        Node lhs = bin.child(0);
+        Node rhs = bin.child(1);
+        if (lhs.kind == 75) {
+            this.genExpr(lhs);
+            return;
+        }
+        if (lhs.kind == 6) {
+            this.requireResolvableAssignTarget(lhs);
+            this.rejectGlobalWriteInAnonBody(lhs);
+            int off = this.findLocal(lhs.name);
+            int gi = this.findGlobal(lhs.name);
+            this.genExpr(lhs);
+            this.asm.cmpRI32(0, 0);
+            int doAssign = this.newLabel();
+            int done = this.newLabel();
+            this.asm.jeLabel(doAssign);
+            this.asm.jmpLabel(done);
+            this.asm.bindLabel(doAssign);
+            this.genExpr(rhs);
+            this.coerceStoreToDouble(lhs, rhs);
+            string assignCurT = this.getLocalType(lhs.name);
+            if (rhs.kind == 10 && !rhs.isMember && this.isClassName(rhs.name)) {
+                if (off != 0 && !this.isClassName(assignCurT)) {
+                    this.setLocalType(lhs.name, rhs.name);
+                }
+            } else if (off != 0 && !this.isClassName(assignCurT)) {
+                string rhsClass = this.findClassForExpr(rhs);
+                if (rhsClass != "") {
+                    this.setLocalType(lhs.name, rhsClass);
+                }
+            }
+            string oldT = this.getLocalType(lhs.name);
+            string newT = this.inferExprType(rhs);
+            if (newT != "" && (this.isArrayLikeType(oldT) || this.isArrayLikeType(newT))) {
+                this.setLocalType(lhs.name, newT);
+            }
+            if (off != 0) {
+                if (this.isRefParam(lhs.name)) {
+                    this.asm.pushR64(0);
+                    this.asm.movRMBase(0, 5, off);
+                    this.asm.popR64(1);
+                    this.asm.movMBaseR(0, 1, 0);
+                    this.asm.movRR64(0, 1);
+                } else {
+                    this.asm.movMBaseR(5, 0, off);
+                }
+            } else if (gi >= 0) {
+                this.genGlobalStore(gi);
+                this.asm.movRR64(0, 1);
+            } else if (this.currentClassName != "") {
+                int fieldOff = this.findFieldOffset(this.currentClassName, lhs.name);
+                if (fieldOff >= 0) {
+                    this.assertWritableField(this.currentClassName, lhs.name, lhs);
+                    if (this.checkVisibleStore(this.currentClassName, lhs.name)) {
+                        this.asm.bindLabel(done);
+                        return;
+                    }
+                    int thisOff = this.findLocal("this");
+                    if (thisOff != 0) {
+                        this.asm.pushR64(0);
+                        this.asm.movRMBase(0, 5, thisOff);
+                        this.asm.addRI32(0, fieldOff);
+                        this.asm.popR64(1);
+                        this.asm.movMBaseR(0, 1, 0);
+                        this.asm.movRR64(0, 1);
+                    }
+                }
+            }
+            this.asm.bindLabel(done);
+            return;
+        }
+        if (lhs.kind == 13 && lhs.childCount() >= 1) {
+            Node obj = lhs.child(0);
+            string fieldName = lhs.name;
+            if (this.isDictOrObjectType(this.inferExprType(obj))) {
+                this.genExpr(lhs);
+                this.asm.cmpRI32(0, 0);
+                int doAssign = this.newLabel();
+                int done = this.newLabel();
+                this.asm.jeLabel(doAssign);
+                this.asm.jmpLabel(done);
+                this.asm.bindLabel(doAssign);
+                this.genExpr(rhs);
+                int tmpOff = this.allocLocal("__coal_rhs");
+                this.asm.movMBaseR(5, 0, tmpOff);
+                Node rhsTmp = new Node(); rhsTmp.kind = 6; rhsTmp.name = "__coal_rhs";
+                Node idxNode = new Node(); idxNode.kind = 24;
+                idxNode.children.add(obj);
+                Node keyNode = new Node(); keyNode.kind = 2; keyNode.strVal = fieldName;
+                idxNode.children.add(keyNode);
+                Node setBin = new Node(); setBin.kind = 7; setBin.op = 20;
+                setBin.children.add(idxNode);
+                setBin.children.add(rhsTmp);
+                this.genDictIndexSet(setBin);
+                this.asm.movRMBase(0, 5, tmpOff);
+                this.asm.bindLabel(done);
+                return;
+            }
+            this.genExpr(obj);
+            int fieldOff = -1;
+            string lookupCls = "";
+            if (obj.kind == 6 && obj.name == "this") {
+                fieldOff = this.findFieldOffset(this.currentClassName, fieldName);
+                lookupCls = this.currentClassName;
+            } else if (obj.kind == 6) {
+                string varType = this.getLocalType(obj.name);
+                string lookupType = varType;
+                string elemType = this.arrayElementType(varType);
+                if (elemType != "") { lookupType = elemType; }
+                fieldOff = this.findFieldOffset(lookupType, fieldName);
+                lookupCls = lookupType;
+                if (fieldOff < 0) {
+                    fieldOff = this.findFieldOffsetInAllClasses(fieldName);
+                }
+            } else {
+                string ownerType = this.inferExprType(obj);
+                fieldOff = this.findFieldOffset(ownerType, fieldName);
+                lookupCls = ownerType;
+                if (fieldOff < 0) {
+                    fieldOff = this.findFieldOffsetInAllClasses(fieldName);
+                }
+            }
+            if (fieldOff < 0) {
+                this.genExpr(lhs);
+                this.asm.cmpRI32(0, 0);
+                int doAssign = this.newLabel();
+                int done = this.newLabel();
+                this.asm.jeLabel(doAssign);
+                this.asm.jmpLabel(done);
+                this.asm.bindLabel(doAssign);
+                this.genExpr(rhs);
+                this.asm.bindLabel(done);
+                return;
+            }
+            this.assertWritableField(lookupCls, fieldName, lhs);
+            if (this.checkVisibleStore(lookupCls, fieldName)) { return; }
+            this.asm.addRI32(0, fieldOff);
+            string addrName = "__coal_addr";
+            int addrOff = this.allocLocal(addrName);
+            this.asm.movMBaseR(5, 0, addrOff);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.cmpRI32(0, 0);
+            int doAssign2 = this.newLabel();
+            int done2 = this.newLabel();
+            this.asm.jeLabel(doAssign2);
+            this.asm.jmpLabel(done2);
+            this.asm.bindLabel(doAssign2);
+            this.asm.movRMBase(1, 5, addrOff);
+            this.asm.pushR64(1);
+            this.genExpr(rhs);
+            this.coerceStoreToDouble(lhs, rhs);
+            this.asm.movRR64(1, 0);
+            this.asm.popR64(0);
+            this.asm.movMBaseR(0, 1, 0);
+            this.asm.movRR64(0, 1);
+            this.asm.bindLabel(done2);
+            return;
+        }
+        if (lhs.kind == 24 && lhs.childCount() >= 2) {
+            Node arrNode = lhs.child(0);
+            Node idxNode = lhs.child(1);
+            if (this.isDictOrObjectType(this.inferReceiverType(arrNode))) {
+                this.genExpr(lhs);
+                this.asm.cmpRI32(0, 0);
+                int doAssign = this.newLabel();
+                int done = this.newLabel();
+                this.asm.jeLabel(doAssign);
+                this.asm.jmpLabel(done);
+                this.asm.bindLabel(doAssign);
+                this.genExpr(rhs);
+                int tmpOff = this.allocLocal("__coal_rhs");
+                this.asm.movMBaseR(5, 0, tmpOff);
+                Node rhsTmp = new Node(); rhsTmp.kind = 6; rhsTmp.name = "__coal_rhs";
+                Node setBin = new Node(); setBin.kind = 7; setBin.op = 20;
+                setBin.children.add(lhs);
+                setBin.children.add(rhsTmp);
+                this.genDictIndexSet(setBin);
+                this.asm.movRMBase(0, 5, tmpOff);
+                this.asm.bindLabel(done);
+                return;
+            }
+            this.genExpr(arrNode);
+            string arrTmpName = "__coal_arr";
+            int arrOff = this.allocLocal(arrTmpName);
+            this.asm.movMBaseR(5, 0, arrOff);
+            this.genExpr(idxNode);
+            string idxTmpName = "__coal_idx";
+            int idxOff = this.allocLocal(idxTmpName);
+            this.asm.movMBaseR(5, 0, idxOff);
+            this.asm.movRMBase(0, 5, arrOff);
+            this.asm.movRMBase(1, 5, idxOff);
+            this.emitIndexBoundsCheck();
+            this.asm.shlR64Imm(1, 3);
+            this.asm.addRR64(0, 1);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.cmpRI32(0, 0);
+            int doAssign = this.newLabel();
+            int done = this.newLabel();
+            this.asm.jeLabel(doAssign);
+            this.asm.jmpLabel(done);
+            this.asm.bindLabel(doAssign);
+            this.asm.movRMBase(0, 5, arrOff);
+            this.asm.movRMBase(1, 5, idxOff);
+            this.asm.shlR64Imm(1, 3);
+            this.asm.addRR64(0, 1);
+            this.asm.pushR64(0);
+            this.genExpr(rhs);
+            this.coerceStoreToDouble(lhs, rhs);
+            this.asm.movRR64(1, 0);
+            this.asm.popR64(0);
+            this.asm.movMBaseR(0, 1, 0);
+            this.asm.movRR64(0, 1);
+            this.asm.bindLabel(done);
+            return;
+        }
+        this.genExpr(lhs);
+    }
+
     public void genPostIncDec(Node bin, bool plus) {
         // Post-increment `x++` / post-decrement `x--` must evaluate to the
         // OLD value of the target while storing old +/- 1 (parity with the
@@ -13762,9 +14068,18 @@ public void genNewCall(Node call) {
             string t = this.inferExprType(expr);
             return t == "string";
         }
+        if (expr.kind == 75) {
+            // DOCS/273 safe chain classifies like the guarded access.
+            if (expr.childCount() > 0) { return this.isStringLike(expr.child(0)); }
+            return false;
+        }
         if (expr.kind == 7) {
             int op = expr.op;
             if (op == 1) {
+                if (this.isStringLike(expr.child(0))) { return true; }
+                if (this.isStringLike(expr.child(1))) { return true; }
+            }
+            if (op == 25 || op == 38) {
                 if (this.isStringLike(expr.child(0))) { return true; }
                 if (this.isStringLike(expr.child(1))) { return true; }
             }
@@ -13787,6 +14102,10 @@ public void genNewCall(Node call) {
 
     public bool isCharExpr(Node expr) {
         if (expr.kind == 3) { return true; }
+        if (expr.kind == 75) {
+            if (expr.childCount() > 0) { return this.isCharExpr(expr.child(0)); }
+            return false;
+        }
         if (expr.kind == 6) {
             string t = this.getLocalType(expr.name);
             return t == "char" || t == "char?";
@@ -13816,6 +14135,10 @@ public void genNewCall(Node call) {
     // arithmetic results, calls and consts stay signed there, so they stay
     // signed here too).
     public bool isUint64Like(Node expr) {
+        if (expr.kind == 75) {
+            if (expr.childCount() > 0) { return this.isUint64Like(expr.child(0)); }
+            return false;
+        }
         if (expr.kind == 6) {
             return this.getLocalType(expr.name) == "uint64";
         }
@@ -13903,6 +14226,13 @@ public void genNewCall(Node call) {
                 if (this.isFloatLike(expr.child(0))) { return true; }
                 if (this.isFloatLike(expr.child(1))) { return true; }
             }
+            if (fop == 25 || fop == 38) {
+                if (this.isFloatLike(expr.child(0))) { return true; }
+                if (this.isFloatLike(expr.child(1))) { return true; }
+            }
+        }
+        if (expr.kind == 75) {
+            if (expr.childCount() > 0) { return this.isFloatLike(expr.child(0)); }
         }
         if (expr.kind == 23) {
             if (expr.childCount() > 0) { return this.isFloatLike(expr.child(0)); }
@@ -14073,6 +14403,17 @@ public void genNewCall(Node call) {
             if (expr.childCount() >= 3) {
                 if (!this.isArrayValue(expr.child(1))) { return false; }
                 return this.isArrayValue(expr.child(2));
+            }
+            return false;
+        }
+        if (expr.kind == 75) {
+            if (expr.childCount() > 0) { return this.isArrayValue(expr.child(0)); }
+            return false;
+        }
+        if (expr.kind == 7 && (expr.op == 25 || expr.op == 38)) {
+            if (expr.childCount() >= 2) {
+                if (this.isArrayValue(expr.child(0))) { return true; }
+                return this.isArrayValue(expr.child(1));
             }
             return false;
         }

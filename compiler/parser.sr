@@ -311,6 +311,7 @@ class Parser {
         if (nk == 161 || nk == 162 || nk == 142 || nk == 143) { return true; }
         if (nk == 123 || nk == 148 || nk == 144 || nk == 147) { return true; }
         if (nk == 109 || nk == 120 || nk == 140) { return true; }
+        if (nk == 163 || nk == 169 || nk == 170) { return true; }
         return false;
     }
 
@@ -1182,6 +1183,8 @@ class Parser {
         if (kind == 147) { return "..."; }
         if (kind == 148) { return "??"; }
         if (kind == 163) { return "?."; }
+        if (kind == 169) { return "?["; }
+        if (kind == 170) { return "??="; }
         if (kind == 164) { return "protected"; }
         if (kind == 165) { return "typealias"; }
         if (kind == 167) { return "internal"; }
@@ -3130,6 +3133,10 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 // receiver once; when it is null the whole expression yields
                 // null instead of dereferencing.  Wrapped in a kind-75 node
                 // so codegen can short-circuit the member access/call.
+                // Left-associative at `.` precedence: the loop re-applies,
+                // so `a?.b?.c` nests as `((a?.b)?.c)` with each receiver
+                // spilled once (see DOCS/273).
+                Token qmTok = this.peek();
                 this.advance();
                 Token name = this.advance();
                 Node qmMember = null;
@@ -3153,8 +3160,40 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     qmMember = member;
                 }
                 Node qm = new Node(); qm.kind = 75;
+                qm.line = lhs.line; qm.col = lhs.col;
                 qm.children.add(qmMember);
                 lhs = qm;
+                continue;
+            }
+            if (this.check(169)) {
+                // DOCS/273 null-safe indexing `users?[i]`: element index
+                // only, chainable with `?.`/`?[]` at `.` precedence. A null
+                // receiver yields null without evaluating the index; a live
+                // receiver runs the normal bounds-checked index. `?..`
+                // slicing is rejected.
+                this.advance();
+                bool oldBoundary = this.rangeIsSliceBoundary;
+                this.rangeIsSliceBoundary = true;
+                Node safeIdx = this.parseExpr(0);
+                bool isSlice = this.check(109) || this.check(144);
+                if (isSlice) {
+                    Token sliceTok = this.peek();
+                    this.recordError((string)sliceTok.line + ":" + (string)sliceTok.col + ": ?[: null-safe slicing is not supported — write users?[i] for elements (see DOCS/273)");
+                    this.advance();
+                    if (!this.check(105)) {
+                        this.parseExpr(0);
+                    }
+                }
+                this.rangeIsSliceBoundary = oldBoundary;
+                this.expect(105);
+                Node idxNode = new Node(); idxNode.kind = 24;
+                idxNode.children.add(lhs);
+                idxNode.children.add(safeIdx);
+                idxNode.line = lhs.line; idxNode.col = lhs.col;
+                Node qmIdx = new Node(); qmIdx.kind = 75;
+                qmIdx.line = lhs.line; qmIdx.col = lhs.col;
+                qmIdx.children.add(idxNode);
+                lhs = qmIdx;
                 continue;
             }
             if (this.check(142)) {
@@ -3181,6 +3220,24 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 coalesce.children.add(lhs);
                 coalesce.children.add(this.parseExpr(2));
                 lhs = coalesce;
+                continue;
+            }
+            if (this.check(170) && minPrec <= 1) {
+                // DOCS/273 assign-if-null `cache ??= rhs`: assigns (and
+                // evaluates RHS) only when LHS is null, yields the resulting
+                // value. Right-associative at `=` precedence. A safe access
+                // is never a target (`a?.b ??= c` is Invalid assignment).
+                Token coalTok = this.peek();
+                if (lhs.kind == 75) {
+                    this.recordError((string)coalTok.line + ":" + (string)coalTok.col + ": Invalid assignment target");
+                }
+                this.advance();
+                Node coalRhs = this.parseExpr(1);
+                Node coalAssign = new Node(); coalAssign.kind = 7; coalAssign.op = 38;
+                coalAssign.line = coalTok.line; coalAssign.col = coalTok.col;
+                coalAssign.children.add(lhs);
+                coalAssign.children.add(coalRhs);
+                lhs = coalAssign;
                 continue;
             }
             if (this.check(123) && minPrec <= 1) {
@@ -3276,8 +3333,14 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             if (prec < minPrec) { break; }
             int nextMin = prec + 1;
             int op = this.peek().kind;
-            if (op == 110 || op == 130 || op == 131 || op == 132 || op == 133 || op == 157 || op == 158 || op == 159 || op == 160 || op == 161 || op == 162) {
+            if (op == 110 || op == 130 || op == 131 || op == 132 || op == 133 || op == 157 || op == 158 || op == 159 || op == 160 || op == 161 || op == 162 || op == 170) {
                 nextMin = 1;
+            }
+            // DOCS/273: a safe access yields a value, not a place — it can
+            // never be an assignment target (`a?.b = c` is Invalid assignment).
+            if (lhs.kind == 75 && (op == 110 || op == 130 || op == 131 || op == 132 || op == 133 || op == 157 || op == 158 || op == 159 || op == 160 || op == 161 || op == 162 || op == 170)) {
+                Token opTok = this.peek();
+                this.recordError((string)opTok.line + ":" + (string)opTok.col + ": Invalid assignment target");
             }
             this.advance();
             Node rhs = this.parseExpr(nextMin);
@@ -3454,6 +3517,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         if (kind == 144) { return 27; }
         if (kind == 147) { return 26; }
         if (kind == 148) { return 25; }
+        if (kind == 170) { return 38; }
         if (kind == 116) { return 22; }
         if (kind == 117) { return 23; }
         if (kind == 118) { return 24; }
@@ -3516,7 +3580,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
     }
 
     private int getPrec(int kind) {
-        if (kind == 110 || kind == 130 || kind == 131 || kind == 132 || kind == 133 || kind == 148 || kind == 157 || kind == 158 || kind == 159 || kind == 160 || kind == 161 || kind == 162) { return 1; }
+        if (kind == 110 || kind == 130 || kind == 131 || kind == 132 || kind == 133 || kind == 148 || kind == 170 || kind == 157 || kind == 158 || kind == 159 || kind == 160 || kind == 161 || kind == 162) { return 1; }
         if (kind == 139) { return 2; }
         if (kind == 138) { return 3; }
         if (kind == 135 || kind == 134) { return 4; }
