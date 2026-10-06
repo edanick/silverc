@@ -6770,6 +6770,186 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRMBase(0, 5, arrOff);
     }
 
+    public string swapArgName(Node expr) {
+        if (expr.kind == 6) { return expr.name; }
+        if (expr.kind == 8 || expr.kind == 72) {
+            if (expr.childCount() > 0) { return this.swapArgName(expr.child(0)); }
+            return "";
+        }
+        if (expr.kind == 23) {
+            if (expr.childCount() > 0) { return this.swapArgName(expr.child(0)); }
+            return "";
+        }
+        return "";
+    }
+
+    public string swapVarKind(string varName) {
+        string varType = this.getLocalType(varName);
+        if (varType == "string" || varType == "string?") { return "string"; }
+        if (varType == "float" || varType == "float64" || varType == "double" || varType == "float?" || varType == "float64?" || varType == "double?") { return "float"; }
+        if (varType == "char" || varType == "char?") { return "char"; }
+        if (varType.length >= 2 && varType[varType.length - 2] == '[' && varType[varType.length - 1] == ']') {
+            string elemType = this.arrayElementType(varType);
+            if (elemType == "string") { return "string[]"; }
+            if (elemType == "float" || elemType == "float64" || elemType == "double") { return "float[]"; }
+            if (elemType == "char") { return "char[]"; }
+            if (elemType == "bool") { return "bool[]"; }
+            if (elemType == "byte") { return "byte[]"; }
+            if (elemType == "int" || elemType == "int8" || elemType == "int16" || elemType == "int32" || elemType == "int64" || elemType == "uint" || elemType == "uint8" || elemType == "u8" || elemType == "uint64") { return "int[]"; }
+            if (this.isClassName(elemType)) { return elemType + "[]"; }
+            return "array";
+        }
+        if (this.isClassName(varType)) { return varType; }
+        if (varType != "") { return "int"; }
+        return "";
+    }
+
+    public void genArraySwap(Node call) {
+        int argCount = call.childCount() - 1;
+        if (argCount < 0) { argCount = 0; }
+        if (argCount != 2) {
+            this.emitThrowException("swap requires two indexes");
+            this.asm.xorRR64(0, 0);
+            return;
+        }
+        Node arrNode = call.child(0);
+        int arrOff = this.allocLocal("__arr_swap_arr");
+        int iOff = this.allocLocal("__arr_swap_i");
+        int jOff = this.allocLocal("__arr_swap_j");
+        int lenOff = this.allocLocal("__arr_swap_len");
+        int v1Off = this.allocLocal("__arr_swap_v1");
+        int v2Off = this.allocLocal("__arr_swap_v2");
+        this.genExpr(arrNode);
+        this.asm.movMBaseR(5, 0, arrOff);
+        this.genExpr(call.child(1));
+        this.asm.movMBaseR(5, 0, iOff);
+        this.genExpr(call.child(2));
+        this.asm.movMBaseR(5, 0, jOff);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+        int oob = this.newLabel();
+        int ok = this.newLabel();
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jlLabel(oob);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(oob);
+        this.asm.movRMBase(0, 5, jOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jlLabel(oob);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(oob);
+        this.asm.jmpLabel(ok);
+        this.asm.bindLabel(oob);
+        this.emitThrowException("index out of range");
+        this.asm.bindLabel(ok);
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(0, 1, 0);
+        this.asm.movMBaseR(5, 0, v1Off);
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.movRMBase(0, 5, jOff);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(0, 1, 0);
+        this.asm.movMBaseR(5, 0, v2Off);
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(0, 5, v2Off);
+        this.asm.movMBaseR(1, 0, 0);
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.movRMBase(0, 5, jOff);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(0, 5, v1Off);
+        this.asm.movMBaseR(1, 0, 0);
+        this.asm.xorRR64(0, 0);
+    }
+
+    public void genSwapCall(Node call) {
+        if (call.childCount() != 2) {
+            this.emitThrowException("swap requires two variables");
+            this.asm.xorRR64(0, 0);
+            return;
+        }
+        string firstName = this.swapArgName(call.child(0));
+        string secondName = this.swapArgName(call.child(1));
+        if (firstName.length == 0 || secondName.length == 0) {
+            this.emitThrowException("swap requires two variables");
+            this.asm.xorRR64(0, 0);
+            return;
+        }
+        if (firstName == secondName) {
+            this.asm.xorRR64(0, 0);
+            return;
+        }
+        string firstKind = this.swapVarKind(firstName);
+        string secondKind = this.swapVarKind(secondName);
+        if (firstKind.length > 0 && secondKind.length > 0 && firstKind != secondKind && firstKind != "array" && secondKind != "array") {
+            this.emitThrowException("swap type mismatch: variables must have the same type");
+            this.asm.xorRR64(0, 0);
+            return;
+        }
+        int firstOff = this.findLocal(firstName);
+        int firstGlobal = -1;
+        if (firstOff == 0) { firstGlobal = this.findGlobal(firstName); }
+        if (firstOff == 0 && firstGlobal < 0) {
+            this.emitThrowException("swap requires two variables");
+            this.asm.xorRR64(0, 0);
+            return;
+        }
+        int secondOff = this.findLocal(secondName);
+        int secondGlobal = -1;
+        if (secondOff == 0) { secondGlobal = this.findGlobal(secondName); }
+        if (secondOff == 0 && secondGlobal < 0) {
+            this.emitThrowException("swap requires two variables");
+            this.asm.xorRR64(0, 0);
+            return;
+        }
+        int addrFirst = this.allocLocal("__swap_a1");
+        int addrSecond = this.allocLocal("__swap_a2");
+        if (firstOff != 0) {
+            if (this.isRefParam(firstName)) {
+                this.asm.movRMBase(0, 5, firstOff);
+            } else {
+                this.asm.leaRBase(0, 5, firstOff);
+            }
+        } else {
+            int patchPos = this.asm.buf.length;
+            this.asm.emitImm64(0, 0);
+            this.globalPatchOffsets.add(patchPos + 2);
+            this.globalPatchIndices.add(firstGlobal);
+        }
+        this.asm.movMBaseR(5, 0, addrFirst);
+        if (secondOff != 0) {
+            if (this.isRefParam(secondName)) {
+                this.asm.movRMBase(0, 5, secondOff);
+            } else {
+                this.asm.leaRBase(0, 5, secondOff);
+            }
+        } else {
+            int patchPos2 = this.asm.buf.length;
+            this.asm.emitImm64(0, 0);
+            this.globalPatchOffsets.add(patchPos2 + 2);
+            this.globalPatchIndices.add(secondGlobal);
+        }
+        this.asm.movMBaseR(5, 0, addrSecond);
+        this.asm.movRMBase(1, 5, addrFirst);
+        this.asm.movRMBase(2, 1, 0);
+        this.asm.movRMBase(0, 5, addrSecond);
+        this.asm.movRMBase(8, 0, 0);
+        this.asm.movMBaseR(1, 8, 0);
+        this.asm.movMBaseR(0, 2, 0);
+        this.asm.xorRR64(0, 0);
+    }
+
     public void genArrayUnique(Node call) {
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
@@ -7735,6 +7915,8 @@ int strIdx = this.stringPatchIndices[i];
             this.genSleepCall(call);
         } else if (builtinName && name == "cargs") {
             this.genCargsCall(call);
+        } else if (builtinName && name == "swap" && !call.isMember) {
+            this.genSwapCall(call);
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "llmai" || call.child(0).name == "LLMAI") && call.name == "chat") {
             // Builtin LLM chat completion (DOCS/206): llmai.chat(url, headers, body)
             this.genLlmaiChatCall(call);
@@ -7912,6 +8094,8 @@ int strIdx = this.stringPatchIndices[i];
             this.genArrayContains(call);
         } else if (call.isMember && call.childCount() > 0 && name == "sort" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArraySort(call);
+        } else if (call.isMember && call.childCount() > 0 && name == "swap" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+            this.genArraySwap(call);
         } else if (call.isMember && call.childCount() > 0 && name == "unique" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArrayUnique(call);
         } else if (call.isMember && call.childCount() > 1 && name == "join" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
