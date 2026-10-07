@@ -106,6 +106,16 @@ class Parser {
     // there is an operator token again, never the `in` of a `for`/`foreach`
     // loop header.
     private bool inMembershipOperand;
+    // DOCS/274: hidden class definitions minted by `new class { ... }`
+    // expressions. Each anonymous class desugars to a top-level class with
+    // a generated name plus a `new Hidden()` expression; the definitions
+    // accumulate here during the parse and are drained into the program by
+    // parseProgram, so every downstream stage sees an ordinary named class.
+    private prop Node[] anonClasses;
+    // DOCS/274: per-parse counter mixed into each minted hidden-class name
+    // (alongside the definition's structural hash) so two identical bodies
+    // still mint distinct names.
+    private prop int anonCounter;
 
     construct (Token[] toks) {
         this.tokens = toks;
@@ -141,6 +151,8 @@ class Parser {
         this.anonWalkDepth = 0;
         this.parenDepth = 0;
         this.inMembershipOperand = false;
+        this.anonClasses = [];
+        this.anonCounter = 0;
     }
 
     // Provide per-line character lengths so bracket diagnostics can point
@@ -1269,6 +1281,17 @@ class Parser {
                 }
             }
         }
+        // DOCS/274: anonymous classes desugar during expression parsing
+        // into hidden top-level classes (see parseAnonClass). Drain them
+        // here so they join the program like any named class declaration.
+        // The generated names embed a structural hash of each definition
+        // plus a per-parse counter, so merged multi-file programs never
+        // collide: identical bodies merge harmlessly (same name, same
+        // definition), differing bodies always differ by name.
+        for (int hi = 0; hi < this.anonClasses.length; hi++) {
+            items.add(this.anonClasses[hi]);
+        }
+        this.anonClasses = [];
         // Flush the merged missing-semicolon message (single line listing
         // every position, joined with "and").
         if (this.missingSemiLines.length > 0) {
@@ -1860,6 +1883,17 @@ class Parser {
         this.expect(30);
         node.name = this.advance().text;
         this.registerDeclaredType(node.name);
+        this.parseClassParentsInto(node);
+        this.expect(102);
+        this.parseClassBodyInto(node);
+        this.expect(103);
+        return node;
+    }
+
+    // Shared parent-list parser for named (`class C : A, B` /
+    // `class C extends A, B`, DOCS/207) and anonymous
+    // (`new class : A, B` / `new class extends A, B`, DOCS/274) classes.
+    private void parseClassParentsInto(Node node) {
         if (this.check(109) || this.check(60)) {
             this.advance();
             // Multiple inheritance (DOCS/207): comma-separated parents for
@@ -1874,14 +1908,158 @@ class Parser {
                 node.parentClasses.add(nextParent);
             }
         }
-        this.expect(102);
+    }
+
+    // Shared member parser for named and anonymous (DOCS/274) class bodies:
+    // visibility sections, inline modifiers, `construct`, `def` methods,
+    // props (read only / visible), statics, `*`-private fields, methods and
+    // plain fields. Stops before the closing `}` which the caller consumes.
+    private void parseClassBodyInto(Node node) {
+        bool savedInternal = this.classSectionInternal;
         this.classSectionInternal = false;
         while (!this.check(103) && !this.check(0)) {
             Node member = this.parseClassMember();
             if (member != null) { node.children.add(member); }
         }
+        this.classSectionInternal = savedInternal;
+    }
+
+    // DOCS/274: `new class { ... }` anonymous class expression. Parses the
+    // optional parent list (`extends Base` / `: Base, Other`) and the class
+    // body with the shared named-class parsers, mints a hidden top-level
+    // class (`__AnonClass_<hash>`), queues it for parseProgram to drain,
+    // and returns `new __AnonClass_<hash>()` — so each evaluation creates
+    // one fresh instance with its own fields, dispatched through the
+    // ordinary named-class layout/method tables.
+    private Node parseAnonClass(Token newTok) {
+        this.expect(30);
+        // Anonymous classes are unnamed: a bare identifier here is a missing
+        // `extends`/`:`, never a name. (`implements` also lands here — it
+        // lexes as an identifier because Silver has no such keyword:
+        // foundations use `extends`/`:` per SPEC section 8 and DOCS/207.)
+        if (this.check(7)) {
+            Token badTok = this.peek();
+            this.recordError((string)badTok.line + ":" + (string)badTok.col + ": Unexpected token 'class name: anonymous classes have no name — write `new class { ... }`, optionally with `extends Parent` / `: Parent` after `class` (Silver has no `implements` keyword; foundations attach with `extends`/`:` — see DOCS/274)'");
+            this.advance();
+        }
+        // `found` declares a foundation (interface) at top level — it is
+        // neither a parent nor, inside the body, a field modifier.
+        if (this.check(33)) {
+            Token foundTok = this.peek();
+            this.recordError((string)foundTok.line + ":" + (string)foundTok.col + ": Unexpected token 'found: `found` declares a foundation at top level, it is not an anonymous-class parent — write `new class extends Base { ... }` (see DOCS/274)'");
+            this.advance();
+        }
+        Node hidden = new Node();
+        hidden.kind = 102;
+        hidden.line = newTok.line;
+        hidden.col = newTok.col;
+        hidden.srcModule = this.curModule;
+        this.parseClassParentsInto(hidden);
+        this.expect(102);
+        this.parseClassBodyInto(hidden);
         this.expect(103);
-        return node;
+        // No constructor arguments: the instance is built with zero args, so
+        // field setup belongs in a zero-arg `construct { ... }`.
+        if (this.check(100)) {
+            Token parenTok = this.peek();
+            this.recordError((string)parenTok.line + ":" + (string)parenTok.col + ": Unexpected token '(: anonymous classes take no constructor arguments — initialize fields in `construct { ... }` (see DOCS/274)'");
+            this.skipBalancedParens();
+        }
+        // The desugared instance is built as `new Hidden()` with no
+        // arguments, so a `construct` needing arguments could never run.
+        for (int mi = 0; mi < hidden.childCount(); mi++) {
+            Node m = hidden.child(mi);
+            if (m.kind == 100 && m.name == "construct" && m.childCount() > 0) {
+                Node cparams = m.child(0);
+                int required = 0;
+                for (int pi = 0; pi < cparams.childCount(); pi++) {
+                    if (cparams.child(pi).childCount() == 0) { required++; }
+                }
+                if (required > 0) {
+                    int errLine = m.line;
+                    int errCol = m.col;
+                    if (errLine == 0) { errLine = newTok.line; errCol = newTok.col; }
+                    this.recordError((string)errLine + ":" + (string)errCol + ": Unexpected token 'construct: anonymous class constructor needs " + (string)required + " argument(s) but `new class { ... }` passes none — give every parameter a default value or write `construct { ... }` (see DOCS/274)'");
+                }
+            }
+        }
+        string hiddenName = this.mintAnonClassName(hidden, newTok);
+        hidden.name = hiddenName;
+        this.registerDeclaredType(hiddenName);
+        this.anonClasses.add(hidden);
+        Node res = new Node();
+        res.kind = 10;
+        res.name = hiddenName;
+        res.isStatic = true;
+        res.line = newTok.line;
+        res.col = newTok.col;
+        return res;
+    }
+
+    // DOCS/274: mint the hidden name for one anonymous class definition.
+    // The name embeds an FNV-1a hash over the definition's structural rendering
+    // (plus line/col, so every occurrence differs) plus a per-parse counter
+    // (so even identical spellings differ). Hash-based naming keeps merged
+    // multi-file programs collision-free without threading file identities
+    // through the parse entry: identical bodies share a name AND a definition
+    // (harmless duplicates), differing bodies always differ by name.
+    private string mintAnonClassName(Node hidden, Token newTok) {
+        while (true) {
+            int curCount = this.anonCounter;
+            string render = (string)curCount + "|" + (string)newTok.line + "|" + (string)newTok.col + "|" + this.renderAnonDef(hidden);
+            curCount++;
+            this.anonCounter = curCount;
+            int64 h = this.anonFnv1a(render);
+            string hex = this.anonHex16(h);
+            string name = "__AnonClass_" + hex;
+            if (!this.isDeclaredTypeName(name)) { return name; }
+        }
+        return "";
+    }
+
+    private string renderAnonDef(Node hidden) {
+        string r = "";
+        r += hidden.parentClass + "|";
+        for (int i = 0; i < hidden.parentClasses.length; i++) { r += hidden.parentClasses[i] + ","; }
+        r += "|";
+        for (int j = 0; j < hidden.childCount(); j++) {
+            Node m = hidden.child(j);
+            r += (string)m.kind + ":" + m.name + ":" + m.typeHint + "|";
+            for (int k = 0; k < m.childCount(); k++) {
+                Node c = m.child(k);
+                r += "[" + (string)c.kind + ":" + c.name + ":" + c.typeHint + "]";
+                for (int l = 0; l < c.childCount(); l++) {
+                    Node gc = c.child(l);
+                    r += "{" + (string)gc.kind + ":" + gc.name + ":" + gc.typeHint + "}";
+                }
+                r += ";";
+            }
+            r += "#";
+        }
+        return r;
+    }
+
+    // FNV-1a 64-bit over the input bytes (zero-deps hashing for DOCS/274
+    // hidden-class names, mirrors silverc-rs fnv1a64).
+    private int64 anonFnv1a(string s) {
+        int64 h = -3750763034362895579;
+        for (int i = 0; i < s.length; i++) {
+            h = h ^ int64(s[i]);
+            h = h * 1099511628211;
+        }
+        return h;
+    }
+
+    private string anonHex16(int64 v) {
+        string digits = "0123456789abcdef";
+        string r = "";
+        for (int idx = 0; idx < 16; idx++) {
+            int shift = 60 - idx * 4;
+            int64 nib64 = (v >> shift) & 15;
+            int nib = (int)nib64;
+            r += projectSlice(digits, nib, nib + 1);
+        }
+        return r;
     }
 
     private Node? parseEnum() {
@@ -1932,6 +2110,18 @@ class Parser {
             this.advance();
         }
         if (this.classSectionInternal) { memberInternal = true; }
+        // DOCS/274: `found` declares a foundation at top level — it is never
+        // a member starter. Without this guard a stray `found` (e.g.
+        // `private found Provider[] providers;`) falls through to a cryptic
+        // closing-brace error; name the actual mistake instead. Sits after
+        // inline-visibility parsing so prefixed forms (`private found ...`)
+        // point here too.
+        if (this.check(33)) {
+            Token foundTok = this.peek();
+            this.recordError((string)foundTok.line + ":" + (string)foundTok.col + ": Unexpected token 'found: `found` declares a foundation at top level, it is not a field modifier — write `private Provider[] providers;` (see DOCS/274)'");
+            this.advance();
+            return null;
+        }
         // `read only` / `visible` contextual modifiers directly before `prop`,
         // in either order (`read only visible prop`, `visible read only prop`).
         // `read`/`only`/`visible` are not keywords (kind 7 identifiers) and stay
@@ -1970,6 +2160,9 @@ class Parser {
             ctor.kind = 100;
             ctor.name = "construct";
             ctor.isInternal = memberInternal;
+            Token ctorTok = this.peek();
+            ctor.line = ctorTok.line;
+            ctor.col = ctorTok.col;
             this.advance();
             // The parameter list is optional: `construct { ... }` is a
             // zero-parameter constructor, `construct(params) { ... }` the
@@ -3641,6 +3834,12 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         }
         if (kind == 6) { n.kind = 5; return n; }
         if (kind == 7) { n.kind = 6; n.name = t.text; return n; }        if (kind == 39) {
+            // DOCS/274: `new class { ... }` — anonymous class expression.
+            // Desugars to a hidden named class plus a zero-argument `new`
+            // of it (see parseAnonClass).
+            if (this.check(30)) {
+                return this.parseAnonClass(t);
+            }
             Node ctor = new Node();
             ctor.kind = 10;
             ctor.name = this.advance().text;
@@ -4047,10 +4246,22 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         Lexer lx = new Lexer(text);
         Token[] toks = lx.tokenize();
         Parser pp = new Parser(toks);
+        // DOCS/274: holes re-lex into a fresh sub-parser. Carry the
+        // anonymous-class counter across so minted hidden names stay unique,
+        // then take the sub-parser's hidden classes (and their names) back —
+        // otherwise a `new class` inside `$"{...}"` would dangle.
+        pp.anonCounter = this.anonCounter;
         Node en = pp.parseExpr(0);
         for (int e = 0; e < pp.diagErrors.length; e++) { this.recordError(pp.diagErrors[e]); }
         if (!pp.check(0)) {
             this.recordError("Expected end of interpolation hole at line " + (string)hLine + ", column " + (string)hCol);
+        }
+        this.anonCounter = pp.anonCounter;
+        for (int hi = 0; hi < pp.anonClasses.length; hi++) {
+            Node hidden = pp.anonClasses[hi];
+            hidden.srcModule = this.curModule;
+            this.registerDeclaredType(hidden.name);
+            this.anonClasses.add(hidden);
         }
         return en;
     }
