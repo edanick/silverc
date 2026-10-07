@@ -872,6 +872,37 @@ class MiniCg {
             if (expr.childCount() > 0) { return this.findClassForExpr(expr.child(0)); }
             return "";
         }
+        if (expr.kind == 23 && expr.childCount() > 0) { return this.findClassForExpr(expr.child(0)); }
+        if (expr.kind == 7 && expr.childCount() >= 2) {
+            // DOCS/275: an overloaded arithmetic binary yields the
+            // overload's return object so chained member access resolves.
+            if (expr.op == 1 || expr.op == 2 || expr.op == 3 || expr.op == 4 || expr.op == 13) {
+                int bIdx = this.findBinaryOperator(expr.child(0), expr.child(1), expr.op);
+                if (bIdx >= 0 && bIdx < this.funcRetTypes.length) {
+                    string bRet = this.funcRetTypes[bIdx];
+                    if (bRet != "" && this.isClassName(bRet)) { return bRet; }
+                    if (bIdx < this.funcClasses.length) {
+                        string bDecl = this.funcClasses[bIdx];
+                        if (bDecl != "" && this.isClassName(bDecl)) { return bDecl; }
+                    }
+                }
+            }
+            return "";
+        }
+        if (expr.kind == 8 && expr.childCount() > 0) {
+            if (expr.op == 0) {
+                int uIdx = this.findUnaryOperator(expr.child(0), 0);
+                if (uIdx >= 0 && uIdx < this.funcRetTypes.length) {
+                    string uRet = this.funcRetTypes[uIdx];
+                    if (uRet != "" && this.isClassName(uRet)) { return uRet; }
+                    if (uIdx < this.funcClasses.length) {
+                        string uDecl = this.funcClasses[uIdx];
+                        if (uDecl != "" && this.isClassName(uDecl)) { return uDecl; }
+                    }
+                }
+            }
+            return "";
+        }
         if (expr.kind == 6) {
             if (expr.name == "this") {
                 if (this.currentClassName != "") { return this.currentClassName; }
@@ -4723,6 +4754,17 @@ int strIdx = this.stringPatchIndices[i];
         } else if (kind == 7) {
             this.genBinary(expr);
         } else if (kind == 8) {
+            // DOCS/275: unary overloads (`operator!` / unary `operator-`)
+            // win over builtin `!`/`-` when the operand is the declaring
+            // type; `!(bool)` keeps builtin lowering so `!(this == b)`
+            // inside `operator!=` terminates.
+            if ((expr.op == 0 || expr.op == 1) && expr.childCount() > 0) {
+                int uIdx = this.findUnaryOperator(expr.child(0), expr.op);
+                if (uIdx >= 0) {
+                    this.genOperatorUnary(expr.child(0), uIdx);
+                    return;
+                }
+            }
             if (expr.op == 3) {
                 // Address-of operator (&x): compute the address of the operand.
                 // For a simple local variable, emit LEA [rbp+off] instead of
@@ -5681,6 +5723,17 @@ int strIdx = this.stringPatchIndices[i];
             return "";
         }
         if (expr.kind == 7) {
+            // DOCS/275: an overloaded arithmetic binary yields its return
+            // object (comparisons yield bool); chained member access and
+            // method calls resolve through it.
+            if (expr.op == 1 || expr.op == 2 || expr.op == 3 || expr.op == 4 || expr.op == 13) {
+                int bIdx = this.findBinaryOperator(expr.child(0), expr.child(1), expr.op);
+                if (bIdx >= 0 && bIdx < this.funcRetTypes.length) {
+                    string bRet = this.funcRetTypes[bIdx];
+                    if (bRet != "") { return bRet; }
+                    if (bIdx < this.funcClasses.length) { return this.funcClasses[bIdx]; }
+                }
+            }
             if (expr.op == 1) {
                 string lt = this.inferExprType(expr.child(0));
                 string rt = this.inferExprType(expr.child(1));
@@ -5722,6 +5775,17 @@ int strIdx = this.stringPatchIndices[i];
                 return rt;
             }
             return "int";
+        }
+        if (expr.kind == 8) {
+            if (expr.op == 1) { return "bool"; }
+            if (expr.op == 0 && expr.childCount() > 0) {
+                int uIdx = this.findUnaryOperator(expr.child(0), 0);
+                if (uIdx >= 0 && uIdx < this.funcRetTypes.length) {
+                    string uRet = this.funcRetTypes[uIdx];
+                    if (uRet != "") { return uRet; }
+                    if (uIdx < this.funcClasses.length) { return this.funcClasses[uIdx]; }
+                }
+            }
         }
         return "";
     }
@@ -12741,9 +12805,211 @@ public void genNewCall(Node call) {
         this.asm.movqR64XMM(0, 0);
     }
 
+    // DOCS/275: operator overload method name for a binary op.
+    private string binaryOperatorName(int op) {
+        if (op == 1) { return "operator+"; }
+        if (op == 2) { return "operator-"; }
+        if (op == 3) { return "operator*"; }
+        if (op == 4) { return "operator/"; }
+        if (op == 13) { return "operator%"; }
+        if (op == 5) { return "operator=="; }
+        if (op == 6) { return "operator!="; }
+        if (op == 7) { return "operator<"; }
+        if (op == 8) { return "operator<="; }
+        if (op == 9) { return "operator>"; }
+        if (op == 10) { return "operator>="; }
+        return "";
+    }
+
+    // DOCS/275: operator overload method name for a unary op. Only `!`
+    // and unary `-` are overloadable.
+    private string unaryOperatorName(int op) {
+        if (op == 1) { return "operator!"; }
+        if (op == 0) { return "operator-"; }
+        return "";
+    }
+
+    // True for a null literal (possibly parenthesized). `is null` desugars
+    // to `== null` before codegen, so this also covers `is null` checks.
+    private bool isNullOperand(Node expr) {
+        if (expr.kind == 5) { return true; }
+        if (expr.kind == 23 && expr.childCount() > 0) { return this.isNullOperand(expr.child(0)); }
+        return false;
+    }
+
+    // DOCS/275: the class name an operator operand belongs to, for
+    // left-first overload lookup. Strips a trailing `?`.
+    public string operatorClassFor(Node expr) {
+        if (expr.kind == 23 && expr.childCount() > 0) { return this.operatorClassFor(expr.child(0)); }
+        if (expr.kind == 75 && expr.childCount() > 0) { return this.operatorClassFor(expr.child(0)); }
+        if (expr.kind == 6) {
+            if (expr.name == "this") {
+                if (this.currentClassName != "") { return this.currentClassName; }
+                return "";
+            }
+            string lt = this.getLocalType(expr.name);
+            if (lt != "") {
+                string base = lt;
+                if (base.length >= 1 && base[base.length - 1] == '?') { base = base.substring(0, base.length - 1); }
+                if (this.isClassName(base)) { return base; }
+            }
+            if (this.isClassName(expr.name)) { return expr.name; }
+            if (this.currentClassName != "") {
+                string ft = this.findFieldType(this.currentClassName, expr.name);
+                if (ft != "") {
+                    string fbase = ft;
+                    if (fbase.length >= 1 && fbase[fbase.length - 1] == '?') { fbase = fbase.substring(0, fbase.length - 1); }
+                    if (this.isClassName(fbase)) { return fbase; }
+                }
+            }
+            return "";
+        }
+        string t = this.inferExprType(expr);
+        if (t != "") {
+            string base = t;
+            if (base.length >= 1 && base[base.length - 1] == '?') { base = base.substring(0, base.length - 1); }
+            if (this.isClassName(base)) { return base; }
+        }
+        string fc = this.findClassForExpr(expr);
+        if (fc != "") {
+            string base2 = fc;
+            if (base2.length >= 1 && base2[base2.length - 1] == '?') { base2 = base2.substring(0, base2.length - 1); }
+            if (this.isClassName(base2)) { return base2; }
+        }
+        return "";
+    }
+
+    // DOCS/275: resolve an operator overload on `cls` through the MRO.
+    // Returns the function index, or -1 when no ancestor declares it with
+    // an arity accepting `explicitArgs`.
+    public int findOperatorFunc(string cls, string opName, int explicitArgs) {
+        string base = cls;
+        if (base.length >= 1 && base[base.length - 1] == '?') { base = base.substring(0, base.length - 1); }
+        Node noProbe = null;
+        Node noProbeB = null;
+        int own = this.selectOverloadIdx(opName, base, explicitArgs, noProbe, noProbeB);
+        if (own >= 0) { return own; }
+        return this.resolveMroFunc(base, opName, explicitArgs);
+    }
+
+    // DOCS/275: resolve a binary operator overload for `lhs op rhs`.
+    // Returns the function index, or -1. Exact-op lookup only and no
+    // dispatch for null-compared comparisons.
+    public int findBinaryOperator(Node lhs, Node rhs, int op) {
+        string opName = this.binaryOperatorName(op);
+        if (opName == "") { return -1; }
+        if ((op == 5 || op == 6 || op == 7 || op == 8 || op == 9 || op == 10) && (this.isNullOperand(lhs) || this.isNullOperand(rhs))) { return -1; }
+        string lhsCls = this.operatorClassFor(lhs);
+        if (lhsCls != "") {
+            int f1 = this.findOperatorFunc(lhsCls, opName, 1);
+            if (f1 >= 0) { return f1; }
+        }
+        string rhsCls = this.operatorClassFor(rhs);
+        if (rhsCls != "") {
+            int f2 = this.findOperatorFunc(rhsCls, opName, 1);
+            if (f2 >= 0) { return f2; }
+        }
+        return -1;
+    }
+
+    // DOCS/275: resolve a unary operator overload for `op inner`.
+    public int findUnaryOperator(Node inner, int op) {
+        string opName = this.unaryOperatorName(op);
+        if (opName == "") { return -1; }
+        string cls = this.operatorClassFor(inner);
+        if (cls == "") { return -1; }
+        return this.findOperatorFunc(cls, opName, 0);
+    }
+
+    // DOCS/275: emit a resolved binary operator call. The declaring-type
+    // operand binds `this`; the other binds the explicit param. Uses the
+    // instance call ABI with MRO base adjustment via genMemberCall.
+    public void genOperatorBinary(Node lhs, Node rhs, bool leftIsThis, int funcIdx) {
+        Node thisExpr = lhs;
+        Node argExpr = rhs;
+        if (!leftIsThis) { thisExpr = rhs; argExpr = lhs; }
+        Node call = new Node();
+        call.kind = 10;
+        call.name = this.funcNames[funcIdx];
+        call.isMember = true;
+        call.line = thisExpr.line;
+        call.col = thisExpr.col;
+        call.children.add(thisExpr);
+        call.children.add(argExpr);
+        this.genMemberCall(call);
+    }
+
+    // DOCS/275: emit a resolved unary operator call (`this`-only).
+    public void genOperatorUnary(Node inner, int funcIdx) {
+        Node call = new Node();
+        call.kind = 10;
+        call.name = this.funcNames[funcIdx];
+        call.isMember = true;
+        call.line = inner.line;
+        call.col = inner.col;
+        call.children.add(inner);
+        this.genMemberCall(call);
+    }
+
     public void genBinary(Node bin) {
         if (bin.childCount() < 2) { return; }
         int op = bin.op;
+        // DOCS/275: `a += b` (and `-= *= /= %=`) on an overloaded type
+        // lowers to `a = a + b` so the matching binary overload runs.
+        if (op == 14 || op == 15 || op == 16 || op == 17 || op == 29) {
+            int baseOp = 0;
+            if (op == 14) { baseOp = 1; }
+            else if (op == 15) { baseOp = 2; }
+            else if (op == 16) { baseOp = 3; }
+            else if (op == 17) { baseOp = 4; }
+            else if (op == 29) { baseOp = 13; }
+            if (baseOp != 0) {
+                int probeIdx = this.findBinaryOperator(bin.child(0), bin.child(1), baseOp);
+                if (probeIdx >= 0) {
+                    Node updated = new Node();
+                    updated.kind = 7;
+                    updated.op = baseOp;
+                    updated.children.add(bin.child(0));
+                    updated.children.add(bin.child(1));
+                    Node assign = new Node();
+                    assign.kind = 7;
+                    assign.op = 20;
+                    assign.line = bin.line;
+                    assign.col = bin.col;
+                    assign.children.add(bin.child(0));
+                    assign.children.add(updated);
+                    this.genBinary(assign);
+                    return;
+                }
+            }
+        }
+        // DOCS/275: operator overloads win over every builtin numeric /
+        // string lowering, but only when at least one operand is the
+        // declaring type. Exact-op lookup and no dispatch for
+        // null-compared comparisons.
+        string binOpName = this.binaryOperatorName(op);
+        if (binOpName != "") {
+            bool isCmp = op == 5 || op == 6 || op == 7 || op == 8 || op == 9 || op == 10;
+            bool nullBypass = isCmp && (this.isNullOperand(bin.child(0)) || this.isNullOperand(bin.child(1)));
+            if (!nullBypass) {
+                string lhsCls = this.operatorClassFor(bin.child(0));
+                if (lhsCls != "") {
+                    int f1 = this.findOperatorFunc(lhsCls, binOpName, 1);
+                    if (f1 >= 0) {
+                        this.genOperatorBinary(bin.child(0), bin.child(1), true, f1);
+                        return;
+                    }
+                }
+                string rhsCls = this.operatorClassFor(bin.child(1));
+                if (rhsCls != "") {
+                    int f2 = this.findOperatorFunc(rhsCls, binOpName, 1);
+                    if (f2 >= 0) {
+                        this.genOperatorBinary(bin.child(0), bin.child(1), false, f2);
+                        return;
+                    }
+                }
+            }
+        }
         if (op == 25) {
             this.genExpr(bin.child(0));
             this.asm.pushR64(0);
