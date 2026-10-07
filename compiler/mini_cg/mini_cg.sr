@@ -149,6 +149,14 @@ class MiniCg {
     public prop int retValOff;
     public prop string[] classNames;
     public prop string[] classParentClasses;
+    // Multiple inheritance (DOCS/207): every listed parent per class.
+    // classParentClasses above stays the FIRST listed parent (so the
+    // single-parent paths read it unchanged); the full ordered list rides
+    // the flat triple below (starts/counts parallel to classNames, names
+    // in classParentList). Structs record an empty list.
+    public prop int[] classParentStarts;
+    public prop int[] classParentCounts;
+    public prop string[] classParentList;
     public prop string[] enumNames;
     public prop int[] classFieldStarts;
     public prop int[] classFieldCounts;
@@ -369,6 +377,9 @@ class MiniCg {
         this.retValOff = 0;
         this.classNames = [];
         this.classParentClasses = [];
+        this.classParentStarts = [];
+        this.classParentCounts = [];
+        this.classParentList = [];
         this.enumNames = [];
         this.classFieldStarts = [];
         this.classFieldCounts = [];
@@ -464,119 +475,281 @@ class MiniCg {
         // work. Structs (kind 101) share the same layout tables as classes:
         // their fields are parsed as identifier-less kind-0 nodes, so the
         // field-collection pass below reads typeHint/name directly.
+        // Multiple inheritance (DOCS/207): the full ordered parent list
+        // rides classParentStarts/Counts/List; classParentClasses keeps the
+        // first listed parent for the single-parent readers.
         for (int i = 0; i < program.length; i++) {
             Node item = program[i];
             if (item.kind == 102 || item.kind == 101) {
                 this.classNames.add(item.name);
                 this.classParentClasses.add(item.parentClass);
+                this.classParentStarts.add(this.classParentList.length);
+                if (item.kind == 102) {
+                    for (int k = 0; k < item.parentClasses.length; k++) {
+                        this.classParentList.add(item.parentClasses[k]);
+                    }
+                    this.classParentCounts.add(item.parentClasses.length);
+                } else {
+                    this.classParentCounts.add(0);
+                }
                 this.classFieldStarts.add(0);
                 this.classFieldCounts.add(0);
             }
         }
-        // Second pass: collect fields and methods with inheritance. Structs
-        // (kind 101) have no inheritance and no methods; only their fields.
-        int classIdx = 0;
+        // Inheritance errors read like the bootstrap type checker: unknown
+        // parents, duplicates, self-parents, and cycles abort compilation.
+        this.validateInheritance(program);
+        // Second pass: collect fields and methods with inheritance, resolved
+        // iteratively so forward parent references work. A subclass
+        // concatenates its parents' expanded slots in listed order (a field
+        // arriving via two parents keeps one slot per path; direct access
+        // uses the first slot), then appends its own fields (a same-named
+        // own field reuses the inherited first slot). Structs (kind 101)
+        // have no inheritance and no methods; only their fields.
+        int[] classItemIdx = [];
+        for (int i = 0; i < program.length; i++) {
+            if (program[i].kind == 102 || program[i].kind == 101) {
+                classItemIdx.add(i);
+            }
+        }
+        int[] layoutDone = [];
+        for (int i = 0; i < classItemIdx.length; i++) {
+            layoutDone.add(0);
+        }
+        for (int guard = 0; guard < classItemIdx.length + 1; guard++) {
+            bool madeProgress = false;
+            for (int ci = 0; ci < classItemIdx.length; ci++) {
+                if (layoutDone[ci] != 1) {
+                if (program[classItemIdx[ci]].kind == 101) {
+                    Node sitem = program[classItemIdx[ci]];
+                    int sstart = this.classFieldNames.length;
+                    int scnt = 0;
+                    for (int j = 0; j < sitem.childCount(); j++) {
+                        Node smember = sitem.child(j);
+                        this.classFieldNames.add(smember.name);
+                        this.classFieldOffsets.add(scnt * 8);
+                        this.classFieldTypes.add(smember.typeHint);
+                        this.classFieldReadOnly.add(false);
+                        this.classFieldVisible.add(false);
+                        this.classFieldOwner.add(sitem.name);
+                        Node snoInit = new Node();
+                        this.classFieldInits.add(snoInit);
+                        scnt++;
+                    }
+                    this.classFieldStarts[ci] = sstart;
+                    this.classFieldCounts[ci] = scnt;
+                    layoutDone[ci] = 1;
+                    madeProgress = true;
+                } else {
+                    Node citem = program[classItemIdx[ci]];
+                    bool parentsReady = true;
+                    int plist = this.classParentStarts[ci];
+                    int pcnt = this.classParentCounts[ci];
+                    for (int k = 0; k < pcnt; k++) {
+                        int pidx = this.classIndexOf(this.classParentList[plist + k]);
+                        if (pidx < 0 || layoutDone[pidx] == 0) {
+                            parentsReady = false;
+                        }
+                    }
+                    if (parentsReady) {
+                        int start = this.classFieldNames.length;
+                        int cnt = 0;
+                        for (int k = 0; k < pcnt; k++) {
+                            int pidx = this.classIndexOf(this.classParentList[plist + k]);
+                            if (pidx >= 0) {
+                                int pStart = this.classFieldStarts[pidx];
+                                int pCnt = this.classFieldCounts[pidx];
+                                for (int pj = 0; pj < pCnt; pj++) {
+                                    this.classFieldNames.add(this.classFieldNames[pStart + pj]);
+                                    this.classFieldOffsets.add(cnt * 8);
+                                    this.classFieldTypes.add(this.classFieldTypes[pStart + pj]);
+                                    this.classFieldReadOnly.add(this.classFieldReadOnly[pStart + pj]);
+                                    this.classFieldVisible.add(this.classFieldVisible[pStart + pj]);
+                                    this.classFieldOwner.add(this.classFieldOwner[pStart + pj]);
+                                    this.classFieldInits.add(this.classFieldInits[pStart + pj]);
+                                    cnt++;
+                                }
+                            }
+                        }
+                        for (int j = 0; j < citem.childCount(); j++) {
+                            Node member = citem.child(j);
+                            if (member.kind == 50) {
+                                bool shadowed = false;
+                                for (int s = 0; s < cnt; s++) {
+                                    if (this.classFieldNames[start + s] == member.name) {
+                                        shadowed = true;
+                                    }
+                                }
+                                if (!shadowed) {
+                                    this.classFieldNames.add(member.name);
+                                    this.classFieldOffsets.add(cnt * 8);
+                                    this.classFieldTypes.add(member.typeHint);
+                                    this.classFieldReadOnly.add(member.isReadOnly);
+                                    this.classFieldVisible.add(member.isVisible);
+                                    this.classFieldOwner.add(citem.name);
+                                    if (member.isReadOnly && member.childCount() > 0) {
+                                        this.classFieldInits.add(member.child(0));
+                                    } else {
+                                        Node noInit = new Node();
+                                        this.classFieldInits.add(noInit);
+                                    }
+                                    cnt++;
+                                }
+                            }
+                        }
+                        this.classFieldStarts[ci] = start;
+                        this.classFieldCounts[ci] = cnt;
+                        for (int j = 0; j < citem.childCount(); j++) {
+                            Node cmember = citem.child(j);
+                            if (cmember.kind == 100) {
+                                this.methodNames.add(cmember.name);
+                                this.methodClassNames.add(citem.name);
+                            }
+                        }
+                        // Inherited methods: left-to-right depth-first MRO
+                        // (own wins, else the first listed parent wins).
+                        string[] mro = this.ancestryPreOrder(citem.name);
+                        for (int a = 1; a < mro.length; a++) {
+                            for (int mi = 0; mi < this.methodNames.length; mi++) {
+                                if (this.methodClassNames[mi] == mro[a] && this.methodClassNames[mi] != "") {
+                                    bool hasOverride = false;
+                                    for (int mj = 0; mj < this.methodNames.length; mj++) {
+                                        if (this.methodClassNames[mj] == citem.name && this.methodNames[mj] == this.methodNames[mi]) {
+                                            hasOverride = true;
+                                        }
+                                    }
+                                    if (!hasOverride) {
+                                        this.methodNames.add(this.methodNames[mi]);
+                                        this.methodClassNames.add(citem.name);
+                                    }
+                                }
+                            }
+                        }
+                        layoutDone[ci] = 1;
+                        madeProgress = true;
+                    }
+                }
+                }
+            }
+            if (!madeProgress) {
+                break;
+            }
+        }
+    }
+
+    // Multiple inheritance validation (DOCS/207, parity with the bootstrap
+    // type checker): every listed parent must be a known class, no parent
+    // may repeat, no class may list itself, and the parent graph must be
+    // acyclic. Runs after the name-collection pass so forward references
+    // resolve; any violation aborts compilation with the bootstrap message.
+    public void validateInheritance(Node[] program) {
         for (int i = 0; i < program.length; i++) {
             Node item = program[i];
             if (item.kind == 102) {
-                int start = this.classFieldNames.length;
-                int cnt = 0;
-                if (item.parentClass != "") {
-                    int parentIdx = -1;
-                    for (int pi = 0; pi < this.classNames.length; pi++) {
-                        if (this.classNames[pi] == item.parentClass) {
-                            parentIdx = pi;
+                for (int a = 0; a < item.parentClasses.length; a++) {
+                    string pname = item.parentClasses[a];
+                    if (pname == item.name) {
+                        printline((string)item.line + ":" + (string)item.col + ": Cyclic inheritance: inheritance cycle detected involving '" + item.name + " -> " + item.name + "'");
+                        exit(1);
+                        return;
+                    }
+                    bool dup = false;
+                    for (int b = 0; b < a; b++) {
+                        if (item.parentClasses[b] == pname) {
+                            dup = true;
                         }
                     }
-                    if (parentIdx >= 0) {
-                        int pStart = this.classFieldStarts[parentIdx];
-                        int pCnt = this.classFieldCounts[parentIdx];
-                        for (int pj = 0; pj < pCnt; pj++) {
-                            this.classFieldNames.add(this.classFieldNames[pStart + pj]);
-                            this.classFieldOffsets.add(cnt * 8);
-                            this.classFieldTypes.add(this.classFieldTypes[pStart + pj]);
-                            this.classFieldReadOnly.add(this.classFieldReadOnly[pStart + pj]);
-                            this.classFieldVisible.add(this.classFieldVisible[pStart + pj]);
-                            this.classFieldOwner.add(this.classFieldOwner[pStart + pj]);
-                            this.classFieldInits.add(this.classFieldInits[pStart + pj]);
-                            cnt++;
-                        }
+                    if (dup) {
+                        printline((string)item.line + ":" + (string)item.col + ": Duplicate definition '" + pname + "'");
+                        exit(1);
+                        return;
+                    }
+                    if (this.classIndexOf(pname) < 0) {
+                        printline((string)item.line + ":" + (string)item.col + ": Unknown type '" + pname + "'");
+                        exit(1);
+                        return;
                     }
                 }
-                for (int j = 0; j < item.childCount(); j++) {
-                    Node member = item.child(j);
-                    if (member.kind == 50) {
-                        this.classFieldNames.add(member.name);
-                        this.classFieldOffsets.add(cnt * 8);
-                        this.classFieldTypes.add(member.typeHint);
-                        this.classFieldReadOnly.add(member.isReadOnly);
-                        this.classFieldVisible.add(member.isVisible);
-                        this.classFieldOwner.add(item.name);
-                        if (member.isReadOnly && member.childCount() > 0) {
-                            this.classFieldInits.add(member.child(0));
-                        } else {
-                            Node noInit = new Node();
-                            this.classFieldInits.add(noInit);
-                        }
-                        cnt++;
-                    }
-                }
-                this.classFieldStarts[classIdx] = start;
-                this.classFieldCounts[classIdx] = cnt;
-                for (int j = 0; j < item.childCount(); j++) {
-                    Node member = item.child(j);
-                    if (member.kind == 100) {
-                        this.methodNames.add(member.name);
-                        this.methodClassNames.add(item.name);
-                    }
-                }
-                if (item.parentClass != "") {
-                    int parentIdx = -1;
-                    for (int pi = 0; pi < this.classNames.length; pi++) {
-                        if (this.classNames[pi] == item.parentClass) {
-                            parentIdx = pi;
-                        }
-                    }
-                    if (parentIdx >= 0) {
-                        int savedLen = this.methodNames.length;
-                        for (int mi = 0; mi < savedLen; mi++) {
-                            if (this.methodClassNames[mi] == item.parentClass && this.methodClassNames[mi] != "") {
-                                bool hasOverride = false;
-                                for (int mj = 0; mj < this.methodNames.length; mj++) {
-                                    if (this.methodClassNames[mj] == item.name && this.methodNames[mj] == this.methodNames[mi]) {
-                                        hasOverride = true;
-                                    }
-                                }
-                if (!hasOverride) {
-                    this.methodNames.add(this.methodNames[mi]);
-                    this.methodClassNames.add(item.name);
-                }
-                            }
-                        }
-                    }
-                }
-                classIdx++;
-            } else if (item.kind == 101) {
-                // Struct layout: fields only, no inheritance or methods.
-                int start = this.classFieldNames.length;
-                int cnt = 0;
-                for (int j = 0; j < item.childCount(); j++) {
-                    Node member = item.child(j);
-                    this.classFieldNames.add(member.name);
-                    this.classFieldOffsets.add(cnt * 8);
-                    this.classFieldTypes.add(member.typeHint);
-                    this.classFieldReadOnly.add(false);
-                    this.classFieldVisible.add(false);
-                    this.classFieldOwner.add(item.name);
-                    Node noInit = new Node();
-                    this.classFieldInits.add(noInit);
-                    cnt++;
-                }
-                this.classFieldStarts[classIdx] = start;
-                this.classFieldCounts[classIdx] = cnt;
-                classIdx++;
             }
         }
+        int[] color = [];
+        for (int i = 0; i < this.classNames.length; i++) {
+            color.add(0);
+        }
+        for (int r = 0; r < this.classNames.length; r++) {
+            if (color[r] == 0) {
+                string cycle = this.findInheritanceCycle(r, color);
+                if (cycle != "") {
+                    int ln = 0;
+                    int cl = 0;
+                    for (int i = 0; i < program.length; i++) {
+                        if (program[i].kind == 102 && program[i].name == this.classNames[r]) {
+                            ln = program[i].line;
+                            cl = program[i].col;
+                        }
+                    }
+                    printline((string)ln + ":" + (string)cl + ": Cyclic inheritance: inheritance cycle detected involving '" + cycle + "'");
+                    exit(1);
+                    return;
+                }
+            }
+        }
+    }
+
+    // Iterative depth-first cycle search from class table index `root`
+    // (bootstrap parent-graph walk): returns the chain naming the first
+    // cycle found (e.g. `B -> A -> B`), or "" when the reachable subgraph
+    // is acyclic. `color` is shared across roots (0 unvisited, 1 on the
+    // current path, 2 finished).
+    public string findInheritanceCycle(int root, int[] color) {
+        int[] workNode = [];
+        int[] workNext = [];
+        string[] path = [];
+        color[root] = 1;
+        workNode.add(root);
+        workNext.add(0);
+        path.add(this.classNames[root]);
+        while (workNode.length > 0) {
+            int top = workNode.length - 1;
+            int cur = workNode[top];
+            int nxt = workNext[top];
+            if (nxt < this.classParentCounts[cur]) {
+                workNext[top] = nxt + 1;
+                string pname = this.classParentList[this.classParentStarts[cur] + nxt];
+                int pidx = this.classIndexOf(pname);
+                if (pidx >= 0) {
+                    if (color[pidx] == 1) {
+                        int seg = 0;
+                        for (int s = 0; s < path.length; s++) {
+                            if (path[s] == pname) {
+                                seg = s;
+                                break;
+                            }
+                        }
+                        string chain = "";
+                        for (int s = seg; s < path.length; s++) {
+                            if (chain != "") {
+                                chain += " -> ";
+                            }
+                            chain += path[s];
+                        }
+                        chain += " -> " + pname;
+                        return chain;
+                    } else if (color[pidx] == 0) {
+                        color[pidx] = 1;
+                        path.add(pname);
+                        workNode.add(pidx);
+                        workNext.add(0);
+                    }
+                }
+            } else {
+                color[cur] = 2;
+                path.pop();
+                workNode.pop();
+                workNext.pop();
+            }
+        }
+        return "";
     }
 
     public bool isDictType(string t) {
@@ -833,8 +1006,9 @@ class MiniCg {
                 }
             }
         }
-        string ancestor = this.parentClassName(className);
-        while (ancestor != "") {
+        string[] mroOwner = this.ancestryPreOrder(className);
+        for (int d = 1; d < mroOwner.length; d++) {
+            string ancestor = mroOwner[d];
             int astart = -1;
             int acnt = 0;
             for (int i = 0; i < this.classNames.length; i++) {
@@ -853,7 +1027,6 @@ class MiniCg {
                     }
                 }
             }
-            ancestor = this.parentClassName(ancestor);
         }
         return className;
     }
@@ -8834,6 +9007,166 @@ int strIdx = this.stringPatchIndices[i];
         return "";
     }
 
+    // Multiple inheritance helpers (DOCS/207). parentClassName above stays
+    // the first-listed-parent reader; everything below reads the full
+    // ordered list. A method inherited from a non-first parent reads that
+    // parent's subobject, so call sites shift `this` by the declaring
+    // class's base (first-parent-chain bases are 0, exactly the
+    // single-inheritance shape, which stays byte-identical).
+    public int classIndexOf(string className) {
+        for (int i = 0; i < this.classNames.length; i++) {
+            if (this.classNames[i] == className) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    public int parentCount(string className) {
+        int idx = this.classIndexOf(className);
+        if (idx < 0) {
+            return 0;
+        }
+        return this.classParentCounts[idx];
+    }
+
+    public string parentAt(string className, int pos) {
+        int idx = this.classIndexOf(className);
+        if (idx < 0 || pos < 0 || pos >= this.classParentCounts[idx]) {
+            return "";
+        }
+        return this.classParentList[this.classParentStarts[idx] + pos];
+    }
+
+    // Byte offset of direct parent `parent`'s block inside `className`'s
+    // expanded layout: the expanded slots of the parents listed before it.
+    // The first parent always sits at base 0 (prefix layout, exactly like
+    // single inheritance).
+    public int parentBlockBase(string className, string parent) {
+        int base = 0;
+        int idx = this.classIndexOf(className);
+        if (idx < 0) {
+            return 0;
+        }
+        for (int k = 0; k < this.classParentCounts[idx]; k++) {
+            string pname = this.classParentList[this.classParentStarts[idx] + k];
+            if (pname == parent) {
+                return base;
+            }
+            int pidx = this.classIndexOf(pname);
+            if (pidx >= 0) {
+                base += this.classFieldCounts[pidx] * 8;
+            }
+        }
+        return base;
+    }
+
+    // Left-to-right method-resolution order for `className`: the class
+    // itself first, then transitive parents depth-first in listed order
+    // (duplicates skipped, so a diamond visits the shared ancestor once,
+    // at its first-listed position). Cycle-safe via a visited set.
+    public string[] ancestryPreOrder(string className) {
+        string[] order = [];
+        string[] seen = [];
+        this.collectAncestry(className, order, seen);
+        return order;
+    }
+
+    private void collectAncestry(string className, string[] order, string[] seen) {
+        for (int i = 0; i < seen.length; i++) {
+            if (seen[i] == className) {
+                return;
+            }
+        }
+        seen.add(className);
+        order.add(className);
+        int idx = this.classIndexOf(className);
+        if (idx >= 0) {
+            for (int k = 0; k < this.classParentCounts[idx]; k++) {
+                this.collectAncestry(this.classParentList[this.classParentStarts[idx] + k], order, seen);
+            }
+        }
+    }
+
+    // Byte offset of `target`'s subobject inside `className`'s layout along
+    // the first-listed path (depth-first, left-to-right, matching the
+    // method search below). Returns -1 when `target` is not an ancestor.
+    public int subobjectBase(string className, string target) {
+        if (className == target) {
+            return 0;
+        }
+        string[] seen = [];
+        return this.subobjectBaseIn(className, target, 0, seen);
+    }
+
+    private int subobjectBaseIn(string className, string target, int base, string[] seen) {
+        for (int i = 0; i < seen.length; i++) {
+            if (seen[i] == className) {
+                return -1;
+            }
+        }
+        seen.add(className);
+        int idx = this.classIndexOf(className);
+        if (idx < 0) {
+            return -1;
+        }
+        for (int k = 0; k < this.classParentCounts[idx]; k++) {
+            string pname = this.classParentList[this.classParentStarts[idx] + k];
+            int next = base + this.parentBlockBase(className, pname);
+            if (pname == target) {
+                return next;
+            }
+            int deeper = this.subobjectBaseIn(pname, target, next, seen);
+            if (deeper >= 0) {
+                return deeper;
+            }
+        }
+        return -1;
+    }
+
+    // Resolve `name` on `recvClass` through the MRO (own class already
+    // checked by the caller): the first ancestor left-to-right depth-first
+    // whose selectOverloadIdx accepts `nargs`. Returns the function index,
+    // or -1 when no ancestor declares it.
+    public int resolveMroFunc(string recvClass, string name, int nargs) {
+        string base = recvClass;
+        if (base.length >= 1) {
+            if (base[base.length - 1] == '?') {
+                base = base.substring(0, base.length - 1);
+            }
+        }
+        string[] order = this.ancestryPreOrder(base);
+        for (int depth = 0; depth < 64; depth++) {
+            if (depth + 1 >= order.length) {
+                break;
+            }
+            string ancestor = order[depth + 1];
+            int hit = this.selectOverloadIdx(name, ancestor, nargs, null, null);
+            if (hit >= 0) {
+                return hit;
+            }
+        }
+        return -1;
+    }
+
+    // Resolve an inherited `construct` through the MRO (own class already
+    // checked by the caller): the nearest ancestor's constructor in
+    // left-to-right depth-first order. Returns the function index, or -1.
+    public int resolveMroConstructor(string className, int nargs) {
+        string[] order = this.ancestryPreOrder(className);
+        for (int depth = 0; depth < 64; depth++) {
+            if (depth + 1 >= order.length) {
+                break;
+            }
+            string ancestor = order[depth + 1];
+            int hit = this.findConstructor(ancestor, nargs);
+            if (hit >= 0) {
+                return hit;
+            }
+        }
+        return -1;
+    }
+
     public int findConstructor(string className, int nargs) {
         int ctorIdx = -1;
         // Exact-arity match first: `new Env()` must select the no-arg
@@ -8968,17 +9301,21 @@ public void genNewCall(Node call) {
         argTemps.add(t);
     }
     int ctorIdx = this.findConstructor(call.name, nargs);
+    // Base of the constructor's declaring subobject inside the new
+    // instance (0 for own and first-parent-chain constructors, exactly
+    // the single-inheritance shape).
+    int ctorRecvBase = 0;
     if (ctorIdx < 0) {
         // Inherit the nearest ancestor's constructor when this class defines
         // none of its own (e.g. `new ValueException(...)` when
-        // `ValueException extends Exception` has no construct).
-        string current = call.name;
-        for (int guard = 0; guard < this.classNames.length; guard++) {
-            string parent = this.parentClassName(current);
-            if (parent == "") { break; }
-            ctorIdx = this.findConstructor(parent, nargs);
-            if (ctorIdx >= 0) { break; }
-            current = parent;
+        // `ValueException extends Exception` has no construct). MRO:
+        // own first, then parents left-to-right depth-first.
+        ctorIdx = this.resolveMroConstructor(call.name, nargs);
+        if (ctorIdx >= 0) {
+            int ctorBase = this.subobjectBase(call.name, this.funcClasses[ctorIdx]);
+            if (ctorBase > 0) {
+                ctorRecvBase = ctorBase;
+            }
         }
     }
     if (ctorIdx >= 0 && ctorIdx < this.funcOffsets.length) {
@@ -9032,6 +9369,11 @@ public void genNewCall(Node call) {
         int ctorThisReg = 1;
         if (this.isLinuxTarget()) { ctorThisReg = 7; }
         this.asm.movRMBase(ctorThisReg, 5, tmpOff);
+        if (ctorRecvBase != 0) {
+            // Inherited from a non-first parent: shift `this` to the
+            // declaring class's subobject within the MI layout.
+            this.asm.addRI32(ctorThisReg, ctorRecvBase);
+        }
         for (int i = 0; i < nargs && i + 1 < ctorNreg; i++) {
             if (this.isLinuxTarget()) {
                 this.asm.movRMBase(this.sysvRegAt(i + 1), 5, argTemps[i]);
@@ -9113,7 +9455,11 @@ public void genNewCall(Node call) {
 
     public void genSuperCall(Node call) {
         // super(arg0, arg1, ...) - call parent class constructor with `this`.
-        // Only valid inside a class constructor.
+        // Only valid inside a class constructor. Multiple inheritance
+        // (DOCS/207): super() calls the FIRST listed parent's construct
+        // (classParentClasses holds the first parent); remaining parents'
+        // fields are initialized manually. The first parent sits at base 0,
+        // so `this` passes unshifted.
         if (this.currentFunctionName != "construct") { return; }
 
         // Find parent class of the current class.
@@ -12118,23 +12464,28 @@ public void genNewCall(Node call) {
         // that declares it, not to the any-class fallback below (which
         // binds the LAST same-named method of ANY class -- e.g.
         // ScrollBar.markDirty() bound GalleryHost.markDirty(), whose
-        // foreign field layout faulted on first access). Walk the parent
-        // chain nearest-first (parity with silverc-rs resolve_method
-        // parent walk); the nullable "?" suffix reads through to the base
-        // class exactly like the exact-class check above.
+        // foreign field layout faulted on first access). Walk the ancestry
+        // left-to-right depth-first (DOCS/207 MRO: own wins, else the
+        // first listed parent wins); the nullable "?" suffix reads through
+        // to the base class exactly like the exact-class check above.
+        // A method from a non-first parent reads that parent's subobject,
+        // so the receiver shifts by its base below (0 for own and
+        // first-parent-chain methods, exactly the single-inheritance
+        // shape).
+        int recvBase = 0;
         if (funcIdx < 0) {
-            string ancestor = recvClass;
-            if (ancestor.length >= 1) {
-                if (ancestor[ancestor.length - 1] == '?') {
-                    ancestor = ancestor.substring(0, ancestor.length - 1);
+            funcIdx = this.resolveMroFunc(recvClass, name, explicitUserArgs);
+            if (funcIdx >= 0) {
+                string recvStripped = recvClass;
+                if (recvStripped.length >= 1) {
+                    if (recvStripped[recvStripped.length - 1] == '?') {
+                        recvStripped = recvStripped.substring(0, recvStripped.length - 1);
+                    }
                 }
-            }
-            ancestor = this.parentClassName(ancestor);
-            for (int depth = 0; depth < 64; depth++) {
-                if (ancestor == "") { break; }
-                funcIdx = this.selectOverloadIdx(name, ancestor, explicitUserArgs, null, null);
-                if (funcIdx >= 0) { break; }
-                ancestor = this.parentClassName(ancestor);
+                int base = this.subobjectBase(recvStripped, this.funcClasses[funcIdx]);
+                if (base > 0) {
+                    recvBase = base;
+                }
             }
         }
         // DOCS/259 G2: a zero-arg member call on a receiver whose class
@@ -12244,6 +12595,15 @@ public void genNewCall(Node call) {
             }
             int argOff = this.scratchBaseOffset - (8 * (scratchBase + i));
             this.asm.movMBaseR(5, 0, argOff);
+        }
+        if (recvBase != 0) {
+            // Inherited from a non-first parent: the method reads that
+            // parent's subobject, so shift the spilled receiver by its base
+            // before it loads into registers or stack slots below.
+            int recvOff = this.scratchBaseOffset - (8 * scratchBase);
+            this.asm.movRMBase(0, 5, recvOff);
+            this.asm.addRI32(0, recvBase);
+            this.asm.movMBaseR(5, 0, recvOff);
         }
 
         int extraStack = 0;
