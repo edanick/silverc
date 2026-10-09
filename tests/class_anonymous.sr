@@ -1,0 +1,118 @@
+// DOCS/274 — anonymous classes: `new class { ... }` expressions.
+// DataProviderManager singleton (private provider list with
+// register/validate/count), isolation between two instances,
+// immediate (unbound) calls, and inheritance from a named parent.
+class Provider {
+    string name;
+
+    construct(string n) {
+        this.name = n;
+    }
+
+    string describe() {
+        return this.name;
+    }
+}
+
+class Service {
+    string title;
+
+    construct(string t) {
+        this.title = t;
+    }
+
+    string label() {
+        return "service:" + this.title;
+    }
+}
+
+void check(bool ok, string label) {
+    if (!ok) {
+        printline("FAIL " + label);
+        exit(1);
+    }
+}
+
+void main() {
+    var DataProviderManager = new class {
+        private Provider[] providers;
+
+        construct {
+            this.providers = [];
+        }
+
+        public void register(Provider p) {
+            this.providers.add(p);
+        }
+
+        public int count() {
+            return this.providers.length;
+        }
+
+        public void validate() {
+            if (this.providers.length == 0) {
+                printline("manager: no providers");
+            } else {
+                printline("manager: providers ok");
+            }
+        }
+    };
+    DataProviderManager.validate();
+    check(DataProviderManager.count() == 0, "manager starts empty");
+    DataProviderManager.register(new Provider("alpha"));
+    DataProviderManager.register(new Provider("beta"));
+    printline(DataProviderManager.count());
+    check(DataProviderManager.count() == 2, "manager holds two");
+    DataProviderManager.validate();
+
+    var OtherManager = new class {
+        private Provider[] providers;
+
+        construct {
+            this.providers = [];
+        }
+
+        public void register(Provider p) {
+            this.providers.add(p);
+        }
+
+        public int count() {
+            return this.providers.length;
+        }
+    };
+    check(OtherManager.count() == 0, "second instance starts empty");
+    OtherManager.register(new Provider("solo"));
+    check(OtherManager.count() == 1, "second instance holds one");
+    check(DataProviderManager.count() == 2, "first instance undisturbed");
+
+    new class {
+        public void hello() {
+            printline("immediate hello");
+        }
+    }.hello();
+
+    int answer = new class {
+        public int value() {
+            return 42;
+        }
+    }.value();
+    check(answer == 42, "immediate return");
+    printline(answer);
+
+    var Dog = new class extends Service {
+        construct {
+            this.title = "Rex";
+        }
+
+        public string tag() {
+            return this.label() + "!";
+        }
+    };
+    printline(Dog.label());
+    check(Dog.label() == "service:Rex", "inherited method");
+    check(Dog.tag() == "service:Rex!", "own method");
+
+    printline($"manager holds {(DataProviderManager.count())} providers");
+
+    printline("anonymous classes ok");
+}

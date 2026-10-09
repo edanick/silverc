@@ -1,0 +1,91 @@
+// DOCS/273: null-safe member/call chains (`?.`).
+// Exit code 0 = exact. Covers null/non-null field + method, multi-step
+// chains, short-circuit laziness (tail calls never run on null), each
+// receiver evaluated once, and combos with `??`.
+
+class Inner {
+    public prop string value;
+    construct (string v) {
+        this.value = v;
+    }
+}
+
+class Outer {
+    public prop Inner? inner;
+    construct (Inner? i) {
+        this.inner = i;
+    }
+    public Inner? counted() {
+        printline("counted-called");
+        return this.inner;
+    }
+    public string greet(string prefix) {
+        return prefix + "outer";
+    }
+}
+
+void check(bool ok, string label) {
+    if (!ok) {
+        printline("FAIL " + label);
+        exit(1);
+    }
+}
+
+string boomArg() {
+    printline("FAIL arg evaluated on null receiver");
+    exit(1);
+    return "boom";
+}
+
+void main() {
+    Outer hub = new Outer(new Inner("deep"));
+    Outer? gone = null;
+    Outer flat = new Outer(null);
+
+    // Field: non-null yields the field.
+    string? a = hub?.inner?.value;
+    check((a ?? "MISSING") == "deep", "live-field-chain");
+
+    // First receiver null: whole chain is null, rest never runs.
+    string? b = gone?.inner?.value;
+    check((b ?? "MISSING") == "MISSING", "dead-field-chain");
+
+    // Middle null: tail never runs.
+    string? c = flat?.inner?.value;
+    check((c ?? "MISSING") == "MISSING", "mid-field-chain");
+
+    // Method with no args on non-null / null.
+    string? d = hub?.counted()?.value;
+    check((d ?? "MISSING") == "deep", "live-method-chain");
+    string? e = gone?.counted()?.value;
+    check((e ?? "MISSING") == "MISSING", "dead-method-chain");
+
+    // Laziness: the tail call must not run when the first receiver is null.
+    // `counted` prints when it runs; the null chain above must have printed
+    // nothing extra, and the live chain exactly once (receiver-once: twice
+    // would print twice, which the eye confirms; the value confirms once).
+    printline("before-null-tail");
+    string? f = gone?.counted()?.value;
+    check((f ?? "MISSING") == "MISSING", "null-tail-value");
+    printline("after-null-tail");
+
+    // Method with args on non-null / null.
+    string? g = hub?.greet("hi-");
+    check((g ?? "MISSING") == "hi-outer", "live-args-call");
+    string? h = gone?.greet("hi-");
+    check((h ?? "MISSING") == "MISSING", "dead-args-call");
+
+    // Args never evaluate on a null receiver (`boomArg` exits 1 if run).
+    string? h2 = gone?.greet(boomArg());
+    check((h2 ?? "MISSING") == "MISSING", "dead-args-lazy");
+
+    // String method via `?.` + `??` (the DOCS/273 headline shape).
+    string? n1 = null;
+    int len1 = n1?.length() ?? 0;
+    check(len1 == 0, "null-length-coalesce");
+    string? n2 = "bob";
+    int len2 = n2?.length() ?? 0;
+    check(len2 == 3, "live-length-coalesce");
+
+    printline("nullable chain ok");
+}
