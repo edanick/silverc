@@ -1,6 +1,7 @@
 mod export log;
 import {stringify} from json;
 import {writeString} from fs;
+import {Exception} from exception;
 
 public const int TRACE = 0;
 public const int DEBUG = 1;
@@ -8,10 +9,21 @@ public const int INFO = 2;
 public const int WARN = 3;
 public const int ERROR = 4;
 
-private int currentLevel = 2;
-private string currentFormat = "[${level}] ${message}";
-private string logFile = "";
-private bool useFile = false;
+class LogState {
+    public int level;
+    public string format;
+    public string file;
+    public bool useFile;
+
+    construct {
+        this.level = 2;
+        this.format = "[${level}] ${message}";
+        this.file = "";
+        this.useFile = false;
+    }
+}
+
+private LogState state = new LogState();
 
 private string levelName(int level) {
     if (level == 0) { return "TRACE"; }
@@ -23,20 +35,20 @@ private string levelName(int level) {
 }
 
 private void writeLog(int level, string message, object data) {
-    if (level < currentLevel) { return; }
-    string line = currentFormat.replace("${level}", levelName(level)).replace("${message}", message);
+    if (level < state.level) { return; }
+    string line = state.format.replace("${level}", levelName(level)).replace("${message}", message);
     if (data != null) {
         line += " " + json.stringify(data);
     }
-    if (useFile) {
-        fs.writeString(logFile, line + "\n");
+    if (state.useFile) {
+        fs.writeString(state.file, line + "\n");
     } else {
         printline(line);
     }
 }
 
-public void setLevel(int level) { currentLevel = level; }
-public void setFormat(string fmt) { currentFormat = fmt; }
+public void setLevel(int level) { state.level = level; }
+public void setFormat(string fmt) { state.format = fmt; }
 
 public void trace(string msg) { writeLog(TRACE, msg, null); }
 public void debug(string msg) { writeLog(DEBUG, msg, null); }
@@ -44,9 +56,21 @@ public void info(string msg) { writeLog(INFO, msg, null); }
 public void info(string msg, object data) { writeLog(INFO, msg, data); }
 public void warn(string msg) { writeLog(WARN, msg, null); }
 public void error(string msg) { writeLog(ERROR, msg, null); }
-public void error(string msg, exception ex) { writeLog(ERROR, msg + ": " + ex.message, null); }
+public void error(string msg, Exception ex) {
+    // NOTE (probed on the self-hosted macx64 backend): formulations that
+    // rebind a concat involving the cross-module `ex.message` field (inline
+    // call argument, or reassignment of a local first bound to it) corrupt
+    // the heap and abort in libsystem_malloc on a later allocation. The
+    // fresh-local two-step below is stable in small call graphs but still
+    // unreliable when surrounded by many other log calls (compiler-level
+    // string/field aliasing bug, mini_cg); DOCS/174 therefore logs errors
+    // through the one-argument error(msg) overload.
+    string message = ex.message;
+    string detail = msg + ": " + message;
+    writeLog(ERROR, detail, null);
+}
 
 public void toFile(string path) {
-    logFile = path;
-    useFile = true;
+    state.file = path;
+    state.useFile = true;
 }

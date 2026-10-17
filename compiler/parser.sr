@@ -1038,6 +1038,7 @@ class Parser {
         this.expect(100);
         Node v = new Node();
         v.kind = 50;
+        bool leadVt = this.parseLeadStar();
         string vt = this.advance().text;
         if (this.check(120)) {
             while (!this.check(121) && !this.check(106) && !this.check(103)) {
@@ -1046,6 +1047,8 @@ class Parser {
             if (this.check(121)) { vt += ">"; this.advance(); }
         }
         while (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } vt += "[]"; }
+        vt = this.parsePointerSuffix(vt);
+        vt = this.applyLeadStar(vt, leadVt);
         if (this.check(123)) { this.advance(); vt += "?"; }
         v.typeHint = vt;
         v.name = this.advance().text;
@@ -2197,6 +2200,7 @@ class Parser {
                 this.advance();
                 while (!this.check(101) && !this.check(0)) {
                     Node param = new Node();
+                    bool leadCpt = this.parseLeadStar();
                     string cpt = this.advance().text;
                     if (this.check(120)) {
                         while (!this.check(121) && !this.check(106) && !this.check(103)) {
@@ -2205,6 +2209,8 @@ class Parser {
                         if (this.check(121)) { cpt += ">"; this.advance(); }
                     }
                     while (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } cpt += "[]"; }
+                    cpt = this.parsePointerSuffix(cpt);
+                    cpt = this.applyLeadStar(cpt, leadCpt);
                     if (this.check(123)) { this.advance(); cpt += "?"; }
                     if (this.check(100)) {
                         // DOCS/259 G1 -- function-typed constructor parameter
@@ -2276,6 +2282,7 @@ class Parser {
             this.advance();
             Node field = new Node();
             field.kind = 50;
+            bool leadProp = this.parseLeadStar();
             string ft = this.advance().text;
             if (this.check(120)) {
                 while (!this.check(121) && !this.check(106) && !this.check(103)) {
@@ -2291,6 +2298,8 @@ class Parser {
                 ft = "void ()";
             }
             while (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } ft += "[]"; }
+            ft = this.parsePointerSuffix(ft);
+            ft = this.applyLeadStar(ft, leadProp);
             if (this.check(123)) { this.advance(); ft += "?"; }
             field.typeHint = ft;
             field.name = this.advance().text;
@@ -2353,8 +2362,14 @@ class Parser {
         // `Type name (` probe would misread the shape.
         Node? opMethod = this.tryParseOperator(memberStatic, memberInternal, memberExplicitPrivate);
         if (opMethod != null) { return opMethod; }
-        if (this.check(28) || this.check(18) || this.check(19) || this.check(20) || this.check(21) || this.check(25) || this.check(27) || this.check(22) || this.check(23) || this.check(26) || this.check(17) || this.check(7)) {
+        if (this.check(28) || this.check(18) || this.check(19) || this.check(20) || this.check(21) || this.check(25) || this.check(27) || this.check(22) || this.check(23) || this.check(26) || this.check(17) || this.check(7) || this.looksLikeLeadDecl()) {
             int savedPos = this.pos;
+            // Plain-field leading `*` is DISCARDED (silveri parity: its
+            // class-field branch sets `field.typeHint = typ` with no `*`
+            // appended, so `internal * string serial` is a normal string
+            // field). A method shape below restores savedPos, so `*T name()`
+            // still reaches parseFunction with pointer semantics.
+            this.parseLeadStar();
             string ft = this.advance().text;
             if (this.check(120)) {
                 while (!this.check(121) && !this.check(106) && !this.check(103)) {
@@ -2371,6 +2386,7 @@ class Parser {
                 ft = "void ()";
             }
             while (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } ft += "[]"; }
+            ft = this.parsePointerSuffix(ft);
             if (this.check(123)) { this.advance(); ft += "?"; }
             if (this.check(7) && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 106) {
                 Node field = new Node();
@@ -2436,7 +2452,7 @@ class Parser {
                 }
             }
         }
-        bool canStart = this.check(17) || this.check(18) || this.check(19) || this.check(20) || this.check(21) || this.check(22) || this.check(23) || this.check(25) || this.check(26) || this.check(27) || this.check(28) || this.check(7) || this.check(120);
+        bool canStart = this.check(17) || this.check(18) || this.check(19) || this.check(20) || this.check(21) || this.check(22) || this.check(23) || this.check(25) || this.check(26) || this.check(27) || this.check(28) || this.check(7) || this.check(120) || this.check(113);
         if (!canStart) { return null; }
         int saved = this.pos;
         bool isVoid = false;
@@ -2446,8 +2462,9 @@ class Parser {
             isVoid = true;
         } else {
             Token rtTok = this.peek();
-            bool rtOk = rtTok.kind == 18 || rtTok.kind == 19 || rtTok.kind == 20 || rtTok.kind == 21 || rtTok.kind == 22 || rtTok.kind == 23 || rtTok.kind == 25 || rtTok.kind == 26 || rtTok.kind == 27 || rtTok.kind == 28 || rtTok.kind == 7 || rtTok.kind == 120;
+            bool rtOk = rtTok.kind == 18 || rtTok.kind == 19 || rtTok.kind == 20 || rtTok.kind == 21 || rtTok.kind == 22 || rtTok.kind == 23 || rtTok.kind == 25 || rtTok.kind == 26 || rtTok.kind == 27 || rtTok.kind == 28 || rtTok.kind == 7 || rtTok.kind == 120 || rtTok.kind == 113;
             if (!rtOk) { this.pos = saved; return null; }
+            bool leadOpRet = this.parseLeadStar();
             retType = this.advance().text;
             if (retType == "<") {
                 while (!this.check(121) && !this.check(106) && !this.check(103) && !this.check(0)) {
@@ -2465,6 +2482,8 @@ class Parser {
                 if (this.check(105)) { this.advance(); }
                 retType += "[]";
             }
+            retType = this.parsePointerSuffix(retType);
+            retType = this.applyLeadStar(retType, leadOpRet);
             if (this.check(123)) { this.advance(); retType += "?"; }
         }
         if (!(this.check(7) && this.peek().text == "operator")) { this.pos = saved; return null; }
@@ -2506,6 +2525,7 @@ class Parser {
             if (this.check(107)) { this.advance(); continue; }
             if (!this.tokenStartsParam(this.peek().kind)) { break; }
             Token ptStart = this.peek();
+            bool leadOpPt = this.parseLeadStar();
             string pt = this.advance().text;
             if (this.check(120)) {
                 while (!this.check(121) && !this.check(106) && !this.check(103) && !this.check(0)) {
@@ -2514,6 +2534,8 @@ class Parser {
                 if (this.check(121)) { pt += ">"; this.advance(); }
             }
             while (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } pt += "[]"; }
+            pt = this.parsePointerSuffix(pt);
+            pt = this.applyLeadStar(pt, leadOpPt);
             if (this.check(123)) { this.advance(); pt += "?"; }
             if (this.check(100)) {
                 Token ftTok = this.peek();
@@ -2603,7 +2625,7 @@ class Parser {
     // Kinds that can begin a parameter's type inside a `( ... )` list.
     private bool tokenStartsParam(int kind) {
         if (kind == 17 || kind == 18 || kind == 19 || kind == 20 || kind == 21 || kind == 22 || kind == 23 || kind == 25 || kind == 26 || kind == 27) { return true; }
-        if (kind == 28 || kind == 7 || kind == 120 || kind == 50 || kind == 51) { return true; }
+        if (kind == 28 || kind == 7 || kind == 120 || kind == 50 || kind == 51 || kind == 113) { return true; }
         if (kind == 150 || kind == 151 || kind == 152 || kind == 153 || kind == 154 || kind == 155) { return true; }
         return false;
     }
@@ -2621,7 +2643,9 @@ class Parser {
             if (this.check(167)) { node.isInternal = true; }
             this.advance();
         }
-        string retType = this.advance().text;
+        string retType = "";
+        bool leadFnRet = this.parseLeadStar();
+        retType = this.advance().text;
         if (this.check(120)) {
             while (!this.check(121) && !this.check(106) && !this.check(103)) {
                 retType += this.advance().text;
@@ -2635,6 +2659,8 @@ class Parser {
             if (this.check(121)) { retType += ">"; this.advance(); }
         }
         while (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } retType += "[]"; }
+        retType = this.parsePointerSuffix(retType);
+        retType = this.applyLeadStar(retType, leadFnRet);
         if (this.check(123)) { this.advance(); retType += "?"; }
         node.typeHint = retType;
         node.name = this.advance().text;
@@ -2662,6 +2688,7 @@ class Parser {
                 return node;
             }
             Node param = new Node();
+            bool leadFnPt = this.parseLeadStar();
             string pt = this.advance().text;
             if (this.check(120)) {
                 while (!this.check(121) && !this.check(106) && !this.check(103)) {
@@ -2670,6 +2697,8 @@ class Parser {
                 if (this.check(121)) { pt += ">"; this.advance(); }
             }
             while (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } pt += "[]"; }
+            pt = this.parsePointerSuffix(pt);
+            pt = this.applyLeadStar(pt, leadFnPt);
             if (this.check(123)) { this.advance(); pt += "?"; }
             if (this.check(100)) {
                 // DOCS/259 -- function-typed parameter suffix: `void () name`
@@ -2737,6 +2766,7 @@ class Parser {
         if (variadicTail) { this.sigVariadic.add(1); } else { this.sigVariadic.add(0); }
         if (this.check(145)) {
             this.advance();
+            bool leadArrow = this.parseLeadStar();
             string ret = this.advance().text;
             if (this.check(120)) {
                 while (!this.check(121) && !this.check(106) && !this.check(103)) {
@@ -2745,6 +2775,8 @@ class Parser {
                 if (this.check(121)) { ret += ">"; this.advance(); }
             }
             while (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } ret += "[]"; }
+            ret = this.parsePointerSuffix(ret);
+            ret = this.applyLeadStar(ret, leadArrow);
             if (this.check(123)) { this.advance(); ret += "?"; }
             node.typeHint = ret;
         }
@@ -2852,6 +2884,13 @@ class Parser {
                 }
             }
         }
+        // Leading-star local declaration `*T name ...` (DOCS/50): only a
+        // `*` + full-type + identifier shape declares; dereference, index,
+        // call and multiply shapes (`*p = v;`, `*p[i];`, `*f(x);`, `*a * b;`)
+        // stay expression statements (see looksLikeLeadDecl).
+        if (this.looksLikeLeadDecl()) {
+            return this.parseVarDecl();
+        }
         if (this.check(7) && this.pos + 1 < this.tokens.length) {
             Token next = this.tokens[this.pos + 1];
             if (next.kind == 7) {
@@ -2930,6 +2969,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         if (this.check(151)) {
             this.advance();
             Node n = new Node(); n.kind = 73; n.isAlias = true;
+            bool leadAlias = this.parseLeadStar();
             string aliasType = this.advance().text;
             if (this.check(120)) {
                 while (!this.check(121) && !this.check(106) && !this.check(103)) {
@@ -2942,6 +2982,8 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 this.expect(105);
                 aliasType += "[]";
             }
+            aliasType = this.parsePointerSuffix(aliasType);
+            aliasType = this.applyLeadStar(aliasType, leadAlias);
             if (this.check(123)) { this.advance(); aliasType += "?"; }
             n.typeHint = aliasType;
             n.name = this.advance().text;
@@ -3041,6 +3083,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         this.expect(165);
         n.name = this.advance().text;
         this.expect(110);
+        bool leadTAlias = this.parseLeadStar();
         string aliasType = this.advance().text;
         if (this.check(120)) {
             while (!this.check(121) && !this.check(106) && !this.check(103)) {
@@ -3053,6 +3096,8 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             this.expect(105);
             aliasType += "[]";
         }
+        aliasType = this.parsePointerSuffix(aliasType);
+        aliasType = this.applyLeadStar(aliasType, leadTAlias);
         if (this.check(123)) { this.advance(); aliasType += "?"; }
         n.typeHint = aliasType;
         this.registerDeclaredType(n.name);
@@ -3060,15 +3105,133 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         return n;
     }
 
+    // DOCS/50: pointer type suffix `T*` (at minimum `int32*`, generalized
+    // to any `T*`): after the `[]` array suffixes, one trailing `*` makes
+    // the type a raw-address pointer (values are 8-byte cells). Mirrors
+    // silverc-rs parse_type (arrays, then a single `*`, then `?`). A
+    // second `*` is left unconsumed so `int** p` fails loudly downstream
+    // instead of silently becoming a pointer.
+    private string parsePointerSuffix(string base) {
+        if (this.check(113)) { this.advance(); return base + "*"; }
+        return base;
+    }
+
+    // DOCS/50 leading-star pointer types (`*T` in annotation position):
+    // guarded consume of one leading `*` (token 113). Returns true when a
+    // star was consumed. A `*` NOT followed by a type-start token is left
+    // alone (deref `*p`, multiply, `&&` never reach these sites with a
+    // type-start next, and the two statement/member dispatches use the
+    // fuller looksLikeLeadDecl lookahead below). A second `*` (`**T`) is
+    // a loud error, mirroring how a second trailing `*` fails downstream.
+    private bool parseLeadStar() {
+        if (!this.check(113)) { return false; }
+        if (!this.typeStartsAt(this.pos + 1)) { return false; }
+        this.advance();
+        if (this.check(113)) {
+            Token t = this.peek();
+            this.recordError((string)t.line + ":" + (string)t.col + ": pointer type takes only one `*`; write `T*` or `*T` (see DOCS/50)");
+            while (this.check(113)) { this.advance(); }
+        }
+        return true;
+    }
+
+    // Fold a consumed leading star into the trailing form, so `*T` and
+    // `T*` share exactly one typeHint and all downstream codegen (deref,
+    // address printing, ref-param exclusion). `*T*` is a loud error.
+    // NOTE: the plain class/struct FIELD path deliberately does NOT call
+    // this (it discards the star, matching silveri's class-field branch
+    // which sets `field.typeHint = typ` with no `*` appended).
+    private string applyLeadStar(string base, bool lead) {
+        if (!lead) { return base; }
+        if (base.endsWith("*")) {
+            Token t = this.peek();
+            this.recordError((string)t.line + ":" + (string)t.col + ": pointer type `" + base + "` takes only one `*`; write `T*` or `*T` (see DOCS/50)");
+            return base;
+        }
+        return base + "*";
+    }
+
+    // True when tokens[at] can start a type name (mirrors the member
+    // dispatch and tokenStartsParam kind sets). Lead-star lookahead only.
+    private bool typeStartsAt(int at) {
+        if (at < 0 || at >= this.tokens.length) { return false; }
+        int k = this.tokens[at].kind;
+        if (k == 17 || k == 18 || k == 19 || k == 20 || k == 21 || k == 22 || k == 23 || k == 25 || k == 26 || k == 27) { return true; }
+        if (k == 28 || k == 7 || k == 120) { return true; }
+        return false;
+    }
+
+    // True for `* Type name ...` declaration shapes (locals and members):
+    // a leading `*`, one full type (base + `<...>` generics + `[]` pairs +
+    // `?`, plus an optional second `*` which still counts as decl-shaped
+    // so `*T*` errors as a declaration, not a dereference), then an
+    // identifier. Dereference/index/call shapes (`*p = v;`, `*p[i];`,
+    // `*f(x);`, `*a * b;`, `*a.b;`) never have an identifier there and
+    // stay expression statements.
+    private bool looksLikeLeadDecl() {
+        if (!this.check(113)) { return false; }
+        int at = this.pos + 1;
+        if (!this.typeStartsAt(at)) { return false; }
+        if (this.tokens[at].kind == 120) {
+            at++;
+            while (at < this.tokens.length && this.tokens[at].kind != 121 && this.tokens[at].kind != 106 && this.tokens[at].kind != 103) { at++; }
+            if (at >= this.tokens.length || this.tokens[at].kind != 121) { return false; }
+            at++;
+        } else {
+            at++;
+            if (at < this.tokens.length && this.tokens[at].kind == 120) {
+                at++;
+                while (at < this.tokens.length && this.tokens[at].kind != 121 && this.tokens[at].kind != 106 && this.tokens[at].kind != 103) { at++; }
+                if (at >= this.tokens.length || this.tokens[at].kind != 121) { return false; }
+                at++;
+            }
+        }
+        while (at + 1 < this.tokens.length && this.tokens[at].kind == 104 && this.tokens[at + 1].kind == 105) { at += 2; }
+        if (at < this.tokens.length && this.tokens[at].kind == 123) { at++; }
+        if (at < this.tokens.length && this.tokens[at].kind == 113) { at++; }
+        if (at >= this.tokens.length || this.tokens[at].kind != 7) { return false; }
+        return true;
+    }
+
     private Node parseTypeNameInit() {
         Node n = new Node(); n.kind = 50;
+        bool leadLocal = this.parseLeadStar();
         string typeName = this.advance().text;
         if (this.check(120)) {
             bool isTupleType = typeName == "tuple";
-            while (!this.check(121) && !this.check(106) && !this.check(103)) {
-                this.advance();
+            // Keep the generic arguments in the type hint (e.g.
+            // `dict<string,P> d;` records "dict<string,P>", not "dict"):
+            // params, props and type aliases already collect them, and
+            // codegen's dict value typing (dictValueType) needs them so
+            // `d[k].field` resolves the value class. Nested generics
+            // (`dict<string, dict<string,int>>`) track bracket depth so
+            // only the MATCHING `>` ends the hint. `tuple` keeps its
+            // opaque single-word hint.
+            int genDepth = 0;
+            bool genClosed = false;
+            while (!this.check(106) && !this.check(103)) {
+                if (this.check(121)) {
+                    genDepth--;
+                    typeName += this.advance().text;
+                    if (genDepth == 0) { genClosed = true; break; }
+                    continue;
+                }
+                if (this.check(141)) {
+                    // The lexer fuses `>>` (token 141): nested generics
+                    // that close together (`dict<string, dict<string,int>>`)
+                    // end on one token closing two levels.
+                    genDepth -= 2;
+                    typeName += this.advance().text;
+                    if (genDepth <= 0) { genClosed = true; break; }
+                    continue;
+                }
+                if (this.check(120)) { genDepth++; }
+                typeName += this.advance().text;
             }
-            this.expect(121);
+            if (!genClosed) {
+                if (this.check(121)) { typeName += ">"; this.advance(); }
+                else { this.expect(121); }
+            }
             if (isTupleType) { typeName = "tuple"; }
         } else if (typeName == "<") {
             // Union/result type `<A | B>` (DOCS/29) or nullable `<T>`: collect
@@ -3083,6 +3246,8 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             this.expect(105);
             typeName += "[]";
         }
+        typeName = this.parsePointerSuffix(typeName);
+        typeName = this.applyLeadStar(typeName, leadLocal);
         if (this.check(123)) { this.advance(); typeName += "?"; }
         n.typeHint = typeName;
         if (this.check(50)) { this.advance(); n.isMut = true; }
@@ -3213,8 +3378,11 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         if (this.check(53)) {
             this.advance();
             this.expect(100);
+            bool leadCatch = this.parseLeadStar();
             string catchType = this.advance().text;
             while (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } catchType += "[]"; }
+            catchType = this.parsePointerSuffix(catchType);
+            catchType = this.applyLeadStar(catchType, leadCatch);
             if (this.check(123)) { this.advance(); catchType += "?"; }
             n.name = this.advance().text;
             n.typeHint = catchType;
@@ -4094,6 +4262,26 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         return -1;
     }
 
+    // True when the token after a `match` token cannot begin a match
+    // subject: `) ; , ] }` end the expression, `.`/`?.`/`?[`/ternary
+    // continue it, and the binary/assignment operators take it as an
+    // operand. A match subject can never start with any of these, so every
+    // currently-valid program keeps the match-expression parse exactly.
+    // Anything else (notably `(` and expression-leading tokens) keeps the
+    // legacy match-expression path.
+    private bool matchIsIdentAhead() {
+        if (this.pos >= this.tokens.length) { return false; }
+        int nk = this.tokens[this.pos].kind;
+        if (nk == 101 || nk == 103 || nk == 105 || nk == 106 || nk == 107) { return true; }
+        if (nk == 108 || nk == 163 || nk == 169 || nk == 109 || nk == 123) { return true; }
+        if (nk == 110 || nk == 114 || nk == 115 || nk == 118) { return true; }
+        if (nk == 130 || nk == 131 || nk == 132 || nk == 133) { return true; }
+        if (nk == 134 || nk == 135 || nk == 136 || nk == 137) { return true; }
+        if (nk == 138 || nk == 139 || nk == 140 || nk == 141) { return true; }
+        if (nk == 142 || nk == 143 || nk == 148 || nk == 170) { return true; }
+        return false;
+    }
+
     private Node parsePrefix() {
         Token t = this.advance();
         Node n = new Node();
@@ -4103,11 +4291,15 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         if (kind == 1) {
             // Number literal.  The token text distinguishes ints from floats:
             // a float's spelling contains a '.' (46) or exponent marker
-            // 'e'/'E' (101/69), which the lexer preserves verbatim.
+            // 'e'/'E' (101/69), which the lexer preserves verbatim. Hex
+            // spellings are exempt: their 'e'/'E' are DIGITS (0x5e is 94,
+            // not 5e0), flagged by the lexer's isHexNum.
             bool isFloat = false;
-            for (int tc = 0; tc < t.text.length; tc++) {
-                int tcc = t.text[tc];
-                if (tcc == 46 || tcc == 101 || tcc == 69) { isFloat = true; break; }
+            if (!t.isHexNum) {
+                for (int tc = 0; tc < t.text.length; tc++) {
+                    int tcc = t.text[tc];
+                    if (tcc == 46 || tcc == 101 || tcc == 69) { isFloat = true; break; }
+                }
             }
             if (isFloat) { n.kind = 1; n.intVal = t.intVal; }
             else { n.kind = 0; n.intVal = t.intVal; }
@@ -4197,6 +4389,12 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         }
 
         if (kind == 16) {
+            // `match` as an identifier (DOCS/176 `bool match = ...`): when
+            // the next token cannot begin a match subject, this is a variable
+            // reference, not a match expression.
+            if (this.matchIsIdentAhead()) {
+                n.kind = 6; n.name = t.text; return n;
+            }
             // `match (subject) { pattern => expr; ... }` is an expression: the
             // value of the matched arm is the match's value.  Arms may carry a
             // guard `pattern if cond => body` (DOCS/154); the guard (if any)
@@ -4383,6 +4581,10 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         if (kind == 122) { n.kind = 8; n.op = 1; n.children.add(this.parseExpr(10)); return n; }
         if (kind == 119) { n.kind = 8; n.op = 2; n.children.add(this.parseExpr(10)); return n; }
         if (kind == 116) { n.kind = 8; n.op = 3; n.children.add(this.parseExpr(10)); return n; }
+        // DOCS/50: dereference `*p` — a value expression loading the 8-byte
+        // cell at the address `p` holds. Prefix position only, so infix
+        // multiply (`a * b`) is unaffected.
+        if (kind == 113) { n.kind = 8; n.op = 4; n.children.add(this.parseExpr(10)); return n; }
         if (kind == 156) {
             Node a = new Node(); a.kind = 72;
             a.children.add(this.parseExpr(10));

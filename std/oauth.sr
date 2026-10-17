@@ -15,8 +15,15 @@ class request {
 
     construct(token t) { this.tok = t; }
 
-    public string get(string url) {
-        return http.get(url);
+    // NOTE: named `fetch`, not `get` -- a method named `get` in a std module
+    // miscompiles EVERY http.get call site in that module on the self-host
+    // s4 backend (the emitter binds the qualified http.get call back to the
+    // class's own method -> runaway recursion -> SIGSEGV; verified by probe:
+    // the same body under any other name runs clean). The local-copy dodge
+    // below additionally avoids the parameter/this register overlap.
+    public string fetch(string url) {
+        string u = url;
+        return http.get(u);
     }
 }
 
@@ -28,13 +35,17 @@ class client {
     private string tokenUrl;
     private string[] scopes;
 
-    construct(object config) {
-        this.clientId = config.clientId;
-        this.clientSecret = config.clientSecret;
-        this.redirectUri = config.redirectUri;
-        this.authUrl = config.authUrl;
-        this.tokenUrl = config.tokenUrl;
-        this.scopes = config.scopes;
+    // Positional config: object-literal construction (`{key: value}` named
+    // args) is not a Silver form, so the five config strings and the scope
+    // list arrive as plain positional arguments.
+    construct(string clientId, string clientSecret, string redirectUri,
+              string authUrl, string tokenUrl, string[] scopes) {
+        this.clientId = clientId;
+        this.clientSecret = clientSecret;
+        this.redirectUri = redirectUri;
+        this.authUrl = authUrl;
+        this.tokenUrl = tokenUrl;
+        this.scopes = scopes;
     }
 
     public string authorizationUrl(string responseType) {

@@ -110,7 +110,50 @@ class JsonParser {
                 s += this.advance();
             } else { break; }
         }
-        return float64(s);
+        return this.strToF(s);
+    }
+
+    // Manual decimal parse: the float64(string) conversion is unreliable on
+    // the self-host (it converts the string POINTER), so numbers are
+    // accumulated digit by digit: [minus] digits [. digits] [eE [+-] exp].
+    private float64 strToF(string s) {
+        int i = 0;
+        bool neg = false;
+        if (i < s.length && s[i] == '-') { neg = true; i++; }
+        float64 whole = 0.0;
+        while (i < s.length && s[i] >= '0' && s[i] <= '9') {
+            whole = whole * 10.0 + float64(s[i] - '0');
+            i++;
+        }
+        float64 frac = 0.0;
+        if (i < s.length && s[i] == '.') {
+            i++;
+            float64 scale = 0.1;
+            while (i < s.length && s[i] >= '0' && s[i] <= '9') {
+                frac += float64(s[i] - '0') * scale;
+                scale /= 10.0;
+                i++;
+            }
+        }
+        float64 result = whole + frac;
+        if (i < s.length && (s[i] == 'e' || s[i] == 'E')) {
+            i++;
+            bool eneg = false;
+            if (i < s.length && (s[i] == '+' || s[i] == '-')) {
+                if (s[i] == '-') { eneg = true; }
+                i++;
+            }
+            int exp = 0;
+            while (i < s.length && s[i] >= '0' && s[i] <= '9') {
+                exp = exp * 10 + (s[i] - '0');
+                i++;
+            }
+            float64 m = 1.0;
+            for (int k = 0; k < exp; k++) { m *= 10.0; }
+            if (eneg) { result /= m; } else { result *= m; }
+        }
+        if (neg) { return -result; }
+        return result;
     }
 
     private bool parseBool() {
@@ -124,104 +167,77 @@ class JsonParser {
             this.pos += s.length;
         }
     }
-}
 
-class JsonSerializer {
-    private prop int indentLevel;
-
-    construct { this.indentLevel = 0; }
-
-    private string indentStr(int indent) {
+    private string spaces(int n) {
         string s = "";
-        for (int i = 0; i < this.indentLevel * indent; i++) { s += " "; }
+        for (int i = 0; i < n; i++) { s += " "; }
         return s;
     }
 
-    public string stringify(object val, int indent) {
-        return this.serialize(val, indent, false);
-    }
-
-    public string stringifyMulti(object val, int indent, bool multiline) {
-        return this.serialize(val, indent, multiline);
-    }
-
-    private string serialize(object val, int indent, bool multi) {
-        if (val == null) { return "null"; }
-        if (val is bool) {
-            if (val as bool) { return "true"; }
+    // Pretty-print (DOCS/96 json beautify): parse the NEXT value and render
+    // it with `indent` spaces per nesting level, one member per line --
+    // python json.dumps(data, indent=N) formatting. Empty objects/arrays
+    // stay inline ("{}" / "[]").
+    private string parsePrettyValue(int level, int indent) {
+        char? c = this.peek();
+        if (c == null) { return "null"; }
+        if (c == '{') { return this.parsePrettyObject(level, indent); }
+        if (c == '[') { return this.parsePrettyArray(level, indent); }
+        if (c == '"') { return "\"" + this.parseString() + "\""; }
+        if (c == 't' || c == 'f') {
+            if (this.parseBool()) { return "true"; }
             return "false";
         }
-        if (val is int || val is float64 || val is float) { return val.toString(); }
-        if (val is string) { return "\"" + this.escape(val as string) + "\""; }
-        if (val is dict<string, object>) {
-            return this.serializeDict(val as dict<string, object>, indent, multi);
-        }
-        if (val is object[]) {
-            return this.serializeArray(val as object[], indent, multi);
-        }
-        return val.toString();
+        if (c == 'n') { this.expect("null"); return "null"; }
+        return (string)this.parseNumber();
     }
 
-    private string escape(string s) {
-        string r = "";
-        foreach (char c in s) {
-            if (c == '"') { r += "\\\""; }
-            else if (c == '\\') { r += "\\\\"; }
-            else if (c == '\n') { r += "\\n"; }
-            else if (c == '\t') { r += "\\t"; }
-            else if (c == '\r') { r += "\\r"; }
-            else { r += c; }
+    private string parsePrettyObject(int level, int indent) {
+        this.advance();
+        if (this.peek() == '}') { this.advance(); return "{}"; }
+        string pad = this.spaces((level + 1) * indent);
+        string endPad = this.spaces(level * indent);
+        string out = "{";
+        while (true) {
+            this.skip();
+            string key = this.parseString();
+            this.skip();
+            this.expect(":");
+            this.skip();
+            string val = this.parsePrettyValue(level + 1, indent);
+            out += "\n" + pad + "\"" + key + "\": " + val;
+            this.skip();
+            if (this.peek() == '}') { this.advance(); break; }
+            if (this.peek() == ',') { this.advance(); out += ","; }
         }
-        return r;
+        out += "\n" + endPad + "}";
+        return out;
     }
 
-    private string serializeDict(dict<string, object> d, int indent, bool multi) {
-        string[] keys = [];
-        foreach (string k in d.keys()) { keys.add(k); }
-        if (keys.length == 0) { return "{}"; }
-        if (!multi) {
-            string r = "{";
-            for (int i = 0; i < keys.length; i++) {
-                if (i > 0) { r += ", "; }
-                r += "\"" + keys[i] + "\": " + this.serialize(d[keys[i]], indent, false);
-            }
-            r += "}";
-            return r;
+    private string parsePrettyArray(int level, int indent) {
+        this.advance();
+        if (this.peek() == ']') { this.advance(); return "[]"; }
+        string pad = this.spaces((level + 1) * indent);
+        string endPad = this.spaces(level * indent);
+        string out = "[";
+        while (true) {
+            string val = this.parsePrettyValue(level + 1, indent);
+            out += "\n" + pad + val;
+            this.skip();
+            if (this.peek() == ']') { this.advance(); break; }
+            if (this.peek() == ',') { this.advance(); out += ","; }
         }
-        this.indentLevel++;
-        string r = "{\n";
-        for (int i = 0; i < keys.length; i++) {
-            if (i > 0) { r += ",\n"; }
-            r += this.indentStr(indent) + "\"" + keys[i] + "\": " + this.serialize(d[keys[i]], indent, true);
-        }
-        r += "\n";
-        this.indentLevel--;
-        r += this.indentStr(indent) + "}";
-        return r;
+        out += "\n" + endPad + "]";
+        return out;
     }
+}
 
-    private string serializeArray(object[] arr, int indent, bool multi) {
-        if (arr.length == 0) { return "[]"; }
-        if (!multi) {
-            string r = "[";
-            for (int i = 0; i < arr.length; i++) {
-                if (i > 0) { r += ", "; }
-                r += this.serialize(arr[i], indent, false);
-            }
-            r += "]";
-            return r;
-        }
-        this.indentLevel++;
-        string r = "[\n";
-        for (int i = 0; i < arr.length; i++) {
-            if (i > 0) { r += ",\n"; }
-            r += this.indentStr(indent) + this.serialize(arr[i], indent, true);
-        }
-        r += "\n";
-        this.indentLevel--;
-        r += this.indentStr(indent) + "]";
-        return r;
-    }
+// json.stringify(text, <options>) divert target (DOCS/96): parse raw JSON
+// text and return the pretty-printed form.
+public string beautify(string jsonStr, int indent) {
+    if (indent <= 0) { indent = 2; }
+    JsonParser p = new JsonParser(jsonStr);
+    return p.parsePrettyValue(0, indent);
 }
 
 public object parse(string jsonStr) {
@@ -235,17 +251,3 @@ public void load(string filepath, object obj) {
     obj = p.parseValue();
 }
 
-public string stringify(object val, int indent) {
-    JsonSerializer s = new JsonSerializer();
-    return s.stringify(val, indent);
-}
-
-public string stringify(object val, int indent, bool multiline) {
-    JsonSerializer s = new JsonSerializer();
-    return s.stringifyMulti(val, indent, multiline);
-}
-
-public string beautify(string jsonStr) {
-    object parsed = parse(jsonStr);
-    return stringify(parsed, 2, true);
-}

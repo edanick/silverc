@@ -345,7 +345,12 @@ string projectSourcePath(string root, string[] sourceDirs, string moduleName) {
 }
 
 bool projectBuiltin(string name) {
-    return name == "fs" || name == "json" || name == "yaml"
+    // fs/llmai/os stay native (compiler-lowered builtins). json/yaml load
+    // their Silver sources from std/ (DOCS/66-69): the reference toolchain
+    // implements them natively, but the self-host compiles the Silver
+    // parsers (whose serializers were removed — `is <Type>` runtime
+    // dispatch is not Silver in either toolchain, see DOCS/275).
+    return name == "fs"
         || name == "llmai" || name == "LLMAI"
         || name == "os";
 }
@@ -1099,7 +1104,13 @@ string projectStripDirectivesCustom(string source, NativeModules nm) {
             }
             bool isWin32Import = isImportLine && projectFind(trimmed, "win32", 0) >= 0;
             bool isLinuxImport = isImportLine && projectFind(trimmed, "linux", 0) >= 0;
-            if (isImportLine && !isWin32Import && !isLinuxImport) {
+            // MAC.md Phase D: mac grant imports ride beside win32/linux ones
+            // (mac.libsystem, ...). Without this the parser never sees them
+            // on MAC-filtered builds and every mac native call reports
+            // `unknown method`. Kept lines that match no mac grant are
+            // harmless (the mac recorder only answers to `mac`/`mac.`).
+            bool isMacImport = isImportLine && projectFind(trimmed, "mac", 0) >= 0;
+            if (isImportLine && !isWin32Import && !isLinuxImport && !isMacImport) {
                 bool keepCustom = false;
                 int impPos = projectFind(trimmed, "import", 0);
                 int semiPos = projectFind(trimmed, ";", 0);
@@ -1396,6 +1407,7 @@ string projectExpandCollections(string source, string root, string collections) 
             if (semi < 0) {
                 projectCollectionFail("missing .col path", line);
             }
+            string tail = projectSlice(path, semi, path.length);
             path = projectTrim(projectSlice(path, 0, semi));
             if (collections.length == 0 || path.length == 0 || !projectHasSuffix(path, ".col") || projectFind(path, "..", 0) >= 0) {
                 projectCollectionFail(path, line);
@@ -1403,11 +1415,11 @@ string projectExpandCollections(string source, string root, string collections) 
             if (path[0] == '/' || path[0] == '\\') {
                 projectCollectionFail(path, line);
             }
-            string fullPath = projectJoin(root, collections + "\\" + path);
+            string fullPath = projectJoin(projectJoin(root, collections), path);
             if (!file.exists(fullPath)) {
                 projectCollectionFail(path, line);
             }
-            lineParts.add(prefix + " = " + projectCollectionLiteral(fullPath) + projectSlice(path, semi, path.length));
+            lineParts.add(prefix + " = " + projectCollectionLiteral(fullPath) + tail);
         } else {
             lineParts.add(text);
         }

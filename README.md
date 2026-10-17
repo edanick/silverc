@@ -13,7 +13,19 @@ one language for many possibilities.
 - **Version:** 0.7.9.4
 - **Copyright:** © 2025 Edan M.
 
+## macOS Port
+
+- **Copyright:** © 2026 StavA
+- Enabling support for Silver on macOS
+- Enabling Silver compiler support on macOS (Rosetta x86_64 backend)
+- Maintainer and QA of the macOS version (unit tests)
+- Programming language creator: Edan M.
+
 ## Quick start
+
+The macOS stage-1 executable is in [`executables/macos/`](executables/macos/).
+The macOS workspace's test fixtures are in [`Mac Tests/`](Mac%20Tests/).
+See their READMEs for the known test failures and unsuccessful stage-3 bootstrap.
 
 ### Put `silverc` on your `PATH`
 

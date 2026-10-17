@@ -27,17 +27,21 @@ import * from watcher;
 import * from progress;
 import * from visibility;
 import * from preprocess;
+import * from macx64;
 // Timing and pid identity ride the universal std modules (time -> QPC behind
 // its own #on WINDOWS regions; sysinfo -> GetCurrentProcessId likewise). No
 // bare win32 import remains in the driver: the only raw OS surface left is
-// the JIT child-process runner, whose calls sit inside a #on WINDOWS region
-// (see jitExecute) because process.run cannot supply its contract (no exit
-// code, faults on self-host — see that function's comment).
+// the JIT child-process runner, whose calls sit inside #on WINDOWS / #on
+// LINUX / #on MAC regions (see jitExecute) because process.run cannot supply
+// its contract (no exit code, faults on self-host — see that function's
+// comment).
 import * from time;
 import * from datetime;
 import * from sysinfo;
 #on LINUX
 import * from linux.libc;
+#on MAC
+import * from mac.libsystem;
 #off
 
 // Print the final success line on STDERR (alongside the progress lines) once
@@ -65,12 +69,18 @@ string cacheMarkerPrefix() {
 void printHelp() {
     printline("Silver Compiler v0.7.9.4");
     printline("Copyright: © 2025 Edan M.");
+    printline("Silver for macOS: Copyright © 2026 StavA - macOS support,");
+    printline("macOS compiler support, maintainer and QA of the macOS version");
+    printline("(unit tests). Programming language creator: Edan M.");
     printline("");
     printline("Usage:");
 #on WINDOWS
     printline("  silverc [options] [<input.sr> [<output.exe>]]");
     printline("  silverc -i <input.sr> -o <output.exe>");
 #on LINUX
+    printline("  silverc [options] [<input.sr> [<output>]]");
+    printline("  silverc -i <input.sr> -o <output>");
+#on MAC
     printline("  silverc [options] [<input.sr> [<output>]]");
     printline("  silverc -i <input.sr> -o <output>");
 #off
@@ -83,6 +93,8 @@ void printHelp() {
 #on WINDOWS
     printline("  -o <file>         Output executable file (default: silverc.exe)");
 #on LINUX
+    printline("  -o <file>         Output executable file (default: silverc)");
+#on MAC
     printline("  -o <file>         Output executable file (default: silverc)");
 #off
     printline("");
@@ -103,7 +115,7 @@ void printHelp() {
     printline("  --cache-object    Persistent per-target object cache (<os>-<arch> under the same root)");
     printline("  --watch           Predictive precompilation watcher");
     printline("  --threads <N>     Explicit worker count (default: total threads - 2)");
-    printline("  --os windows|linux|mac  Target OS (default: host; WINDOWS, LINUX, MAC)");
+    printline("  --os windows|linux|mac|macx64  Target OS (default: host; WINDOWS, LINUX, MAC, MACX64)");
     printline("  --debug           Debug build-mode: feeds `#on DEBUG` regions (default is release)");
     printline("  --release         Release is the default build mode, no flag needed - don't use this. Not a flag: prints a notice (default mode is release) and exits");
     printline("");
@@ -113,6 +125,9 @@ void printHelp() {
     printline("  silverc input.sr output.exe");
     printline("  silverc -i input.sr -o output.exe");
 #on LINUX
+    printline("  silverc input.sr output");
+    printline("  silverc -i input.sr -o output");
+#on MAC
     printline("  silverc input.sr output");
     printline("  silverc -i input.sr -o output");
 #off
@@ -636,8 +651,8 @@ string collectImports(string source, string inputFile, string ignored, string[] 
 // (no shell involved — CreateProcessA maps straight onto the OS), wait for
 // it to finish, and hand its exit code back to the caller.
 //
-// The spawn ladder stays a raw `#on WINDOWS` region (the one OS layer this
-// driver carries): std process.run() cannot stand in for it — it passes a
+// The spawn ladder stays raw `#on` regions (the one OS layer this driver
+// carries): std process.run() cannot stand in for it — it passes a
 // null lpProcessInformation (faults 0xC0000005 on the self-hosted compiler
 // on every path, per the std/process.sr header), never waits explicitly, and
 // hardcodes exitCode = 0 instead of reading the child's exit code, while the
@@ -646,6 +661,10 @@ string collectImports(string source, string inputFile, string ignored, string[] 
 // LINUX branch (additive, below) mirrors this with a TEMP ELF +
 // fork/execve/waitpid ladder via linux.libc; the WINDOWS ladder stays
 // byte-identical.
+// MAC branch (additive, below) mirrors this with a TEMP Mach-O +
+// posix_spawn/waitpid ladder via mac.libsystem (Darwin has no bare fork:
+// macos.rs deliberately absents fork/execve; posix_spawn is the native
+// spawn). The WINDOWS/LINUX ladders stay byte-identical.
 // ---------------------------------------------------------------------------
 
 int jitExecute(CliFlags flags, int[] peData, string inputPath) {
@@ -680,6 +699,30 @@ int jitExecute(CliFlags flags, int[] peData, string inputPath) {
     file.delete(elfPath);
     return (st >> 8) & 0xFF;
     #off
+    #on MAC
+    // Darwin spawn: posix_spawn (NOT fork/execve — absent from the mac grant
+    // tables, matching silverc-rs macos.rs) + waitpid, via mac.libsystem
+    // (imported above). argv/env ride null exactly like the LINUX ladder's
+    // execve(elfPath, null, null): the entry rebuilds argv itself.
+    string tmpM = env.get("TMPDIR");
+    if (tmpM.length == 0) { tmpM = "/tmp"; }
+    string jitDirM = tmpM + "/silverc-jit";
+    ensureDirTree(jitDirM);
+    string stemM = drvFileStem(inputPath);
+    if (stemM.length == 0) { stemM = "jit"; }
+    string machoPath = jitDirM + "/" + stemM + "_" + (string)datetime.now().milliseconds() + "_" + (string)sysinfo.pid();
+    file.writeBytes(machoPath, peData);
+    int pidM = 0;
+    int spawnRc = posix_spawn(&pidM, machoPath, null, null, null, null);
+    if (spawnRc != 0 || pidM <= 0) {
+        flags.errLine("jit: failed to execute " + machoPath);
+        return 1;
+    }
+    int stM = 0;
+    waitpid(pidM, &stM, 0);
+    file.delete(machoPath);
+    return (stM >> 8) & 0xFF;
+    #off
     file.writeBytes(exePath, peData);
     #on WINDOWS
     // Zeroed STARTUPINFO (104 bytes) and PROCESS_INFORMATION (24 bytes)
@@ -701,8 +744,9 @@ int jitExecute(CliFlags flags, int[] peData, string inputPath) {
     file.delete(exePath);
     return gotCode;
     #off
-    // Non-Windows machines have no spawn backend yet (regions are filled on
-    // those machines later); the same failure shape as a failed spawn.
+    // Non-Windows/non-Linux/non-Mac machines have no spawn backend yet
+    // (regions are filled on those machines later); the same failure shape
+    // as a failed spawn.
     flags.errLine("jit: failed to execute " + exePath);
     return 1;
 }
@@ -1231,6 +1275,9 @@ void main() {
         printline("Language: Silver");
         printline("Version:  0.7.9.4");
         printline("Copyright: © 2025 Edan M.");
+        printline("Silver for macOS: Copyright © 2026 StavA - macOS support,");
+        printline("macOS compiler support, maintainer and QA of the macOS version");
+        printline("(unit tests). Programming language creator: Edan M.");
         printline("Run with --help for usage information.");
         exit(0);
     }
@@ -1295,6 +1342,8 @@ void main() {
     #on WINDOWS
     if (outputFile.length == 0) { outputFile = "silverc.exe"; }
     #on LINUX
+    if (outputFile.length == 0) { outputFile = "silverc"; }
+    #on MAC
     if (outputFile.length == 0) { outputFile = "silverc"; }
     #off
 
@@ -1619,10 +1668,20 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
         string[] preAbs = [];
         for (int ci0 = 0; ci0 < chunks.paths.length; ci0++) {
             string chunkAbs0 = chunks.paths[ci0].replaceAll("/", "\\");
+            // FS-native spelling for the stat below: marker paths arrive
+            // with `/` separators, which the `\` key spelling above keeps
+            // for the record keys (relOf/bcNormKey fold them back). On
+            // LINUX/MAC a `\` path never stats — modification() falls back
+            // to the epoch default and freshness rode the hash alone.
+            // WINDOWS keeps the `\` spelling verbatim.
+            string chunkFs0 = chunkAbs0;
+            #on LINUX or MAC
+            chunkFs0 = chunkAbs0.replaceAll("\\", "/");
+            #off
             int hashEnd0 = chunks.ends[ci0];
             if (hashEnd0 > chunks.starts[ci0] && hashEnd0 < source.length && source[hashEnd0 - 1] == '\n') { hashEnd0--; }
             int64 chunkHash0 = hash.fnv1(source, chunks.starts[ci0], hashEnd0);
-            int chunkMtime0 = file.modification(chunkAbs0).milliseconds();
+            int chunkMtime0 = file.modification(chunkFs0).milliseconds();
             preHashes.add(chunkHash0);
             preMtimes.add(chunkMtime0);
             preAbs.add(chunkAbs0);
@@ -1705,7 +1764,12 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
         drvNm = projectParseNativeModules(manifest);
     }
     PipeParseOut pout = new PipeParseOut();
-    pipeParseUnit(tokens, lineLens, true, drvNm, ppTargetOsFor(flags.targetOs), true, pout);
+    // MAC.md Phase D: the Rosetta bridge emits SysV, so native grants
+    // resolve Linux-side (linux.* names lower through the SysV call
+    // shapes and link from libSystem at finalize).
+    string parseTargetOs = ppTargetOsFor(flags.targetOs);
+    if (parseTargetOs == "MACX64") { parseTargetOs = "LINUX"; }
+    pipeParseUnit(tokens, lineLens, true, drvNm, parseTargetOs, true, pout);
     ast = pout.program;
 
     // Post-parse call diagnostics (EXCEPTIONS/*.md): unknown-method /
@@ -1811,6 +1875,50 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
     // internal __silver_rt_alloc pointer slot inside the data area.
     cg.appendRuntimeData();
 
+    // MAC.md Phase D (additive): Rosetta-bridge (MACX64) finalize. The
+    // emission above already ran as SysV (isLinuxTarget covers MACX64);
+    // here imports remap to their macOS owners and the image links as a
+    // non-PIE x86_64 Mach-O. --runtime has no bridge support yet (loud).
+    bool isMacX64 = cg.targetOs == "MACX64";
+    if (isMacX64 && flags.mode == 2) {
+        eprintln("silverc: --runtime is not supported with --os macx64");
+        exit(1);
+    }
+    if (isMacX64) {
+        int macEntryOff = cg.mainLabelOffset;
+        if (cg.globalNames.length > 0) { macEntryOff = cg.entryOffset; }
+        if (cg.runtimeEntryOffset >= 0) { macEntryOff = cg.runtimeEntryOffset; }
+        int[] macCode = asm.getBytes();
+        int[] macData = cg.getStringData();
+        for (int zg = 0; zg < cg.globalAreaSize; zg++) { macData.add(0); }
+        string[] macFuncNames = [];
+        for (int mi = 0; mi < cg.importDlls.length; mi++) {
+            string mDll = cg.importDlls[mi];
+            string mFn = cg.importFuncs[mi];
+            if (mDll == "libc.so.6" || mDll == "") {
+                mDll = "/usr/lib/libSystem.B.dylib";
+            } else if (mDll == "libcrypto.so.3") {
+                mDll = "/usr/lib/libcrypto.dylib";
+            } else if (mDll != "/usr/lib/libSystem.B.dylib" && mDll != "/usr/lib/libcrypto.dylib") {
+                eprintln("silverc: --os macx64 cannot link " + mDll + " (" + mFn + "); Windows-only modules are unsupported on macOS");
+                exit(1);
+            }
+            cg.importDlls[mi] = mDll;
+            macFuncNames.add("_" + mFn);
+        }
+        int64[] macLayout = macX64Plan(macCode.length, macData.length, macFuncNames.length, macEntryOff);
+        cg.macX64DataVaddr = macLayout[2];
+        cg.macX64SlotAddrs = [];
+        for (int si = 0; si < macFuncNames.length; si++) {
+            cg.macX64SlotAddrs.add(macLayout[5] + si * 8);
+        }
+        cg.patchForwardCalls(macCode);
+        cg.patchStringRefs(macCode, 0, 0);
+        cg.patchMacX64ImportRefs(macCode);
+        cg.patchRuntimeRefs(macCode, 0, 0);
+        cg.patchGlobalRefs(macCode, macData.length - cg.globalAreaSize, 0);
+        peData = macX64Emit(macLayout, macCode, macData, macFuncNames);
+    } else {
     int entryOff = cg.mainLabelOffset;
     if (cg.globalNames.length > 0) { entryOff = cg.entryOffset; }
     if (cg.runtimeEntryOffset >= 0) { entryOff = cg.runtimeEntryOffset; }
@@ -1853,6 +1961,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
 
     pe.globalAreaSize = cg.globalAreaSize;
     peData = pe.build(finalCode, stringData, versionData);
+    } // end else (non-MACX64 finalize)
     }
 
     if (flags.mode == 1) {

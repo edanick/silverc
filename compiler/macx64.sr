@@ -1,0 +1,358 @@
+mod export macx64;
+
+// MAC.md Phase D (additive) -- x86_64 Mach-O writer for the macOS Rosetta
+// bridge. UNGATED free functions (usable from any host build): the driver
+// calls macX64Plan() for addresses, patches code, then macX64Emit().
+// Layout mirrors silverc-rs macho_x64 (validated on hardware): __PAGEZERO /
+// __TEXT (headers + code) / __DATA (strings + state, RW) / __DATA_CONST
+// (non-lazy slots, SG_READ_ONLY, chained fixups) / __LINKEDIT (fixups +
+// empty trie); LC_LOAD_DYLINKER offset-12 form, LC_UUID, LC_LOAD_DYLIB
+// libSystem (sole source, ordinal 1), LC_BUILD_VERSION, LC_MAIN, non-PIE.
+// Deterministic (UUID derives from content lengths): repeated self-builds
+// converge byte-identically.
+//
+// NOTE: Silver array parameters are by-value handles (heap writes share,
+// growth past capacity stays local), so every append helper RETURNS the
+// array and callers re-adopt it (`buf = macX64AddU32(buf, v)`).
+
+int macX64AlignUp(int64 v, int64 a) {
+    int64 m = v % a;
+    if (m != 0) { return v + (a - m); }
+    return v;
+}
+
+// True when a native import returns 32-bit C int (rather than a 64-bit
+// value or pointer). x86-64 zeroes RAX's high half on EAX writes, so
+// without a sign-extending movSlq after the call Silver's 64-bit int
+// would observe 4294967295 instead of -1. Mirrors silverc-rs
+// native_returns_32bit; conservative (unknown names return false).
+bool macX64Returns32Bit(string name) {
+    if (name == "open") { return true; }
+    if (name == "close") { return true; }
+    if (name == "read") { return true; }
+    if (name == "write") { return true; }
+    if (name == "unlink") { return true; }
+    if (name == "rename") { return true; }
+    if (name == "mkdir") { return true; }
+    if (name == "rmdir") { return true; }
+    if (name == "chmod") { return true; }
+    if (name == "fchmod") { return true; }
+    if (name == "ioctl") { return true; }
+    if (name == "fcntl") { return true; }
+    if (name == "dup") { return true; }
+    if (name == "dup2") { return true; }
+    if (name == "pipe") { return true; }
+    if (name == "socket") { return true; }
+    if (name == "connect") { return true; }
+    if (name == "bind") { return true; }
+    if (name == "listen") { return true; }
+    if (name == "accept") { return true; }
+    if (name == "shutdown") { return true; }
+    if (name == "getsockopt") { return true; }
+    if (name == "setsockopt") { return true; }
+    if (name == "send") { return true; }
+    if (name == "recv") { return true; }
+    if (name == "sendto") { return true; }
+    if (name == "recvfrom") { return true; }
+    if (name == "stat") { return true; }
+    if (name == "fstat") { return true; }
+    if (name == "lstat") { return true; }
+    if (name == "ftruncate") { return true; }
+    if (name == "nanosleep") { return true; }
+    if (name == "clock_gettime") { return true; }
+    if (name == "select") { return true; }
+    if (name == "poll") { return true; }
+    if (name == "kqueue") { return true; }
+    if (name == "kevent") { return true; }
+    if (name == "waitpid") { return true; }
+    if (name == "kill") { return true; }
+    if (name == "chdir") { return true; }
+    if (name == "fchdir") { return true; }
+    if (name == "sysctl") { return true; }
+    if (name == "sysctlbyname") { return true; }
+    if (name == "atoi") { return true; }
+    if (name == "abs") { return true; }
+    if (name == "rand") { return true; }
+    if (name == "getpid") { return true; }
+    if (name == "getppid") { return true; }
+    if (name == "getuid") { return true; }
+    if (name == "geteuid") { return true; }
+    if (name == "pthread_create") { return true; }
+    if (name == "pthread_join") { return true; }
+    if (name == "pthread_detach") { return true; }
+    if (name == "pthread_kill") { return true; }
+    if (name == "dlclose") { return true; }
+    if (name == "munlock") { return true; }
+    if (name == "mprotect") { return true; }
+    return false;
+}
+
+int[] macX64AddU32(int[] buf, int v) {
+    buf.add(v & 0xFF);
+    buf.add((v >> 8) & 0xFF);
+    buf.add((v >> 16) & 0xFF);
+    buf.add((v >> 24) & 0xFF);
+    return buf;
+}
+
+int[] macX64AddU64(int[] buf, int64 v) {
+    buf.add(int(v & 0xFF));
+    buf.add(int((v >> 8) & 0xFF));
+    buf.add(int((v >> 16) & 0xFF));
+    buf.add(int((v >> 24) & 0xFF));
+    buf.add(int((v >> 32) & 0xFF));
+    buf.add(int((v >> 40) & 0xFF));
+    buf.add(int((v >> 48) & 0xFF));
+    buf.add(int((v >> 56) & 0xFF));
+    return buf;
+}
+
+int[] macX64AddU16(int[] buf, int v) {
+    buf.add(v & 0xFF);
+    buf.add((v >> 8) & 0xFF);
+    return buf;
+}
+
+// layout vector slots:
+// 0 rxVaddr, 1 dataOff, 2 dataVaddr, 3 dataLen, 4 slotsOff, 5 slotsVaddr,
+// 6 fixOff, 7 entryFileoff, 8 codeLen
+int64[] macX64Plan(int codeLen, int dataLen, int nImports, int mainOffset) {
+    int64 TEXT_BASE = 4294967296;
+    int64 PAGE = 4096;
+    int64 CODE_OFF = 4096;
+    int64 rxVaddr = TEXT_BASE + CODE_OFF;
+    int64 dataOff = macX64AlignUp(CODE_OFF + codeLen, PAGE);
+    int64 dataVaddr = TEXT_BASE + dataOff;
+    int64 slotsOff = macX64AlignUp(dataOff + dataLen, PAGE);
+    int64 slotsVaddr = TEXT_BASE + slotsOff;
+    int64 fixOff = macX64AlignUp(slotsOff + nImports * 8, PAGE);
+    int64[] layout = [];
+    layout.add(rxVaddr);
+    layout.add(dataOff);
+    layout.add(dataVaddr);
+    layout.add(dataLen);
+    layout.add(slotsOff);
+    layout.add(slotsVaddr);
+    layout.add(fixOff);
+    layout.add(CODE_OFF + mainOffset);
+    layout.add(codeLen);
+    return layout;
+}
+
+// Chained-fixups blob, byte-exact ld encoding (see silverc-rs macho_x64):
+// 32-byte header, starts_in_image (chain seg index 3 of 5), starts_in_segment
+// (fmt 2 = DYLD_CHAINED_PTR_64), compact imports (1 | nameOff<<9, pool has a
+// leading NUL), 8-padded. funcs carry the UNDERSCORED names in slot order.
+int[] macX64BuildFixups(string[] funcs, int64 segFileoff) {
+    int[] pool = [];
+    pool.add(0);
+    int[] nameOffs = [];
+    for (int f = 0; f < funcs.length; f++) {
+        nameOffs.add(pool.length);
+        string nm = funcs[f];
+        for (int k = 0; k < nm.length; k++) { pool.add(nm[k]); }
+        pool.add(0);
+    }
+    int[] imp = [];
+    for (int g = 0; g < nameOffs.length; g++) {
+        int e = 1 + nameOffs[g] * 512;
+        imp = macX64AddU32(imp, e);
+    }
+    int startsSegOff = 56;
+    int importsOff = startsSegOff + 24;
+    int symbolsOff = importsOff + imp.length;
+    int[] fix = [];
+    fix = macX64AddU32(fix, 0);
+    fix = macX64AddU32(fix, 32);
+    fix = macX64AddU32(fix, importsOff);
+    fix = macX64AddU32(fix, symbolsOff);
+    fix = macX64AddU32(fix, funcs.length);
+    fix = macX64AddU32(fix, 1);
+    fix = macX64AddU32(fix, 0);
+    fix = macX64AddU32(fix, 0);
+    fix = macX64AddU32(fix, 5);
+    fix = macX64AddU32(fix, 0);
+    fix = macX64AddU32(fix, 0);
+    fix = macX64AddU32(fix, 0);
+    fix = macX64AddU32(fix, 24);
+    fix = macX64AddU32(fix, 0);
+    fix = macX64AddU32(fix, 24);
+    fix = macX64AddU16(fix, 4096);
+    fix = macX64AddU16(fix, 2);
+    fix = macX64AddU64(fix, segFileoff);
+    fix = macX64AddU32(fix, 0);
+    fix = macX64AddU16(fix, 1);
+    fix = macX64AddU16(fix, 0);
+    for (int b = 0; b < imp.length; b++) { fix.add(imp[b]); }
+    for (int p = 0; p < pool.length; p++) { fix.add(pool[p]); }
+    while (fix.length % 8 != 0) { fix.add(0); }
+    return fix;
+}
+
+int[] macX64AddSegName(int[] cmds, string segname) {
+    for (int i = 0; i < 16; i++) {
+        if (i < segname.length) { cmds.add(segname[i]); } else { cmds.add(0); }
+    }
+    return cmds;
+}
+
+int[] macX64AddSection(int[] cmds, string sectname, string segname, int64 addr, int64 size, int64 offset, int align, int flags, int reserved1) {
+    cmds = macX64AddSegName(cmds, sectname);
+    cmds = macX64AddSegName(cmds, segname);
+    cmds = macX64AddU64(cmds, addr);
+    cmds = macX64AddU64(cmds, size);
+    cmds = macX64AddU32(cmds, int(offset));
+    cmds = macX64AddU32(cmds, align);
+    cmds = macX64AddU32(cmds, 0);
+    cmds = macX64AddU32(cmds, 0);
+    cmds = macX64AddU32(cmds, flags);
+    cmds = macX64AddU32(cmds, reserved1);
+    cmds = macX64AddU32(cmds, 0);
+    cmds = macX64AddU32(cmds, 0);
+    return cmds;
+}
+
+int[] macX64AddSegmentHead(int[] cmds, int nsects) {
+    cmds = macX64AddU32(cmds, 25);
+    cmds = macX64AddU32(cmds, 72 + 80 * nsects);
+    return cmds;
+}
+
+int[] macX64AddSegmentTail(int[] cmds, int64 vmaddr, int64 vmsize, int64 fileoff, int64 filesize, int maxprot, int initprot, int nsects, int flags) {
+    cmds = macX64AddU64(cmds, vmaddr);
+    cmds = macX64AddU64(cmds, vmsize);
+    cmds = macX64AddU64(cmds, fileoff);
+    cmds = macX64AddU64(cmds, filesize);
+    cmds = macX64AddU32(cmds, maxprot);
+    cmds = macX64AddU32(cmds, initprot);
+    cmds = macX64AddU32(cmds, nsects);
+    cmds = macX64AddU32(cmds, flags);
+    return cmds;
+}
+
+int[] macX64Emit(int64[] layout, int[] code, int[] data, string[] funcs) {
+    int64 TEXT_BASE = 4294967296;
+    int64 CODE_OFF = 4096;
+    int64 rxVaddr = layout[0];
+    int64 dataOff = layout[1];
+    int64 dataVaddr = layout[2];
+    int64 dataLen = layout[3];
+    int64 slotsOff = layout[4];
+    int64 slotsVaddr = layout[5];
+    int64 fixOff = layout[6];
+    int64 entryFileoff = layout[7];
+    int n = funcs.length;
+    int[] fix = macX64BuildFixups(funcs, slotsOff);
+    int[] trie = [];
+    for (int z = 0; z < 8; z++) { trie.add(0); }
+    int64 trieOff = fixOff + fix.length;
+    int[] cmds = [];
+    // __PAGEZERO
+    cmds = macX64AddSegmentHead(cmds, 0);
+    cmds = macX64AddSegName(cmds, "__PAGEZERO");
+    cmds = macX64AddSegmentTail(cmds, 0, TEXT_BASE, 0, 0, 0, 0, 0, 0);
+    // __TEXT
+    cmds = macX64AddSegmentHead(cmds, 1);
+    cmds = macX64AddSegName(cmds, "__TEXT");
+    cmds = macX64AddSegmentTail(cmds, TEXT_BASE, dataOff, 0, dataOff, 5, 5, 1, 0);
+    cmds = macX64AddSection(cmds, "__text", "__TEXT", rxVaddr, layout[8], CODE_OFF, 0, 2147484672, 0);
+    // __DATA
+    int64 dataFilesz = slotsOff - dataOff;
+    cmds = macX64AddSegmentHead(cmds, 1);
+    cmds = macX64AddSegName(cmds, "__DATA");
+    cmds = macX64AddSegmentTail(cmds, dataVaddr, macX64AlignUp(dataFilesz, 4096), dataOff, dataFilesz, 3, 3, 1, 0);
+    cmds = macX64AddSection(cmds, "__data", "__DATA", dataVaddr, dataLen, dataOff, 0, 0, 0);
+    // __DATA_CONST
+    int64 slotsLen = n * 8;
+    cmds = macX64AddSegmentHead(cmds, 1);
+    cmds = macX64AddSegName(cmds, "__DATA_CONST");
+    cmds = macX64AddSegmentTail(cmds, slotsVaddr, 4096, slotsOff, slotsLen, 3, 3, 1, 16);
+    cmds = macX64AddSection(cmds, "__nl_symbol_ptr", "__DATA_CONST", slotsVaddr, slotsLen, slotsOff, 3, 6, 0);
+    // LC_LOAD_DYLINKER (offset-12 Apple form)
+    string dl = "/usr/lib/dyld";
+    int dlLen = 12 + dl.length + 1;
+    while (dlLen % 8 != 0) { dlLen++; }
+    cmds = macX64AddU32(cmds, 14);
+    cmds = macX64AddU32(cmds, dlLen);
+    cmds = macX64AddU32(cmds, 12);
+    for (int i = 0; i < dl.length; i++) { cmds.add(dl[i]); }
+    cmds.add(0);
+    while (cmds.length % 8 != 0) { cmds.add(0); }
+    // LC_UUID (deterministic: content lengths)
+    cmds = macX64AddU32(cmds, 27);
+    cmds = macX64AddU32(cmds, 24);
+    cmds = macX64AddU64(cmds, layout[8] * 1000003 + dataLen * 917 + n * 31 + 2654435761);
+    cmds = macX64AddU64(cmds, slotsOff * 31 + fixOff * 7 + 40503);
+    // LC_BUILD_VERSION (platform macOS, minos 26.0, sdk 27.0, one tool)
+    cmds = macX64AddU32(cmds, 50);
+    cmds = macX64AddU32(cmds, 32);
+    cmds = macX64AddU32(cmds, 1);
+    cmds = macX64AddU32(cmds, 1703936);
+    cmds = macX64AddU32(cmds, 1769472);
+    cmds = macX64AddU32(cmds, 1);
+    cmds = macX64AddU32(cmds, 3);
+    cmds = macX64AddU32(cmds, 102809600);
+    // LC_MAIN (0x80000028)
+    cmds = macX64AddU32(cmds, 2147483688);
+    cmds = macX64AddU32(cmds, 24);
+    cmds = macX64AddU64(cmds, entryFileoff);
+    cmds = macX64AddU64(cmds, 0);
+    // LC_LOAD_DYLIB libSystem (sole chained-fixups source, ordinal 1)
+    string dy = "/usr/lib/libSystem.B.dylib";
+    int dyLen = 24 + dy.length + 1;
+    while (dyLen % 8 != 0) { dyLen++; }
+    cmds = macX64AddU32(cmds, 12);
+    cmds = macX64AddU32(cmds, dyLen);
+    cmds = macX64AddU32(cmds, 24);
+    cmds = macX64AddU32(cmds, 0);
+    cmds = macX64AddU32(cmds, 65536);
+    cmds = macX64AddU32(cmds, 65536);
+    for (int q = 0; q < dy.length; q++) { cmds.add(dy[q]); }
+    cmds.add(0);
+    while (cmds.length % 8 != 0) { cmds.add(0); }
+    // LC_DYLD_CHAINED_FIXUPS (0x80000034)
+    cmds = macX64AddU32(cmds, 2147483700);
+    cmds = macX64AddU32(cmds, 16);
+    cmds = macX64AddU32(cmds, int(fixOff));
+    cmds = macX64AddU32(cmds, fix.length);
+    // LC_DYLD_EXPORTS_TRIE (0x80000033)
+    cmds = macX64AddU32(cmds, 2147483699);
+    cmds = macX64AddU32(cmds, 16);
+    cmds = macX64AddU32(cmds, int(trieOff));
+    cmds = macX64AddU32(cmds, trie.length);
+    // __LINKEDIT covers the fixups + trie
+    int64 leFilesz = (trieOff + trie.length) - fixOff;
+    cmds = macX64AddSegmentHead(cmds, 0);
+    cmds = macX64AddSegName(cmds, "__LINKEDIT");
+    cmds = macX64AddSegmentTail(cmds, TEXT_BASE + fixOff, macX64AlignUp(leFilesz, 4096), fixOff, leFilesz, 1, 1, 0, 0);
+    // header
+    int[] out = [];
+    out = macX64AddU32(out, 4277009103);
+    out = macX64AddU32(out, 16777223);
+    out = macX64AddU32(out, 3);
+    out = macX64AddU32(out, 2);
+    out = macX64AddU32(out, 12);
+    out = macX64AddU32(out, cmds.length);
+    out = macX64AddU32(out, 133);
+    out = macX64AddU32(out, 0);
+    for (int c = 0; c < cmds.length; c++) { out.add(cmds[c]); }
+    while (out.length < 4096) { out.add(0); }
+    for (int k = 0; k < code.length; k++) { out.add(code[k]); }
+    while (out.length < dataOff) { out.add(0); }
+    for (int d = 0; d < data.length; d++) { out.add(data[d]); }
+    while (out.length < slotsOff) { out.add(0); }
+    for (int s = 0; s < n; s++) {
+        out.add(s & 0xFF);
+        out.add((s >> 8) & 0xFF);
+        out.add(0);
+        out.add(0);
+        out.add(0);
+        out.add(0);
+        if (s + 1 < n) { out.add(16); } else { out.add(0); }
+        out.add(128);
+    }
+    while (out.length < fixOff) { out.add(0); }
+    for (int x = 0; x < fix.length; x++) { out.add(fix[x]); }
+    for (int y = 0; y < trie.length; y++) { out.add(trie[y]); }
+    return out;
+}

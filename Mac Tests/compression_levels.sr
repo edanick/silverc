@@ -1,0 +1,50 @@
+// Compression levels (DOCS/260): deflate/gzip are zlib-style 0..9 (0 = stored,
+// 1..9 = increasing match-search effort), zstd is 1..22; each `compress(data,
+// level)` takes an optional level (default 6 / 6 / 3). Asserts every in-range
+// level round-trips, higher level is never worse (non-increasing output), and
+// level 0 (stored) is strictly larger than level 1. Out-of-range levels throw a
+// ValueException (never clamp) -- that abort path is checked outside the suite
+// (a passing suite run must exit 0, so in-range levels only). Runs on the
+// compilers (they execute the codecs).
+import { gzip, zstd, deflate } from compression;
+
+bool eq(byte[] a, byte[] e) {
+    if (a.length != e.length) { return false; }
+    for (int i = 0; i < a.length; i++) { if (a[i] != e[i]) { return false; } }
+    return true;
+}
+
+void main() {
+    byte[] r = [];
+    for (int k = 0; k < 200; k++) {
+        r.add(65); r.add(66); r.add(67); r.add(65); r.add(66); r.add(90);
+    }
+    int prev = -1;
+    for (int level = 0; level <= 9; level++) {
+        byte[] c = deflate.compress(r, level);
+        if (!eq(deflate.decompress(c), r)) { printline("FAIL dfl rt"); exit(1); }
+        if (prev >= 0 && c.length > prev) { printline("FAIL dfl grow"); exit(1); }
+        prev = c.length;
+    }
+    if (!(deflate.compress(r, 0).length > deflate.compress(r, 1).length)) { printline("FAIL dfl stored>l1"); exit(1); }
+
+    int gprev = -1;
+    for (int level = 0; level <= 9; level++) {
+        byte[] c = gzip.compress(r, level);
+        if (!eq(gzip.decompress(c), r)) { printline("FAIL gz rt"); exit(1); }
+        if (gprev >= 0 && c.length > gprev) { printline("FAIL gz grow"); exit(1); }
+        gprev = c.length;
+    }
+    if (!(gzip.compress(r, 0).length > gzip.compress(r, 1).length)) { printline("FAIL gz stored>l1"); exit(1); }
+
+    for (int level = 1; level <= 22; level++) {
+        byte[] c = zstd.compress(r, level);
+        if (!eq(zstd.decompress(c), r)) { printline("FAIL zs rt"); exit(1); }
+    }
+
+    // Omitted level uses each algorithm's default (6 / 6 / 3) and round-trips.
+    if (!eq(deflate.decompress(deflate.compress(r)), r)) { printline("FAIL dfl def"); exit(1); }
+    if (!eq(gzip.decompress(gzip.compress(r)), r)) { printline("FAIL gz def"); exit(1); }
+    if (!eq(zstd.decompress(zstd.compress(r)), r)) { printline("FAIL zs def"); exit(1); }
+    printline("levels-ok");
+}

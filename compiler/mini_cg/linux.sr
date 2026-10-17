@@ -384,6 +384,68 @@ class MiniCgLinux {
         cg.asm.addRI32(0, 8);
     }
 
+    // MAC.md Phase D (additive): rebuild argv from the LC_MAIN spill
+    // ([RBP+8]=argc, [RBP+16]=argv base; see the emitFunction spill) into
+    // the same heap layout the LINUX nn/Windows parsers produce
+    // ([argc, arg0, ...], arr+8 returned). Mirrors genLinuxCargsCall
+    // exactly except argv[i] loads through the argv pointer.
+    public void genMacX64CargsCall(MiniCg cg) {
+        int argcOff = cg.allocLocal("__cargs_argc");
+        int arrOff = cg.allocLocal("__cargs_arr");
+        int iOff = cg.allocLocal("__cargs_i");
+        int argvOff = cg.allocLocal("__cargs_argv");
+        // argc/argv come from the entry-captured globals (valid in every
+        // function). The old [RBP+8]/[RBP+16] frame slots only held them
+        // inside main; helpers like cli.args() read garbage there.
+        cg.genGlobalLoad(cg.findGlobal("__mac_argc"));
+        cg.asm.movMBaseR(5, 0, argcOff);
+        cg.genGlobalLoad(cg.findGlobal("__mac_argv"));
+        cg.asm.movMBaseR(5, 0, argvOff);
+        // size = (argc+1)*8 into R8; malloc + zero via the heap helper.
+        cg.asm.movRMBase(0, 5, argcOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.shlR64Imm(0, 3);
+        cg.asm.movRR64(8, 0);
+        this.emitLinuxHeapAllocFromR8(cg);
+        cg.asm.movMBaseR(5, 0, arrOff);
+        // [arr] = argc
+        cg.asm.movRMBase(1, 5, argcOff);
+        cg.asm.movRMBase(0, 5, arrOff);
+        cg.asm.movMBaseR(0, 1, 0);
+        // i = 0; while i < argc: arr[8+i*8] = argv[i]
+        cg.asm.xorRR64(0, 0);
+        cg.asm.movMBaseR(5, 0, iOff);
+        int loopL = cg.newLabel();
+        int doneL = cg.newLabel();
+        cg.asm.bindLabel(loopL);
+        cg.asm.movRMBase(0, 5, iOff);
+        cg.asm.movRMBase(1, 5, argcOff);
+        cg.asm.cmpRR64(0, 1);
+        cg.asm.jgeLabel(doneL);
+        // argv[i]: R10 = argvBase; R10 = [R10 + i*8]
+        cg.asm.movRMBase(11, 5, iOff);
+        cg.asm.shlR64Imm(11, 3);
+        cg.asm.movRMBase(10, 5, argvOff);
+        cg.asm.addRR64(10, 11);
+        cg.asm.movRMBase(10, 10, 0);
+        // arr[8+i*8] = argv[i]
+        cg.asm.movRMBase(11, 5, arrOff);
+        cg.asm.addRI32(11, 8);
+        cg.asm.movRMBase(1, 5, iOff);
+        cg.asm.shlR64Imm(1, 3);
+        cg.asm.addRR64(11, 1);
+        cg.asm.movMBaseR(11, 10, 0);
+        // i++
+        cg.asm.movRMBase(0, 5, iOff);
+        cg.asm.addRI32(0, 1);
+        cg.asm.movMBaseR(5, 0, iOff);
+        cg.asm.jmpLabel(loopL);
+        cg.asm.bindLabel(doneL);
+        // Arrays point at their first element: skip the length word.
+        cg.asm.movRMBase(0, 5, arrOff);
+        cg.asm.addRI32(0, 8);
+    }
+
     public void emitLinuxVariadicTail(MiniCg cg, string lib, string fn, int[] fixedOffs, int[] valOffs, Node[] vals) {
         int firstFixed = fixedOffs.length;
         int gpNeed = 0;
@@ -530,6 +592,7 @@ class MiniCgLinux {
         cg.asm.movRMBase(0, 0, 0);
         cg.asm.callR64(0);
         cg.emitAbiCallTeardown();
+        cg.linuxPost("open");
         int feNo = cg.newLabel();
         int feDone = cg.newLabel();
         cg.asm.cmpRI32(0, 0);
@@ -613,6 +676,7 @@ class MiniCgLinux {
         cg.asm.movRMBase(0, 0, 0);
         cg.asm.callR64(0);
         cg.emitAbiCallTeardown();
+        cg.linuxPost("open");
         int srcFdOff = cg.allocLocal("__fcp_srcfd");
         cg.asm.movMBaseR(5, 0, srcFdOff);
         int copyFail0 = cg.newLabel();
@@ -632,6 +696,7 @@ class MiniCgLinux {
         cg.asm.movRMBase(0, 0, 0);
         cg.asm.callR64(0);
         cg.emitAbiCallTeardown();
+        cg.linuxPost("open");
         int dstFdOff = cg.allocLocal("__fcp_dstfd");
         cg.asm.movMBaseR(5, 0, dstFdOff);
         cg.asm.cmpRI32(0, 0);
@@ -651,6 +716,7 @@ class MiniCgLinux {
         cg.asm.movRMBase(0, 0, 0);
         cg.asm.callR64(0);
         cg.emitAbiCallTeardown();
+        cg.linuxPost("read");
         cg.asm.movMBaseR(5, 0, nOff);
         cg.asm.cmpRI32(0, 0);
         cg.asm.jlLabel(copyFailLoop);

@@ -1,0 +1,85 @@
+// DOCS/273: assign-if-null (`??=`).
+// Exit code 0 = exact. Covers null-assigns / non-null-keeps, RHS laziness
+// (RHS never evaluates when LHS is live), the expression value, and field
+// + whole-array targets, plus combos with `??`, `?.` and `?[]`.
+
+class Item {
+    public prop string? tag;
+    construct () {
+        this.tag = null;
+    }
+}
+
+string makeTag() {
+    printline("makeTag-called");
+    return "T";
+}
+
+string loadCache() {
+    printline("loading");
+    return "data";
+}
+
+string boomRhs() {
+    printline("FAIL rhs evaluated on live lhs");
+    exit(1);
+    return "boom";
+}
+
+void check(bool ok, string label) {
+    if (!ok) {
+        printline("FAIL " + label);
+        exit(1);
+    }
+}
+
+void main() {
+    // Null assigns, live keeps.
+    string? cache = null;
+    cache ??= loadCache();
+    check((cache ?? "MISSING") == "data", "null-assigns");
+    cache ??= loadCache();
+    check((cache ?? "MISSING") == "data", "live-keeps");
+
+    // RHS laziness: `boomRhs` exits 1 if it ever evaluates.
+    string? keep = "old";
+    keep ??= boomRhs();
+    check((keep ?? "MISSING") == "old", "live-rhs-lazy");
+
+    // The expression value is the resulting value.
+    string? c = null;
+    string? r = (c ??= "filled");
+    check((r ?? "MISSING") == "filled", "expr-value-null");
+    check((c ?? "MISSING") == "filled", "expr-stored-null");
+    string? k = "keep";
+    string? r2 = (k ??= "other");
+    check((r2 ?? "MISSING") == "keep", "expr-value-live");
+
+    // Field target: null assigns once, then keeps without re-running RHS.
+    Item it = new Item();
+    it.tag ??= makeTag();
+    check((it.tag ?? "MISSING") == "T", "field-null-assigns");
+    it.tag ??= makeTag();
+    check((it.tag ?? "MISSING") == "T", "field-live-keeps");
+
+    // Whole-array target.
+    string[]? arr = null;
+    arr ??= ["a", "b"];
+    check((arr?[0] ?? "MISSING") == "a", "array-null-assigns-0");
+    check((arr?[1] ?? "MISSING") == "b", "array-null-assigns-1");
+
+    // Array element target: live element keeps, RHS never runs.
+    string[] pair = ["x", "y"];
+    pair[0] ??= boomRhs();
+    check(pair[0] == "x", "elem-live-keeps");
+
+    // Combos with `?.` / `?[]` / `??`.
+    string? name = null;
+    int len = name?.length() ?? 0;
+    check(len == 0, "combo-null-length");
+    name ??= "bob";
+    int len2 = name?.length() ?? 0;
+    check(len2 == 3, "combo-live-length");
+
+    printline("assign if null ok");
+}

@@ -442,6 +442,50 @@ public string sha1(string data) {
     return bytesToHex(sha1Core(strToBytes(data)));
 }
 
+// MD-5 (RFC 1321), pure Silver: same block machinery as SHA-256 but with
+// little-endian words, the 128-bit little-endian length trailer, per-round
+// shift amounts, and the F/G/H/I round functions.
+public string md5(string data) {
+    return bytesToHex(md5Core(strToBytes(data)));
+}
+
+// SHA-512 (FIPS 180-4), pure Silver: 64-bit words over 128-byte blocks.
+// Constants that do not fit a positive int64 are spelled as
+// (hi << 32) | lo; rotates are logical-right (arithmetic shift copies are
+// masked away), and additions wrap mod 2^64 naturally.
+public string sha512(string data) {
+    return bytesToHex(sha512Core(strToBytes(data)));
+}
+
+// File hashing: hash the file's text bytes (embedded NULs truncate, exactly
+// like the fnv1File/djb2File text forms above).
+public string md5File(string path) {
+    return md5(file.readString(path));
+}
+
+public string sha1File(string path) {
+    return sha1(file.readString(path));
+}
+
+public string sha256File(string path) {
+    return sha256(file.readString(path));
+}
+
+public string sha512File(string path) {
+    return sha512(file.readString(path));
+}
+
+// Timing-safe compare: constant number of operations over the (equal or
+// unequal) inputs; only the final diff decides.
+public bool compare(string a, string b) {
+    if (a.length != b.length) { return false; }
+    int diff = 0;
+    for (int i = 0; i < a.length; i++) {
+        diff |= (a[i] ^ b[i]) & 0xFF;
+    }
+    return diff == 0;
+}
+
 // RFC 2104 HMAC with a 64-byte block. Keys longer than 64 bytes are hashed
 // first (H(key)); the key is then zero-padded to the block size and XORed
 // with ipad (0x36) / opad (0x5C):
@@ -690,4 +734,312 @@ string hmacHex(string key, int[] msgBytes, int algo) {
         outerDig = sha1Core(concatBytes(opad, innerDig));
     }
     return bytesToHex(outerDig);
+}
+
+// ---------------------------------------------------------------------------
+// MD-5 core (RFC 1321).
+// ---------------------------------------------------------------------------
+
+// MD-5 round shift: rounds 0-15 use [7,12,17,22], 16-31 [5,9,14,20],
+// 32-47 [4,11,16,23], 48-63 [6,10,15,21] (per group of four).
+int md5Shift(int t) {
+    int q = t / 16;
+    int r = t % 4;
+    if (q == 0) {
+        if (r == 0) { return 7; }
+        if (r == 1) { return 12; }
+        if (r == 2) { return 17; }
+        return 22;
+    }
+    if (q == 1) {
+        if (r == 0) { return 5; }
+        if (r == 1) { return 9; }
+        if (r == 2) { return 14; }
+        return 20;
+    }
+    if (q == 2) {
+        if (r == 0) { return 4; }
+        if (r == 1) { return 11; }
+        if (r == 2) { return 16; }
+        return 23;
+    }
+    if (r == 0) { return 6; }
+    if (r == 1) { return 10; }
+    if (r == 2) { return 15; }
+    return 21;
+}
+
+// MD-5 block fill: message bytes, 0x80 terminator, zero padding, then the
+// bit length as an 8-byte LITTLE-endian trailer.
+void fillBlockMD5(int[] blk, int[] msg, int idx, int len, int total, int64 totalBits) {
+    for (int j = 0; j < 64; j++) {
+        int abs = idx + j;
+        int v = 0;
+        if (abs < len) {
+            v = msg[abs] & 0xFF;
+        } else if (abs == len) {
+            v = 0x80;
+        } else if (abs >= total - 8) {
+            int64 sh = 8 * (int)(abs - (total - 8));
+            v = (int)((totalBits >> sh) & 0xFF);
+        }
+        blk[j] = v;
+    }
+}
+
+int[] md5Core(int[] msg) {
+    int[] h = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+    int[] k = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+        0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+        0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+        0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+        0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+        0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+        0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+        0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
+    ];
+    int len = msg.length;
+    int64 totalBits = (int)len * 8;
+    int pad = 0;
+    while (((len + 1 + pad) % 64) != 56) {
+        pad++;
+    }
+    int total = len + 1 + pad + 8;
+    int[] blk = new int[64];
+    int[] m = new int[16];
+    int idx = 0;
+    while (idx < total) {
+        fillBlockMD5(blk, msg, idx, len, total, totalBits);
+        for (int t = 0; t < 16; t++) {
+            m[t] = (blk[t * 4] & 0xFF) | ((blk[t * 4 + 1] & 0xFF) << 8) | ((blk[t * 4 + 2] & 0xFF) << 16) | ((blk[t * 4 + 3] & 0xFF) << 24);
+        }
+        int64 a = (int)(h[0]);
+        int64 b = (int)(h[1]);
+        int64 c = (int)(h[2]);
+        int64 d = (int)(h[3]);
+        for (int t = 0; t < 64; t++) {
+            int64 f = 0;
+            int g = 0;
+            if (t < 16) {
+                f = (b & c) | ((b ^ 0xFFFFFFFF) & d);
+                g = t;
+            } else if (t < 32) {
+                f = (d & b) | ((d ^ 0xFFFFFFFF) & c);
+                g = (5 * t + 1) % 16;
+            } else if (t < 48) {
+                f = b ^ c ^ d;
+                g = (3 * t + 5) % 16;
+            } else {
+                f = c ^ (b | (d ^ 0xFFFFFFFF));
+                g = (7 * t) % 16;
+            }
+            int64 tmp = d;
+            d = c;
+            c = b;
+            int64 sum = (a + f + (int)(k[t]) + (int)(m[g])) & 0xFFFFFFFF;
+            b = (b + rotl32(sum, md5Shift(t))) & 0xFFFFFFFF;
+            a = tmp;
+        }
+        h[0] = (int)(((int)(h[0]) + a) & 0xFFFFFFFF);
+        h[1] = (int)(((int)(h[1]) + b) & 0xFFFFFFFF);
+        h[2] = (int)(((int)(h[2]) + c) & 0xFFFFFFFF);
+        h[3] = (int)(((int)(h[3]) + d) & 0xFFFFFFFF);
+        idx += 64;
+    }
+    int[] out = [];
+    for (int i = 0; i < 4; i++) {
+        int64 word = (int)(h[i]);
+        out.add((int)((word) & 0xFF));
+        out.add((int)((word >> 8) & 0xFF));
+        out.add((int)((word >> 16) & 0xFF));
+        out.add((int)((word >> 24) & 0xFF));
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// SHA-512 core (FIPS 180-4): 64-bit words, 128-byte blocks.
+// ---------------------------------------------------------------------------
+
+// Mask of the low k bits (k <= 63); k == 63 relies on the two's-complement
+// wrap of INT64_MIN - 1 == INT64_MAX.
+int64 maskLow64(int k) {
+    return ((int64)1 << k) - 1;
+}
+
+// Logical right rotate on a 64-bit word held in int64 bits: the arithmetic
+// right shift's sign-extension copies are masked away before the OR.
+int64 rotr64(int64 x, int n) {
+    int64 hi = x << (64 - n);
+    int64 lo = (x >> n) & maskLow64(64 - n);
+    return hi | lo;
+}
+
+// SHA-512 block fill: message bytes, 0x80, zeros, and the bit length as a
+// 16-byte BIG-endian trailer (the high 8 bytes are zero for any realistic
+// message).
+void fillBlock512(int[] blk, int[] msg, int idx, int len, int total, int64 totalBits) {
+    for (int j = 0; j < 128; j++) {
+        int abs = idx + j;
+        int v = 0;
+        if (abs < len) {
+            v = msg[abs] & 0xFF;
+        } else if (abs == len) {
+            v = 0x80;
+        } else if (abs >= total - 16) {
+            // 16-byte big-endian bit length. The high 8 bytes are always
+            // zero here (the message length fits totalBits' low 63 bits)
+            // and MUST be written as a constant: shifting right by 64 is a
+            // no-op on x86 (the hardware takes the count mod 64), so the
+            // high bytes can never come out of totalBits by shifting.
+            if (abs < total - 8) {
+                v = 0;
+            } else {
+                int64 sh = 8 * (int)(total - 1 - abs);
+                v = (int)((totalBits >> sh) & 0xFF);
+            }
+        }
+        blk[j] = v;
+    }
+}
+
+// SHA-512 round constants as hi/lo 32-bit int tables: the int[] literal
+// context stores each element's raw bits (the same shape as the SHA-256 K
+// table), so the spelling is immune to int-vs-float literal
+// re-classification quirks; the 64-bit words are assembled in sha512Core.
+int[] sha512KHi() {
+    return [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        0xca273ece, 0xd186b8c7, 0xeada7dd6, 0xf57d4f7f, 0x06f067aa, 0x0a637dc5, 0x113f9804, 0x1b710b35,
+        0x28db77f5, 0x32caab7b, 0x3c9ebe0a, 0x431d67c4, 0x4cc5d4be, 0x597f299c, 0x5fcb6fab, 0x6c44198c
+    ];
+}
+
+int[] sha512KLo() {
+    return [
+        0xd728ae22, 0x23ef65cd, 0xec4d3b2f, 0x8189dbbc, 0xf348b538, 0xb605d019, 0xaf194f9b, 0xda6d8118,
+        0xa3030242, 0x45706fbe, 0x4ee4b28c, 0xd5ffb4e2, 0xf27b896f, 0x3b1696b1, 0x25c71235, 0xcf692694,
+        0x9ef14ad2, 0x384f25e3, 0x8b8cd5b5, 0x77ac9c65, 0x592b0275, 0x6ea6e483, 0xbd41fbd4, 0x831153b5,
+        0xee66dfab, 0x2db43210, 0x98fb213f, 0xbeef0ee4, 0x3da88fc2, 0x930aa725, 0xe003826f, 0x0a0e6e70,
+        0x46d22ffc, 0x5c26c926, 0x5ac42aed, 0x9d95b3df, 0x8baf63de, 0x3c77b2a8, 0x47edaee6, 0x1482353b,
+        0x4cf10364, 0xbc423001, 0xd0f89791, 0x0654be30, 0xd6ef5218, 0x5565a910, 0x5771202a, 0x32bbd1b8,
+        0xb8d2d0c8, 0x5141ab53, 0xdf8eeb99, 0xe19b48a8, 0xc5c95a63, 0xe3418acb, 0x7763e373, 0xd6b2b8a3,
+        0x5defb2fc, 0x43172f60, 0xa1f0ab72, 0x1a6439ec, 0x23631e28, 0xde82bde9, 0xb2c67915, 0xe372532b,
+        0xea26619c, 0x21c0c207, 0xcde0eb1e, 0xee6ed178, 0x72176fba, 0xa2c898a6, 0xbef90dae, 0x131c471b,
+        0x23047d84, 0x40c72493, 0x15c9bebc, 0x9c100d4c, 0xcb3e42b6, 0xfc657e2a, 0x3ad6faec, 0x4a475817
+    ];
+}
+
+int[] sha512HHi() {
+    return [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+}
+
+int[] sha512HLo() {
+    return [0xf3bcc908, 0x84caa73b, 0xfe94f82b, 0x5f1d36f1, 0xade682d1, 0x2b3e6c1f, 0xfb41bd6b, 0x137e2179];
+}
+
+int[] sha512Core(int[] msg) {
+    int[] hHi = sha512HHi();
+    int[] hLo = sha512HLo();
+    int64[] h = [];
+    for (int i = 0; i < 8; i++) {
+        h.add(((int64)hHi[i] << 32) | (int64)(hLo[i] & 0xFFFFFFFF));
+    }
+    int[] kHi = sha512KHi();
+    int[] kLo = sha512KLo();
+    int64[] k = [];
+    for (int i = 0; i < 80; i++) {
+        k.add(((int64)kHi[i] << 32) | (int64)(kLo[i] & 0xFFFFFFFF));
+    }
+    int len = msg.length;
+    int64 totalBits = (int)len * 8;
+    int pad = 0;
+    while (((len + 1 + pad) % 128) != 112) {
+        pad++;
+    }
+    int total = len + 1 + pad + 16;
+    int[] blk = new int[128];
+    int64[] w = new int64[80];
+    int idx = 0;
+    while (idx < total) {
+        fillBlock512(blk, msg, idx, len, total, totalBits);
+        for (int t = 0; t < 16; t++) {
+            int64 word = 0;
+            for (int b = 0; b < 8; b++) {
+                word = (word << 8) | (int64)(blk[t * 8 + b] & 0xFF);
+            }
+            w[t] = word;
+        }
+        for (int t = 16; t < 80; t++) {
+            int64 wm15 = w[t - 15];
+            int64 wm2 = w[t - 2];
+            // s0/s1 use SHR (logical right); Silver's >> is arithmetic, so
+            // the sign-extension copies are masked away.
+            int64 s0 = rotr64(wm15, 1) ^ rotr64(wm15, 8) ^ ((wm15 >> 7) & maskLow64(57));
+            int64 s1 = rotr64(wm2, 19) ^ rotr64(wm2, 61) ^ ((wm2 >> 6) & maskLow64(58));
+            w[t] = w[t - 16] + s0 + w[t - 7] + s1;
+        }
+        int64 a = h[0];
+        int64 b = h[1];
+        int64 c = h[2];
+        int64 d = h[3];
+        int64 e = h[4];
+        int64 f = h[5];
+        int64 g = h[6];
+        int64 hh = h[7];
+        for (int t = 0; t < 80; t++) {
+            int64 S1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41);
+            int64 ch = (e & f) ^ ((e ^ -1) & g);
+            int64 temp1 = hh + S1 + ch + k[t] + w[t];
+            int64 S0 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39);
+            int64 maj = (a & b) ^ (a & c) ^ (b & c);
+            int64 temp2 = S0 + maj;
+            hh = g;
+            g = f;
+            f = e;
+            e = d + temp1;
+            d = c;
+            c = b;
+            b = a;
+            a = temp1 + temp2;
+        }
+        h[0] = h[0] + a;
+        h[1] = h[1] + b;
+        h[2] = h[2] + c;
+        h[3] = h[3] + d;
+        h[4] = h[4] + e;
+        h[5] = h[5] + f;
+        h[6] = h[6] + g;
+        h[7] = h[7] + hh;
+        idx += 128;
+    }
+    int[] out = [];
+    for (int i = 0; i < 8; i++) {
+        int64 word = h[i];
+        out.add((int)((word >> 56) & 0xFF));
+        out.add((int)((word >> 48) & 0xFF));
+        out.add((int)((word >> 40) & 0xFF));
+        out.add((int)((word >> 32) & 0xFF));
+        out.add((int)((word >> 24) & 0xFF));
+        out.add((int)((word >> 16) & 0xFF));
+        out.add((int)((word >> 8) & 0xFF));
+        out.add((int)(word & 0xFF));
+    }
+    return out;
 }

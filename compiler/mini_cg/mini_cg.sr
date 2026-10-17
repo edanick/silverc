@@ -56,6 +56,12 @@ class MiniCg {
     public prop int mainLabelOffset;
     public prop string[] funcNames;
     public prop string[] funcClasses;
+    // Dynamic class types of `object`/`var` locals initialized from class
+    // instances (parallel arrays): lets field reads and method calls on an
+    // object-typed variable bind the class instead of routing to the dict
+    // layout (which faulted on class memory).
+    public prop string[] objectDynNames;
+    public prop string[] objectDynTypes;
     // Owning module per collected function (parallel to funcNames): the
     // `mod export` name of the file that declared it, "" for the entry file
     // and synthetic helpers. A module-qualified call (`datetime.now()`)
@@ -128,6 +134,12 @@ class MiniCg {
     public prop string[] macAliasLocals;
     public prop string[] macAliasExports;
     public prop string[] macAliasLibs;
+    // MAC.md Phase D -- Rosetta-bridge (MACX64) layout inputs, set by the
+    // driver after planning (all int64: addresses exceed 32 bits).
+    // macX64DataVaddr anchors strings/state; macX64SlotAddrs carries one
+    // non-lazy slot address per flat import for patchMacX64ImportRefs.
+    public prop int64 macX64DataVaddr;
+    public prop int64[] macX64SlotAddrs;
     // DOCS/261 -- per-project custom native modules (`.srp` `nativeModules`).
     // Empty when the manifest declares none (absent key = no change). Bare
     // names resolve per targetOs with no `#on` regions; fixed tables above
@@ -209,6 +221,12 @@ class MiniCg {
     public prop int[] liveSlots;
     public prop bool[] liveSlotIsArray;
     public prop int qcTempCounter;
+    // Typed array-literal element hint (mirrors silverc-rs
+    // gen_expr_as_type): while lowering an array literal against a
+    // declared `E[]`, kind-74 `{...}` elements build real E struct
+    // objects instead of degrading to dicts. Empty outside a typed
+    // lowering, so untyped literals keep the dict behavior.
+    public prop string arrayLitElemHint;
     // OVERHAUL.md threading module: effective worker count for this
     // compilation (total - 2 by default or the explicit --threads N).
     public prop int threadCount;
@@ -323,6 +341,8 @@ class MiniCg {
         this.stringData = [];
         this.mainLabelOffset = 0;
         this.funcNames = [];
+        this.objectDynNames = [];
+        this.objectDynTypes = [];
         this.funcClasses = [];
         this.funcModules = [];
         this.constNames = [];
@@ -366,6 +386,8 @@ class MiniCg {
         this.macAliasLocals = [];
         this.macAliasExports = [];
         this.macAliasLibs = [];
+        this.macX64DataVaddr = 0;
+        this.macX64SlotAddrs = [];
         this.customNative = new NativeModules();
         this.loopStartStack = [];
         this.loopEndStack = [];
@@ -437,6 +459,7 @@ class MiniCg {
         this.liveSlots = [];
         this.liveSlotIsArray = [];
         this.qcTempCounter = 0;
+        this.arrayLitElemHint = "";
         this.currentExcHandler = -1;
         this.currentCatch = -1;
         this.currentFinally = -1;
@@ -766,10 +789,16 @@ class MiniCg {
         bool inVal = false;
         string result = "";
         while (i < len) {
-            if (t[i] == '<') { depth++; }
-            else if (t[i] == '>') {
+            if (t[i] == '<') {
+                depth++;
+                // Nested value types keep their inner brackets
+                // (`dict<string,dict<string,int>>` values are
+                // `dict<string,int>`, not `dictstring,int`).
+                if (inVal) { result += t[i]; }
+            } else if (t[i] == '>') {
                 depth--;
                 if (depth == 0) { return result; }
+                if (inVal) { result += t[i]; }
             } else if (t[i] == ',' && depth == 1) {
                 inVal = true;
             } else if (inVal) {
@@ -961,7 +990,16 @@ class MiniCg {
                 cnt = this.classFieldCounts[i];
             }
         }
-        if (start < 0) { return -1; }
+        if (start < 0) {
+            // Builtin exception instances (emitThrowException) always carry
+            // the canonical std exception layout even when the class was
+            // never collected (no `from exception` import), in which case a
+            // member read previously emitted no load and observed a stale
+            // register. Resolve the four canonical fields for any
+            // uncollected *Exception type; collected classes keep their own
+            // layout above.
+            return this.builtinExceptionFieldOffset(className, fieldName);
+        }
         for (int i = 0; i < cnt; i++) {
             if (this.classFieldNames[start + i] == fieldName) {
                 return this.classFieldOffsets[start + i];
@@ -1080,12 +1118,52 @@ class MiniCg {
                 cnt = this.classFieldCounts[i];
             }
         }
-        if (start < 0) { return ""; }
+        if (start < 0) { return this.builtinExceptionFieldType(className, fieldName); }
         for (int i = 0; i < cnt; i++) {
             if (this.classFieldNames[start + i] == fieldName) {
                 return this.classFieldTypes[start + i];
             }
         }
+        return "";
+    }
+
+    // Canonical stdlib exception layout (std/exception.sr: every exception
+    // class carries message/string@0, line/int@8, column/int@16,
+    // reason/string@24). Builtin raises (emitThrowException) always build
+    // this shape, but the class may be absent from the tables when the unit
+    // never imports it, so the offsets/types below keep catch-variable
+    // member access well-formed. Collected classes always win (callers only
+    // reach here when the class lookup misses); class registration itself
+    // is untouched, so `new Exception(...)` without the import still fails
+    // to resolve exactly as before.
+    public bool isBuiltinExceptionName(string className) {
+        string base = className;
+        if (base.length > 1 && base[base.length - 1] == '?') {
+            base = base.substring(0, base.length - 1);
+        }
+        if (base.length < 9) { return false; }
+        int tail = base.length - 9;
+        string suffix = base.substring(tail, 9);
+        return suffix == "Exception";
+    }
+
+    public int builtinExceptionFieldOffset(string className, string fieldName) {
+        if (this.isClassName(className)) { return -1; }
+        if (!this.isBuiltinExceptionName(className)) { return -1; }
+        if (fieldName == "message") { return 0; }
+        if (fieldName == "line") { return 8; }
+        if (fieldName == "column") { return 16; }
+        if (fieldName == "reason") { return 24; }
+        return -1;
+    }
+
+    public string builtinExceptionFieldType(string className, string fieldName) {
+        if (this.isClassName(className)) { return ""; }
+        if (!this.isBuiltinExceptionName(className)) { return ""; }
+        if (fieldName == "message") { return "string"; }
+        if (fieldName == "line") { return "int"; }
+        if (fieldName == "column") { return "int"; }
+        if (fieldName == "reason") { return "string"; }
         return "";
     }
 
@@ -1301,9 +1379,19 @@ class MiniCg {
     // ------------------------------------------------------------------
 
     // True when this compilation targets Linux (driver sets targetOs via
-    // ppTargetOsFor; "" behaves as WINDOWS).
+    // ppTargetOsFor; "" behaves as WINDOWS). MACX64 (the macOS Rosetta
+    // bridge) counts as Linux here: it emits the identical SysV program,
+    // only the container/entry/import owners differ (see isMacX64Target).
     public bool isLinuxTarget() {
-        return this.targetOs == "LINUX";
+        return this.targetOs == "LINUX" || this.targetOs == "MACX64";
+    }
+
+    // True when emitting through the macOS Rosetta bridge (MAC.md Phase D):
+    // full SysV x64 program in a non-PIE x86_64 Mach-O. Check before
+    // isLinuxTarget() wherever the bridge deviates (entry spill, cargs,
+    // import/container patching); everywhere else the Linux behavior rides.
+    public bool isMacX64Target() {
+        return this.targetOs == "MACX64";
     }
 
     // True when compiling for macOS (AAPCS64 ABI + Mach-O output). All macOS
@@ -1311,6 +1399,14 @@ class MiniCg {
     // when false (mirrors silverc-rs is_mac()).
     public bool isMacTarget() {
         return this.targetOs == "MAC";
+    }
+
+    // True when emitting through the macOS Rosetta bridge (MAC.md Phase D):
+    // full SysV x64 program in a non-PIE x86_64 Mach-O. Check before
+    // isLinuxTarget() wherever the bridge deviates (entry spill, cargs,
+    // import/container patching); everywhere else the Linux behavior rides.
+    public bool isMacX64Target() {
+        return this.targetOs == "MACX64";
     }
 
     // --- AAPCS64 policy (MAC.md section 8, macOS ARM64 only, code-only) ---
@@ -1712,6 +1808,7 @@ class MiniCg {
     }
 
     private string customEffectiveTarget() {
+        if (this.targetOs == "MACX64") { return "LINUX"; }
         if (this.targetOs.length > 0) { return this.targetOs; }
         return "WINDOWS";
     }
@@ -1736,7 +1833,7 @@ class MiniCg {
             exit(1);
             return;
         }
-        bool isLinux = target == "LINUX";
+        bool isLinux = target == "LINUX" || target == "MACX64";
         if (node.isStatic) {
             if (!this.customNative.starAllowed(source, target)) {
                 printline("Error: " + nativeStarMsg(source));
@@ -1881,7 +1978,10 @@ class MiniCg {
     public void emitThrowException(string message) {
         // Allocate a 32-byte exception object with the std Exception layout
         // (message@0, line@8, column@16, reason@24), store it in the global
-        // exception state, and dispatch to the nearest handler.
+        // exception state, and dispatch to the nearest handler. The message
+        // is duplicated onto the heap (like `new Exception(literal)` storing
+        // a heap argument) so the instance owns both string fields: a static
+        // literal must never be reachable as a heap-owned exception string.
         int sizeOff = this.allocLocal("__exc_size");
         this.asm.movRI64(0, 32);
         this.asm.movMBaseR(5, 0, sizeOff);
@@ -1889,6 +1989,7 @@ class MiniCg {
         int objOff = this.allocLocal("__exc_obj");
         this.asm.movMBaseR(5, 0, objOff);
         this.emitLlmaiStringLiteral(message);
+        this.emitLlmaiStringDup();
         this.asm.movRMBase(1, 5, objOff);
         this.asm.movMBaseR(1, 0, 0);
         this.asm.movMBaseR(1, 0, 24);
@@ -1901,6 +2002,14 @@ class MiniCg {
         this.asm.movRI64(0, 1);
         int eaIdx = this.findGlobal("__exc_active");
         this.genGlobalStore(eaIdx);
+        // Builtin raises always throw a fully-built object: clear the
+        // raw-string marker so a stale flag from an earlier `throw
+        // "string"` (left set by a string-typed catch, which does not
+        // consume it) can never re-wrap this object at a class-typed
+        // catch entry.
+        this.asm.movRI64(0, 0);
+        int rsIdxT = this.findGlobal("__exc_rawstr");
+        this.genGlobalStore(rsIdxT);
         this.emitExceptionJump();
     }
 
@@ -1950,6 +2059,26 @@ class MiniCg {
     }
 
     public void patchGlobalRefs(int[] code, int globalsStart, int rdataRva) {
+        // MAC.md Phase D (additive): globals live in the Mach-O __DATA
+        // segment at macX64DataVaddr + globalsStart + globalOffsets[gi].
+        // Checked before isLinuxTarget(); every other target is byte-identical.
+        if (this.isMacX64Target()) {
+            int64 macBase = this.macX64DataVaddr;
+            for (int i = 0; i < this.globalPatchOffsets.length; i++) {
+                int patchPos = this.globalPatchOffsets[i];
+                int gi = this.globalPatchIndices[i];
+                int64 addr = macBase + globalsStart + this.globalOffsets[gi];
+                code[patchPos] = addr & 0xFF;
+                code[patchPos + 1] = (addr >> 8) & 0xFF;
+                code[patchPos + 2] = (addr >> 16) & 0xFF;
+                code[patchPos + 3] = (addr >> 24) & 0xFF;
+                code[patchPos + 4] = (addr >> 32) & 0xFF;
+                code[patchPos + 5] = (addr >> 40) & 0xFF;
+                code[patchPos + 6] = (addr >> 48) & 0xFF;
+                code[patchPos + 7] = (addr >> 56) & 0xFF;
+            }
+            return;
+        }
         // LINUX SysV backend (additive): globals live in the ELF RW data
         // segment right after stringData (mini_ef LINUX build() zero-pads
         // dataLen = stringData + globalAreaSize), so the address is
@@ -2127,6 +2256,28 @@ class MiniCg {
         return this.macBackend.computeMacGotAddresses(this);
     }
 
+    public void patchMacX64ImportRefs(int[] code) {
+        // MAC.md Phase D (additive): rewrite every import call site to the
+        // absolute non-lazy slot address (macX64SlotAddrs, flat import
+        // order, set by the driver after planning). Mirrors the #on LINUX
+        // twin's loop, but the addresses ride the prop (int64: they exceed
+        // 32 bits) instead of the int[] iatAddrs parameter. Only called on
+        // the MACX64 target, so every other target is byte-identical.
+        for (int i = 0; i < this.importPatchOffsets.length; i++) {
+            int patchPos = this.importPatchOffsets[i];
+            int funcIdx = this.importPatchFuncIndices[i];
+            int64 addr = this.macX64SlotAddrs[funcIdx];
+            code[patchPos] = addr & 0xFF;
+            code[patchPos + 1] = (addr >> 8) & 0xFF;
+            code[patchPos + 2] = (addr >> 16) & 0xFF;
+            code[patchPos + 3] = (addr >> 24) & 0xFF;
+            code[patchPos + 4] = (addr >> 32) & 0xFF;
+            code[patchPos + 5] = (addr >> 40) & 0xFF;
+            code[patchPos + 6] = (addr >> 48) & 0xFF;
+            code[patchPos + 7] = (addr >> 56) & 0xFF;
+        }
+    }
+
     public void patchImportRefs(int[] code, int[] iatAddrs, int rdataRva) {
         // WINDOWS-TARGET: rewrites every import call site to the absolute
         // PE IAT slot address (0x140000000 + rdataRva + iatOff). The Linux
@@ -2170,6 +2321,28 @@ class MiniCg {
     }
 
     public void patchStringRefs(int[] code, int stringsStart, int rdataRva) {
+        // MAC.md Phase D (additive): strings live in the Mach-O __DATA
+        // segment at macX64DataVaddr + stringsStart + dataOff. Checked
+        // before isLinuxTarget(); every other target is byte-identical.
+        if (this.isMacX64Target()) {
+            int64 macBase = this.macX64DataVaddr;
+            for (int i = 0; i < this.stringPatchOffsets.length; i++) {
+                int patchPos = this.stringPatchOffsets[i];
+                int strIdx = this.stringPatchIndices[i];
+                StrEntry se = this.strings[strIdx];
+                int dataOff = se.dataOffset;
+                int64 addr = macBase + stringsStart + dataOff;
+                code[patchPos] = addr & 0xFF;
+                code[patchPos + 1] = (addr >> 8) & 0xFF;
+                code[patchPos + 2] = (addr >> 16) & 0xFF;
+                code[patchPos + 3] = (addr >> 24) & 0xFF;
+                code[patchPos + 4] = (addr >> 32) & 0xFF;
+                code[patchPos + 5] = (addr >> 40) & 0xFF;
+                code[patchPos + 6] = (addr >> 48) & 0xFF;
+                code[patchPos + 7] = (addr >> 56) & 0xFF;
+            }
+            return;
+        }
         // LINUX SysV backend (additive): strings live in the ELF RW data
         // segment at elfDataVaddr() + stringsStart + dataOff (mini_ef LINUX
         // build() copies stringData to dataOff). The WINDOWS loop below is
@@ -2261,6 +2434,11 @@ int strIdx = this.stringPatchIndices[i];
                 // LINUX SysV backend (additive): linux imports resolve beside
                 // win32 ones (registrars self-filter by source namespace).
                 this.registerLinuxImport(pi);
+                // MAC.md Phase D: mac imports resolve beside them (the
+                // registrar self-filters by source namespace; without this
+                // macCallResolves never fires and every mac native call
+                // reports `unknown method` / falls into the linux error).
+                this.registerMacImport(pi);
                 // DOCS/261 bare custom grants resolve per targetOs beside them.
                 this.registerCustomBareImport(pi);
                 // Source-module imports are
@@ -2340,8 +2518,9 @@ int strIdx = this.stringPatchIndices[i];
             }
         }
         // Exception-state globals of the cooperative throw/catch model
-        // (__exc_active flag + __exc_value object slot): two writable slots
-        // registered after user globals so their indices are stable and the
+        // (__exc_active flag + __exc_value object slot + __exc_rawstr
+        // raw-string marker): three writable slots registered after user
+        // globals so their indices are stable and the
         // init stub zeroes them. Target-selected at runtime (not a region):
         // the running binary always carries every backend, so --os cross
         // builds resolve alike on any host; the Linux target additionally
@@ -2357,12 +2536,39 @@ int strIdx = this.stringPatchIndices[i];
         this.globalOffsets.add(this.globalOffsets.length * 8);
         Node excMissing2 = new Node(); excMissing2.kind = 255;
         this.globalInits.add(excMissing2);
+        // Mirror of the reference exc_state[16]: a user `throw "string"`
+        // sets it so a class-typed catch entry can re-wrap the raw string
+        // into the standard 32-byte exception object (string-typed catches
+        // keep the raw string; the marker is consumed either way). Builtin
+        // raises always throw objects and clear it.
+        this.globalNames.add("__exc_rawstr");
+        this.globalTypes.add("int");
+        this.globalOffsets.add(this.globalOffsets.length * 8);
+        Node excMissing3 = new Node(); excMissing3.kind = 255;
+        this.globalInits.add(excMissing3);
         if (this.isLinuxTarget()) {
             this.globalNames.add("__linux_stack_top");
             this.globalTypes.add("int");
             this.globalOffsets.add(this.globalOffsets.length * 8);
             Node stkMissing = new Node(); stkMissing.kind = 255;
             this.globalInits.add(stkMissing);
+        }
+        // MAC.md Phase D: cargs must work from ANY function, not just main.
+        // The [RBP+8]/[RBP+16] spill slots only exist in main's frame; a
+        // helper like cli.args() (or any `return cargs`) read return
+        // addresses and garbage there. Capture argc/argv into globals at
+        // main entry instead; the mac cargs reader loads from these.
+        if (this.isMacX64Target()) {
+            this.globalNames.add("__mac_argc");
+            this.globalTypes.add("int");
+            this.globalOffsets.add(this.globalOffsets.length * 8);
+            Node macArgcMissing = new Node(); macArgcMissing.kind = 255;
+            this.globalInits.add(macArgcMissing);
+            this.globalNames.add("__mac_argv");
+            this.globalTypes.add("int");
+            this.globalOffsets.add(this.globalOffsets.length * 8);
+            Node macArgvMissing = new Node(); macArgvMissing.kind = 255;
+            this.globalInits.add(macArgvMissing);
         }
         if (this.globalNames.length > 0) {
             this.globalAreaSize = this.globalNames.length * 8;
@@ -2602,6 +2808,13 @@ int strIdx = this.stringPatchIndices[i];
             if (this.refCalleeNames[ri] == func.name) {
                 int idx = this.refCalleeParams[ri];
                 if (idx >= 0 && idx < params.childCount()) {
+                    // DOCS/50: a `T*` parameter is an explicit pointer — an
+                    // `&x` argument is its address VALUE, not a by-reference
+                    // binding, so it keeps plain address semantics (explicit
+                    // `*p` loads/stores). Only plain-typed parameters take
+                    // the legacy auto-deref treatment.
+                    string pt = params.child(idx).typeHint;
+                    if (pt.length > 0 && pt[pt.length - 1] == '*') { continue; }
                     this.refParams.add(params.child(idx).name);
                 }
             }
@@ -3177,6 +3390,16 @@ int strIdx = this.stringPatchIndices[i];
         // into __linux_stack_top before any push (entry runs with the kernel
         // RSP: [RSP]=argc, [RSP+8]=argv[0], ...). genCargsCall rebuilds
         // argc/argv from it. Skipped on WINDOWS (targetOs is "").
+        // MAC.md Phase D (MACX64): dyld CALLS this stub with (argc=RDI,
+        // argv=RSI) instead of the kernel stack, so emulate the _start
+        // shape first (push rsi; push rdi -> [RSP]=argc, [RSP+8]=argv)
+        // and capture that. The pre-main reload below passes the pair
+        // through to main (its LC_MAIN spill then serves cargs exactly
+        // like the no-globals shape).
+        if (this.isMacX64Target()) {
+            this.asm.pushR64(6);
+            this.asm.pushR64(7);
+        }
         if (this.isLinuxTarget()) {
             this.emitLinuxStackCapture();
         }
@@ -3191,6 +3414,13 @@ int strIdx = this.stringPatchIndices[i];
         this.emitAbiCallTeardown();
 
         if (this.hasMain) {
+            // MAC.md Phase D (MACX64): reload the dyld (argc, argv) pair
+            // stashed at the stub entry so main's LC_MAIN spill sees them.
+            if (this.isMacX64Target()) {
+                this.emitLinuxStackTopLoad();
+                this.asm.movRMBase(7, 0, 0);
+                this.asm.movRMBase(6, 0, 8);
+            }
             // main();
             this.emitAbiCallSetup(0);
             this.asm.callRel32(0);
@@ -3385,6 +3615,23 @@ int strIdx = this.stringPatchIndices[i];
     this.asm.label(func.name);
     this.asm.pushR64(5);
     this.asm.movRR64(5, 4);
+    // MAC.md Phase D (additive): an LC_MAIN entry is CALLED by dyld with
+    // (argc=RDI=7, argv=RSI=6), unlike the ELF _start stack the SysV
+    // emission expects. Spill both into the slots the mac cargs reader
+    // uses ([RBP+8]=argc, [RBP+16]=argv base). Safe: main never returns
+    // (it ends in the exit syscall), so clobbering dyld's return address
+    // is harmless. Every other target is byte-identical to before.
+    if (func.name == "main" && this.isMacX64Target()) {
+        this.asm.movMBaseR(5, 7, 8);
+        this.asm.movMBaseR(5, 6, 16);
+        // Capture argc/argv into globals: the frame-relative spill above
+        // is only valid inside main, but cargs must work from any function
+        // (cli.args(), `return cargs`). genGlobalStore takes RAX.
+        this.asm.movRR64(0, 7);
+        this.genGlobalStore(this.findGlobal("__mac_argc"));
+        this.asm.movRR64(0, 6);
+        this.genGlobalStore(this.findGlobal("__mac_argv"));
+    }
     if (func.childCount() > 0) {
         Node paramsFn = func.child(0);
         for (int i = 0; i < paramsFn.childCount(); i++) {
@@ -3751,6 +3998,20 @@ int strIdx = this.stringPatchIndices[i];
         Node trackInit = null;
         if (stmt.childCount() > 0) { trackInit = stmt.child(0); }
         this.trackDictDecl(stmt.name, stmt.typeHint, trackInit);
+        // Dynamic-type tracking: `object x = new Foo()` / `object x =
+        // classFn()` — record the initializer's class so field reads and
+        // method calls on the object-typed variable bind the class (via
+        // objectDynamicTypeOf) instead of the dict layout.
+        if (stmt.childCount() > 0) {
+            string initType = this.inferExprType(stmt.child(0));
+            bool initIsClass = false;
+            for (int ci = 0; ci < this.classNames.length; ci++) {
+                if (this.classNames[ci] == initType) { initIsClass = true; }
+            }
+            if (initIsClass && (stmt.typeHint == "object" || stmt.typeHint == "" || stmt.typeHint == "var")) {
+                this.recordObjectDynamicType(stmt.name, initType);
+            }
+        }
         if (stmt.childCount() > 0) {
                 Node initNode = stmt.child(0);
                 if (initNode.kind == 7 && initNode.op == 28) {
@@ -3786,7 +4047,11 @@ int strIdx = this.stringPatchIndices[i];
                     // isStringLike, so its pointer is never masked).
                     this.genCharToString(initNode);
                 } else {
-                    this.genExpr(initNode);
+                    // Typed lowering so `Point[] a = [{...}]` boxes
+                    // elements as structs (mirrors silverc-rs
+                    // gen_expr_as_type on decl init); untyped shapes
+                    // fall through to genExpr unchanged.
+                    this.genExprAsType(initNode, stmt.typeHint);
                     // `double d = n;` widens the integer to a real double
                     // (silverc-rs does this in its decl-init arm); without it
                     // the raw integer bits landed in the double slot.
@@ -3874,6 +4139,16 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.movRI64(0, 1);
             int eaIdx = this.findGlobal("__exc_active");
             this.genGlobalStore(eaIdx);
+            // Raw-string marker (reference exc_state[16] mirror): a thrown
+            // string caught by a class-typed handler re-wraps at catch entry
+            // so `e.message` is the thrown text, never a wild pointer;
+            // string-typed handlers keep receiving the raw string. Object
+            // throws clear it.
+            int liRaw = 0;
+            if (this.inferExprType(stmt.child(0)) == "string") { liRaw = 1; }
+            this.asm.movRI64(0, liRaw);
+            int rsIdx = this.findGlobal("__exc_rawstr");
+            this.genGlobalStore(rsIdx);
             this.emitExceptionJump();
         } else if (stmt.kind == 59) {
             bool hasCatch = stmt.name != "";
@@ -3919,6 +4194,49 @@ int strIdx = this.stringPatchIndices[i];
 
                 int evIdx2 = this.findGlobal("__exc_value");
                 this.genGlobalLoad(evIdx2);
+                // A raw-string throw (__exc_rawstr marker, see the throw
+                // arm) caught by a class-typed handler re-wraps into the
+                // standard 32-byte exception object (message@0 /
+                // reason@24 = thrown string, line@8 / column@16 = 0 --
+                // the emitThrowException layout), so `e.message` is the
+                // thrown text instead of a wild pointer fault.
+                // String-typed handlers keep the raw string; the marker
+                // is consumed either way.
+                if (this.isClassName(stmt.typeHint) || this.isBuiltinExceptionName(stmt.typeHint)) {
+                    int crRawOff = this.allocLocal("__exc_raw_str");
+                    this.asm.movMBaseR(5, 0, crRawOff);
+                    int crMkOff = this.allocLocal("__exc_wrap_mk");
+                    int rsIdx2 = this.findGlobal("__exc_rawstr");
+                    this.genGlobalLoad(rsIdx2);
+                    this.asm.movMBaseR(5, 0, crMkOff);
+                    this.asm.movRI64(0, 0);
+                    this.genGlobalStore(rsIdx2);
+                    int crWrap = this.newLabel();
+                    int crNoWrap = this.newLabel();
+                    this.asm.movRMBase(0, 5, crMkOff);
+                    this.asm.cmpRI32(0, 0);
+                    this.asm.jeLabel(crNoWrap);
+                    // 32-byte exception object: message@0 = raw,
+                    // reason@24 = raw, line@8 = column@16 = 0.
+                    int crSizeOff = this.allocLocal("__exc_wrap_size");
+                    this.asm.movRI64(0, 32);
+                    this.asm.movMBaseR(5, 0, crSizeOff);
+                    this.emitLlmaiHeapAlloc(crSizeOff);
+                    int crObjOff = this.allocLocal("__exc_wrap_obj");
+                    this.asm.movMBaseR(5, 0, crObjOff);
+                    this.asm.movRMBase(1, 5, crObjOff);
+                    this.asm.movRMBase(0, 5, crRawOff);
+                    this.asm.movMBaseR(1, 0, 0);
+                    this.asm.movMBaseR(1, 0, 24);
+                    this.asm.xorRR64(2, 2);
+                    this.asm.movMBaseR(1, 2, 8);
+                    this.asm.movMBaseR(1, 2, 16);
+                    this.asm.movRMBase(0, 5, crObjOff);
+                    this.asm.jmpLabel(crWrap);
+                    this.asm.bindLabel(crNoWrap);
+                    this.asm.movRMBase(0, 5, crRawOff);
+                    this.asm.bindLabel(crWrap);
+                }
                 int catchOff = this.allocLocal(stmt.name);
                 this.asm.movMBaseR(5, 0, catchOff);
                 this.asm.movRI64(0, 0);
@@ -4141,6 +4459,24 @@ int strIdx = this.stringPatchIndices[i];
                 this.asm.jmpLabel(contLbl);
             }
         } else if (stmt.kind == 64) {
+            if (stmt.childCount() > 1) {
+                // Reject provably non-iterable receivers at compile time.
+                // The lowering below reads an array length header at [-8]
+                // and walks with array stride, so a scalar receiver (e.g.
+                // `foreach (x in 5)`) segfaults and a dict receiver walks
+                // stride-16 entries with stride 8 (keys/values interleaved
+                // or worse). Arrays keep the array lowering and strings keep
+                // their exact status-quo behavior; unknown/dynamic receivers
+                // (""/var/object, unprovable) keep the legacy lowering.
+                // Dict iteration itself stays unimplemented (separate
+                // feature); it now fails loud instead of walking garbage.
+                string feRecvT = this.inferExprType(stmt.child(1));
+                if (feRecvT != "" && feRecvT != "var" && feRecvT != "object" && feRecvT != "object?" && feRecvT != "string" && feRecvT != "string?" && !this.isArrayLikeType(feRecvT)) {
+                    Node feRecv = stmt.child(1);
+                    printline("foreach requires an array receiver, got '" + feRecvT + "' at line " + (string)feRecv.line + ", column " + (string)feRecv.col);
+                    exit(1);
+                }
+            }
             int startLbl = this.newLabel();
             int endLbl = this.newLabel();
             int contLbl = this.newLabel();
@@ -4291,18 +4627,79 @@ int strIdx = this.stringPatchIndices[i];
             if (fieldOff < 0) { continue; }
             // Nested struct literal: the field type is itself a struct, so
             // recurse with that type instead of treating `{...}` as a dict.
+            // Array-typed fields route through the typed lowering so
+            // `pts: [{...}]` boxes elements as structs too.
             string fieldType = this.findFieldType(typeName, key.name);
             if (value.kind == 74 && (fieldType == typeName || typeName == fieldType + "?")) {
                 this.genStructLiteral(value, fieldType);
             } else if (value.kind == 74) {
                 this.genStructLiteral(value, fieldType);
             } else {
-                this.genExpr(value);
+                this.genExprAsType(value, fieldType);
             }
             this.asm.movRMBase(1, 5, objOff);
             this.asm.movMBaseR(1, 0, fieldOff);
         }
         this.asm.movRMBase(0, 5, objOff);
+    }
+
+    // True when `t` names a known class/struct (nullable suffix
+    // allowed). `object`/`var`/empty never qualify: those lower to
+    // the dict layout.
+    public bool isStructTypeName(string t) {
+        if (t == "" || t == "var" || t == "object" || t == "object?") { return false; }
+        string base = t;
+        if (base.length > 0 && base[base.length - 1] == '?') {
+            base = base.substring(0, base.length - 1);
+        }
+        return this.isClassName(base);
+    }
+
+    // Typed expression lowering (mirrors silverc-rs gen_expr_as_type):
+    // a `{...}` literal against a known class builds a real struct
+    // object; an array literal against `E[]` lowers each element
+    // against `E` so struct elements box correctly instead of
+    // degrading to dicts (whose layout reads back as garbage
+    // through class field offsets). Anything else falls through to
+    // genExpr unchanged.
+    public void genExprAsType(Node expr, string typeName) {
+        if (expr.kind == 74 && this.isStructTypeName(typeName)) {
+            this.genStructLiteral(expr, typeName);
+            return;
+        }
+        if (expr.kind == 19 && typeName.length >= 2 && typeName[typeName.length - 2] == '[' && typeName[typeName.length - 1] == ']') {
+            string elemT = this.arrayElementType(typeName);
+            string saved = this.arrayLitElemHint;
+            this.arrayLitElemHint = elemT;
+            this.genExpr(expr);
+            this.arrayLitElemHint = saved;
+            return;
+        }
+        this.genExpr(expr);
+    }
+
+    // One array-literal element under the ambient typed-element hint.
+    // The fallback clears the hint around nested evaluation so an
+    // outer `Point[]` never leaks into unrelated inner literals
+    // (call arguments, dict values, ...); nested array literals
+    // re-derive their own hint by stripping one `[]` layer.
+    public void genArrayLitElement(Node child) {
+        string hint = this.arrayLitElemHint;
+        if (child.kind == 74 && this.isStructTypeName(hint)) {
+            this.genStructLiteral(child, hint);
+            return;
+        }
+        if (child.kind == 19 && hint.length >= 2 && hint[hint.length - 2] == '[' && hint[hint.length - 1] == ']') {
+            string saved = this.arrayLitElemHint;
+            this.arrayLitElemHint = this.arrayElementType(hint);
+            this.genExpr(child);
+            this.arrayLitElemHint = saved;
+            return;
+        }
+        string saved2 = this.arrayLitElemHint;
+        this.arrayLitElemHint = "";
+        this.genExpr(child);
+        this.arrayLitElemHint = saved2;
     }
 
     public void genExpr(Node expr) {
@@ -4326,6 +4723,13 @@ int strIdx = this.stringPatchIndices[i];
             if (expr.boolVal) { this.asm.emitImm64(0, 1); } else { this.asm.emitImm64(0, 0); }
         } else if (kind == 5) {
             this.asm.xorRR64(0, 0);
+        } else if (kind == 74) {
+            // Nested anonymous object literal (a dict/object value inside
+            // another literal, call argument, or index). Top-level
+            // declarations route through genStructLiteral; every OTHER
+            // position must lower here or emits nothing and leaves a stale
+            // register in the slot (nested `server: { port: 8080 }` read 0).
+            this.genStructLiteralAsDict(expr);
         } else if (kind == 66) {
             // Dictionary layout: [capacity, length, key/value slots...].
             int count = expr.childCount();
@@ -4528,8 +4932,10 @@ int strIdx = this.stringPatchIndices[i];
                         this.asm.jmpLabel(loopStart);
                         this.asm.bindLabel(loopEnd);
                     } else {
-                        // Plain element: evaluate and store at alloc+16+idx*8
-                        this.genExpr(child);
+                        // Plain element: evaluate (typed when the literal
+                        // lowers against a declared element type) and store
+                        // at alloc+16+idx*8
+                        this.genArrayLitElement(child);
                         this.asm.movRMBase(1, 5, allocOff);
                         this.asm.addRI32(1, 16);
                         this.asm.movRMBase(2, 5, idxOff);
@@ -4568,7 +4974,7 @@ int strIdx = this.stringPatchIndices[i];
                 this.asm.emitImm64(1, count);
                 this.asm.movMBaseR(0, 1, 8);
                 for (int i = 0; i < count; i++) {
-                    this.genExpr(expr.child(i));
+                    this.genArrayLitElement(expr.child(i));
                     this.asm.movRMBase(1, 5, arrOff);
                     this.asm.movMBaseR(1, 0, 16 + i * 8);
                 }
@@ -4765,7 +5171,15 @@ int strIdx = this.stringPatchIndices[i];
                     return;
                 }
             }
-            if (expr.op == 3) {
+            if (expr.op == 4) {
+                // DOCS/50 dereference load `*p`: the operand evaluates to an
+                // address; load the full 8-byte cell at that address into
+                // RAX (a pointer IS an address, so any `T*` works).
+                if (expr.childCount() > 0) {
+                    this.genExpr(expr.child(0));
+                    this.asm.movRMBase(0, 0, 0);
+                }
+            } else if (expr.op == 3) {
                 // Address-of operator (&x): compute the address of the operand.
                 // For a simple local variable, emit LEA [rbp+off] instead of
                 // loading the value (the old code evaluated the child, leaving
@@ -4943,6 +5357,11 @@ int strIdx = this.stringPatchIndices[i];
             int64 va = 0x140000000 + 0x1000 + target;
             if (this.isLinuxTarget()) {
                 va = this.elfCodeVaddr() + target;
+            }
+            // MAC.md Phase D: the bridge links code at 0x100001000
+            // (TEXT_BASE + 0x1000, layout-independent constant).
+            if (this.isMacX64Target()) {
+                va = 4294967296 + 4096 + target;
             }
             int pos = this.anonRelocPatchOffsets[r];
             this.asm.buf[pos] = va & 0xFF;
@@ -5342,6 +5761,39 @@ int strIdx = this.stringPatchIndices[i];
         if (obj.kind == 24) {
             Node arrNode = obj.child(0);
             string arrType = this.inferExprType(arrNode);
+            if (this.isDictType(arrType)) {
+                // Dict-index member read (`d[k].field`): genArrayIndex would
+                // route the dict receiver to genDictIndexGet and leave the
+                // VALUE cell in r0, but the field load then keyed off the
+                // inferred index type, which is "" while local dict decls
+                // carried no generic args — the read returned the slot
+                // pointer instead of the field. Load the value cell, then
+                // the field through the dict's value class
+                // (dictValueType), with the unique-field fallback used by
+                // the kind-6 arm when the value type is unresolvable.
+                // Dict/object-VALUED dicts keep the `d.key` semantics: the
+                // field is a key lookup on the value dict.
+                string dvType = this.dictValueType(arrType).trim();
+                if (this.isDictOrObjectType(dvType)) {
+                    Node nestedIdx = new Node();
+                    nestedIdx.kind = 24;
+                    nestedIdx.children.add(obj);
+                    Node nestedKey = new Node();
+                    nestedKey.kind = 2;
+                    nestedKey.strVal = fieldName;
+                    nestedIdx.children.add(nestedKey);
+                    this.genDictIndexGet(nestedIdx);
+                    return;
+                }
+                this.genDictIndexGet(obj);
+                int fieldOff = -1;
+                if (dvType != "") { fieldOff = this.findFieldOffset(dvType, fieldName); }
+                if (fieldOff < 0) { fieldOff = this.findFieldOffsetInAllClasses(fieldName); }
+                if (fieldOff >= 0) {
+                    this.asm.movRMBase(0, 0, fieldOff);
+                }
+                return;
+            }
             this.genArrayIndex(obj);
             string elemType = this.inferExprType(obj);
             if (elemType == "") { elemType = this.arrayElementType(arrType); }
@@ -5494,7 +5946,16 @@ int strIdx = this.stringPatchIndices[i];
                 }
             }
             string localType = this.getLocalType(expr.name);
-            if (localType != "") { return localType; }
+            if (localType != "") {
+                // Object-typed local holding a class instance: adopt the
+                // recorded dynamic type so member access binds the class
+                // (field reads/method calls) rather than the dict layout.
+                if (localType == "object") {
+                    string dynType = this.objectDynamicTypeOf(expr.name);
+                    if (dynType != "") { return dynType; }
+                }
+                return localType;
+            }
             // Bare class field: `field` inside a method resolves to
             // this.field (parity with silverc-rs infer_struct_type).
             if (this.currentClassName != "") {
@@ -5604,7 +6065,7 @@ int strIdx = this.stringPatchIndices[i];
                 if (cname == "contains" && recvType == "string") {
                     return "bool";
                 }
-                if ((cname == "indexOf" || cname == "find") && recvType == "string") {
+                if ((cname == "indexOf" || cname == "find" || cname == "lastIndexOf") && recvType == "string") {
                     return "int";
                 }
                 if (cname == "charCodeAt" && recvType == "char") {
@@ -5656,6 +6117,16 @@ int strIdx = this.stringPatchIndices[i];
                     }
                 }
                 if (cname == "reverse") {
+                    if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
+                        return recvType;
+                    }
+                }
+                // concat/slice build a fresh array of the receiver's
+                // element type (mirrors silverc-rs). Without this,
+                // member reads chained on the result
+                // (`ps.concat(ps)[1].x`) inferred unknown and emitted
+                // no field load, reading back 0.
+                if (cname == "concat" || cname == "slice") {
                     if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
                         return recvType;
                     }
@@ -5778,6 +6249,22 @@ int strIdx = this.stringPatchIndices[i];
         }
         if (expr.kind == 8) {
             if (expr.op == 1) { return "bool"; }
+            // DOCS/50: an address is an int-like value (it prints through
+            // the integer `%lld` path); a dereference yields the pointed-to
+            // cell, typed by stripping one trailing `*` (an unknown base
+            // falls back to int so every consumer stays on the integer path).
+            if (expr.op == 3) { return "int"; }
+            if (expr.op == 4) {
+                if (expr.childCount() > 0) {
+                    string pt = this.inferExprType(expr.child(0));
+                    if (pt.length > 1 && pt[pt.length - 1] == '*') {
+                        string base = "";
+                        for (int pi = 0; pi < pt.length - 1; pi++) { base += pt[pi]; }
+                        if (base.length > 0) { return base; }
+                    }
+                }
+                return "int";
+            }
             if (expr.op == 0 && expr.childCount() > 0) {
                 int uIdx = this.findUnaryOperator(expr.child(0), 0);
                 if (uIdx >= 0 && uIdx < this.funcRetTypes.length) {
@@ -5817,8 +6304,33 @@ int strIdx = this.stringPatchIndices[i];
             }
         }
         string objType = this.inferExprType(obj);
+        // Object/dict receivers: any member of a dict-valued object is an
+        // object (nested literals chain). Class instances stored in object
+        // vars keep inferExprType's class answer (dynamic-type tracking),
+        // so field reads and method calls still bind the class.
+        if (objType == "object" || (objType == "" && obj.kind == 6 && this.objectDynamicTypeOf(obj.name) == "")) { return "object"; }
         string fieldType = this.findFieldType(objType, fieldName);
         return fieldType;
+    }
+
+    // Dynamic type of an `object`/`var`-declared variable initialized from
+    // a class instance (DOCS/270 / html.parse shape): the class name once
+    // recorded, "" when the value is a dict/object literal. Field reads and
+    // method calls on the variable then bind the class exactly like a
+    // statically-typed local.
+    public string objectDynamicTypeOf(string name) {
+        for (int i = 0; i < this.objectDynNames.length; i++) {
+            if (this.objectDynNames[i] == name) { return this.objectDynTypes[i]; }
+        }
+        return "";
+    }
+
+    public void recordObjectDynamicType(string name, string cls) {
+        for (int i = 0; i < this.objectDynNames.length; i++) {
+            if (this.objectDynNames[i] == name) { this.objectDynTypes[i] = cls; return; }
+        }
+        this.objectDynNames.add(name);
+        this.objectDynTypes.add(cls);
     }
 
     public int findFieldOffsetInAllClasses(string fieldName) {
@@ -6982,11 +7494,236 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.bindLabel(done);
     }
 
+    // Array concatenation core: RAX = fresh a ++ b (header [capacity,
+    // length], data at +16; mirrors silverc-rs emit_array_concat). aOff
+    // and bOff hold the two array pointers. Backs `a + b` on arrays and
+    // the `.concat(b)` method.
+    public void genArrayConcatCore(int aOff, int bOff) {
+        int laOff = this.allocLocal("__concat_la");
+        int lbOff = this.allocLocal("__concat_lb");
+        int nlenOff = this.allocLocal("__concat_nlen");
+        int capOff = this.allocLocal("__concat_cap");
+        int newOff = this.allocLocal("__concat_new");
+        int iOff = this.allocLocal("__concat_i");
+        this.asm.movRMBase(0, 5, aOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, laOff);
+        this.asm.movRMBase(0, 5, bOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lbOff);
+        this.asm.movRMBase(0, 5, laOff);
+        this.asm.movRMBase(1, 5, lbOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(5, 0, nlenOff);
+        int capGe = this.newLabel();
+        int capDone = this.newLabel();
+        this.asm.movRMBase(0, 5, nlenOff);
+        this.asm.cmpRI32(0, 8);
+        this.asm.jgeLabel(capGe);
+        this.asm.movRI64(0, 8);
+        this.asm.jmpLabel(capDone);
+        this.asm.bindLabel(capGe);
+        this.asm.movRMBase(0, 5, nlenOff);
+        this.asm.bindLabel(capDone);
+        this.asm.movMBaseR(5, 0, capOff);
+        this.asm.movRMBase(8, 5, capOff);
+        this.asm.addRI32(8, 2);
+        this.asm.shlR64Imm(8, 3);
+        this.emitLinuxHeapAllocFromR8();
+        this.asm.movRMBase(1, 5, capOff);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(1, 5, nlenOff);
+        this.asm.movMBaseR(0, 1, 8);
+        this.asm.addRI32(0, 16);
+        this.asm.movMBaseR(5, 0, newOff);
+        // Pass 0 copies a[0..la) to new[0..); pass 1 copies b[0..lb) to
+        // new[la..). The write base selects per pass (0, then laOff).
+        for (int pass = 0; pass < 2; pass++) {
+            int srcOff = aOff;
+            int limOff = laOff;
+            if (pass == 1) { srcOff = bOff; limOff = lbOff; }
+            int loopL = this.newLabel();
+            int doneL = this.newLabel();
+            this.asm.movRI64(0, 0);
+            this.asm.movMBaseR(5, 0, iOff);
+            this.asm.movRI64(0, 0);
+            this.asm.movMBaseR(5, 0, iOff);
+            this.asm.bindLabel(loopL);
+            this.asm.movRMBase(0, 5, iOff);
+            this.asm.movRMBase(1, 5, limOff);
+            this.asm.cmpRR64(0, 1);
+            this.asm.jgeLabel(doneL);
+            this.asm.movRMBase(0, 5, srcOff);
+            this.asm.movRMBase(1, 5, iOff);
+            this.asm.shlR64Imm(1, 3);
+            this.asm.addRR64(0, 1);
+            this.asm.movRMBase(1, 0, 0);
+            this.asm.movRMBase(0, 5, newOff);
+            this.asm.movRMBase(2, 5, iOff);
+            if (pass == 1) {
+                // Base offset via R10: R1 holds the loaded element and
+                // must survive (the old R1 form stored la instead).
+                this.asm.movRMBase(10, 5, laOff);
+                this.asm.addRR64(2, 10);
+            }
+            this.asm.shlR64Imm(2, 3);
+            this.asm.addRR64(0, 2);
+            this.asm.movMBaseR(0, 1, 0);
+            this.asm.movRMBase(0, 5, iOff);
+            this.asm.addRI32(0, 1);
+            this.asm.movMBaseR(5, 0, iOff);
+            this.asm.jmpLabel(loopL);
+            this.asm.bindLabel(doneL);
+        }
+        this.asm.movRMBase(0, 5, newOff);
+    }
+
+    // `.concat(b)` method form: receiver is child(0), argument child(1).
+    public void genArrayConcatCall(Node call) {
+        Node arrNode = call.child(0);
+        this.genExpr(arrNode);
+        int aOff = this.allocLocal("__concat_call_a");
+        this.asm.movMBaseR(5, 0, aOff);
+        if (call.childCount() > 1) {
+            this.genExpr(call.child(1));
+        } else {
+            this.asm.xorRR64(0, 0);
+        }
+        int bOff = this.allocLocal("__concat_call_b");
+        this.asm.movMBaseR(5, 0, bOff);
+        this.genArrayConcatCore(aOff, bOff);
+    }
+
+    // `.flat()` (one level): fresh concat of every element array.
+    // Elements are trusted to be arrays (doc contract).
+    public void genArrayFlatCall(Node call) {
+        Node arrNode = call.child(0);
+        this.genExpr(arrNode);
+        int arrOff = this.allocLocal("__flat_arr");
+        this.asm.movMBaseR(5, 0, arrOff);
+        int lenOff = this.allocLocal("__flat_len");
+        int totOff = this.allocLocal("__flat_total");
+        int capOff = this.allocLocal("__flat_cap");
+        int newOff = this.allocLocal("__flat_new");
+        int iOff = this.allocLocal("__flat_i");
+        int jOff = this.allocLocal("__flat_j");
+        int wposOff = this.allocLocal("__flat_wpos");
+        int subOff = this.allocLocal("__flat_sub");
+        int sublenOff = this.allocLocal("__flat_sublen");
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, totOff);
+        this.asm.movMBaseR(5, 0, iOff);
+        int sumL = this.newLabel();
+        int sumDone = this.newLabel();
+        this.asm.bindLabel(sumL);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(sumDone);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(1, 5, iOff);
+        this.asm.shlR64Imm(1, 3);
+        this.asm.addRR64(0, 1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movRMBase(1, 5, totOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(5, 0, totOff);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(sumL);
+        this.asm.bindLabel(sumDone);
+        int capGe = this.newLabel();
+        int capDone = this.newLabel();
+        this.asm.movRMBase(0, 5, totOff);
+        this.asm.cmpRI32(0, 8);
+        this.asm.jgeLabel(capGe);
+        this.asm.movRI64(0, 8);
+        this.asm.jmpLabel(capDone);
+        this.asm.bindLabel(capGe);
+        this.asm.movRMBase(0, 5, totOff);
+        this.asm.bindLabel(capDone);
+        this.asm.movMBaseR(5, 0, capOff);
+        this.asm.movRMBase(8, 5, capOff);
+        this.asm.addRI32(8, 2);
+        this.asm.shlR64Imm(8, 3);
+        this.emitLinuxHeapAllocFromR8();
+        this.asm.movRMBase(1, 5, capOff);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(1, 5, totOff);
+        this.asm.movMBaseR(0, 1, 8);
+        this.asm.addRI32(0, 16);
+        this.asm.movMBaseR(5, 0, newOff);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.movMBaseR(5, 0, wposOff);
+        int outer = this.newLabel();
+        int outerDone = this.newLabel();
+        int inner = this.newLabel();
+        int innerDone = this.newLabel();
+        this.asm.bindLabel(outer);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(outerDone);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(1, 5, iOff);
+        this.asm.shlR64Imm(1, 3);
+        this.asm.addRR64(0, 1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.movMBaseR(5, 0, subOff);
+        this.asm.movRMBase(0, 5, subOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, sublenOff);
+        this.asm.movMBaseR(5, 0, jOff);
+        this.asm.bindLabel(inner);
+        this.asm.movRMBase(0, 5, jOff);
+        this.asm.movRMBase(1, 5, sublenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(innerDone);
+        this.asm.movRMBase(0, 5, subOff);
+        this.asm.movRMBase(1, 5, jOff);
+        this.asm.shlR64Imm(1, 3);
+        this.asm.addRR64(0, 1);
+        this.asm.movRMBase(1, 0, 0);
+        this.asm.movRMBase(0, 5, newOff);
+        this.asm.movRMBase(2, 5, wposOff);
+        this.asm.shlR64Imm(2, 3);
+        this.asm.addRR64(0, 2);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(0, 5, wposOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, wposOff);
+        this.asm.movRMBase(0, 5, jOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, jOff);
+        this.asm.jmpLabel(inner);
+        this.asm.bindLabel(innerDone);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(outer);
+        this.asm.bindLabel(outerDone);
+        this.asm.movRMBase(0, 5, newOff);
+    }
+
     public void genArraySort(Node call) {
         Node arrNode = call.child(0);
         string arrType = this.inferExprType(arrNode);
         string elemType = this.arrayElementType(arrType);
         bool stringElements = elemType == "string";
+        // Sort direction (DOCS/85): a compile-time string-literal argument
+        // selects the comparator polarity -- `sort("desc")` reverses it,
+        // `sort("asc")` (and any other shape, matching the previous
+        // ignored-argument behavior) keeps ascending. The argument node is
+        // never evaluated, so non-literal directions are simply ignored.
+        bool descending = false;
+        if (call.childCount() > 1 && call.child(1).kind == 2 && call.child(1).strVal == "desc") {
+            descending = true;
+        }
         int arrOff = this.allocLocal("__sort_arr");
         int lenOff = this.allocLocal("__sort_len");
         int iOff = this.allocLocal("__sort_i");
@@ -7038,9 +7775,13 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.callR64(0);
             this.asm.emitCallTeardown();
             this.asm.cmpRI32(0, 0);
-            this.asm.jleLabel(insert);
+            if (descending) {
+                this.asm.jgeLabel(insert);
+            } else {
+                this.asm.jleLabel(insert);
+            }
         } else {
-            // arr[j] > key -> shift right
+            // arr[j] > key -> shift right (descending flips to arr[j] < key)
             this.asm.movRMBase(1, 5, arrOff);
             this.asm.movRMBase(2, 5, jOff);
             this.asm.shlR64Imm(2, 3);
@@ -7048,7 +7789,11 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.movRMBase(0, 1, 0);
             this.asm.movRMBase(2, 5, keyOff);
             this.asm.cmpRR64(0, 2);
-            this.asm.jleLabel(insert);
+            if (descending) {
+                this.asm.jgeLabel(insert);
+            } else {
+                this.asm.jleLabel(insert);
+            }
         }
         // arr[j+1] = arr[j]
         this.asm.movRMBase(1, 5, arrOff);
@@ -8041,10 +8786,10 @@ int strIdx = this.stringPatchIndices[i];
                     this.asm.bindLabel(pcCheck);
                     this.asm.cmpRR64(2, 9);
                     this.asm.jgeLabel(pcDone);
-                    // NB: imulRR64 emits IMUL reg, r/m with the SECOND
-                    // operand as the destination, so the accumulator stays
-                    // in RAX only with the operands in (9, 0) order.
-                    this.asm.imulRR64(9, 0);
+                    // imulRR64(dst, src) accumulates into dst (IMUL r64,
+                    // r/m64 with the reg field as destination), so the
+                    // base-10 accumulator stays in RAX with (0, 9) order.
+                    this.asm.imulRR64(0, 9);
                     this.asm.addRR64(0, 2);
                     this.asm.incR64(1);
                     this.asm.jmpLabel(pcDigits);
@@ -8214,6 +8959,29 @@ int strIdx = this.stringPatchIndices[i];
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && call.child(0).name == "json" && name == "stringify") {
             // json.stringify(value): native JSON text lowering matching
             // silverc-rs stdlib/json.rs (string/int/float/bool/array).
+            // Beautify shape (DOCS/96): a STRING receiver plus an option
+            // argument parses-and-pretty-prints raw JSON text instead of
+            // quoting it. When std/json.sr is collected (import json), divert
+            // to its Silver `beautify(text, indent)`; without the import the
+            // legacy quoting lowering still answers.
+            if (call.childCount() >= 3 && this.inferExprType(call.child(1)) == "string" && this.jsonBeautifyResolves()) {
+                Node bc = new Node();
+                bc.kind = 10;
+                bc.name = "beautify";
+                bc.isMember = true;
+                bc.line = call.line;
+                bc.col = call.col;
+                bc.children.add(call.child(0));
+                bc.children.add(call.child(1));
+                Node indentArg = new Node();
+                indentArg.kind = 0;
+                indentArg.intVal = this.jsonIndentOf(call);
+                if (indentArg.intVal <= 0) { indentArg.intVal = 2; }
+                bc.children.add(indentArg);
+                this.genUserCall(bc);
+                this.emitExcCheck();
+                return;
+            }
             this.genJsonStringify(call);
         } else if (builtinName && name == "len") {
             this.genLenCall(call);
@@ -8410,6 +9178,10 @@ int strIdx = this.stringPatchIndices[i];
             this.genArrayContains(call);
         } else if (call.isMember && call.childCount() > 0 && name == "sort" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArraySort(call);
+        } else if (call.isMember && call.childCount() > 1 && name == "concat" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+            this.genArrayConcatCall(call);
+        } else if (call.isMember && call.childCount() > 0 && name == "flat" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+            this.genArrayFlatCall(call);
         } else if (call.isMember && call.childCount() > 0 && name == "swap" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArraySwap(call);
         } else if (call.isMember && call.childCount() > 0 && name == "unique" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
@@ -9508,6 +10280,8 @@ public void genNewCall(Node call) {
             string fieldType = this.findFieldType(clsName, key.name);
             if (value.kind == 74 && fieldType != "") {
                 this.genStructLiteral(value, fieldType);
+            } else if (value.kind == 19 && fieldType != "") {
+                this.genExprAsType(value, fieldType);
             } else {
                 this.genExpr(value);
             }
@@ -10125,6 +10899,13 @@ public void genNewCall(Node call) {
         this.asm.movRMBase(10, 0, 0);
         this.asm.movRI64(0, 0);
         this.asm.callR64(10);
+        // MAC.md Phase D (additive): 32-bit C int returns leave RAX's high
+        // half zeroed; sign-extend for the known 32-bit set so -1 reads as
+        // 64-bit -1 (mirrors silverc-rs native_returns_32bit). LINUX target
+        // is byte-identical to before (checked second).
+        if (this.isMacX64Target() && macX64Returns32Bit(libFn)) {
+            this.asm.movSlq(0, 0);
+        }
         this.emitAbiCallTeardown();
     }
 
@@ -10321,7 +11102,6 @@ public void genNewCall(Node call) {
         }
         if (funcIdx >= 0 && funcIdx < this.funcOffsets.length) {
             int targetOff = this.funcOffsets[funcIdx];
-            int[] argRegs = [1, 2, 8, 9];
             int explicitArgs = call.childCount() - argStart;
             if (explicitArgs < 0) { explicitArgs = 0; }
             Node packedArg = null;
@@ -10473,6 +11253,11 @@ public void genNewCall(Node call) {
         // known-but-ungranted linux export is the same DOCS/213 error as its
         // win32 counterpart.
         if (this.isLinuxTarget()) {
+            // MAC.md Phase D: on the Rosetta bridge, names covered by mac
+            // grants (mac.libsystem, ...) fall through to the MACX64 arm
+            // below instead of erroring here (the module imported the mac
+            // side, not linux.libc, exactly as MAC-filtered sources do).
+            if (!this.isMacX64Target() || !this.macCallResolves(name)) {
             string linuxLib = this.linuxResolveLib(name);
             string linuxFn = name;
             string linuxAliasLib = this.linuxResolveAliasLib(name);
@@ -10492,6 +11277,41 @@ public void genNewCall(Node call) {
             }
             if (this.linuxKnownExport(name)) {
                 printline("Error: linux function '" + name + "' used without importing its module (add: import * from linux." + this.linuxModuleOf(this.linuxBareLib(name)) + ";)");
+                exit(1);
+                return;
+            }
+            } // end MACX64 mac-grant fallthrough guard
+        }
+        // MAC.md Phase D (additive): on the Rosetta bridge, granted mac
+        // calls (mac.libsystem, ...) emit real SysV import calls through
+        // genLinuxImportCall (same shape, libSystem owners) instead of the
+        // v1 record-only stub below. Checked before isMacTarget().
+        if (this.isMacX64Target()) {
+            string macXLib = this.macResolveLib(name);
+            string macXFn = name;
+            for (int ma = 0; ma < this.macAliasLocals.length; ma++) {
+                if (this.macAliasLocals[ma] == name) {
+                    macXLib = this.macAliasLibs[ma];
+                    macXFn = this.macAliasExports[ma];
+                    break;
+                }
+            }
+            if (macXLib.length == 0) {
+                string bare = this.macBareLib(name);
+                if (bare.length > 0) { macXLib = bare; macXFn = name; }
+            }
+            if (macXLib.length > 0) {
+                if (!this.macAllowed(macXLib, macXFn)) {
+                    printline("Error: mac function '" + name + "' used without importing its module (add: import * from mac." + this.macModuleOf(macXLib) + ";)");
+                    exit(1);
+                    return;
+                }
+                this.genLinuxImportCall(call, argStart, macXLib, macXFn);
+                this.emitExcCheck();
+                return;
+            }
+            if (this.macKnownExport(name)) {
+                printline("Error: mac function '" + name + "' used without importing its module (add: import * from mac." + this.macModuleOf(this.macBareLib(name)) + ";)");
                 exit(1);
                 return;
             }
@@ -10862,6 +11682,28 @@ public void genNewCall(Node call) {
         return true;
     }
 
+    // True when class `cls` declares a method `name` itself or inherits
+    // one through its ancestry (arity-blind: any declaration keeps the
+    // static-call path for a bare class-name receiver).
+    private bool classOrMroDeclares(string name, string cls) {
+        string[] order = this.ancestryPreOrder(cls);
+        for (int d = 0; d < order.length; d++) {
+            for (int i = 0; i < this.funcNames.length; i++) {
+                if (this.funcNames[i] == name && this.funcClasses[i] == order[d]) { return true; }
+            }
+        }
+        return false;
+    }
+
+    // True when a module-global (classless) function `name` exists in any
+    // collected module.
+    private bool globalFuncExists(string name) {
+        for (int i = 0; i < this.funcNames.length; i++) {
+            if (this.funcNames[i] == name && this.funcClasses[i] == "") { return true; }
+        }
+        return false;
+    }
+
     public bool isUserClassMemberCall(Node call) {
         if (call.childCount() < 1) { return false; }
         Node recv = call.child(0);
@@ -10872,12 +11714,45 @@ public void genNewCall(Node call) {
         // register and corrupt string/object parameters.
         if (recv.kind == 6) {
             for (int i = 0; i < this.classNames.length; i++) {
-                if (this.classNames[i] == recv.name) { return true; }
+                if (this.classNames[i] == recv.name) {
+                    // A bare class name that ALSO names a module's global
+                    // namespace (uuid.isValid shape): when the class (or its
+                    // ancestry) declares no such method but a module global
+                    // of this name exists, the call names the module global
+                    // -- declining routes to genUserCall, which drops the
+                    // receiver. Keeping the member path would bind the
+                    // global through the method ABI and shift every argument
+                    // (uuid.isValid always read a garbage receiver and
+                    // returned false). A declared method still wins.
+                    if (!this.classOrMroDeclares(call.name, recv.name) && this.globalFuncExists(call.name)) {
+                        return false;
+                    }
+                    return true;
+                }
             }
         }
         string recvClass = this.inferExprType(recv);
         for (int i = 0; i < this.classNames.length; i++) {
             if ((this.classNames[i] == recvClass || recvClass == this.classNames[i] + "?")) { return true; }
+        }
+        // Dynamic dispatch (DOCS/270 object initializer / html.parse shape):
+        // an object-typed (or untyped) receiver holding a class instance.
+        // When exactly one class in the program defines this method name,
+        // bind that class's mangled method — the reference compiler's
+        // find_class_for_expr fallback. Ambiguous names stay unresolved
+        // (genUserCall reports them). Module-qualified calls (html.parse)
+        // are NEVER dynamic dispatch: the receiver names a module, and
+        // binding the module's free function through the method ABI would
+        // shift every argument and fault.
+        if ((recvClass == "" || recvClass == "object") && this.moduleCallTarget(call) == "") {
+            string uniqueOwner = "";
+            for (int c = 0; c < this.funcNames.length; c++) {
+                if (this.funcNames[c] == call.name && this.funcClasses[c] != "") {
+                    if (uniqueOwner != "") { return false; }
+                    uniqueOwner = this.funcClasses[c];
+                }
+            }
+            if (uniqueOwner != "") { return true; }
         }
         return false;
     }
@@ -10974,7 +11849,7 @@ public void genNewCall(Node call) {
             }
         }
         if (recvType == "string") {
-            if (name == "contains" || name == "isDigits" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "substr" || name == "substring" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toFloatBits" || name == "toBytes" || name == "repeat") {
+            if (name == "contains" || name == "isDigits" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "lastIndexOf" || name == "substr" || name == "substring" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toFloatBits" || name == "toBytes" || name == "repeat") {
                 return true;
             }
         }
@@ -11530,6 +12405,186 @@ public void genNewCall(Node call) {
             this.asm.bindLabel(ioDone);
             return;
         }
+        if (name == "lastIndexOf") {
+            // Mirror of indexOf/find above scanning for the LAST hit
+            // (parity with silverc-rs emit_string_last_find /
+            // emit_string_last_find_char): string needles via repeated
+            // strstr keeping the final match bounded by the optional
+            // start (matches must begin at index <= start; a missing
+            // start bounds at len), char needles via a reverse byte
+            // scan from min(start, len-1) down to 0. Absolute index or
+            // -1 in R0 on miss.
+            if (call.childCount() < 2) { this.asm.movRI64(0, -1); return; }
+            if (this.isCharExpr(call.child(1))) {
+                int lcRecv = this.allocLocal("__lfind_recv");
+                int lcByte = this.allocLocal("__lfind_byte");
+                int lcStart = this.allocLocal("__lfind_start");
+                int lcLen = this.allocLocal("__lfind_len");
+                int lcI = this.allocLocal("__lfind_i");
+                this.genExpr(recv);
+                this.asm.movMBaseR(5, 0, lcRecv);
+                this.genExpr(call.child(1));
+                this.asm.movMBaseR(5, 0, lcByte);
+                if (call.childCount() >= 3) {
+                    this.genExpr(call.child(2));
+                    this.asm.movMBaseR(5, 0, lcStart);
+                } else {
+                    this.asm.xorRR64(0, 0);
+                    this.asm.movMBaseR(5, 0, lcStart);
+                }
+                // len = strlen(recv)
+                this.asm.movRMBase(1, 5, lcRecv);
+                this.addImportPatch("ucrtbase.dll", "strlen");
+                int lcSL = 0xDEADBEEFCAFEBADD;
+                this.asm.emitImm64(0, lcSL);
+                this.asm.movRMBase(0, 0, 0);
+                this.asm.emitCallSetup(0);
+                this.asm.callR64(0);
+                this.asm.emitCallTeardown();
+                this.asm.movMBaseR(5, 0, lcLen);
+                // i = start given ? min(start, len-1) : len-1 (a negative
+                // start or empty string skips the scan and lands on -1).
+                int lcStartOk = this.newLabel();
+                if (call.childCount() >= 3) {
+                    this.asm.movRMBase(0, 5, lcStart);
+                    this.asm.movRMBase(1, 5, lcLen);
+                    this.asm.subRI32(1, 1);
+                    this.asm.cmpRR64(0, 1);
+                    this.asm.jleLabel(lcStartOk);
+                    this.asm.movRR64(0, 1);
+                } else {
+                    this.asm.movRMBase(0, 5, lcLen);
+                    this.asm.subRI32(0, 1);
+                }
+                this.asm.bindLabel(lcStartOk);
+                this.asm.movMBaseR(5, 0, lcI);
+                // needle low byte (genExpr may leave wider values)
+                this.asm.movRMBase(2, 5, lcByte);
+                this.asm.andRImm(2, 0xFF);
+                this.asm.movMBaseR(5, 2, lcByte);
+                int lcLoop = this.newLabel();
+                int lcFound = this.newLabel();
+                int lcDone = this.newLabel();
+                this.asm.bindLabel(lcLoop);
+                // while (i >= 0) -- signed; -1 falls through to not-found
+                this.asm.movRMBase(0, 5, lcI);
+                this.asm.cmpRI32(0, 0);
+                this.asm.jlLabel(lcDone);
+                // if (recv[i] == needle) -> found
+                this.asm.movRMBase(11, 5, lcI);
+                this.asm.movRMBase(0, 5, lcRecv);
+                this.asm.addRR64(0, 11);
+                this.asm.movzxByteMBase(0, 0, 0);
+                this.asm.movRMBase(1, 5, lcByte);
+                this.asm.cmpRR64(0, 1);
+                this.asm.jeLabel(lcFound);
+                this.asm.movRMBase(0, 5, lcI);
+                this.asm.subRI32(0, 1);
+                this.asm.movMBaseR(5, 0, lcI);
+                this.asm.jmpLabel(lcLoop);
+                this.asm.bindLabel(lcFound);
+                this.asm.movRMBase(0, 5, lcI);
+                this.asm.jmpLabel(lcDone);
+                this.asm.bindLabel(lcDone);
+                // i < 0 lands here: report -1
+                int lcMissed = this.newLabel();
+                this.asm.cmpRI32(0, 0);
+                this.asm.jgeLabel(lcMissed);
+                this.asm.movRI64(0, -1);
+                this.asm.bindLabel(lcMissed);
+                return;
+            }
+            int liRecv = this.allocLocal("__lfind_recv");
+            int liNeedle = this.allocLocal("__lfind_needle");
+            int liStart = this.allocLocal("__lfind_start");
+            this.genExpr(recv);
+            this.asm.movMBaseR(5, 0, liRecv);
+            this.genExpr(call.child(1));
+            this.asm.movMBaseR(5, 0, liNeedle);
+            if (call.childCount() >= 3) {
+                this.genExpr(call.child(2));
+                this.asm.movMBaseR(5, 0, liStart);
+            }
+            // len = strlen(recv)
+            int liLen = this.allocLocal("__lfind_len");
+            this.asm.movRMBase(1, 5, liRecv);
+            this.addImportPatch("ucrtbase.dll", "strlen");
+            int liSL = 0xDEADBEEFCAFEBADD;
+            this.asm.emitImm64(0, liSL);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movMBaseR(5, 0, liLen);
+            // best = -1 up front: the negative-start early exit jumps
+            // straight to the done tail, which reports best verbatim.
+            int liBest = this.allocLocal("__lfind_best");
+            this.asm.movRI64(0, -1);
+            this.asm.movMBaseR(5, 0, liBest);
+            // bound = start given ? clamp(start, 0, len) : len. A negative
+            // start disqualifies everything (skip straight to the -1 tail).
+            int liBound = this.allocLocal("__lfind_bound");
+            int liPos = this.allocLocal("__lfind_pos");
+            int liDone = this.newLabel();
+            if (call.childCount() >= 3) {
+                int liStartOk = this.newLabel();
+                int liLenOk = this.newLabel();
+                this.asm.movRMBase(0, 5, liStart);
+                this.asm.cmpRI32(0, 0);
+                this.asm.jgeLabel(liStartOk);
+                this.asm.jmpLabel(liDone);
+                this.asm.bindLabel(liStartOk);
+                this.asm.movRMBase(1, 5, liLen);
+                this.asm.cmpRR64(0, 1);
+                this.asm.jleLabel(liLenOk);
+                this.asm.movRR64(0, 1);
+                this.asm.bindLabel(liLenOk);
+                this.asm.movMBaseR(5, 0, liBound);
+            } else {
+                this.asm.movRMBase(0, 5, liLen);
+                this.asm.movMBaseR(5, 0, liBound);
+            }
+            // pos = 0
+            this.asm.xorRR64(0, 0);
+            this.asm.movMBaseR(5, 0, liPos);
+            int liLoop = this.newLabel();
+            this.asm.bindLabel(liLoop);
+            // while (pos <= bound)
+            this.asm.movRMBase(0, 5, liPos);
+            this.asm.movRMBase(1, 5, liBound);
+            this.asm.cmpRR64(0, 1);
+            this.asm.jgLabel(liDone);
+            // strstr(recv + pos, needle)
+            this.asm.movRMBase(0, 5, liRecv);
+            this.asm.movRMBase(11, 5, liPos);
+            this.asm.addRR64(0, 11);
+            this.asm.movRR64(1, 0);
+            this.asm.movRMBase(2, 5, liNeedle);
+            this.addImportPatch("ucrtbase.dll", "strstr");
+            int liSS = 0xDEADBEEFCAFEBADD;
+            this.asm.emitImm64(0, liSS);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.cmpRI32(0, 0);
+            this.asm.jeLabel(liDone);
+            // idx = hit - recv; a hit beginning past the bound ends the
+            // scan: later hits only start further right.
+            this.asm.movRMBase(11, 5, liRecv);
+            this.asm.subRR64(0, 11);
+            this.asm.movRMBase(11, 5, liBound);
+            this.asm.cmpRR64(0, 11);
+            this.asm.jgLabel(liDone);
+            // best = idx; pos = idx + 1; repeat
+            this.asm.movMBaseR(5, 0, liBest);
+            this.asm.addRI32(0, 1);
+            this.asm.movMBaseR(5, 0, liPos);
+            this.asm.jmpLabel(liLoop);
+            this.asm.bindLabel(liDone);
+            this.asm.movRMBase(0, 5, liBest);
+            return;
+        }
         if (name == "substr" || name == "substring") {
             // substr(start) / substr(start, len) - allocate a new NUL-terminated copy.
             int sbRecv = this.allocLocal("__sub_recv");
@@ -11633,6 +12688,14 @@ public void genNewCall(Node call) {
             this.asm.xorRR64(2, 2);
             this.asm.movMBaseByteR(0, 2, 0);
             this.asm.movRMBase(0, 5, sbDst);
+            return;
+        }
+        if (name == "pad" || name == "padLeft" || name == "padRight") {
+            int padSides = 0;
+            if (name == "pad") { padSides = 3; }
+            else if (name == "padLeft") { padSides = 1; }
+            else { padSides = 2; }
+                        this.genStringPad(call, recv, padSides);
             return;
         }
         if (name == "toLower" || name == "lower") {
@@ -12492,6 +13555,24 @@ public void genNewCall(Node call) {
                 if (this.classNames[ci] == recv.name) { recvClass = recv.name; }
             }
         }
+        // Dynamic dispatch (DOCS/270 / html.parse shape): an object-typed
+        // receiver holding a class instance. When exactly one class defines
+        // this method name, adopt it as the receiver class so the exact-
+        // class/overload machinery below binds the right method (the bare
+        // any-class fallback would bind the LAST same-named method of any
+        // class and fault on foreign fields). Module-qualified calls never
+        // take this path (their receiver names a module, not an instance).
+        if ((recvClass == "" || recvClass == "object") && this.moduleCallTarget(call) == "") {
+            string dynOwner = "";
+            bool dynAmbiguous = false;
+            for (int dc = 0; dc < this.funcNames.length; dc++) {
+                if (this.funcNames[dc] == name && this.funcClasses[dc] != "") {
+                    if (dynOwner != "" && this.funcClasses[dc] != dynOwner) { dynAmbiguous = true; break; }
+                    dynOwner = this.funcClasses[dc];
+                }
+            }
+            if (dynOwner != "" && !dynAmbiguous) { recvClass = dynOwner; }
+        }
         int funcIdx = -1;
         // Overload dispatch by argument count:
         // among this class's same-named methods, the LAST declaration
@@ -13070,6 +14151,19 @@ public void genNewCall(Node call) {
             // silently produced garbage from the string-concat path.
             if (lt == "string" || rt == "string") {
                 this.genStringConcat(bin);
+                return;
+            }
+            // Array concatenation `a + b` (DOCS/90): both sides array
+            // types (depth >= 1). Type-based (never a name match), so
+            // int methods sharing an array-method name are unaffected.
+            if (this.arrayTypeDepth(lt) >= 1 && this.arrayTypeDepth(rt) >= 1) {
+                this.genExpr(bin.child(0));
+                int addAOff = this.allocLocal("__bin_add_a");
+                this.asm.movMBaseR(5, 0, addAOff);
+                this.genExpr(bin.child(1));
+                int addBOff = this.allocLocal("__bin_add_b");
+                this.asm.movMBaseR(5, 0, addBOff);
+                this.genArrayConcatCore(addAOff, addBOff);
                 return;
             }
         }
@@ -13923,12 +15017,61 @@ public void genNewCall(Node call) {
                 return;
             }
         }
+        Node cmpDerefLhs = lhs;
+        while (cmpDerefLhs.kind == 23 && cmpDerefLhs.childCount() > 0) { cmpDerefLhs = cmpDerefLhs.child(0); }
+        if (cmpDerefLhs.kind == 8 && cmpDerefLhs.op == 4 && cmpDerefLhs.childCount() > 0) {
+            // Dereference compound-assign (`*p += v`, `(*p) -= v`, and the
+            // `(*p)++`/`(*p)--` fallback which routes here): read-modify-
+            // write the full 8-byte cell through the evaluated address. The
+            // old fallthrough only evaluated the RHS and discarded it
+            // (silent no-store). Integer ops mirror the index-element arm.
+            this.genExpr(cmpDerefLhs.child(0));
+            int derefAddrOff = this.allocLocal("__derefassign_addr");
+            this.asm.movMBaseR(5, 0, derefAddrOff);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.pushR64(0);
+            this.genExpr(rhs);
+            this.asm.movRR64(1, 0);
+            this.asm.popR64(0);
+            if (op == 14) { this.asm.addRR64(0, 1); }
+            else if (op == 15) { this.asm.subRR64(0, 1); }
+            else if (op == 16) { this.asm.mulRR64(1); }
+            else if (op == 17) { this.emitDivisorCheck(); this.asm.cqo(); this.asm.idivR64(1); }
+            else if (op == 29) { this.emitDivisorCheck(); this.asm.cqo(); this.asm.idivR64(1); this.asm.movRR64(0, 2); }
+            else if (op == 30) { this.asm.andRR64(0, 1); }
+            else if (op == 31) { this.asm.orRR64(0, 1); }
+            else if (op == 32) { this.asm.xorRR64(0, 1); }
+            else if (op == 33) { this.asm.movRR64(11, 1); this.asm.shlRCl64(0); }
+            else if (op == 34) { this.asm.movRR64(11, 1); this.asm.shrRCl64(0); }
+            this.asm.movRMBase(11, 5, derefAddrOff);
+            this.asm.movMBaseR(11, 0, 0);
+            return;
+        }
         this.genExpr(rhs);
     }
 
     public void genAssign(Node bin) {
         Node lhs = bin.child(0);
         Node rhs = bin.child(1);
+        // DOCS/50 dereference store `*p = v`: evaluate the address, then the
+        // value, and store the full 8-byte cell through the address. RAX
+        // ends as the stored value (an assignment yields its RHS). A fully
+        // parenthesized LHS (`(*p) = v`) unwraps to the same deref: the
+        // paren node (kind 23) is transparent in reads already, and the old
+        // code fell through to the bare genExpr(rhs) discard (silent
+        // no-store) because only the bare shape matched.
+        Node derefLhs = lhs;
+        while (derefLhs.kind == 23 && derefLhs.childCount() > 0) { derefLhs = derefLhs.child(0); }
+        if (derefLhs.kind == 8 && derefLhs.op == 4 && derefLhs.childCount() > 0) {
+            this.genExpr(derefLhs.child(0));
+            this.asm.pushR64(0);
+            this.genExpr(rhs);
+            this.asm.movRR64(1, 0);
+            this.asm.popR64(0);
+            this.asm.movMBaseR(0, 1, 0);
+            this.asm.movRMBase(0, 0, 0);
+            return;
+        }
         if (lhs.kind == 13 && lhs.childCount() >= 1) {
             Node titleObj = lhs.child(0);
             if (titleObj.kind == 6 && titleObj.name == "console" && lhs.name == "title") {
@@ -13951,6 +15094,13 @@ public void genNewCall(Node call) {
                 string lhsType = this.getLocalType(lhs.name);
                 if (lhsType == "") { lhsType = this.getLocalType(lhs.name); }
                 this.genStructLiteral(rhs, lhsType);
+            } else if (rhs.kind == 19) {
+                // Array literal reassignment (`a = [{...}]`): lower
+                // against the variable's declared element type so struct
+                // elements box correctly.
+                string lhsArrType = this.getLocalType(lhs.name);
+                this.genExprAsType(rhs, lhsArrType);
+                this.coerceStoreToDouble(lhs, rhs);
             } else {
                 this.genExpr(rhs);
                 this.coerceStoreToDouble(lhs, rhs);
@@ -14128,6 +15278,50 @@ public void genNewCall(Node call) {
                 }
                 return;
             }
+            if (obj.kind == 24 && obj.childCount() >= 2) {
+                // Struct-array element field store (`arr[i].field = v`):
+                // was a silent no-op (only rhs was evaluated). Index to
+                // the element box, then store into its field slot.
+                // Dict/object elements keep the old behavior.
+                string wArrType = this.inferExprType(obj.child(0));
+                string wElemType = this.inferExprType(obj);
+                if (wElemType == "") {
+                    wElemType = this.arrayElementType(wArrType);
+                }
+                if (this.isDictType(wArrType)) {
+                    // Dict receiver (`d[k].field = v`): the element is the
+                    // dict's VALUE class (dictValueType). A bare `dict`
+                    // hint has no `[]` suffix, so the array fallback above
+                    // yielded "dict" itself and the store silently no-oped.
+                    string wDvType = this.dictValueType(wArrType).trim();
+                    if (wDvType != "") { wElemType = wDvType; }
+                }
+                if (!this.isDictOrObjectType(wElemType)) {
+                    int wFieldOff = this.findFieldOffset(wElemType, fieldName);
+                    if (wFieldOff < 0) {
+                        wFieldOff = this.findFieldOffsetInAllClasses(fieldName);
+                    }
+                    if (wFieldOff >= 0) {
+                        this.assertWritableField(wElemType, fieldName, lhs);
+                        if (this.checkVisibleStore(wElemType, fieldName)) { return; }
+                        string wFieldType = this.findFieldType(wElemType, fieldName);
+                        if (rhs.kind == 74 && this.isStructTypeName(wFieldType)) {
+                            this.genStructLiteral(rhs, wFieldType);
+                        } else {
+                            this.genExpr(rhs);
+                            this.coerceStoreToDouble(lhs, rhs);
+                        }
+                        this.asm.pushR64(0);
+                        this.genArrayIndex(obj);
+                        this.asm.addRI32(0, wFieldOff);
+                        this.asm.popR64(1);
+                        this.asm.movMBaseR(0, 1, 0);
+                        return;
+                    }
+                }
+                this.genExpr(rhs);
+                return;
+            }
         }
         if (lhs.kind == 24 && lhs.childCount() >= 2) {
             Node arrNode = lhs.child(0);
@@ -14155,8 +15349,15 @@ public void genNewCall(Node call) {
                 int arrOff = this.findLocal(arrNode.name);
                 this.genExpr(idxNode);
                 this.asm.pushR64(0);
-                this.genExpr(rhs);
-                this.coerceStoreToDouble(lhs, rhs);
+                string idxElemType = this.arrayElementType(this.getLocalType(arrNode.name));
+                if (rhs.kind == 74 && this.isStructTypeName(idxElemType)) {
+                    // Whole-struct store (`arr[i] = {...}`): build a real
+                    // struct object, not a dict.
+                    this.genStructLiteral(rhs, idxElemType);
+                } else {
+                    this.genExpr(rhs);
+                    this.coerceStoreToDouble(lhs, rhs);
+                }
                 this.asm.pushR64(0);
                 this.asm.movRMBase(11, 5, arrOff);
                 this.asm.popR64(12);
@@ -14184,8 +15385,15 @@ public void genNewCall(Node call) {
                 this.asm.popR64(0);
                 this.asm.addRR64(0, 11);
                 this.asm.pushR64(0);
-                this.genExpr(rhs);
-                this.coerceStoreToDouble(lhs, rhs);
+                string idxElemType2 = this.arrayElementType(this.inferExprType(arrNode));
+                if (rhs.kind == 74 && this.isStructTypeName(idxElemType2)) {
+                    // Whole-struct store through a global/computed array
+                    // base: same struct (not dict) boxing as the local arm.
+                    this.genStructLiteral(rhs, idxElemType2);
+                } else {
+                    this.genExpr(rhs);
+                    this.coerceStoreToDouble(lhs, rhs);
+                }
                 this.asm.movRR64(12, 0);
                 this.asm.popR64(0);
                 if (arrIsStrideOne) {
@@ -16162,7 +17370,504 @@ public void genNewCall(Node call) {
             this.genIntToString(arg);
             return;
         }
+        if (this.isDictOrObjectType(t)) {
+            // Dict/object receiver (DOCS/67): serialize the dict runtime
+            // layout [cap, len, k/v pairs...] as {...} text. Per-entry value
+            // rendering uses the compile-time per-key kinds recorded by
+            // trackDictDecl/noteDictWrite (insertion order == runtime entry
+            // order for literal-built dicts); entries beyond the tracked key
+            // list fall back to the whole-dict kind, then decimal.
+            string[] keyKinds = [];
+            if (arg.kind == 6) {
+                for (int ki = 0; ki < this.dictFieldVars.length; ki++) {
+                    if (this.dictFieldVars[ki] == arg.name) {
+                        keyKinds.add(this.dictFieldKinds[ki]);
+                    }
+                }
+            } else if (arg.kind == 66 || arg.kind == 74) {
+                for (int pi = 0; pi < arg.childCount(); pi++) {
+                    Node pair = arg.child(pi);
+                    if (pair.kind == 18 && pair.childCount() == 2) {
+                        keyKinds.add(this.classifyDictValue(pair.child(1)));
+                    }
+                }
+            }
+            string fallbackKind = "";
+            if (this.isDictType(t)) {
+                fallbackKind = this.dictDeclKind(t);
+            } else if (arg.kind == 6) {
+                fallbackKind = this.dictWholeKindOf(arg.name);
+            }
+            this.genJsonDict(arg, keyKinds, fallbackKind, this.jsonIndentOf(call));
+            return;
+        }
         this.genJsonLit("null");
+    }
+
+    // Compile-time indent of a json.stringify option argument. An int literal
+    // is the indent width; a `true` bool literal (or an `x = true` flag
+    // assignment node) means pretty-print and defaults to 2. The option node
+    // itself is NEVER evaluated -- evaluating the assignment shape would
+    // report the flag name as an undefined variable -- so every accepted
+    // shape must be readable statically. Unknown shapes contribute 0
+    // (compact output), matching the ignored-argument behavior before the
+    // indent support existed.
+    public int jsonIndentOfArg(Node a) {
+        if (a == null) { return 0; }
+        if (a.kind == 0) {
+            if (a.intVal > 0) { return (int)a.intVal; }
+            return 0;
+        }
+        if (a.kind == 4) {
+            if (a.boolVal) { return 2; }
+            return 0;
+        }
+        if (a.kind == 20 && a.childCount() == 2 && a.child(1).kind == 4) {
+            if (a.child(1).boolVal) { return 2; }
+            return 0;
+        }
+        if (a.kind == 20 && a.childCount() == 2 && a.child(1).kind == 0) {
+            if (a.child(1).intVal > 0) { return (int)a.child(1).intVal; }
+            return 0;
+        }
+        return 0;
+    }
+
+    // Indent width of a json.stringify(data, indent[, flag]) call: the
+    // largest contribution of the option arguments; 0 keeps compact form.
+    public int jsonIndentOf(Node call) {
+        int indent = 0;
+        if (call.childCount() >= 3) {
+            int c2 = this.jsonIndentOfArg(call.child(2));
+            if (c2 > indent) { indent = c2; }
+        }
+        if (call.childCount() >= 4) {
+            int c3 = this.jsonIndentOfArg(call.child(3));
+            if (c3 > indent) { indent = c3; }
+        }
+        return indent;
+    }
+
+    // True when the collected std/json.sr module exports beautify(text,
+    // indent) (the beautify divert below only applies then).
+    public bool jsonBeautifyResolves() {
+        for (int i = 0; i < this.funcNames.length; i++) {
+            if (this.funcNames[i] == "beautify" && this.funcClasses[i] == "" && this.funcModuleMatches(i, "json")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Serialize a dict/object value (RAX after genExpr(dictNode) = pointer to
+    // the first key slot; [p-8] = length, key[i] at p+i*16, value[i] at
+    // p+i*16+8) into `{"k":v,...}` JSON text. keyKinds holds the tracked
+    // per-entry value kinds in insertion order ("" = decimal); fallbackKind
+    // covers entries past the tracked list. indent > 0 switches to the
+    // pretty form (python json.dumps(indent=N)): newline + N spaces before
+    // every entry, `"key": value` spacing, newline + N spaces before the
+    // closing brace. Two passes: total size, then fill -- same shape as
+    // genJsonArray. Entry rendering: kind "string" -> strlen-quoted copy,
+    // kind "float" -> %g, else %lld decimal.
+    public void genJsonDict(Node dictNode, string[] keyKinds, string fallbackKind, int indent) {
+        bool ml = indent > 0;
+        int dOff = this.allocLocal("__jd_d");
+        int lenOff = this.allocLocal("__jd_len");
+        int iOff = this.allocLocal("__jd_i");
+        int totalOff = this.allocLocal("__jd_total");
+        int bufOff = this.allocLocal("__jd_buf");
+        int posOff = this.allocLocal("__jd_pos");
+        int scratchOff = this.allocLocal("__jd_scr");
+        int elenOff = this.allocLocal("__jd_elen");
+        int cntOff = this.allocLocal("__jd_cnt");
+        int kindOff = this.allocLocal("__jd_kind");
+        // Kind code table as a runtime int[] literal (0=decimal, 1=string,
+        // 2=float); [p-8] gives its length so untracked entries fall back.
+        int fallbackCode = 0;
+        if (fallbackKind == "string") { fallbackCode = 1; }
+        else if (fallbackKind == "float") { fallbackCode = 2; }
+        Node kindArr = new Node();
+        kindArr.kind = 19;
+        for (int ci = 0; ci < keyKinds.length; ci++) {
+            Node code = new Node();
+            code.kind = 0;
+            if (keyKinds[ci] == "string") { code.intVal = 1; }
+            else if (keyKinds[ci] == "float") { code.intVal = 2; }
+            else { code.intVal = 0; }
+            kindArr.children.add(code);
+        }
+        this.genExpr(kindArr);
+        int kindsOff = this.allocLocal("__jd_kinds");
+        this.asm.movMBaseR(5, 0, kindsOff);
+        // scratch = malloc(64): pass-1 renders each number entry here to
+        // measure its text length (the slot must hold a real buffer before
+        // the loop, or sprintf writes through an uninitialized qword).
+        this.asm.movRI64(1, 64);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, scratchOff);
+        // ---- shared: evaluate the dict, read its length ----
+        this.genExpr(dictNode);
+        this.asm.movMBaseR(5, 0, dOff);
+        this.asm.movRMBase(0, 5, dOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+        // ---- pass 1: total = 2 + commas + key/value text lengths ----
+        this.asm.movRI64(0, 2);
+        this.asm.movMBaseR(5, 0, totalOff);
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        int sumLoop = this.newLabel();
+        int sumEnd = this.newLabel();
+        int sumBody = this.newLabel();
+        int sumNum = this.newLabel();
+        int sumNumEnd = this.newLabel();
+        this.asm.bindLabel(sumLoop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(sumEnd);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.cmpRI32(0, 0);
+        int sumNoComma = this.newLabel();
+        this.asm.jeLabel(sumNoComma);
+        this.asm.movRMBase(0, 5, totalOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, totalOff);
+        this.asm.bindLabel(sumNoComma);
+        if (ml) {
+            this.genJsonNewlineIndent(totalOff, indent);
+        }
+        // kind = i < kindsLen ? kindsArr[i] : fallbackCode
+        this.genJsonEntryKind(kindsOff, iOff, fallbackCode, kindOff);
+        // rcx = key = [d + i*16]
+        this.asm.movRMBase(1, 5, dOff);
+        this.asm.movRMBase(2, 5, iOff);
+        this.asm.shlR64Imm(2, 4);
+        this.asm.addRR64(1, 2);
+        this.asm.movRMBase(1, 1, 0);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(1, 5, totalOff);
+        this.asm.addRI32(0, 3);
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(5, 0, totalOff);
+        if (ml) {
+            this.asm.movRMBase(0, 5, totalOff);
+            this.asm.addRI32(0, 1);
+            this.asm.movMBaseR(5, 0, totalOff);
+        }
+        // value length by kind
+        this.genJsonLoadEntryValue(dOff, iOff);
+        this.asm.movRMBase(0, 5, kindOff);
+        this.asm.cmpRI32(0, 1);
+        this.asm.jneLabel(sumNum);
+        // string: total += strlen(v) + 2
+        this.asm.movRMBase(1, 5, dOff);
+        this.asm.movRMBase(2, 5, iOff);
+        this.asm.shlR64Imm(2, 4);
+        this.asm.addRI32(2, 8);
+        this.asm.addRR64(1, 2);
+        this.asm.movRMBase(1, 1, 0);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(1, 5, totalOff);
+        this.asm.addRI32(0, 2);
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(5, 0, totalOff);
+        this.asm.jmpLabel(sumNumEnd);
+        this.asm.bindLabel(sumNum);
+        // number: sprintf(scratch, fmt, v); total += strlen(scratch)
+        this.genJsonSprintfEntryValue(scratchOff, kindOff);
+        this.asm.movRMBase(1, 5, scratchOff);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(1, 5, totalOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(5, 0, totalOff);
+        this.asm.bindLabel(sumNumEnd);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(sumLoop);
+        this.asm.bindLabel(sumEnd);
+        if (ml) {
+            // closing newline only (pad 0: the top level carries no outer
+            // indent), and only when the dict is non-empty
+            int closeSkip = this.newLabel();
+            this.asm.movRMBase(0, 5, lenOff);
+            this.asm.cmpRI32(0, 0);
+            this.asm.jeLabel(closeSkip);
+            this.asm.movRMBase(0, 5, totalOff);
+            this.asm.addRI32(0, 1);
+            this.asm.movMBaseR(5, 0, totalOff);
+            this.asm.bindLabel(closeSkip);
+        }
+        // ---- buf = malloc(total + 1); *pos++ = '{' ----
+        this.asm.movRMBase(1, 5, totalOff);
+        this.asm.addRI32(1, 1);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, bufOff);
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.movMBaseR(5, 0, posOff);
+        this.asm.movRMBase(1, 5, posOff);
+        this.asm.movRI64(2, 123);
+        this.asm.movMBaseByteR(1, 2, 0);
+        this.asm.movRMBase(0, 5, posOff);
+        this.asm.incR64(0);
+        this.asm.movMBaseR(5, 0, posOff);
+        // ---- pass 2: write entries ----
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        int fillLoop = this.newLabel();
+        int fillEnd = this.newLabel();
+        int fillNum = this.newLabel();
+        int fillNumEnd = this.newLabel();
+        this.asm.bindLabel(fillLoop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(fillEnd);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.cmpRI32(0, 0);
+        int fillNoComma = this.newLabel();
+        this.asm.jeLabel(fillNoComma);
+        this.asm.movRMBase(1, 5, posOff);
+        this.asm.movRI64(2, 44);
+        this.asm.movMBaseByteR(1, 2, 0);
+        this.asm.movRMBase(0, 5, posOff);
+        this.asm.incR64(0);
+        this.asm.movMBaseR(5, 0, posOff);
+        this.asm.bindLabel(fillNoComma);
+        if (ml) {
+            // newline + indent spaces at the cursor
+            this.asm.movRMBase(1, 5, posOff);
+            this.asm.movRI64(2, 10);
+            this.asm.movMBaseByteR(1, 2, 0);
+            this.asm.movRMBase(0, 5, posOff);
+            this.asm.incR64(0);
+            this.asm.movMBaseR(5, 0, posOff);
+            this.asm.movRI64(0, 0);
+            this.asm.movMBaseR(5, 0, cntOff);
+            int spcLoop = this.newLabel();
+            int spcEnd = this.newLabel();
+            this.asm.bindLabel(spcLoop);
+            this.asm.movRMBase(0, 5, cntOff);
+            this.asm.movRI64(1, indent);
+            this.asm.cmpRR64(0, 1);
+            this.asm.jgeLabel(spcEnd);
+            this.asm.movRMBase(1, 5, posOff);
+            this.asm.movRI64(2, 32);
+            this.asm.movMBaseByteR(1, 2, 0);
+            this.asm.movRMBase(0, 5, posOff);
+            this.asm.incR64(0);
+            this.asm.movMBaseR(5, 0, posOff);
+            this.asm.movRMBase(0, 5, cntOff);
+            this.asm.incR64(0);
+            this.asm.movMBaseR(5, 0, cntOff);
+            this.asm.jmpLabel(spcLoop);
+            this.asm.bindLabel(spcEnd);
+        }
+        // kind code for this entry
+        this.genJsonEntryKind(kindsOff, iOff, fallbackCode, kindOff);
+        // sprintf(pos, "\"%s\": ...", key); pos += ret
+        string keyFmt = "\"%s\":";
+        if (ml) { keyFmt = "\"%s\": "; }
+        int keyFmtIdx = this.addString(keyFmt);
+        this.asm.movRMBase(1, 5, posOff);
+        int kfs = this.asm.buf.length;
+        this.asm.emitImm64(0, 0);
+        this.stringPatchOffsets.add(kfs + 2);
+        this.stringPatchIndices.add(keyFmtIdx);
+        this.asm.movRR64(2, 0);
+        this.asm.movRMBase(8, 5, dOff);
+        this.asm.movRMBase(9, 5, iOff);
+        this.asm.shlR64Imm(9, 4);
+        this.asm.addRR64(8, 9);
+        this.asm.movRMBase(8, 8, 0);
+        this.addImportPatch("msvcrt.dll", "sprintf");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(1, 5, posOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(5, 0, posOff);
+        // value by kind
+        this.genJsonLoadEntryValue(dOff, iOff);
+        this.asm.movRMBase(0, 5, kindOff);
+        this.asm.cmpRI32(0, 1);
+        this.asm.jneLabel(fillNum);
+        // string: sprintf(pos, "\"%s\"", v); pos += ret
+        this.asm.movRMBase(1, 5, posOff);
+        int vsIdx = this.addString("\"%s\"");
+        int vss = this.asm.buf.length;
+        this.asm.emitImm64(0, 0);
+        this.stringPatchOffsets.add(vss + 2);
+        this.stringPatchIndices.add(vsIdx);
+        this.asm.movRR64(2, 0);
+        this.asm.movRMBase(8, 5, dOff);
+        this.asm.movRMBase(9, 5, iOff);
+        this.asm.shlR64Imm(9, 4);
+        this.asm.addRI32(9, 8);
+        this.asm.addRR64(8, 9);
+        this.asm.movRMBase(8, 8, 0);
+        this.addImportPatch("msvcrt.dll", "sprintf");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(1, 5, posOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(5, 0, posOff);
+        this.asm.jmpLabel(fillNumEnd);
+        this.asm.bindLabel(fillNum);
+        // number: sprintf(pos, fmt, v); pos += ret
+        this.genJsonSprintfEntryValue(posOff, kindOff);
+        this.asm.movRMBase(1, 5, posOff);
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(5, 0, posOff);
+        this.asm.bindLabel(fillNumEnd);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(fillLoop);
+        this.asm.bindLabel(fillEnd);
+        if (ml) {
+            // closing newline only (pad 0), skip when empty
+            int closeSkip2 = this.newLabel();
+            this.asm.movRMBase(0, 5, lenOff);
+            this.asm.cmpRI32(0, 0);
+            this.asm.jeLabel(closeSkip2);
+            this.asm.movRMBase(1, 5, posOff);
+            this.asm.movRI64(2, 10);
+            this.asm.movMBaseByteR(1, 2, 0);
+            this.asm.movRMBase(0, 5, posOff);
+            this.asm.incR64(0);
+            this.asm.movMBaseR(5, 0, posOff);
+            this.asm.bindLabel(closeSkip2);
+        }
+        // *pos++ = '}'; *pos = 0; RAX = buf
+        this.asm.movRMBase(0, 5, posOff);
+        this.asm.movRI64(2, 125);
+        this.asm.movMBaseByteR(0, 2, 0);
+        this.asm.movRMBase(0, 5, posOff);
+        this.asm.incR64(0);
+        this.asm.movRI64(2, 0);
+        this.asm.movMBaseByteR(0, 2, 0);
+        this.asm.movRMBase(0, 5, bufOff);
+    }
+
+    // Add one newline + `indent` spaces to the running total in totalOff.
+    public void genJsonNewlineIndent(int totalOff, int indent) {
+        this.asm.movRMBase(0, 5, totalOff);
+        this.asm.addRI32(0, 1 + indent);
+        this.asm.movMBaseR(5, 0, totalOff);
+    }
+
+    // kindOff = (i < kindsArrLen ? kindsArr[i] : fallback). kindsArr is an
+    // int[] whose data pointer sits in kindsOff ([p-8] = length).
+    public void genJsonEntryKind(int kindsOff, int iOff, int fallbackCode, int kindOff) {
+        this.asm.movRMBase(0, 5, kindsOff);
+        this.asm.movRMBase(0, 0, -8);
+        int kindsLenOff = this.allocLocal("__jd_klen");
+        this.asm.movMBaseR(5, 0, kindsLenOff);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, kindsLenOff);
+        this.asm.cmpRR64(0, 1);
+        int useFallback = this.newLabel();
+        int kindDone = this.newLabel();
+        this.asm.jgeLabel(useFallback);
+        this.asm.movRMBase(0, 5, kindsOff);
+        this.asm.movRMBase(1, 5, iOff);
+        this.asm.shlR64Imm(1, 3);
+        this.asm.addRR64(0, 1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.movMBaseR(5, 0, kindOff);
+        this.asm.jmpLabel(kindDone);
+        this.asm.bindLabel(useFallback);
+        this.asm.movRI64(0, fallbackCode);
+        this.asm.movMBaseR(5, 0, kindOff);
+        this.asm.bindLabel(kindDone);
+    }
+
+    // Load entry i's value qword ([d + i*16 + 8]) into R9, ready for a
+    // sprintf call. (Value stays in a register; the callers only need it as
+    // the sprintf argument.)
+    public void genJsonLoadEntryValue(int dOff, int iOff) {
+        this.asm.movRMBase(9, 5, dOff);
+        this.asm.movRMBase(2, 5, iOff);
+        this.asm.shlR64Imm(2, 4);
+        this.asm.addRI32(2, 8);
+        this.asm.addRR64(9, 2);
+        this.asm.movRMBase(9, 9, 0);
+    }
+
+    // Emit sprintf(target, fmt, value) for the entry value already in R9
+    // (via genJsonLoadEntryValue), with the format chosen by the entry kind
+    // in kindOff ("%g" float vs "%lld" decimal). targetOff holds the
+    // destination buffer pointer (pass-1 scratch or the pass-2 cursor). The
+    // caller adds the return count.
+    public void genJsonSprintfEntryValue(int targetOff, int kindOff) {
+        int fmtIntIdx = this.addString("%lld");
+        int fmtFltIdx = this.addString("%g");
+        int isFloat = this.newLabel();
+        int fmtDone = this.newLabel();
+        int fmtOff = this.allocLocal("__jd_fmt");
+        this.asm.movRMBase(0, 5, kindOff);
+        this.asm.cmpRI32(0, 2);
+        this.asm.jeLabel(isFloat);
+        int fi1 = this.asm.buf.length;
+        this.asm.emitImm64(0, 0);
+        this.stringPatchOffsets.add(fi1 + 2);
+        this.stringPatchIndices.add(fmtIntIdx);
+        this.asm.movMBaseR(5, 0, fmtOff);
+        this.asm.jmpLabel(fmtDone);
+        this.asm.bindLabel(isFloat);
+        int fi2 = this.asm.buf.length;
+        this.asm.emitImm64(0, 0);
+        this.stringPatchOffsets.add(fi2 + 2);
+        this.stringPatchIndices.add(fmtFltIdx);
+        this.asm.movMBaseR(5, 0, fmtOff);
+        this.asm.bindLabel(fmtDone);
+        this.asm.movRMBase(1, 5, targetOff);
+        this.asm.movRMBase(2, 5, fmtOff);
+        this.asm.movRR64(8, 9);
+        // Float varargs travel in XMM0 with AL=1 (win64 ABI): stage the
+        // import pointer through R10 first so the AL setup cannot clobber
+        // it, then set AL=1 unconditionally (claiming one vector arg is
+        // harmless on the decimal path, and printf REQUIRES AL>=1 for %g).
+        this.emitMovqXmmGpr(0, 9);
+        this.addImportPatch("msvcrt.dll", "sprintf");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(10, 0, 0);
+        this.asm.movRI64(0, 1);
+        this.asm.callR64(10);
+        this.asm.emitCallTeardown();
     }
 
     // RAX holds an array data pointer; replace it with the JSON array text
@@ -16591,6 +18296,186 @@ public void genNewCall(Node call) {
         this.asm.bindLabel(zeroDone);
     }
 
+    // String padding: pad(count, fill) both sides, padLeft/padRight one
+    // side (sides bitmask 1=left, 2=right). Mirrors silverc-rs
+    // emit_string_pad: count<=0 or empty fill returns the source; else a
+    // fresh total+1 buffer of fill bytes with the source copied at the
+    // left offset, NUL-terminated. Fill repeats its first byte. A CHAR
+    // fill passes its code value (not a pointer), so strlen on it faults;
+    // detect it statically and use the low byte directly (flen = 1, never
+    // empty, so the early-return interplay is unchanged).
+    public void genStringPad(Node call, Node recv, int sides) {
+        int pdRecv = this.allocLocal("__pad_recv");
+        int pdCount = this.allocLocal("__pad_count");
+        int pdFill = this.allocLocal("__pad_fill");
+        int pdSlen = this.allocLocal("__pad_slen");
+        int pdFlen = this.allocLocal("__pad_flen");
+        int pdTotal = this.allocLocal("__pad_total");
+        int pdDst = this.allocLocal("__pad_dst");
+        int pdI = this.allocLocal("__pad_i");
+        this.genExpr(recv);
+        this.asm.movMBaseR(5, 0, pdRecv);
+        if (call.childCount() > 1) {
+            this.genExpr(call.child(1));
+            this.asm.movMBaseR(5, 0, pdCount);
+        } else {
+            this.asm.movRI64(0, 0);
+            this.asm.movMBaseR(5, 0, pdCount);
+        }
+        bool fillIsChar = false;
+        if (call.childCount() > 2 && this.isCharExpr(call.child(2))) { fillIsChar = true; }
+        if (call.childCount() > 2) {
+            this.genExpr(call.child(2));
+            this.asm.movMBaseR(5, 0, pdFill);
+        } else {
+            int spDef = this.addString(" ");
+            int spp = this.asm.buf.length;
+            this.asm.emitImm64(0, 0);
+            this.stringPatchOffsets.add(spp + 2);
+            this.stringPatchIndices.add(spDef);
+            this.asm.movMBaseR(5, 0, pdFill);
+        }
+        // strlen both (Win64-regged for addImportPatch's shuffle: RCX
+        // carries the argument on every target).
+        this.asm.movRMBase(1, 5, pdRecv);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD7);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, pdSlen);
+        if (fillIsChar) {
+            // CHAR fill holds the code value, not a pointer: strlen on it
+            // faults (the reported crash). Length is trivially 1.
+            this.asm.movRI64(0, 1);
+            this.asm.movMBaseR(5, 0, pdFlen);
+        } else {
+            this.asm.movRMBase(1, 5, pdFill);
+            this.addImportPatch("ucrtbase.dll", "strlen");
+            this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD8);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movMBaseR(5, 0, pdFlen);
+        }
+        // count<=0 or empty fill -> return source
+        int pdRetSrc = this.newLabel();
+        int pdGo = this.newLabel();
+        this.asm.movRMBase(0, 5, pdCount);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jleLabel(pdRetSrc);
+        this.asm.movRMBase(0, 5, pdFlen);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(pdRetSrc);
+        this.asm.jmpLabel(pdGo);
+        this.asm.bindLabel(pdRetSrc);
+        this.asm.movRMBase(0, 5, pdRecv);
+        int pdDone = this.newLabel();
+        this.asm.jmpLabel(pdDone);
+        this.asm.bindLabel(pdGo);
+        this.asm.bindLabel(pdGo);
+        this.asm.movRMBase(0, 5, pdCount);
+        int pdSides = sides;
+        if (pdSides == 3) {
+            this.asm.addRR64(0, 0);
+        }
+        this.asm.movRMBase(1, 5, pdSlen);
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(5, 0, pdTotal);
+        this.asm.movRMBase(8, 5, pdTotal);
+        this.asm.addRI32(8, 1);
+        this.emitLinuxHeapAllocFromR8();
+        this.asm.movMBaseR(5, 0, pdDst);
+        // left loop: i in [0, count) writes fill[0] (sides&1 only)
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, pdI);
+        int pdLeftL = this.newLabel();
+        int pdCopySrc = this.newLabel();
+        this.asm.bindLabel(pdLeftL);
+        this.asm.movRMBase(0, 5, pdI);
+        this.asm.movRMBase(1, 5, pdCount);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(pdCopySrc);
+        if (pdSides == 1 || pdSides == 3) {
+            if (fillIsChar) {
+                this.asm.movRMBase(2, 5, pdFill);
+                this.asm.andRImm(2, 0xFF);
+            } else {
+                this.asm.movRMBase(1, 5, pdFill);
+                this.asm.movzxByteMBase(2, 1, 0);
+            }
+            this.asm.movRMBase(1, 5, pdDst);
+            this.asm.addRR64(1, 0);
+            this.asm.movMBaseByteR(1, 2, 0);
+        }
+        this.asm.movRMBase(0, 5, pdI);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, pdI);
+        this.asm.jmpLabel(pdLeftL);
+        // copy source at leftCount (count when left/both, else 0)
+        this.asm.bindLabel(pdCopySrc);
+        this.asm.movRMBase(0, 5, pdDst);
+        this.asm.movRMBase(1, 5, pdCount);
+        if (pdSides == 2) {
+            this.asm.xorRR64(1, 1);
+        }
+        this.asm.addRR64(0, 1);
+        int pdTmp = this.allocLocal("__pad_tmp");
+        this.asm.movMBaseR(5, 0, pdTmp);
+        // strncpy(dst+left, recv, slen), Win64-regged for the shuffle.
+        this.asm.movRMBase(1, 5, pdTmp);
+        this.asm.movRMBase(2, 5, pdRecv);
+        this.asm.movRMBase(8, 5, pdSlen);
+        this.emitAbiCallSetup(0);
+        this.addImportPatch("msvcrt.dll", "strncpy");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD9);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        // i = slen + leftCount
+        this.asm.movRMBase(0, 5, pdSlen);
+        this.asm.movRMBase(1, 5, pdCount);
+        if (pdSides == 2) {
+            this.asm.xorRR64(1, 1);
+        }
+        this.asm.addRR64(0, 1);
+        this.asm.movMBaseR(5, 0, pdI);
+        // right loop while i < total (sides&2 only)
+        int pdRightL = this.newLabel();
+        int pdFin = this.newLabel();
+        this.asm.bindLabel(pdRightL);
+        this.asm.movRMBase(0, 5, pdI);
+        this.asm.movRMBase(1, 5, pdTotal);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(pdFin);
+        if (pdSides == 2 || pdSides == 3) {
+            if (fillIsChar) {
+                this.asm.movRMBase(2, 5, pdFill);
+                this.asm.andRImm(2, 0xFF);
+            } else {
+                this.asm.movRMBase(1, 5, pdFill);
+                this.asm.movzxByteMBase(2, 1, 0);
+            }
+            this.asm.movRMBase(1, 5, pdDst);
+            this.asm.addRR64(1, 0);
+            this.asm.movMBaseByteR(1, 2, 0);
+        }
+        this.asm.movRMBase(0, 5, pdI);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, pdI);
+        this.asm.jmpLabel(pdRightL);
+        this.asm.bindLabel(pdFin);
+        this.asm.movRMBase(0, 5, pdDst);
+        this.asm.movRMBase(1, 5, pdTotal);
+        this.asm.addRR64(0, 1);
+        this.asm.xorRR64(2, 2);
+        this.asm.movMBaseByteR(0, 2, 0);
+        this.asm.movRMBase(0, 5, pdDst);
+        this.asm.bindLabel(pdDone);
+    }
+
     public void genStringConcat(Node bin) {
         // CONTRACT: Silver strings are NUL-terminated char* end-to-end —
         // .length, comparisons, printline, fs and DLL interop are all
@@ -16763,6 +18648,15 @@ public void genNewCall(Node call) {
     }
 
     public void genCargsCall(Node call) {
+        // MAC.md Phase D (additive): LC_MAIN entry convention. dyld CALLS
+        // the entry with (argc=RDI, argv=RSI); the main spill stores them
+        // at [RBP+8]=argc and [RBP+16]=argv base, so argv[i] needs one
+        // extra indirection versus the ELF _start stack. Layout matches
+        // Linux otherwise. Checked before isLinuxTarget().
+        if (this.isMacX64Target()) {
+            this.linuxBackend.genMacX64CargsCall(this);
+            return;
+        }
         // LINUX SysV backend (additive): rebuild argv from the _start stack
         // captured in __linux_stack_top (same array layout, no exit in the
         // shared path). The WINDOWS command-line parser below is unchanged.
@@ -17205,6 +19099,18 @@ public void genNewCall(Node call) {
     // asm regs 7/6/2 + addImportPatchDirect + emitAbiCallSetup/teardown).
     public void genLinuxFileExists(int pathOff) {
         this.linuxBackend.genLinuxFileExists(this, pathOff);
+    }
+
+    // MAC.md Phase D (additive): sign-extend RAX's low 32 bits after a
+    // native libc call returning 32-bit C int (open/read/...). x86-64
+    // zeroes the high half on EAX writes, so without this a -1 open
+    // result reads as 4294967295 and every `< 0` check misfires (the
+    // file.exists always-true bug). No-op on non-MACX64 targets; pointer
+    // returns never route through here (macX64Returns32Bit gates).
+    public void linuxPost(string fn) {
+        if (this.isMacX64Target() && macX64Returns32Bit(fn)) {
+            this.asm.movSlq(0, 0);
+        }
     }
 
     public void genFileDeleteCall(Node call) {
@@ -19006,13 +20912,20 @@ public void genNewCall(Node call) {
             this.asm.movMBaseR(5, 0, sizeOff);
         } else {
             // int[] points at element zero; its length is stored at -8.
-            // Compact the low byte of each eight-byte element in place. The
-            // array allocation has enough capacity for this prefix, so this
-            // avoids a second heap allocation and keeps the bootstrap ABI
-            // identical across compiler generations.
+            // Compact the low byte of each eight-byte element into a fresh
+            // scratch buffer. The old code compacted IN PLACE, destroying
+            // the caller's array: any later use of it (e.g. passing the
+            // same array to gzip.compress after file.writeBytes) read
+            // packed garbage while the file itself was correct (the
+            // reference bridge never mutates the source). The scratch keeps
+            // the bootstrap ABI identical across compiler generations.
             this.asm.movRMBase(10, 5, dataOff);
             this.asm.movRMBase(0, 10, -8);
             this.asm.movMBaseR(5, 0, sizeOff);
+            this.emitLlmaiHeapAlloc(sizeOff);
+            int scratchOff = this.allocLocal("__wb_scratch");
+            this.asm.movMBaseR(5, 0, scratchOff);
+            bufOff = scratchOff;
 
             int iOff = this.allocLocal("__wb_i");
             this.asm.movRI64(0, 0);
@@ -19023,7 +20936,7 @@ public void genNewCall(Node call) {
             // indexed-SIB encoder so stage2 and later stages use the same
             // conservative instruction subset as stage1.
             this.asm.movRMBase(10, 5, dataOff);
-            this.asm.movRR64(11, 10);
+            this.asm.movRMBase(11, 5, scratchOff);
             int loopLbl = this.newLabel();
             int doneLbl = this.newLabel();
             this.asm.bindLabel(loopLbl);

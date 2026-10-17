@@ -100,6 +100,21 @@ class MiniAsm {
         this.emitU8(0xC0 | ((src & 7) << 3) | (dst & 7));
     }
 
+    // MOVSXD r64, r32: sign-extend the low 32 bits of src into dst.
+    // MAC.md Phase D: native calls returning 32-bit C int leave RAX's high
+    // half zeroed (x86-64 clears it on EAX writes), so Silver's 64-bit int
+    // would see 4294967295 instead of -1. Same shape as movRR64 with the
+    // 0x63 opcode (modrm 11).
+    public void movSlq(int dst, int src) {
+        int rFlag = 0;
+        int sFlag = 0;
+        if (src > 7) { rFlag = 1; }
+        if (dst > 7) { sFlag = 1; }
+        this.emitU8(0x48 | (rFlag << 2) | sFlag);
+        this.emitU8(0x63);
+        this.emitU8(0xC0 | ((src & 7) << 3) | (dst & 7));
+    }
+
     public void movRI64(int dst, int64 imm) {
         int dFlag = 0;
         if (dst > 7) { dFlag = 1; }
@@ -416,14 +431,21 @@ class MiniAsm {
     }
 
     public void imulRR64(int dst, int src) {
+        // IMUL r64, r/m64 (0F AF): unlike the 0x89/0x01/0x29 ALU encoders
+        // above (reg field = source), the reg field is the DESTINATION, so
+        // dst rides in reg (REX.R) and src in r/m (REX.B). The previous
+        // revision copied the ALU layout (src in reg), which silently
+        // computed src = dst*src and left dst unchanged — every
+        // imulRR64(0, 1) accumulator (replace sizing, url port parsing,
+        // linux sleep) kept its old value and the product was discarded.
         int rFlag = 0;
         int sFlag = 0;
-        if (src > 7) { rFlag = 1; }
-        if (dst > 7) { sFlag = 1; }
+        if (dst > 7) { rFlag = 1; }
+        if (src > 7) { sFlag = 1; }
         this.emitU8(0x48 | (rFlag << 2) | sFlag);
         this.emitU8(0x0F);
         this.emitU8(0xAF);
-        this.emitU8(0xC0 | ((src & 7) << 3) | (dst & 7));
+        this.emitU8(0xC0 | ((dst & 7) << 3) | (src & 7));
     }
 
     public void syscall() {

@@ -1,0 +1,233 @@
+// Operator overloading (DOCS/275): C#-shaped static overloads on structs
+// AND classes (`public static Ret operator <op> (Own b)` with implicit
+// `this` + one explicit param; `!` / unary `-` take zero params).
+// Covers Vec2Struct (+, ==, != incl. the `!(this == b)` self-call),
+// a Person-style merge (+ with pdate preference and null branches,
+// ==/!=), the full arithmetic/comparison set, compound assignment via the
+// binary overload, null/`is null` never crashing, builtins unchanged,
+// and the `==`-alone-keeps-builtin-`!=` rule. Exit code 0 = exact.
+public struct Vec2Struct {
+    public prop double X;
+    public prop double Y;
+
+    construct(double x, double y) {
+        this.X = x;
+        this.Y = y;
+    }
+
+    public static Vec2Struct operator + (Vec2Struct b) {
+        return new Vec2Struct(this.X + b.X, this.Y + b.Y);
+    }
+
+    public static Vec2Struct operator - (Vec2Struct b) {
+        return new Vec2Struct(this.X - b.X, this.Y - b.Y);
+    }
+
+    public static Vec2Struct operator * (Vec2Struct b) {
+        return new Vec2Struct(this.X * b.X, this.Y * b.Y);
+    }
+
+    public static bool operator == (Vec2Struct b) {
+        return this.X == b.X && this.Y == b.Y;
+    }
+
+    public static bool operator != (Vec2Struct b) {
+        return !(this == b);
+    }
+
+    public static Vec2Struct operator - () {
+        return new Vec2Struct(0.0 - this.X, 0.0 - this.Y);
+    }
+}
+
+public class Person {
+    public prop string firstname;
+    public prop string lastname;
+    public prop int age;
+    public prop string address;
+    public prop int pdate;
+
+    construct(string fn, string ln, int ag, string addr, int pd) {
+        this.firstname = fn;
+        this.lastname = ln;
+        this.age = ag;
+        this.address = addr;
+        this.pdate = pd;
+    }
+
+    public static Person operator + (Person b) {
+        if (b is null) {
+            return this;
+        }
+        bool preferThis = this.pdate > b.pdate;
+        string fn = this.firstname;
+        string ln = this.lastname;
+        int ag = this.age;
+        string addr = this.address;
+        int pd = this.pdate;
+        if (!preferThis) {
+            fn = b.firstname;
+            ln = b.lastname;
+            ag = b.age;
+            addr = b.address;
+            pd = b.pdate;
+        }
+        return new Person(fn, ln, ag, addr, pd);
+    }
+
+    public static bool operator == (Person b) {
+        if (b is null) {
+            return false;
+        }
+        return this.firstname == b.firstname && this.lastname == b.lastname && this.age == b.age && this.address == b.address && this.pdate == b.pdate;
+    }
+
+    public static bool operator != (Person b) {
+        return !(this == b);
+    }
+}
+
+public struct OnlyEq {
+    public prop int v;
+
+    construct(int x) {
+        this.v = x;
+    }
+
+    public static bool operator == (OnlyEq b) {
+        return this.v == b.v;
+    }
+}
+
+public struct Ordered {
+    public prop int v;
+
+    construct(int x) {
+        this.v = x;
+    }
+
+    public static Ordered operator / (Ordered b) {
+        return new Ordered(this.v / b.v);
+    }
+
+    public static Ordered operator % (Ordered b) {
+        return new Ordered(this.v % b.v);
+    }
+
+    public static Ordered operator - (Ordered b) {
+        return new Ordered(this.v - b.v);
+    }
+
+    public static Ordered operator * (Ordered b) {
+        return new Ordered(this.v * b.v);
+    }
+
+    public static bool operator < (Ordered b) {
+        return this.v < b.v;
+    }
+
+    public static bool operator > (Ordered b) {
+        return this.v > b.v;
+    }
+
+    public static bool operator <= (Ordered b) {
+        return this.v <= b.v;
+    }
+
+    public static bool operator >= (Ordered b) {
+        return this.v >= b.v;
+    }
+
+    public static bool operator ! () {
+        return this.v == 0;
+    }
+}
+
+void check(bool ok, string label) {
+    if (!ok) {
+        printline("FAIL " + label);
+        exit(1);
+    }
+}
+
+void main() {
+    Vec2Struct a = new Vec2Struct(1.0, 2.0);
+    Vec2Struct b = new Vec2Struct(3.0, 4.0);
+    Vec2Struct c = a + b;
+    check(c.X == 4.0, "vec-add-x");
+    check(c.Y == 6.0, "vec-add-y");
+    Vec2Struct d = b - a;
+    check(d.X == 2.0, "vec-sub-x");
+    check(d.Y == 2.0, "vec-sub-y");
+    Vec2Struct e = a * b;
+    check(e.X == 3.0, "vec-mul-x");
+    check(e.Y == 8.0, "vec-mul-y");
+    check(a == a, "vec-eq-self");
+    check(!(a == b), "vec-eq-distinct-false");
+    check(a != b, "vec-neq-distinct");
+    check(!(a != a), "vec-neq-self-false");
+    Vec2Struct n = -a;
+    check(n.X == 0.0 - 1.0, "vec-unary-neg-x");
+    check(n.Y == 0.0 - 2.0, "vec-unary-neg-y");
+    Vec2Struct acc = new Vec2Struct(1.0, 1.0);
+    acc += new Vec2Struct(2.0, 3.0);
+    check(acc.X == 3.0, "vec-compound-add-x");
+    check(acc.Y == 4.0, "vec-compound-add-y");
+
+    Ordered x = new Ordered(10);
+    Ordered y = new Ordered(3);
+    check((x / y).v == 3, "ord-div");
+    check((x % y).v == 1, "ord-mod");
+    check(y < x, "ord-lt");
+    check(x > y, "ord-gt");
+    check((x >= y), "ord-ge");
+    check((y <= x), "ord-le");
+    check(!(x < y), "ord-lt-false");
+    Ordered z = new Ordered(0);
+    check(!z, "ord-not-zero-true");
+    check(!(!x), "ord-double-not-live-true");
+    Ordered m = new Ordered(1);
+    m *= new Ordered(5);
+    check(m.v == 5, "ord-compound-mul");
+    m -= new Ordered(2);
+    check(m.v == 3, "ord-compound-sub");
+
+    Person p1 = new Person("Ann", "Lee", 30, "Main", 20240101);
+    Person p2 = new Person("Bob", "Kay", 40, "Oak", 20240601);
+    Person merged = p1 + p2;
+    check(merged.firstname == "Bob", "person-merge-newer-firstname");
+    check(merged.lastname == "Kay", "person-merge-newer-lastname");
+    check(merged.age == 40, "person-merge-newer-age");
+    check(merged.address == "Oak", "person-merge-newer-address");
+    check(merged.pdate == 20240601, "person-merge-newer-pdate");
+    Person back = p2 + p1;
+    check(back.firstname == "Bob", "person-merge-keeps-newer");
+    Person? nobody = null;
+    Person kept = p1 + nobody;
+    check(kept.firstname == "Ann", "person-null-rhs-returns-this");
+    check(kept.pdate == 20240101, "person-null-rhs-pdate");
+    check(p1 == p1, "person-eq-self");
+    check(!(p1 == p2), "person-eq-distinct-false");
+    check(p1 != p2, "person-neq-distinct");
+    check(!(p1 != p1), "person-neq-self-false");
+    check(!(p1 == null), "person-eq-null-false");
+    check(!(p1 is null), "person-is-null-false");
+    Person? gone = null;
+    check(gone is null, "person-null-is-null");
+    check(p1 is not null, "person-is-not-null");
+
+    OnlyEq e1 = new OnlyEq(5);
+    OnlyEq e2 = new OnlyEq(5);
+    check(e1 == e2, "onlyeq-eq-uses-overload");
+    check(e1 != e2, "onlyeq-neq-keeps-builtin");
+    check(!(e1 == null), "onlyeq-eq-null-false");
+
+    int sum = 1 + 2;
+    check(sum == 3, "builtin-int-add-intact");
+    string joined = "a" + "b";
+    check(joined == "ab", "builtin-string-add-intact");
+    check(1 < 2, "builtin-int-lt-intact");
+    check(!true == false, "builtin-not-intact");
+
+    printline("operator-overloading-ok");
+}
