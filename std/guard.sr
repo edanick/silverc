@@ -65,6 +65,7 @@ const int GOP_BIT_OR = 23;
 const int GOP_BIT_XOR = 24;
 const int GOP_COALESCE = 25;
 const int GOP_MOVE = 28;
+const int GND_SWITCH = 76;
 
 class GuardVar {
     public prop string name;
@@ -104,6 +105,7 @@ class MemoryGuard {
     private prop string[] globalNames;
     private prop string[] nonNullNames;
     private prop int unwrapDepth;
+    public prop string[] warnings;
 
     construct {
         this.vars = [];
@@ -111,6 +113,7 @@ class MemoryGuard {
         this.globalNames = [];
         this.nonNullNames = [];
         this.unwrapDepth = 0;
+        this.warnings = [];
     }
 
     private void fail(string exc, int line, int col, string varName, string msg) {
@@ -488,10 +491,150 @@ class MemoryGuard {
 
     private void checkBlock(Node n) {
         this.pushScope();
-        for (int i = 0; i < n.childCount(); i++) {
-            this.checkStmt(n.child(i));
-        }
+        this.checkStmtList(n);
         this.popScope();
+    }
+
+    // A statement that never completes normally (flow graph
+    // unreachable-flag concept): control cannot flow past it to the next
+    // statement of the same block. Compound forms count when every path
+    // through them terminates.
+    private bool stmtIsTerminal(Node s) {
+        if (s.kind == GND_RETURN || s.kind == GND_RETURN_SHORT || s.kind == GND_THROW
+            || s.kind == GND_BREAK || s.kind == GND_CONTINUE) { return true; }
+        if (s.kind == GND_IF_STMT) {
+            return s.childCount() >= 3 && this.stmtListIsTerminal(s.child(1)) && this.stmtListIsTerminal(s.child(2));
+        }
+        if (s.kind == GND_EXPR_STMT && s.childCount() > 0 && s.child(0).kind == GND_MATCH_EXPR) {
+            return this.matchIsTerminal(s.child(0));
+        }
+        if (s.kind == GND_WHILE) {
+            return s.child(0).kind == GND_BOOL_LIT && s.child(0).boolVal && !this.stmtListContainsBreak(s.child(1));
+        }
+        if (s.kind == GND_SWITCH) { return this.switchIsTerminal(s); }
+        if (s.kind == GND_TRY_CATCH) {
+            if (s.name.length > 0) {
+                return this.stmtListIsTerminal(s.child(0)) && this.stmtListIsTerminal(s.child(1));
+            }
+            // try/finally (no catch): the body either completes or the
+            // exception propagates out of the function, so a terminal body
+            // keeps control from falling past the statement.
+            return this.stmtListIsTerminal(s.child(0));
+        }
+        return false;
+    }
+
+    // A match keeps control from falling past only when it is
+    // exhaustive-looking (a `_` arm) and every arm body terminates.
+    private bool matchIsTerminal(Node m) {
+        if (m.childCount() <= 1) { return false; }
+        bool hasWildcard = false;
+        for (int i = 1; i < m.childCount(); i++) {
+            Node arm = m.child(i);
+            if (arm.kind != GND_MATCH_ARM || arm.childCount() == 0) { return false; }
+            Node pat = arm.child(0);
+            if (pat.kind == GND_IDENT && pat.name == "_") { hasWildcard = true; }
+            Node body = arm.child(arm.childCount() - 1);
+            if (body.kind != GND_BLOCK) { return false; }
+            if (!this.stmtListIsTerminal(body)) { return false; }
+        }
+        return hasWildcard;
+    }
+
+    // Switch node shape: child(0) = subject, then alternating (case value,
+    // case body) children; an even child count carries the else body last.
+    private bool switchIsTerminal(Node s) {
+        int n = s.childCount();
+        if (n % 2 != 0) { return false; }
+        if (!this.stmtListIsTerminal(s.child(n - 1))) { return false; }
+        for (int i = 2; i < n - 1; i += 2) {
+            if (!this.stmtListIsTerminal(s.child(i))) { return false; }
+        }
+        return true;
+    }
+
+    private bool stmtListIsTerminal(Node body) {
+        if (body.kind == GND_BLOCK) {
+            for (int i = 0; i < body.childCount(); i++) {
+                if (this.stmtIsTerminal(body.child(i))) { return true; }
+            }
+            return false;
+        }
+        return this.stmtIsTerminal(body);
+    }
+
+    private bool stmtListContainsBreak(Node body) {
+        if (body.kind == GND_BLOCK) {
+            for (int i = 0; i < body.childCount(); i++) {
+                if (this.stmtContainsBreak(body.child(i))) { return true; }
+            }
+            return false;
+        }
+        return this.stmtContainsBreak(body);
+    }
+
+    // Any break anywhere in the body (even nested in another loop) counts as
+    // an exit, so the while(true) termination judgment stays conservative.
+    private bool stmtContainsBreak(Node s) {
+        if (s.kind == GND_BREAK) { return true; }
+        if (s.kind == GND_BLOCK) { return this.stmtListContainsBreak(s); }
+        if (s.kind == GND_IF_STMT) {
+            if (this.stmtListContainsBreak(s.child(1))) { return true; }
+            return s.childCount() >= 3 && this.stmtListContainsBreak(s.child(2));
+        }
+        if (s.kind == GND_WHILE) { return this.stmtListContainsBreak(s.child(1)); }
+        if (s.kind == GND_FOR_C) { return this.stmtListContainsBreak(s.child(3)); }
+        if (s.kind == GND_FOREACH) { return this.stmtListContainsBreak(s.child(2)); }
+        if (s.kind == GND_EXPR_STMT && s.childCount() > 0 && s.child(0).kind == GND_MATCH_EXPR) {
+            Node m = s.child(0);
+            for (int i = 1; i < m.childCount(); i++) {
+                Node arm = m.child(i);
+                if (arm.childCount() > 0 && this.stmtListContainsBreak(arm.child(arm.childCount() - 1))) { return true; }
+            }
+            return false;
+        }
+        if (s.kind == GND_SWITCH) {
+            int n = s.childCount();
+            int end = n;
+            if (n % 2 == 0) {
+                if (this.stmtListContainsBreak(s.child(n - 1))) { return true; }
+                end = n - 1;
+            }
+            for (int i = 2; i < end; i += 2) {
+                if (this.stmtListContainsBreak(s.child(i))) { return true; }
+            }
+            return false;
+        }
+        if (s.kind == GND_TRY_CATCH) {
+            for (int i = 0; i < s.childCount(); i++) {
+                if (this.stmtListContainsBreak(s.child(i))) { return true; }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    // Check one statement list, reporting the first statement that cannot
+    // execute because an earlier statement of the same block never completes
+    // normally. Unreachability is a warning, not an error: #on/#off
+    // preprocessor regions legitimately keep trailing target-specific code
+    // after a return, so only the directly terminal forms raise it.
+    private void checkStmtList(Node block) {
+        bool terminalSeen = false;
+        for (int i = 0; i < block.childCount(); i++) {
+            Node s = block.child(i);
+            if (terminalSeen) {
+                this.warnings.add("unreachable code detected at line " + (string)s.line + ", column " + (string)s.col);
+                terminalSeen = false;
+                this.checkStmt(s);
+                continue;
+            }
+            this.checkStmt(s);
+            if (s.kind == GND_RETURN || s.kind == GND_RETURN_SHORT || s.kind == GND_THROW
+                || s.kind == GND_BREAK || s.kind == GND_CONTINUE) {
+                terminalSeen = true;
+            }
+        }
     }
 
     private void checkIf(Node n) {
@@ -599,9 +742,7 @@ class MemoryGuard {
     private void checkMatchBody(Node body) {
         if (body.kind == GND_BLOCK) {
             this.pushScope();
-            for (int i = 0; i < body.childCount(); i++) {
-                this.checkStmt(body.child(i));
-            }
+            this.checkStmtList(body);
             this.popScope();
         } else {
             this.checkExpr(body);
@@ -802,6 +943,7 @@ class MemoryGuard {
     }
 
     public void checkProgram(Node[] program) {
+        this.warnings = [];
         for (int i = 0; i < program.length; i++) {
             Node n = program[i];
             if (n.kind == GND_CONST) {
