@@ -43,6 +43,10 @@ const int GND_FUNC = 100;
 const int GND_STRUCT_DEF = 101;
 const int GND_CLASS_DEF = 102;
 const int GND_CONST = 104;
+const int GND_ENUM_DEF = 105;
+const int GND_DEF = 110;
+const int GND_TYPE_ALIAS = 111;
+const int GND_LAMBDA = 80;
 
 const int GOP_ADD = 1;
 const int GOP_SUB = 2;
@@ -65,6 +69,12 @@ const int GOP_BIT_OR = 23;
 const int GOP_BIT_XOR = 24;
 const int GOP_COALESCE = 25;
 const int GOP_MOVE = 28;
+const int GOP_MOD_ASSIGN = 29;
+const int GOP_BIT_AND_ASSIGN = 30;
+const int GOP_BIT_OR_ASSIGN = 31;
+const int GOP_BIT_XOR_ASSIGN = 32;
+const int GOP_SHL_ASSIGN = 33;
+const int GOP_SHR_ASSIGN = 34;
 const int GND_SWITCH = 76;
 
 class GuardVar {
@@ -105,6 +115,8 @@ class MemoryGuard {
     private prop string[] globalNames;
     private prop string[] nonNullNames;
     private prop int unwrapDepth;
+    private prop string[] typeNames;
+    private prop string currentReturnType;
     public prop string[] warnings;
 
     construct {
@@ -113,6 +125,8 @@ class MemoryGuard {
         this.globalNames = [];
         this.nonNullNames = [];
         this.unwrapDepth = 0;
+        this.typeNames = [];
+        this.currentReturnType = "";
         this.warnings = [];
     }
 
@@ -229,6 +243,261 @@ class MemoryGuard {
         return false;
     }
 
+    // Substring by character loop: string.slice miscompiles computed
+    // member args on the bootstrap (STANDARDS §14 exception), so the guard
+    // never calls it.
+    private string gsSlice(string s, int start, int end) {
+        if (start < 0) { start = 0; }
+        if (end > s.length) { end = s.length; }
+        if (end <= start) { return ""; }
+        string r = "";
+        for (int i = start; i < end; i++) { r += s[i]; }
+        return r;
+    }
+
+    private bool isKnownTypeName(string t) {
+        for (int i = 0; i < this.typeNames.length; i++) {
+            if (this.typeNames[i] == t) { return true; }
+        }
+        return false;
+    }
+
+    private bool isPrimitiveSpelling(string t) {
+        return t == "int" || t == "int32" || t == "int64" || t == "uint" || t == "uint64"
+            || t == "float" || t == "float64" || t == "double" || t == "bool" || t == "byte"
+            || t == "char" || t == "string" || t == "void";
+    }
+
+    // Missing-return ("not all code paths return a value" concept,
+    // MEMORY_GUARD totality check): a declared return type is judged when it
+    // is a real Silver value type — a primitive spelling or any composed
+    // shape built on one — or a KNOWN user type. `void`, `var`, fn-pointer
+    // types and unknown legacy names (e.g. `fun main()` parses as returning
+    // `fun`) are not judged: an unregistered name is not a Silver value type.
+    private bool judgedReturnType(string rt) {
+        if (rt.length == 0 || rt == "void" || rt == "var" || rt == "void ()") { return false; }
+        string base = rt;
+        while (base.length > 0) {
+            char last = base[base.length - 1];
+            if (last == ']' || last == '?' || last == '*' || last == '>') {
+                // Strip composed suffixes (array `[]`, nullable `?`, pointer
+                // `*`, generic close `>`) down to the base spelling. `<>`
+                // generic/union/kvp/tuple shapes stay judged (their bases are
+                // real types).
+                if (last == ']') {
+                    if (base.length < 3 || base[base.length - 2] != '[') { return true; }
+                    base = this.gsSlice(base, 0, base.length - 2);
+                } else {
+                    base = this.gsSlice(base, 0, base.length - 1);
+                }
+                continue;
+            }
+            break;
+        }
+        if (base.length == 0) { return true; }
+        if (this.isPrimitiveSpelling(base)) { return true; }
+        if (this.isKnownTypeName(base)) { return true; }
+        if (rt.indexOf("<") >= 0) { return true; }
+        return false;
+    }
+
+    // Nullable flow narrowing (condition-true /
+    // condition-false concept): names proven NON-NULL when `cond`
+    // evaluates to `truth`. Handles both operand orders (`x != null`,
+    // `null != x`), parenthesized conditions, `!` negation, and the
+    // short-circuit operators' definite branches: `a && b` true proves both
+    // sides' true-facts; `a || b` false proves both sides' false-facts.
+    // Indefinite branches prove nothing and stay empty.
+    private void collectNarrowings(Node cond, bool truth, string[] out) {
+        if (cond.kind == GND_PAREN) {
+            this.collectNarrowings(cond.child(0), truth, out);
+            return;
+        }
+        if (cond.kind == GND_UNARY && cond.op == 1) {
+            this.collectNarrowings(cond.child(0), !truth, out);
+            return;
+        }
+        if (cond.kind == GND_BINARY) {
+            if (cond.op == GOP_AND && truth) {
+                this.collectNarrowings(cond.child(0), true, out);
+                this.collectNarrowings(cond.child(1), true, out);
+                return;
+            }
+            if (cond.op == GOP_OR && !truth) {
+                this.collectNarrowings(cond.child(0), false, out);
+                this.collectNarrowings(cond.child(1), false, out);
+                return;
+            }
+            if (cond.op == GOP_EQ || cond.op == GOP_NEQ) {
+                Node nl = cond.child(0);
+                Node nr = cond.child(1);
+                string name = "";
+                if (nr.kind == GND_NULL_LIT && nl.kind == GND_IDENT) { name = nl.name; }
+                if (nl.kind == GND_NULL_LIT && nr.kind == GND_IDENT) { name = nr.name; }
+                if (name.length > 0 && this.isNullableVar(name)) {
+                    // `x != null` true  -> x non-null.
+                    // `x == null` false -> x non-null.
+                    bool proven = (cond.op == GOP_NEQ) == truth;
+                    if (proven) {
+                        bool have = false;
+                        for (int i = 0; i < out.length; i++) {
+                            if (out[i] == name) { have = true; break; }
+                        }
+                        if (!have) { out.add(name); }
+                    }
+                }
+            }
+        }
+    }
+
+    private void addNarrowings(string[] names) {
+        for (int i = 0; i < names.length; i++) { this.nonNullNames.add(names[i]); }
+    }
+
+    // Any assignment may reintroduce null into a previously narrowed
+    // nullable; the flow fact dies here (assignment-fact replaces the
+    // narrowed type).
+    private void dropNonNull(string name) {
+        string[] kept = [];
+        for (int i = 0; i < this.nonNullNames.length; i++) {
+            if (this.nonNullNames[i] != name) { kept.add(this.nonNullNames[i]); }
+        }
+        this.nonNullNames = kept;
+    }
+
+    private void dropNarrowings(string[] names) {
+        for (int i = 0; i < names.length; i++) { this.dropNonNull(names[i]); }
+    }
+
+    // Minimal static type inference for assignability/narrowing checks: a
+    // literal's type, a declared variable's typeHint, parens through, `??`
+    // yields the right side's type. Everything else is unknown ("") and
+    // skips the checks (matching the reference's None inference).
+    private string inferStaticType(Node e) {
+        int k = e.kind;
+        if (k == GND_INT_LIT) { return "int"; }
+        if (k == GND_FLOAT_LIT) { return "float"; }
+        if (k == GND_STRING_LIT) { return "string"; }
+        if (k == GND_CHAR_LIT) { return "char"; }
+        if (k == GND_BOOL_LIT) { return "bool"; }
+        if (k == GND_NULL_LIT) { return "void"; }
+        if (k == GND_PAREN) { return this.inferStaticType(e.child(0)); }
+        if (k == GND_IDENT) {
+            int idx = this.findVar(e.name);
+            if (idx >= 0) { return this.vars[idx].typeHint; }
+            return "";
+        }
+        if (k == GND_BINARY && e.op == GOP_COALESCE) { return this.inferStaticType(e.child(1)); }
+        if (k == GND_UNARY) { return this.inferStaticType(e.child(0)); }
+        return "";
+    }
+
+    private bool isNumericTypeName(string t) {
+        return t == "int" || t == "int32" || t == "int64" || t == "uint" || t == "uint64"
+            || t == "float" || t == "float64" || t == "double" || t == "byte";
+    }
+
+    // Assignability relations (type relations concept, restricted to Silver's
+    // shapes): composed types require their components to agree — nullable
+    // inner types, array element types, and dict key/value types all
+    // recurse. Strings never interchange with numbers or bools in either
+    // direction; chars are exempt pending a documented widening rule;
+    // numeric alias widths (int/int32/int64, float/float64) keep their
+    // historical interchangeability.
+    private void checkTypesCompatible(string expected, string actual, Node at, string varName) {
+        if (expected == actual) { return; }
+        // Allow null to be assigned to any nullable type, and non-null
+        // values to widen into nullable targets.
+        if (expected.endsWith("?")) {
+            if (actual == "void") { return; }
+            if (this.gsSlice(expected, 0, expected.length - 1) == actual) { return; }
+        }
+        if ((expected == "int" && actual == "int32") || (expected == "int32" && actual == "int")) { return; }
+        if ((expected == "float" && actual == "float64") || (expected == "float64" && actual == "float")) { return; }
+        if ((expected == "int" && actual == "int64") || (expected == "int64" && actual == "int")) { return; }
+        if (expected.endsWith("?") && actual.endsWith("?")) {
+            this.checkTypesCompatible(this.gsSlice(expected, 0, expected.length - 1), this.gsSlice(actual, 0, actual.length - 1), at, varName);
+            return;
+        }
+        if (expected.endsWith("[]") && actual.endsWith("[]")) {
+            this.checkTypesCompatible(this.gsSlice(expected, 0, expected.length - 2), this.gsSlice(actual, 0, actual.length - 2), at, varName);
+            return;
+        }
+        if (this.dictKeyOf(expected).length > 0 && this.dictKeyOf(actual).length > 0) {
+            this.checkTypesCompatible(this.dictKeyOf(expected), this.dictKeyOf(actual), at, varName);
+            this.checkTypesCompatible(this.dictValueOf(expected), this.dictValueOf(actual), at, varName);
+            return;
+        }
+        bool stringExpected = expected == "string";
+        bool stringActual = actual == "string";
+        bool numericExpected = this.isNumericTypeName(expected);
+        bool numericActual = this.isNumericTypeName(actual);
+        bool boolExpected = expected == "bool";
+        bool boolActual = actual == "bool";
+        if ((stringExpected && (numericActual || boolActual)) || (stringActual && (numericExpected || boolExpected))) {
+            this.fail("TypeMismatch", at.line, at.col, varName, "expected '" + expected + "', found '" + actual + "'");
+        }
+    }
+
+    // `dict<K, V>` (or bare `<K, V>`) inner key/value text, or "" when the
+    // spelling is not a dict type.
+    private string dictInner(string t) {
+        if (t.startsWith("dict<") && t.endsWith(">")) {
+            return this.gsSlice(t, 5, t.length - 1);
+        }
+        if (t.startsWith("<") && t.endsWith(">") && t.indexOf(",") > 0) {
+            return this.gsSlice(t, 1, t.length - 1);
+        }
+        return "";
+    }
+
+    private int dictComma(string inner) {
+        int depth = 0;
+        for (int i = 0; i < inner.length; i++) {
+            char c = inner[i];
+            if (c == '<') { depth++; }
+            if (c == '>') { depth--; }
+            if (c == ',' && depth == 0) { return i; }
+        }
+        return -1;
+    }
+
+    // Key component of a dict type spelling, or "" when not a dict.
+    private string dictKeyOf(string t) {
+        string inner = this.dictInner(t);
+        if (inner.length == 0) { return ""; }
+        int comma = this.dictComma(inner);
+        if (comma < 0) { return ""; }
+        return this.gsSlice(inner, 0, comma).trim();
+    }
+
+    // Value component of a dict type spelling, or "" when not a dict.
+    private string dictValueOf(string t) {
+        string inner = this.dictInner(t);
+        if (inner.length == 0) { return ""; }
+        int comma = this.dictComma(inner);
+        if (comma < 0) { return ""; }
+        return this.gsSlice(inner, comma + 1, inner.length).trim();
+    }
+
+    // Validate a `return e` / `>> e` / one-line `<< e` expression against
+    // the enclosing function's declared return type: a nullable must not
+    // flow into a non-nullable return slot without a null check.
+    private void checkReturnValue(Node expr, Node at) {
+        string rt = this.currentReturnType;
+        if (rt.length == 0 || rt == "void" || rt == "var" || rt == "void ()") { return; }
+        if (rt.endsWith("?")) { return; }
+        Node src = expr;
+        while (src.kind == GND_PAREN) { src = src.child(0); }
+        if (src.kind != GND_IDENT) { return; }
+        if (this.isNonNullHere(src.name)) { return; }
+        int idx = this.findVar(src.name);
+        if (idx < 0) { return; }
+        if (this.vars[idx].isNullable) {
+            this.fail("NullValueException", at.line, at.col, src.name, "nullable value " + src.name + " returned without a null check (use ??)");
+        }
+    }
+
     private void checkRead(Node n) {
         string name = n.name;
         if (name == "this") { return; }
@@ -322,6 +591,7 @@ class MemoryGuard {
             if (di >= 0) {
                 this.vars[di].isInit = true;
                 this.vars[di].isAlive = true;
+                this.dropNonNull(dest.name);
             }
         } else if (dest.kind != GND_IDENT) {
             this.checkExpr(dest);
@@ -361,7 +631,18 @@ class MemoryGuard {
     private int checkAssign(Node n) {
         Node lhs = n.child(0);
         Node rhs = n.child(1);
+        bool isCompound = n.op != GOP_ASSIGN;
         if (lhs.kind == GND_IDENT && lhs.name != "this") {
+            // Compound assignments read the target before writing
+            // (`x += 1` is `x = x + 1`): an uninitialized target is an
+            // unassigned read, not a fresh initialization. (`x++`/`x--`
+            // take the non-assign path and read the operand directly.)
+            if (isCompound) {
+                int ci = this.findVar(lhs.name);
+                if (ci >= 0 && !this.vars[ci].isInit) {
+                    this.fail("UnassignedVariableCallException", lhs.line, lhs.col, lhs.name, "compound assignment reads '" + lhs.name + "' before it is assigned on all paths");
+                }
+            }
             if (this.isGlobalName(lhs.name)) {
                 this.fail("InvalidAssignment", lhs.line, lhs.col, lhs.name, "cannot write to a global or const");
             }
@@ -377,7 +658,7 @@ class MemoryGuard {
                         this.fail("UnsetAliasCallException", lhs.line, lhs.col, v.name, "alias target is dead or out of scope");
                     }
                 }
-                if (rhs.kind == GND_IDENT && n.op == GOP_ASSIGN) {
+                if (rhs.kind == GND_IDENT && n.op == GOP_ASSIGN && !this.isNonNullHere(rhs.name)) {
                     int ri = this.findVar(rhs.name);
                     if (ri >= 0 && this.vars[ri].isNullable) {
                         if (v.typeHint.length > 0 && !v.typeHint.endsWith("?")) {
@@ -385,6 +666,9 @@ class MemoryGuard {
                         }
                     }
                 }
+                // Any assignment may reintroduce null into a previously
+                // narrowed nullable; the flow fact dies here.
+                this.dropNonNull(lhs.name);
                 v.isInit = true;
                 v.isAlive = true;
                 this.markAddrHolding(v, rhs, lhs);
@@ -405,7 +689,7 @@ class MemoryGuard {
     private void checkNullableInit(Node node, Node init) {
         if (init.kind == GND_IDENT) {
             int ri = this.findVar(init.name);
-            if (ri >= 0 && this.vars[ri].isNullable) {
+            if (ri >= 0 && this.vars[ri].isNullable && !this.isNonNullHere(init.name)) {
                 if (node.typeHint.length > 0 && !node.typeHint.endsWith("?")) {
                     this.fail("NullValueException", init.line, init.col, node.name, "nullable value " + init.name + " used without a null check (use ??)");
                 }
@@ -432,6 +716,14 @@ class MemoryGuard {
         }
         this.checkNullableInit(n, init);
         this.checkExpr(init);
+        // Assignability relations: the initializer's inferred type must
+        // agree with the declared type's components (nullable inner,
+        // array element, dict key/value); strings never interchange with
+        // numbers or bools.
+        string initType = this.inferStaticType(init);
+        if (initType.length > 0 && n.typeHint.length > 0) {
+            this.checkTypesCompatible(n.typeHint, initType, n, name);
+        }
         GuardVar v = new GuardVar();
         v.name = name;
         v.typeHint = n.typeHint;
@@ -640,34 +932,24 @@ class MemoryGuard {
     private void checkIf(Node n) {
         Node cond = n.child(0);
         this.checkExpr(cond);
-        string thenNonNull = "";
-        string elseNonNull = "";
-        if (cond.kind == GND_BINARY && cond.child(1).kind == GND_NULL_LIT && cond.child(0).kind == GND_IDENT) {
-            if (cond.op == GOP_NEQ && this.isNullableVar(cond.child(0).name)) { thenNonNull = cond.child(0).name; }
-            if (cond.op == GOP_EQ && this.isNullableVar(cond.child(0).name)) { elseNonNull = cond.child(0).name; }
-        }
+        string[] thenNarrowed = [];
+        string[] elseNarrowed = [];
+        this.collectNarrowings(cond, true, thenNarrowed);
+        this.collectNarrowings(cond, false, elseNarrowed);
         GuardVar[] before = this.snapshot();
         this.pushScope();
-        if (thenNonNull.length > 0) { this.nonNullNames.add(thenNonNull); }
+        this.addNarrowings(thenNarrowed);
         this.checkStmt(n.child(1));
-        if (thenNonNull.length > 0) {
-            string[] trimmed = [];
-            for (int t = 0; t < this.nonNullNames.length - 1; t++) { trimmed.add(this.nonNullNames[t]); }
-            this.nonNullNames = trimmed;
-        }
+        this.dropNarrowings(thenNarrowed);
         this.popScope();
         GuardVar[] afterThen = this.snapshot();
         this.vars = before;
         GuardVar[] afterElse = [];
         if (n.childCount() >= 3) {
             this.pushScope();
-            if (elseNonNull.length > 0) { this.nonNullNames.add(elseNonNull); }
+            this.addNarrowings(elseNarrowed);
             this.checkStmt(n.child(2));
-            if (elseNonNull.length > 0) {
-                string[] trimmed2 = [];
-                for (int t2 = 0; t2 < this.nonNullNames.length - 1; t2++) { trimmed2.add(this.nonNullNames[t2]); }
-                this.nonNullNames = trimmed2;
-            }
+            this.dropNarrowings(elseNarrowed);
             this.popScope();
             afterElse = this.snapshot();
         } else {
@@ -685,7 +967,13 @@ class MemoryGuard {
         this.checkExpr(n.child(0));
         GuardVar[] before = this.snapshot();
         this.pushScope();
+        // While the loop runs, the condition holds: nullable conditions
+        // like `while (x != null)` narrow `x` inside the body.
+        string[] narrowed = [];
+        this.collectNarrowings(n.child(0), true, narrowed);
+        this.addNarrowings(narrowed);
         this.checkStmt(n.child(1));
+        this.dropNarrowings(narrowed);
         this.popScope();
         this.vars = before;
     }
@@ -739,6 +1027,69 @@ class MemoryGuard {
         }
     }
 
+    // Switch node shape: child(0) = subject, then alternating (case value,
+    // case body) children; an even child count carries the else body last.
+    // Definite-assignment merge (branch-label antecedent union concept,
+    // mirroring if/else): a variable is initialized after the switch only
+    // when it was initialized in the else body AND in every case body;
+    // without an else, the no-match path keeps nothing initialized (the
+    // reference keeps the no-match path unassigned). Liveness unions across
+    // branches plus the pre-switch state, like if-without-else.
+    private void checkSwitch(Node n) {
+        this.checkExpr(n.child(0));
+        GuardVar[] before = this.snapshot();
+        int total = n.childCount();
+        bool hasElse = total % 2 == 0;
+        int pairEnd = total;
+        if (hasElse) { pairEnd = total - 1; }
+        bool[] initOk = [];
+        bool[] aliveAny = [];
+        bool[] addrAny = [];
+        for (int b = 0; b < this.vars.length; b++) {
+            initOk.add(false);
+            aliveAny.add(false);
+            addrAny.add(false);
+        }
+        if (hasElse) {
+            this.vars = before;
+            this.pushScope();
+            this.checkStmtList(n.child(total - 1));
+            this.popScope();
+            for (int b = 0; b < this.vars.length; b++) {
+                initOk[b] = this.vars[b].isInit;
+                aliveAny[b] = this.vars[b].isAlive;
+                addrAny[b] = this.vars[b].holdsAddress;
+            }
+        }
+        for (int ci = 1; ci < pairEnd; ci += 2) {
+            this.vars = before;
+            this.checkExpr(n.child(ci));
+            this.pushScope();
+            this.checkStmtList(n.child(ci + 1));
+            this.popScope();
+            for (int b = 0; b < this.vars.length; b++) {
+                initOk[b] = initOk[b] && this.vars[b].isInit;
+                if (this.vars[b].isAlive) { aliveAny[b] = true; }
+                if (this.vars[b].holdsAddress) { addrAny[b] = true; }
+            }
+        }
+        if (!hasElse) {
+            // No-match path: control falls past the switch with the
+            // pre-switch state (liveness only; initialization stays
+            // unassigned on that path by the merge above).
+            for (int b = 0; b < this.vars.length; b++) {
+                if (before[b].isAlive) { aliveAny[b] = true; }
+                if (before[b].holdsAddress) { addrAny[b] = true; }
+            }
+        }
+        this.vars = before;
+        for (int b = 0; b < this.vars.length; b++) {
+            this.vars[b].isInit = initOk[b];
+            this.vars[b].isAlive = aliveAny[b];
+            this.vars[b].holdsAddress = addrAny[b];
+        }
+    }
+
     private void checkMatchBody(Node body) {
         if (body.kind == GND_BLOCK) {
             this.pushScope();
@@ -775,7 +1126,9 @@ class MemoryGuard {
         }
         if (k == GND_BINARY) {
             int op = n.op;
-            if (op == GOP_ASSIGN || op == GOP_ADD_ASSIGN || op == GOP_SUB_ASSIGN || op == GOP_MUL_ASSIGN || op == GOP_DIV_ASSIGN) { return this.checkAssign(n); }
+            if (op == GOP_ASSIGN || op == GOP_ADD_ASSIGN || op == GOP_SUB_ASSIGN || op == GOP_MUL_ASSIGN || op == GOP_DIV_ASSIGN
+                || op == GOP_MOD_ASSIGN || op == GOP_BIT_AND_ASSIGN || op == GOP_BIT_OR_ASSIGN || op == GOP_BIT_XOR_ASSIGN
+                || op == GOP_SHL_ASSIGN || op == GOP_SHR_ASSIGN) { return this.checkAssign(n); }
             if (op == GOP_MOVE) { this.checkMove(n); return 0; }
             if (op == GOP_COALESCE) {
                 this.unwrapDepth++;
@@ -862,8 +1215,41 @@ class MemoryGuard {
             }
             return 0;
         }
+        if (k == GND_LAMBDA) {
+            // A lambda body belongs to its own generated function: a
+            // `return` inside it must not validate against the enclosing
+            // function's return type, and its parameters are fresh locals.
+            string savedReturnType = this.currentReturnType;
+            this.currentReturnType = "";
+            this.pushScope();
+            for (int li = 0; li < n.childCount() - 1; li++) {
+                Node lp = n.child(li);
+                if (lp.kind == GND_IDENT) {
+                    this.declareVar(lp.name, "var", true, true, false, false, false, false, lp.line, lp.col);
+                }
+            }
+            if (n.childCount() > 0) {
+                this.checkExpr(n.child(n.childCount() - 1));
+            }
+            this.popScope();
+            this.currentReturnType = savedReturnType;
+            return 0;
+        }
         if (k == GND_TERNARY) {
-            for (int i = 0; i < n.childCount(); i++) { this.checkExpr(n.child(i)); }
+            // `x != null ? x + 1 : 0` narrows the branches like an if/else:
+            // the true branch sees the condition's true-facts, the false
+            // branch its false-facts.
+            this.checkExpr(n.child(0));
+            string[] thenNarrowed = [];
+            string[] elseNarrowed = [];
+            this.collectNarrowings(n.child(0), true, thenNarrowed);
+            this.collectNarrowings(n.child(0), false, elseNarrowed);
+            this.addNarrowings(thenNarrowed);
+            this.checkExpr(n.child(1));
+            this.dropNarrowings(thenNarrowed);
+            this.addNarrowings(elseNarrowed);
+            this.checkExpr(n.child(2));
+            this.dropNarrowings(elseNarrowed);
             return 0;
         }
         return 0;
@@ -875,7 +1261,10 @@ class MemoryGuard {
         if (k == GND_VAR_DECL) { this.checkVarDecl(n); return; }
         if (k == GND_ALIAS_DECL) { this.checkAlias(n); return; }
         if (k == GND_RETURN || k == GND_RETURN_SHORT) {
-            if (n.childCount() > 0) { this.checkExpr(n.child(0)); }
+            if (n.childCount() > 0) {
+                this.checkExpr(n.child(0));
+                this.checkReturnValue(n.child(0), n);
+            }
             return;
         }
         if (k == GND_IF_STMT) { this.checkIf(n); return; }
@@ -883,6 +1272,7 @@ class MemoryGuard {
         if (k == GND_FOR_C) { this.checkFor(n); return; }
         if (k == GND_FOREACH) { this.checkForeach(n); return; }
         if (k == GND_TRY_CATCH) { this.checkTryCatch(n); return; }
+        if (k == GND_SWITCH) { this.checkSwitch(n); return; }
         if (k == GND_UNSET) { this.checkUnset(n); return; }
         if (k == GND_DESTRUCTURE) { this.checkDestructure(n); return; }
         if (k == GND_THROW) {
@@ -900,6 +1290,8 @@ class MemoryGuard {
         this.scopeEnds = [];
         this.nonNullNames = [];
         this.unwrapDepth = 0;
+        string savedReturnType = this.currentReturnType;
+        this.currentReturnType = n.typeHint;
         Node params = n.child(0);
         for (int i = 0; i < params.childCount(); i++) {
             Node p = params.child(i);
@@ -910,7 +1302,25 @@ class MemoryGuard {
             if (body.kind == GND_BLOCK) {
                 this.checkBlock(body);
             } else {
+                // One-line `<< body` function: the expression IS the return
+                // value, coerced against the declared return type.
                 this.checkExpr(body);
+                this.checkReturnValue(body, body);
+            }
+        }
+        this.currentReturnType = savedReturnType;
+        // Missing-return analysis ("not all code paths return a value"
+        // concept, MEMORY_GUARD totality check): a function declaring a
+        // value return type must return on every path; falling off the end
+        // of the body would hand the caller an undefined value. `void`
+        // functions (and inference-agnostic `var`) may fall off freely;
+        // unknown legacy type names are not judged.
+        if (this.judgedReturnType(n.typeHint)) {
+            if (n.childCount() >= 2) {
+                Node body = n.child(1);
+                if (body.kind == GND_BLOCK && body.childCount() > 0 && !this.stmtListIsTerminal(body)) {
+                    this.fail("MissingReturn", n.line, n.col, n.name, "function declaring return type '" + n.typeHint + "' can fall off the end without returning (missing return statement)");
+                }
             }
         }
     }
@@ -944,17 +1354,25 @@ class MemoryGuard {
 
     public void checkProgram(Node[] program) {
         this.warnings = [];
+        this.typeNames = [];
+        this.currentReturnType = "";
         for (int i = 0; i < program.length; i++) {
             Node n = program[i];
             if (n.kind == GND_CONST) {
                 this.globalNames.add(n.name);
             } else if (n.kind == GND_CLASS_DEF) {
+                this.typeNames.add(n.name);
                 for (int j = 0; j < n.childCount(); j++) {
                     Node m = n.child(j);
                     if (m.kind == GND_CONST) { this.globalNames.add(m.name); }
                 }
             } else if (n.kind == GND_VAR_DECL) {
                 this.globalNames.add(n.name);
+            } else if (n.kind == GND_STRUCT_DEF || n.kind == GND_ENUM_DEF || n.kind == GND_DEF || n.kind == GND_TYPE_ALIAS) {
+                // Known user type names: class/struct/enum/def/typealias
+                // declarations. A bare unknown return-type spelling is not a
+                // Silver value type, so missing-return does not judge it.
+                this.typeNames.add(n.name);
             }
         }
         for (int i = 0; i < program.length; i++) {
