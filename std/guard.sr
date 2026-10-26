@@ -77,6 +77,9 @@ const int GOP_SHL_ASSIGN = 33;
 const int GOP_SHR_ASSIGN = 34;
 const int GOP_COALESCE_ASSIGN = 38;
 const int GND_SWITCH = 76;
+const int GOP_POST_INC = 35;
+const int GOP_POST_DEC = 36;
+const int GND_NEW_INIT = 88;
 
 // Null-state tri-state (null-state-flow concept): the null-state of
 // evaluating an expression — non-null, maybe-null, or no proof either way.
@@ -111,6 +114,25 @@ class GuardVar {
         this.holdsAddress = false;
         this.aliasOf = "";
         this.addrTarget = "";
+        this.line = 0;
+        this.col = 0;
+    }
+}
+
+// One flattened class-field entry (member-store resolution): the field's
+// name, declared type, and read-only prop flag, in the own-fields-first
+// order the flattened layout resolves with.
+class GuardField {
+    public prop string name;
+    public prop string typeHint;
+    public prop bool isReadOnly;
+    public prop int line;
+    public prop int col;
+
+    construct {
+        this.name = "";
+        this.typeHint = "";
+        this.isReadOnly = false;
         this.line = 0;
         this.col = 0;
     }
@@ -155,6 +177,25 @@ class MemoryGuard {
     private prop string[] usedNames;
     private prop string[] suppressedNames;
     private prop bool unusedTracking;
+    // Class table (class-body flow checking + member-store resolution):
+    // classNames/classNodes hold every class and struct declaration of the
+    // merged program, for flattened field lookups (own fields first, then
+    // every ancestor's, first-listed wins) and receiver-type resolution.
+    private prop string[] classNames;
+    private prop Node[] classNodes;
+    // Enclosing class while its methods are deep-checked: "" outside any
+    // class. Drives the this-less member idiom (fields resolve bare) and
+    // `this`-receiver member-store resolution.
+    private prop string currentClass;
+    // Loop-nesting depth (loop-scope tracking): `break`/`continue` are
+    // legal only above zero. Match, switch and try bodies do not open loop
+    // scope; lambda bodies reset it (a generated function cannot target an
+    // enclosing loop).
+    private prop int loopDepth;
+    // Free-function bodies (call-argument null-tolerance): parallel to
+    // funcSigNames — the callee's declaration node, inspected for null-safe
+    // parameter reads (`??`, `?.`, `== null` guards).
+    private prop Node[] funcSigNodes;
     public prop string[] warnings;
 
     construct {
@@ -180,6 +221,11 @@ class MemoryGuard {
         this.usedNames = [];
         this.suppressedNames = [];
         this.unusedTracking = false;
+        this.classNames = [];
+        this.classNodes = [];
+        this.currentClass = "";
+        this.loopDepth = 0;
+        this.funcSigNodes = [];
         this.warnings = [];
     }
 
@@ -323,6 +369,104 @@ class MemoryGuard {
         return t == "int" || t == "int32" || t == "int64" || t == "uint" || t == "uint64"
             || t == "float" || t == "float64" || t == "double" || t == "bool" || t == "byte"
             || t == "char" || t == "string" || t == "void";
+    }
+
+    private int classIndexOf(string name) {
+        for (int i = 0; i < this.classNames.length; i++) {
+            if (this.classNames[i] == name) { return i; }
+        }
+        return -1;
+    }
+
+    // Flattened instance-field table of a class (member-store resolution):
+    // its own fields first, then every ancestor's in listed order — the
+    // first declaration of a spelling wins, mirroring the first-listed
+    // layout rule. Cycle-guarded so the walk never hangs.
+    private GuardField[] classFieldList(string className) {
+        GuardField[] out = [];
+        string[] visited = [];
+        string[] stack = [];
+        stack.add(className);
+        while (stack.length > 0) {
+            string name = stack[stack.length - 1];
+            stack.pop();
+            if (visited.contains(name)) { continue; }
+            visited.add(name);
+            int ci = this.classIndexOf(name);
+            if (ci < 0) { continue; }
+            Node cd = this.classNodes[ci];
+            for (int f = 0; f < cd.childCount(); f++) {
+                Node m = cd.child(f);
+                if (m.kind != GND_VAR_DECL) { continue; }
+                bool have = false;
+                for (int h = 0; h < out.length; h++) {
+                    if (out[h].name == m.name) { have = true; break; }
+                }
+                if (have) { continue; }
+                GuardField gf = new GuardField();
+                gf.name = m.name;
+                gf.typeHint = m.typeHint;
+                gf.isReadOnly = m.isReadOnly;
+                gf.line = m.line;
+                gf.col = m.col;
+                out.add(gf);
+            }
+            for (int p = 0; p < cd.parentClasses.length; p++) {
+                stack.add(cd.parentClasses[p]);
+            }
+        }
+        return out;
+    }
+
+    // Read-only flag of one field inside a class's flattened layout (own
+    // fields before inherited, first declaration wins). Unknown fields and
+    // classes report false — legacy sources assign through never-declared
+    // fields, and those member stores stay permissive.
+    private bool classFieldReadOnly(string className, string field) {
+        if (this.classIndexOf(className) < 0) { return false; }
+        GuardField[] flat = this.classFieldList(className);
+        for (int i = 0; i < flat.length; i++) {
+            if (flat[i].name == field) { return flat[i].isReadOnly; }
+        }
+        return false;
+    }
+
+    // Receiver class of a member store when the receiver is decidable
+    // (member-store resolution): `this` inside a deep-checked class, or a
+    // local/parameter/field whose declared type names a known class or
+    // struct. Everything else resolves dynamically and is never judged.
+    private string memberStoreClass(Node obj) {
+        if (obj.kind != GND_IDENT) { return ""; }
+        if (obj.name == "this" && this.currentClass.length > 0) { return this.currentClass; }
+        int idx = this.findVar(obj.name);
+        if (idx < 0) { return ""; }
+        string t = this.vars[idx].typeHint;
+        if (t.length == 0) { return ""; }
+        if (this.classIndexOf(t) >= 0) { return t; }
+        return "";
+    }
+
+    // Member-store check (read-only prop rule): a read-only prop is set
+    // exactly once, by its declaration initializer — never by a later
+    // store, not from outside and not from the declaring class's own
+    // methods. Field existence itself stays permissive on purpose.
+    private void checkMemberStore(Node obj, string field, Node at) {
+        string cls = this.memberStoreClass(obj);
+        if (cls.length == 0) { return; }
+        if (this.classFieldReadOnly(cls, field)) {
+            this.fail("ReadOnlyPropAssignment", at.line, at.col, field, "cannot assign to read-only prop '" + cls + "." + field + "'");
+        }
+    }
+
+    // Last dotted segment of a possibly module-qualified spelling
+    // (`net.http.Client` -> `Client`); the plain spelling itself otherwise.
+    private string lastDottedSegment(string s) {
+        int dot = -1;
+        for (int i = 0; i < s.length; i++) {
+            if (s[i] == '.') { dot = i; }
+        }
+        if (dot < 0) { return s; }
+        return this.gsSlice(s, dot + 1, s.length);
     }
 
     // Missing-return ("not all code paths return a value" concept,
@@ -531,30 +675,28 @@ class MemoryGuard {
     // recurse. Strings never interchange with numbers or bools in either
     // direction; chars are exempt pending a documented widening rule;
     // numeric alias widths (int/int32/int64, float/float64) keep their
-    // historical interchangeability.
-    private void checkTypesCompatible(string expected, string actual, Node at, string varName) {
-        if (expected == actual) { return; }
+    // historical interchangeability. The quiet core decides; the failing
+    // wrapper reports.
+    private bool typesCompatibleQuiet(string expected, string actual) {
+        if (expected == actual) { return true; }
         // Allow null to be assigned to any nullable type, and non-null
         // values to widen into nullable targets.
         if (expected.endsWith("?")) {
-            if (actual == "void") { return; }
-            if (this.gsSlice(expected, 0, expected.length - 1) == actual) { return; }
+            if (actual == "void") { return true; }
+            if (this.gsSlice(expected, 0, expected.length - 1) == actual) { return true; }
         }
-        if ((expected == "int" && actual == "int32") || (expected == "int32" && actual == "int")) { return; }
-        if ((expected == "float" && actual == "float64") || (expected == "float64" && actual == "float")) { return; }
-        if ((expected == "int" && actual == "int64") || (expected == "int64" && actual == "int")) { return; }
+        if ((expected == "int" && actual == "int32") || (expected == "int32" && actual == "int")) { return true; }
+        if ((expected == "float" && actual == "float64") || (expected == "float64" && actual == "float")) { return true; }
+        if ((expected == "int" && actual == "int64") || (expected == "int64" && actual == "int")) { return true; }
         if (expected.endsWith("?") && actual.endsWith("?")) {
-            this.checkTypesCompatible(this.gsSlice(expected, 0, expected.length - 1), this.gsSlice(actual, 0, actual.length - 1), at, varName);
-            return;
+            return this.typesCompatibleQuiet(this.gsSlice(expected, 0, expected.length - 1), this.gsSlice(actual, 0, actual.length - 1));
         }
         if (expected.endsWith("[]") && actual.endsWith("[]")) {
-            this.checkTypesCompatible(this.gsSlice(expected, 0, expected.length - 2), this.gsSlice(actual, 0, actual.length - 2), at, varName);
-            return;
+            return this.typesCompatibleQuiet(this.gsSlice(expected, 0, expected.length - 2), this.gsSlice(actual, 0, actual.length - 2));
         }
         if (this.dictKeyOf(expected).length > 0 && this.dictKeyOf(actual).length > 0) {
-            this.checkTypesCompatible(this.dictKeyOf(expected), this.dictKeyOf(actual), at, varName);
-            this.checkTypesCompatible(this.dictValueOf(expected), this.dictValueOf(actual), at, varName);
-            return;
+            if (!this.typesCompatibleQuiet(this.dictKeyOf(expected), this.dictKeyOf(actual))) { return false; }
+            return this.typesCompatibleQuiet(this.dictValueOf(expected), this.dictValueOf(actual));
         }
         bool stringExpected = expected == "string";
         bool stringActual = actual == "string";
@@ -563,8 +705,43 @@ class MemoryGuard {
         bool boolExpected = expected == "bool";
         bool boolActual = actual == "bool";
         if ((stringExpected && (numericActual || boolActual)) || (stringActual && (numericExpected || boolExpected))) {
+            return false;
+        }
+        return true;
+    }
+
+    private void checkTypesCompatible(string expected, string actual, Node at, string varName) {
+        if (!this.typesCompatibleQuiet(expected, actual)) {
             this.fail("TypeMismatch", at.line, at.col, varName, "expected '" + expected + "', found '" + actual + "'");
         }
+    }
+
+    // Fundamental value class of a type spelling (value-kind relations):
+    // every numeric width and char are one numeric class, string and bool
+    // their own. Composed and unknown shapes have none and are never judged
+    // by class.
+    private string fundamentalClass(string t) {
+        if (this.isNumericTypeName(t) || t == "char") { return "numeric"; }
+        if (t == "string") { return "string"; }
+        if (t == "bool") { return "bool"; }
+        return "";
+    }
+
+    // Assignment-value check (later assignments mirror declaration
+    // initializers): a value whose fundamental class cannot fit the target
+    // (`int x; ...; x = "hello"`) is an error at the store, not only at the
+    // declaration. `char` into `string` keeps the declaration widening;
+    // unknown shapes stay permissive.
+    private void checkAssignValueType(string target, Node rhs, Node at, string varName) {
+        string actual = this.inferStaticType(rhs);
+        if (actual.length == 0 || actual == "var" || actual == "void") { return; }
+        if (target == "string" && actual == "char") { return; }
+        string tc = this.fundamentalClass(target);
+        string ac = this.fundamentalClass(actual);
+        if (tc.length > 0 && ac.length > 0 && tc != ac) {
+            this.fail("TypeMismatch", at.line, at.col, varName, "expected '" + this.gArticle(target) + "', found '" + this.gArticle(actual) + "'");
+        }
+        this.checkTypesCompatible(target, actual, at, varName);
     }
 
     // `dict<K, V>` (or bare `<K, V>`) inner key/value text, or "" when the
@@ -795,7 +972,12 @@ class MemoryGuard {
                     this.fail("UnassignedVariableCallException", lhs.line, lhs.col, lhs.name, "compound assignment reads '" + lhs.name + "' before it is assigned on all paths");
                 }
             }
-            if (this.isGlobalName(lhs.name)) {
+            if (this.isGlobalName(lhs.name) && this.findVar(lhs.name) < 0) {
+                // An in-scope binding — a local, a parameter, or an
+                // in-scope class field (this-less member idiom) — shadows a
+                // same-named global: the assignment targets the inner
+                // binding. Only a global with no inner shadow is an invalid
+                // target (const reassignment).
                 this.fail("InvalidAssignment", lhs.line, lhs.col, lhs.name, "cannot write to a global or const");
             }
             int idx = this.findVar(lhs.name);
@@ -818,6 +1000,24 @@ class MemoryGuard {
                         }
                     }
                 }
+                // Compound-store target kinds: `+=` concatenates onto a
+                // string and pushes onto an array; every other compound
+                // operator would compute on the pointer or header bits and
+                // corrupt the value.
+                if (isCompound && n.op != GOP_ADD_ASSIGN) {
+                    string tt = v.typeHint;
+                    if (tt == "string" || tt.endsWith("[]")) {
+                        this.fail("TypeMismatch", lhs.line, lhs.col, lhs.name, "expected a numeric compound-assignment target, found " + this.gArticle(this.typeDisplayName(tt)));
+                    }
+                }
+                // Assignment-value check (later assignments mirror
+                // declaration initializers): a value whose fundamental
+                // class cannot fit the typed target is an error at the
+                // store. Plain `=` only — compound stores compute on the
+                // old value.
+                if (n.op == GOP_ASSIGN && v.typeHint.length > 0) {
+                    this.checkAssignValueType(v.typeHint, rhs, lhs, lhs.name);
+                }
                 // Any assignment may reintroduce null into a previously
                 // narrowed nullable; the flow fact dies here.
                 this.dropNonNull(lhs.name);
@@ -830,6 +1030,9 @@ class MemoryGuard {
             }
         } else if (lhs.kind == GND_MEMBER) {
             this.checkExpr(lhs.child(0));
+            // Member-store resolution: a read-only prop is never writable,
+            // in any store form (plain, compound, inc/dec).
+            this.checkMemberStore(lhs.child(0), lhs.name, lhs);
         } else {
             this.checkExpr(lhs);
         }
@@ -1085,6 +1288,38 @@ class MemoryGuard {
         return this.stmtIsTerminal(body);
     }
 
+    // Context-aware terminality for the missing-return analysis: an
+    // expression-statement call to the builtin `exit` never returns (the
+    // process ends), so a body whose last action is `exit(...)` completes
+    // every path. Only the builtin counts — a user-declared `exit`
+    // function is an ordinary call that returns.
+    private bool stmtIsTerminalCtx(Node s) {
+        if (s.kind == GND_EXPR_STMT && s.childCount() > 0) {
+            Node e = s.child(0);
+            if (e.kind == GND_CALL && !e.isMember && e.name == "exit" && !this.isUserFuncName("exit")) {
+                return true;
+            }
+        }
+        return this.stmtIsTerminal(s);
+    }
+
+    private bool stmtListIsTerminalCtx(Node body) {
+        if (body.kind == GND_BLOCK) {
+            for (int i = 0; i < body.childCount(); i++) {
+                if (this.stmtIsTerminalCtx(body.child(i))) { return true; }
+            }
+            return false;
+        }
+        return this.stmtIsTerminalCtx(body);
+    }
+
+    private bool isUserFuncName(string name) {
+        for (int i = 0; i < this.funcSigNames.length; i++) {
+            if (this.funcSigNames[i] == name) { return true; }
+        }
+        return false;
+    }
+
     private bool stmtListContainsBreak(Node body) {
         if (body.kind == GND_BLOCK) {
             for (int i = 0; i < body.childCount(); i++) {
@@ -1244,7 +1479,9 @@ class MemoryGuard {
         }
         this.pushScope();
         this.addNarrowings(narrowed);
+        this.loopDepth++;
         this.checkStmt(n.child(1));
+        this.loopDepth--;
         string[] bodyNN = this.snapshotNonNull();
         this.popScope();
         // Join: the zero-iteration path contributes the pre-loop state, the
@@ -1260,7 +1497,9 @@ class MemoryGuard {
         GuardVar[] before = this.snapshot();
         this.checkExpr(n.child(1));
         this.pushScope();
+        this.loopDepth++;
         this.checkStmt(n.child(3));
+        this.loopDepth--;
         string[] bodyNN = this.snapshotNonNull();
         this.popScope();
         this.vars = before;
@@ -1275,10 +1514,20 @@ class MemoryGuard {
 
     private void checkForeach(Node n) {
         this.checkExpr(n.child(1));
+        // Iterability check: a scalar number or bool cannot be iterated
+        // (the loop would read it as a collection header). Strings
+        // (chars), arrays, dicts and class values iterate; untyped
+        // collections are never judged.
+        string ct = this.inferStaticType(n.child(1));
+        if (this.isNumericTypeName(ct) || ct == "bool") {
+            this.fail("TypeMismatch", n.line, n.col, n.name, "expected an iterable collection, found " + this.gArticle(this.typeDisplayName(ct)));
+        }
         this.pushScope();
         Node vd = n.child(0);
         this.declareVar(vd.name, vd.typeHint, true, true, false, false, vd.typeHint.endsWith("?"), false, vd.line, vd.col);
+        this.loopDepth++;
         this.checkStmt(n.child(2));
+        this.loopDepth--;
         string[] bodyNN = this.snapshotNonNull();
         this.popScope();
         // Like the C-style for: the body's exit state flows out.
@@ -1356,6 +1605,21 @@ class MemoryGuard {
         bool hasElse = total % 2 == 0;
         int pairEnd = total;
         if (hasElse) { pairEnd = total - 1; }
+        // Duplicate case values (warning grade): two arms with the same
+        // literal (or same dotted enum variant spelling) — the second can
+        // never run, the first equal value wins. Dynamic values are
+        // undecidable and stay silent.
+        string[] seenCases = [];
+        for (int ci = 1; ci < pairEnd; ci += 2) {
+            Node cv = n.child(ci);
+            string ck = this.caseValueKey(cv);
+            if (ck.length == 0) { continue; }
+            if (seenCases.contains(ck)) {
+                this.warnings.add("duplicate case value '" + this.caseValueRender(cv) + "' can never run at line " + (string)cv.line + ", column " + (string)cv.col);
+            } else {
+                seenCases.add(ck);
+            }
+        }
         bool[] initOk = [];
         bool[] aliveAny = [];
         bool[] addrAny = [];
@@ -1535,11 +1799,74 @@ class MemoryGuard {
         this.warnEnumNotExhaustive(en, covered, m.line, m.col);
     }
 
-    // A fundamental (primitive) parameter spelling — the only targets of
-    // the nullable-argument check (class-typed, array and dict parameters
-    // are not judged).
-    private bool isFundamentalParamType(string t) {
-        return this.isNumericTypeName(t) || t == "bool" || t == "char" || t == "string";
+    // Variant-reference check: `EnumName.Variant` must name a declared
+    // variant when the receiver names a known enum that no class or struct
+    // shadows — those receivers resolve dynamically and are never judged.
+    private void checkEnumVariantRef(string enumName, string variant, Node at) {
+        int ei = this.enumIndexOf(enumName);
+        if (ei < 0) { return; }
+        if (this.classIndexOf(enumName) >= 0) { return; }
+        for (int v = 0; v < this.enumCounts[ei]; v++) {
+            if (this.enumVariantNames[this.enumStarts[ei] + v] == variant) { return; }
+        }
+        this.fail("UnknownEnumVariant", at.line, at.col, variant, "enum '" + enumName + "' has no variant '" + variant + "'");
+    }
+
+    // Match-pattern variant references: a dotted `EnumName.Variant`
+    // pattern carries the full spelling in `name`; an invented variant
+    // would match nothing.
+    private void checkMatchPatternVariants(Node m) {
+        for (int i = 1; i < m.childCount(); i++) {
+            Node arm = m.child(i);
+            if (arm.kind != GND_MATCH_ARM || arm.childCount() < 2) { continue; }
+            Node pat = arm.child(0);
+            if (pat.kind != GND_MEMBER) { continue; }
+            int dot = -1;
+            for (int c = 0; c < pat.name.length; c++) {
+                if (pat.name[c] == '.') { dot = c; break; }
+            }
+            if (dot <= 0) { continue; }
+            string en = this.gsSlice(pat.name, 0, dot);
+            string vr = this.gsSlice(pat.name, dot + 1, pat.name.length);
+            this.checkEnumVariantRef(en, vr, arm);
+        }
+    }
+
+    // Comparable key for a switch case value or dict literal key
+    // (duplicate-value check): literals and dotted `EnumName.Variant`
+    // spellings key on their value; anything dynamic (calls, identifiers,
+    // expressions) is undecidable and keys to nothing.
+    private string caseValueKey(Node v) {
+        if (v.kind == GND_INT_LIT) { return "i:" + (string)v.intVal; }
+        if (v.kind == GND_FLOAT_LIT) { return "f:" + (string)v.floatVal; }
+        if (v.kind == GND_STRING_LIT) { return "s:" + v.strVal; }
+        if (v.kind == GND_CHAR_LIT) { return "c:" + (string)v.charVal; }
+        if (v.kind == GND_BOOL_LIT) {
+            if (v.boolVal) { return "b:1"; }
+            return "b:0";
+        }
+        if (v.kind == GND_MEMBER && v.childCount() > 0 && v.child(0).kind == GND_IDENT) {
+            return "e:" + v.child(0).name + "." + v.name;
+        }
+        if (v.kind == GND_PAREN) { return this.caseValueKey(v.child(0)); }
+        return "";
+    }
+
+    // Human spelling of a case value or dict key for its warning.
+    private string caseValueRender(Node v) {
+        if (v.kind == GND_INT_LIT) { return (string)v.intVal; }
+        if (v.kind == GND_FLOAT_LIT) { return (string)v.floatVal; }
+        if (v.kind == GND_STRING_LIT) { return v.strVal; }
+        if (v.kind == GND_CHAR_LIT) { return (string)v.charVal; }
+        if (v.kind == GND_BOOL_LIT) {
+            if (v.boolVal) { return "true"; }
+            return "false";
+        }
+        if (v.kind == GND_MEMBER && v.childCount() > 0 && v.child(0).kind == GND_IDENT) {
+            return v.child(0).name + "." + v.name;
+        }
+        if (v.kind == GND_PAREN) { return this.caseValueRender(v.child(0)); }
+        return "?";
     }
 
     // "an int" / "a string" — the parser owns the same spelling for its
@@ -1552,59 +1879,194 @@ class MemoryGuard {
         return "a " + typeName;
     }
 
+    // Human spelling of a type for value-kind diagnostics: primitives keep
+    // their name, arrays read "X array", nullables "nullable X", dicts
+    // "K-to-V dict"; anything else passes through.
+    private string typeDisplayName(string t) {
+        if (t.endsWith("[]")) {
+            return this.typeDisplayName(this.gsSlice(t, 0, t.length - 2)) + " array";
+        }
+        if (t.endsWith("?")) {
+            return "nullable " + this.typeDisplayName(this.gsSlice(t, 0, t.length - 1));
+        }
+        string dk = this.dictKeyOf(t);
+        if (dk.length > 0) {
+            return dk + "-to-" + this.dictValueOf(t) + " dict";
+        }
+        return t;
+    }
+
     // Argument-level nullable checking on calls (flow null-state check,
     // error grade): a nullable argument may not flow into a non-nullable
     // primitive parameter of a known user function without a null check.
     // It passes when the flow proved the identifier non-null
     // (`if (x != null) f(x)`), when `??` unwrapped it (the inferred type
-    // is the inner, non-nullable one), or when another overload's
-    // nullable/untyped parameter accepts it. Only free calls to functions
-    // whose signatures were collected are judged — member calls and
-    // unknown callees stay silent.
+    // is the inner, non-nullable one), when another overload's
+    // nullable/untyped parameter accepts it, or when the callee reads the
+    // parameter through a null-safe form anywhere in its body (a `??` /
+    // `??=` coalesce on it, an `== null` / `!= null` guard, or a `?.` /
+    // `?[` chain over it — call-argument null-tolerance). Composed
+    // argument types are assignability-checked against the parameter in
+    // their components: array element types, dict key/value types, and
+    // nullable inner types must agree. Only free calls to functions whose
+    // signatures were collected are judged — member calls and unknown
+    // callees stay silent.
     private void checkCallArgs(Node n) {
         int argc = n.childCount();
         if (argc == 0) { return; }
-        bool anyNullable = false;
+        string[] argTypes = [];
+        bool anyCheckable = false;
         for (int j = 0; j < argc; j++) {
-            if (this.inferStaticType(n.child(j)).endsWith("?")) { anyNullable = true; break; }
+            string t = this.inferStaticType(n.child(j));
+            argTypes.add(t);
+            if (t.length > 0 && t != "var" && t != "void") { anyCheckable = true; }
         }
-        if (!anyNullable) { return; }
+        if (!anyCheckable) { return; }
+        // The signature the argument count selects (last-declared first,
+        // default parameters and variadic tails counting): the one whose
+        // parameter types name the diagnostics when nothing accepts.
+        int selected = -1;
+        int lastNamed = -1;
         bool anyArityMatch = false;
         bool anyAccepts = false;
-        int badArgIdx = -1;
-        string badParamName = "";
-        string badParamType = "";
-        string badActual = "";
         for (int s = 0; s < this.funcSigNames.length; s++) {
             if (this.funcSigNames[s] != n.name) { continue; }
-            if (this.funcSigCounts[s] != argc) { continue; }
+            lastNamed = s;
+            if (!this.sigAcceptsArgc(this.funcSigNodes[s], argc)) { continue; }
             anyArityMatch = true;
-            bool ok = true;
-            for (int j = 0; j < argc; j++) {
-                Node arg = n.child(j);
-                string actual = this.inferStaticType(arg);
-                if (!actual.endsWith("?")) { continue; }
-                string pt = this.funcSigParamTypes[this.funcSigStarts[s] + j];
-                if (pt.length == 0 || pt == "var" || pt.endsWith("?")) { continue; }
-                if (!this.isFundamentalParamType(pt)) { continue; }
-                bool narrowed = arg.kind == GND_IDENT && this.isNonNullHere(arg.name);
-                if (!narrowed) {
-                    ok = false;
-                    if (badArgIdx < 0) {
-                        badArgIdx = j;
-                        badParamName = this.funcSigParamNames[this.funcSigStarts[s] + j];
-                        badParamType = pt;
-                        badActual = actual;
-                    }
-                    break;
-                }
-            }
-            if (ok) { anyAccepts = true; break; }
+            if (selected < 0) { selected = s; }
+            if (this.sigAcceptsArgs(s, argc, argTypes, n)) { anyAccepts = true; break; }
         }
         if (!anyArityMatch || anyAccepts) { return; }
-        Node arg = n.child(badArgIdx);
-        string inner = this.gsSlice(badActual, 0, badActual.length - 1);
-        this.fail("ParamTypeMismatch", arg.line, arg.col, badParamName, "expected " + this.gArticle(badParamType) + ", got " + this.gArticle("nullable " + inner) + " — nullable value for \"" + badParamName + "\" parameter of '" + n.name + "' used without a null check (use ??)");
+        if (selected < 0) { selected = lastNamed; }
+        if (selected < 0) { return; }
+        // First failing argument of the selected signature, in the same
+        // per-argument order the acceptance test uses.
+        for (int j = 0; j < argc && j < this.funcSigCounts[selected]; j++) {
+            Node arg = n.child(j);
+            string actual = argTypes[j];
+            if (actual.length == 0 || actual == "var" || actual == "void") { continue; }
+            string pname = this.funcSigParamNames[this.funcSigStarts[selected] + j];
+            string pt = this.funcSigParamTypes[this.funcSigStarts[selected] + j];
+            if (this.argMismatchKind(selected, j, actual) == 1) {
+                this.fail("ParamTypeMismatch", arg.line, arg.col, pname, "expected " + this.gArticle(this.typeDisplayName(pt)) + ", got " + this.gArticle(this.typeDisplayName(actual)));
+            }
+            if (actual.endsWith("?") && this.fundamentalClass(pt).length > 0
+                && pt.length > 0 && pt != "var" && !pt.endsWith("?")) {
+                bool narrowed = arg.kind == GND_IDENT && this.isNonNullHere(arg.name);
+                bool tolerant = this.paramNullTolerant(this.funcSigNodes[selected], pname);
+                if (!narrowed && !tolerant) {
+                    string inner = this.gsSlice(actual, 0, actual.length - 1);
+                    this.fail("ParamTypeMismatch", arg.line, arg.col, pname, "expected " + this.gArticle(pt) + ", got " + this.gArticle("nullable " + inner) + " — nullable value for \"" + pname + "\" parameter of '" + n.name + "' used without a null check (use ??)");
+                }
+            }
+        }
+    }
+
+    // Arity acceptance of one signature for `argc` arguments: default
+    // parameters make the tail optional, a variadic tail takes the rest.
+    private bool sigAcceptsArgc(Node fn, int argc) {
+        Node ps = fn.child(0);
+        int count = ps.childCount();
+        bool variadic = count > 0 && ps.child(count - 1).isVariadic;
+        int fixedLen = count;
+        if (variadic) { fixedLen = count - 1; }
+        int minArgs = 0;
+        for (int i = 0; i < fixedLen; i++) {
+            if (ps.child(i).childCount() == 0) { minArgs++; }
+        }
+        if (variadic) { return argc >= minArgs; }
+        return argc >= minArgs && argc <= count;
+    }
+
+    // Per-signature acceptance of every argument (overload rescue): both
+    // the component relations and the nullable-argument rule must hold for
+    // every parameter the call reaches (a variadic tail takes the rest
+    // unchecked).
+    private bool sigAcceptsArgs(int s, int argc, string[] argTypes, Node call) {
+        Node ps0 = this.funcSigNodes[s].child(0);
+        for (int j = 0; j < argc && j < this.funcSigCounts[s]; j++) {
+            if (ps0.child(j).isVariadic) { break; }
+            string actual = argTypes[j];
+            if (actual.length == 0 || actual == "var" || actual == "void") { continue; }
+            string pt = this.funcSigParamTypes[this.funcSigStarts[s] + j];
+            // Fundamental-class agreement, then the composed component
+            // relations (a string[] argument cannot feed an int[]
+            // parameter).
+            string pfc = this.fundamentalClass(pt);
+            string afc = this.fundamentalClass(actual);
+            if (pfc.length > 0 && afc.length > 0 && pfc != afc) { return false; }
+            if (!this.typesCompatibleQuiet(pt, actual)) { return false; }
+            // Nullable-argument rule with the body-aware tolerance.
+            if (actual.endsWith("?") && pfc.length > 0
+                && pt.length > 0 && pt != "var" && !pt.endsWith("?")) {
+                Node arg = call.child(j);
+                bool narrowed = arg.kind == GND_IDENT && this.isNonNullHere(arg.name);
+                bool tolerant = this.paramNullTolerant(this.funcSigNodes[s], this.funcSigParamNames[this.funcSigStarts[s] + j]);
+                if (!narrowed && !tolerant) { return false; }
+            }
+        }
+        return true;
+    }
+
+    // Which relation fails for argument `j` of signature `s`: 1 = the
+    // value-kind components (class or composed mismatch), 0 = only the
+    // nullable rule. Mirrors sigAcceptsArgs's order.
+    private int argMismatchKind(int s, int j, string actual) {
+        string pt = this.funcSigParamTypes[this.funcSigStarts[s] + j];
+        string pfc = this.fundamentalClass(pt);
+        string afc = this.fundamentalClass(actual);
+        if (pfc.length > 0 && afc.length > 0 && pfc != afc) { return 1; }
+        if (!this.typesCompatibleQuiet(pt, actual)) { return 1; }
+        return 0;
+    }
+
+    // Call-argument null-tolerance: the callee's body reads `param` through
+    // a null-safe form anywhere — a `??` / `??=` whose left side is the
+    // parameter, an `== null` / `!= null` guard on it (either order), or a
+    // `?.` / `?[` chain over it. Such a callee deliberately accepts null
+    // for that parameter. A declaration without a body cannot be judged
+    // and is permissive.
+    private bool paramNullTolerant(Node fn, string param) {
+        if (fn.childCount() < 2) { return true; }
+        Node body = fn.child(1);
+        if (body.kind == GND_BLOCK) {
+            for (int i = 0; i < body.childCount(); i++) {
+                if (this.nodeNullTolerant(body.child(i), param)) { return true; }
+            }
+            return false;
+        }
+        return this.nodeNullTolerant(body, param);
+    }
+
+    // Structural null-safe-use walk over any node tree (statements and
+    // expressions share one node model, so one walker covers both).
+    private bool nodeNullTolerant(Node n, string param) {
+        if (n.kind == GND_BINARY && (n.op == GOP_COALESCE || n.op == GOP_COALESCE_ASSIGN)) {
+            if (this.isParamExpr(n.child(0), param)) { return true; }
+        }
+        // A `?.` / `?[` chain (kind 75) wraps the member/call/index node
+        // whose child(0) is the receiver.
+        if (n.kind == 75) {
+            Node inner = n.child(0);
+            if (inner.childCount() > 0 && this.isParamExpr(inner.child(0), param)) { return true; }
+        }
+        if (n.kind == GND_BINARY && (n.op == GOP_EQ || n.op == GOP_NEQ)) {
+            Node nl = n.child(0);
+            Node nr = n.child(1);
+            if (nl.kind == GND_NULL_LIT && this.isParamExpr(nr, param)) { return true; }
+            if (nr.kind == GND_NULL_LIT && this.isParamExpr(nl, param)) { return true; }
+        }
+        for (int i = 0; i < n.childCount(); i++) {
+            if (this.nodeNullTolerant(n.child(i), param)) { return true; }
+        }
+        return false;
+    }
+
+    // `expr` is exactly the identifier `param` (parentheses stripped).
+    private bool isParamExpr(Node e, string param) {
+        if (e.kind == GND_PAREN) { return this.isParamExpr(e.child(0), param); }
+        return e.kind == GND_IDENT && e.name == param;
     }
 
     private int checkExpr(Node n) {
@@ -1641,7 +2103,10 @@ class MemoryGuard {
                 Node lhs = n.child(0);
                 if (lhs.kind == GND_IDENT && lhs.name != "this") {
                     this.markLocalUsed(lhs.name);
-                    if (this.isGlobalName(lhs.name)) {
+                    // Same shadowing rule as a plain store: an in-scope
+                    // binding (local, parameter, class field) hides a
+                    // same-named global.
+                    if (this.isGlobalName(lhs.name) && this.findVar(lhs.name) < 0) {
                         this.fail("InvalidAssignment", lhs.line, lhs.col, lhs.name, "cannot write to a global or const");
                     }
                     int idx = this.findVar(lhs.name);
@@ -1695,6 +2160,25 @@ class MemoryGuard {
                     this.fail("AddressTypeMistmatchException", bline, bcol, bname, "address arithmetic is not allowed");
                 }
             }
+            // Operand-kind check: `+` concatenates when either side is a
+            // string, but the remaining arithmetic and bitwise operators
+            // have no string meaning — they would compute on the pointer
+            // bits. Only a provably-string operand is rejected.
+            if (op == GOP_SUB || op == GOP_MUL || op == GOP_DIV || op == GOP_MOD
+                || op == GOP_SHL || op == GOP_SHR || op == GOP_BIT_AND || op == GOP_BIT_OR || op == GOP_BIT_XOR) {
+                if (this.inferStaticType(n.child(0)) == "string" || this.inferStaticType(n.child(1)) == "string") {
+                    this.fail("TypeMismatch", n.line, n.col, "", "expected a numeric operand, found a string");
+                }
+            }
+            // Inc/dec on a member target is a member store too
+            // (`obj.field++` is `obj.field = obj.field + 1`): the same
+            // read-only prop rule applies.
+            if (op == GOP_POST_INC || op == GOP_POST_DEC) {
+                Node lt = n.child(0);
+                if (lt.kind == GND_MEMBER) {
+                    this.checkMemberStore(lt.child(0), lt.name, lt);
+                }
+            }
             return 0;
         }
         if (k == GND_UNARY) { this.checkExpr(n.child(0)); return 0; }
@@ -1706,13 +2190,78 @@ class MemoryGuard {
             if (!n.isMember) { this.checkCallArgs(n); }
             return 0;
         }
-        if (k == GND_MEMBER) { this.checkExpr(n.child(0)); return 0; }
-        if (k == GND_INDEX || k == GND_SLICE) {
+        if (k == GND_MEMBER) {
+            // Variant-reference check: `EnumName.Variant` on a known enum
+            // must name a declared variant (covers expression references
+            // and switch case values, which are exprs). A same-named class
+            // or struct shadows the enum and is never judged.
+            if (n.childCount() > 0 && n.child(0).kind == GND_IDENT) {
+                this.checkEnumVariantRef(n.child(0).name, n.name, n);
+            }
+            this.checkExpr(n.child(0));
+            return 0;
+        }
+        if (k == GND_INDEX) {
+            this.checkExpr(n.child(0));
+            this.checkExpr(n.child(1));
+            // Integral-index check: an array element or string char is
+            // addressed by an integer. Dict lookups (dict-typed or
+            // untyped receivers) take any key shape and are never judged.
+            string at = this.inferStaticType(n.child(0));
+            if (at == "string" || at.endsWith("[]")) {
+                string it = this.inferStaticType(n.child(1));
+                if (it == "string" || it == "bool" || it == "float" || it == "float64" || it == "double") {
+                    this.fail("TypeMismatch", n.line, n.col, "", "expected an int index, found " + this.gArticle(this.typeDisplayName(it)));
+                }
+            }
+            return 0;
+        }
+        if (k == GND_SLICE) {
             for (int i = 0; i < n.childCount(); i++) { this.checkExpr(n.child(i)); }
             return 0;
         }
+        if (k == GND_NEW_INIT) {
+            // Object-initializer stores: children are [ctor args..., init
+            // pairs (kind 18: field ident, value)]. A read-only prop takes
+            // no initializer store; duplicate fields were rejected at
+            // parse time.
+            string clsName = this.lastDottedSegment(n.name);
+            for (int i = 0; i < n.childCount(); i++) {
+                Node c = n.child(i);
+                if (c.kind == GND_DICT_PAIR && c.childCount() >= 2) {
+                    Node fld = c.child(0);
+                    if (fld.kind == GND_IDENT && this.classFieldReadOnly(clsName, fld.name)) {
+                        this.fail("ReadOnlyPropAssignment", fld.line, fld.col, fld.name, "cannot assign to read-only prop '" + clsName + "." + fld.name + "'");
+                    }
+                    this.checkExpr(c.child(1));
+                } else {
+                    this.checkExpr(c);
+                }
+            }
+            return 0;
+        }
         if (k == GND_PAREN) { this.checkExpr(n.child(0)); return 0; }
-        if (k == GND_ARRAY_LIT || k == GND_TUPLE_LIT || k == GND_DICT_LIT || k == GND_INTERP || k == GND_STRUCT_DEF) {
+        if (k == GND_ARRAY_LIT || k == GND_TUPLE_LIT || k == GND_INTERP || k == GND_STRUCT_DEF) {
+            for (int i = 0; i < n.childCount(); i++) { this.checkExpr(n.child(i)); }
+            return 0;
+        }
+        if (k == GND_DICT_LIT) {
+            // Duplicate literal keys (warning grade): the earlier entry's
+            // value is overwritten by the later store. Computed keys are
+            // undecidable and stay silent.
+            string[] seenKeys = [];
+            for (int i = 0; i < n.childCount(); i++) {
+                Node pair = n.child(i);
+                if (pair.kind != GND_DICT_PAIR || pair.childCount() < 2) { continue; }
+                Node key = pair.child(0);
+                string ck = this.caseValueKey(key);
+                if (ck.length == 0) { continue; }
+                if (seenKeys.contains(ck)) {
+                    this.warnings.add("duplicate dict key '" + this.caseValueRender(key) + "': the earlier value is overwritten at line " + (string)key.line + ", column " + (string)key.col);
+                } else {
+                    seenKeys.add(ck);
+                }
+            }
             for (int i = 0; i < n.childCount(); i++) { this.checkExpr(n.child(i)); }
             return 0;
         }
@@ -1738,6 +2287,7 @@ class MemoryGuard {
         if (k == GND_MATCH_EXPR) {
             this.checkExpr(n.child(0));
             this.checkEnumExhaustiveMatch(n);
+            this.checkMatchPatternVariants(n);
             // Join-point merge (null-state-flow Meet): every non-terminal
             // arm's exit state must agree; without a wildcard arm the
             // no-match fall-through joins with the pre-match state. Each
@@ -1775,10 +2325,14 @@ class MemoryGuard {
             // function's return type, and its parameters are fresh locals.
             // Null-state isolation: outer facts stay visible (the
             // generated function may share global names), but facts set
-            // inside the lambda body die with it.
+            // inside the lambda body die with it. Loop-scope isolation: a
+            // generated function cannot target an enclosing loop, so its
+            // loop scope starts empty.
             string[] savedNN = this.snapshotNonNull();
             string savedReturnType = this.currentReturnType;
+            int savedLoopDepth = this.loopDepth;
             this.currentReturnType = "";
+            this.loopDepth = 0;
             this.pushScope();
             for (int li = 0; li < n.childCount() - 1; li++) {
                 Node lp = n.child(li);
@@ -1787,10 +2341,19 @@ class MemoryGuard {
                 }
             }
             if (n.childCount() > 0) {
-                this.checkExpr(n.child(n.childCount() - 1));
+                Node lbody = n.child(n.childCount() - 1);
+                if (lbody.kind == GND_BLOCK) {
+                    // A braced lambda body is a statement list: its
+                    // statements take the statement path (loop scope,
+                    // flow facts) exactly like a named function body.
+                    this.checkBlock(lbody);
+                } else {
+                    this.checkExpr(lbody);
+                }
             }
             this.popScope();
             this.nonNullNames = savedNN;
+            this.loopDepth = savedLoopDepth;
             this.currentReturnType = savedReturnType;
             return 0;
         }
@@ -1844,6 +2407,20 @@ class MemoryGuard {
         if (k == GND_SWITCH) { this.checkSwitch(n); return; }
         if (k == GND_UNSET) { this.checkUnset(n); return; }
         if (k == GND_DESTRUCTURE) { this.checkDestructure(n); return; }
+        if (k == GND_BREAK) {
+            // Loop-scope tracking: with no enclosing loop the statement is
+            // a silent no-op in the emitted code.
+            if (this.loopDepth == 0) {
+                this.fail("LoopControlOutsideLoop", n.line, n.col, "", "break outside a loop");
+            }
+            return;
+        }
+        if (k == GND_CONTINUE) {
+            if (this.loopDepth == 0) {
+                this.fail("LoopControlOutsideLoop", n.line, n.col, "", "continue outside a loop");
+            }
+            return;
+        }
         if (k == GND_THROW) {
             for (int i = 0; i < n.childCount(); i++) { this.checkExpr(n.child(i)); }
             return;
@@ -1854,9 +2431,75 @@ class MemoryGuard {
         }
     }
 
-    private void checkFunction(Node n) {
-        this.vars = [];
-        this.scopeEnds = [];
+    // Class-body flow checking: the class's flattened fields (own plus
+    // inherited, first-listed winning) are declared in an enclosing scope so
+    // the this-less member idiom resolves — a bare identifier naming a field
+    // IS the field, for reads and assignment targets alike. Each method then
+    // checks exactly like a standalone function, with its parameters and
+    // locals shadowing same-named fields.
+    private void checkClass(Node n) {
+        // Duplicate own members: two fields of the same name in one class
+        // would share one storage slot; the first-listed one wins and the
+        // second is a mistake. (Inherited same-named fields are legal per
+        // the first-listed layout rule, so only same-class collisions are
+        // judged.)
+        for (int a = 0; a < n.childCount(); a++) {
+            Node fa = n.child(a);
+            if (fa.kind != GND_VAR_DECL) { continue; }
+            for (int b = a + 1; b < n.childCount(); b++) {
+                Node fb = n.child(b);
+                if (fb.kind == GND_VAR_DECL && fb.name == fa.name) {
+                    this.fail("DuplicateDefinition", fb.line, fb.col, fb.name, "duplicate field '" + fb.name + "' of class '" + n.name + "'");
+                }
+            }
+        }
+        string savedClass = this.currentClass;
+        this.currentClass = n.name;
+        this.pushScope();
+        // Own fields first (they win over inherited same-named slots), then
+        // the ancestors'. Fields start initialized: an instance exists only
+        // after its constructor laid the slots out.
+        GuardField[] flat = this.classFieldList(n.name);
+        for (int f = 0; f < flat.length; f++) {
+            GuardField gf = flat[f];
+            this.declareVar(gf.name, gf.typeHint, true, true, false, false, gf.typeHint.endsWith("?"), false, gf.line, gf.col);
+        }
+        for (int j = 0; j < n.childCount(); j++) {
+            Node m = n.child(j);
+            if (m.kind == GND_FUNC) { this.checkFunction(m, true); }
+        }
+        this.popScope();
+        this.currentClass = savedClass;
+    }
+
+    // Duplicate variants inside one enum: the second spelling would answer
+    // as the first at run time, so it is a duplicate declaration.
+    private void checkEnumDef(Node n) {
+        for (int a = 0; a < n.childCount(); a++) {
+            Node va = n.child(a);
+            if (va.kind != 106) { continue; }
+            for (int b = a + 1; b < n.childCount(); b++) {
+                Node vb = n.child(b);
+                if (vb.kind == 106 && vb.name == va.name) {
+                    this.fail("DuplicateDefinition", n.line, n.col, vb.name, "duplicate variant '" + vb.name + "' of enum '" + n.name + "'");
+                }
+            }
+        }
+    }
+
+
+    // Deep-check one function body. `inClass` marks a class method: the
+    // class's flattened fields stay in scope as an enclosing binding level
+    // (the this-less member idiom resolves bare identifiers to fields), so
+    // the local state is not reset — the method's own bindings get a fresh
+    // scope above them instead.
+    private void checkFunction(Node n, bool inClass) {
+        if (inClass) {
+            this.pushScope();
+        } else {
+            this.vars = [];
+            this.scopeEnds = [];
+        }
         this.nonNullNames = [];
         this.unwrapDepth = 0;
         // Assigned-but-never-used tracking is fresh per function
@@ -1898,14 +2541,20 @@ class MemoryGuard {
         // value return type must return on every path; falling off the end
         // of the body would hand the caller an undefined value. `void`
         // functions (and inference-agnostic `var`) may fall off freely;
-        // unknown legacy type names are not judged.
+        // unknown legacy type names are not judged. A builtin `exit(...)`
+        // expression statement never returns (the process ends), so a body
+        // whose last action is one completes every path — only the builtin
+        // counts; a user-declared `exit` function is an ordinary call.
         if (this.judgedReturnType(n.typeHint)) {
             if (n.childCount() >= 2) {
                 Node body = n.child(1);
-                if (body.kind == GND_BLOCK && body.childCount() > 0 && !this.stmtListIsTerminal(body)) {
+                if (body.kind == GND_BLOCK && body.childCount() > 0 && !this.stmtListIsTerminalCtx(body)) {
                     this.fail("MissingReturn", n.line, n.col, n.name, "function declaring return type '" + n.typeHint + "' can fall off the end without returning (missing return statement)");
                 }
             }
+        }
+        if (inClass) {
+            this.popScope();
         }
     }
 
@@ -1917,14 +2566,13 @@ class MemoryGuard {
 
     private void checkTop(Node n) {
         if (n.kind == GND_FUNC) {
-            this.checkFunction(n);
+            this.checkFunction(n, false);
         } else if (n.kind == GND_CONST) {
             this.checkConst(n);
         } else if (n.kind == GND_CLASS_DEF) {
-            for (int j = 0; j < n.childCount(); j++) {
-                Node m = n.child(j);
-                if (m.kind == GND_FUNC) { this.checkFunction(m); }
-            }
+            this.checkClass(n);
+        } else if (n.kind == GND_ENUM_DEF) {
+            this.checkEnumDef(n);
         } else if (n.kind == GND_VAR_DECL) {
             this.checkVarDecl(n);
         } else if (n.kind == GND_ALIAS_DECL) {
@@ -1940,6 +2588,8 @@ class MemoryGuard {
         this.warnings = [];
         this.typeNames = [];
         this.currentReturnType = "";
+        this.currentClass = "";
+        this.loopDepth = 0;
         this.enumNames = [];
         this.enumStarts = [];
         this.enumCounts = [];
@@ -1949,12 +2599,20 @@ class MemoryGuard {
         this.funcSigCounts = [];
         this.funcSigParamTypes = [];
         this.funcSigParamNames = [];
+        this.classNames = [];
+        this.classNodes = [];
+        this.funcSigNodes = [];
         for (int i = 0; i < program.length; i++) {
             Node n = program[i];
             if (n.kind == GND_CONST) {
                 this.globalNames.add(n.name);
             } else if (n.kind == GND_CLASS_DEF) {
                 this.typeNames.add(n.name);
+                // Class table (class-body flow checking + member-store
+                // resolution): every class declaration, for flattened field
+                // lookups.
+                this.classNames.add(n.name);
+                this.classNodes.add(n);
                 for (int j = 0; j < n.childCount(); j++) {
                     Node m = n.child(j);
                     if (m.kind == GND_CONST) { this.globalNames.add(m.name); }
@@ -1966,6 +2624,13 @@ class MemoryGuard {
                 // declarations. A bare unknown return-type spelling is not a
                 // Silver value type, so missing-return does not judge it.
                 this.typeNames.add(n.name);
+                // Structs join the class table too: their fields take the
+                // same member-store read-only resolution (a method-bearing
+                // struct arrives already promoted to a class).
+                if (n.kind == GND_STRUCT_DEF) {
+                    this.classNames.add(n.name);
+                    this.classNodes.add(n);
+                }
             }
             // Enum variant table (exhaustiveness coverage): variants hang
             // off the declaration's kind-106 children.
@@ -1981,7 +2646,8 @@ class MemoryGuard {
             }
             // Free-function signature table (argument-type
             // analysis): top-level functions only — member calls never
-            // resolve against it and stay silent.
+            // resolve against it and stay silent. The declaration node
+            // rides along for the null-tolerance body inspection.
             if (n.kind == GND_FUNC) {
                 this.funcSigNames.add(n.name);
                 this.funcSigStarts.add(this.funcSigParamTypes.length);
@@ -1992,6 +2658,7 @@ class MemoryGuard {
                     this.funcSigParamNames.add(p.name);
                 }
                 this.funcSigCounts.add(ps.childCount());
+                this.funcSigNodes.add(n);
             }
         }
         for (int i = 0; i < program.length; i++) {
