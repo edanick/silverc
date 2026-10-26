@@ -80,6 +80,11 @@ class MiniCg {
     public prop int[] funcParamHasDefaults;
     public prop Node[] funcParamDefaults;
     public prop int[] funcHasVariadic;
+    // Per-function static flag (1 = static method, 0 = free function or
+    // instance method): a bare sibling call inside a class method passes
+    // the live `this` for an instance method of the enclosing chain, and
+    // keeps the zeroed receiver slot for statics.
+    public prop int[] funcIsStatic;
     public prop string[] funcParamTypes;
     public prop int[] localOffsets;
     public prop string[] localNames;
@@ -357,6 +362,7 @@ class MiniCg {
         this.funcParamHasDefaults = [];
         this.funcParamDefaults = [];
         this.funcHasVariadic = [];
+        this.funcIsStatic = [];
         this.funcParamTypes = [];
         this.localOffsets = [];
         this.localNames = [];
@@ -2604,6 +2610,7 @@ int strIdx = this.stringPatchIndices[i];
                 this.funcParamStarts.add(paramStart);
                 this.funcParamCounts.add(paramCount);
                 this.funcHasVariadic.add(hasVariadic ? 1 : 0);
+                this.funcIsStatic.add(0);
             }
         }
         for (int i = 0; i < program.length; i++) {
@@ -2641,6 +2648,7 @@ int strIdx = this.stringPatchIndices[i];
                         this.funcParamStarts.add(paramStart);
                         this.funcParamCounts.add(paramCount);
                         this.funcHasVariadic.add(hasVariadic ? 1 : 0);
+                        this.funcIsStatic.add(member.isStatic ? 1 : 0);
                     }
                 }
             }
@@ -10291,6 +10299,38 @@ public void genNewCall(Node call) {
         this.asm.movRMBase(0, 5, objOff);
     }
 
+    // True when `target` is `cls` itself or an ancestor of it (the
+    // flattened inheritance chain, own name first): a bare call resolving
+    // to a method of such a class is a sibling call on the same instance.
+    // Cycle-guarded so a malformed chain can never hang the walk.
+    public bool classInParentChain(string cls, string target) {
+        string[] visited = [];
+        string[] stack = [];
+        stack.add(cls);
+        while (stack.length > 0) {
+            string cur = stack[stack.length - 1];
+            stack.pop();
+            if (cur == target) { return true; }
+            if (visited.contains(cur)) { continue; }
+            visited.add(cur);
+            int ci = -1;
+            for (int i = 0; i < this.classNames.length; i++) {
+                if (this.classNames[i] == cur) { ci = i; break; }
+            }
+            if (ci < 0) { continue; }
+            if (ci < this.classParentStarts.length) {
+                int ps = this.classParentStarts[ci];
+                int pc = this.classParentCounts[ci];
+                for (int p = 0; p < pc; p++) {
+                    if (ps + p < this.classParentList.length) {
+                        stack.add(this.classParentList[ps + p]);
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     public void genSuperCall(Node call) {
         // super(arg0, arg1, ...) - call parent class constructor with `this`.
         // Only valid inside a class constructor. Multiple inheritance
@@ -11169,7 +11209,22 @@ public void genNewCall(Node call) {
             }
             this.emitAbiCallSetup(extraStack);
             if (staticMethodCall) {
-                this.asm.xorRR64(0, 0);
+                // A bare call inside a class method that resolves to an
+                // instance method of the enclosing class chain (own or
+                // inherited) is a sibling call: the live `this` rides the
+                // receiver slot. Static methods and cross-class bare calls
+                // keep the zeroed slot.
+                bool siblingInstance = false;
+                if (!call.isMember && this.currentClassName.length > 0
+                    && funcIdx < this.funcIsStatic.length && this.funcIsStatic[funcIdx] == 0
+                    && this.classInParentChain(this.currentClassName, lookupClass)) {
+                    siblingInstance = true;
+                }
+                if (siblingInstance) {
+                    this.asm.movRMBase(0, 5, this.findLocal("this"));
+                } else {
+                    this.asm.xorRR64(0, 0);
+                }
                 this.asm.movMBaseR(4, 0, spillBase);
             }
             // Evaluate every argument into RAX and spill it to the shadow
