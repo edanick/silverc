@@ -291,7 +291,23 @@ class MemoryGuard {
         return out;
     }
 
+    // Same-scope redeclaration: a name already bound in the innermost
+    // scope cannot bind again there — the two declarations would share one
+    // storage slot and the second is a mistake. Shadowing across scopes
+    // stays legal (a nested block, branch arm, or method scope may reuse a
+    // name); only the current scope level is judged.
+    private void rejectSameScopeRedecl(string name, int line, int col) {
+        int start = 0;
+        if (this.scopeEnds.length > 0) { start = this.scopeEnds[this.scopeEnds.length - 1]; }
+        for (int i = start; i < this.vars.length; i++) {
+            if (this.vars[i].name == name) {
+                this.fail("DuplicateDefinition", line, col, name, "duplicate variable '" + name + "'");
+            }
+        }
+    }
+
     private void declareVar(string name, string typeHint, bool init, bool alive, bool onceFlag, bool fixedFlag, bool nullable, bool aliasFlag, int line, int col) {
+        this.rejectSameScopeRedecl(name, line, col);
         GuardVar v = new GuardVar();
         v.name = name;
         v.typeHint = typeHint;
@@ -1106,6 +1122,7 @@ class MemoryGuard {
         v.line = n.line;
         v.col = n.col;
         this.markAddrHolding(v, init, n);
+        this.rejectSameScopeRedecl(name, n.line, n.col);
         this.vars.add(v);
         this.dropNonNull(name);
         if (initProof == GNN_NON_NULL) { this.addNonNullFact(name); }
@@ -1131,6 +1148,7 @@ class MemoryGuard {
                 // A fresh alias binding clears a stale fact for a shadowing
                 // outer name (the other branches go through declareVar).
                 this.dropNonNull(aname);
+                this.rejectSameScopeRedecl(aname, n.line, n.col);
                 this.vars.add(v);
             } else if (tgt.kind == GND_NULL_LIT) {
                 this.declareVar(aname, n.typeHint, true, true, false, false, nullable, true, n.line, n.col);
@@ -1910,10 +1928,18 @@ class MemoryGuard {
     // their components: array element types, dict key/value types, and
     // nullable inner types must agree. Only free calls to functions whose
     // signatures were collected are judged — member calls and unknown
-    // callees stay silent.
+    // callees stay silent. Before the per-argument relations, the overload
+    // set is arity-dispatched: a call whose argument count no collected
+    // declaration of the name accepts fails the compile outright.
     private void checkCallArgs(Node n) {
         int argc = n.childCount();
-        if (argc == 0) { return; }
+        // A function-typed local or parameter invokes with zero arguments
+        // (the stored address is called); a same-named free function must
+        // not shadow that invocation into an arity error.
+        if (argc == 0) {
+            int fidx = this.findVar(n.name);
+            if (fidx >= 0 && this.vars[fidx].typeHint == "void ()") { return; }
+        }
         string[] argTypes = [];
         bool anyCheckable = false;
         for (int j = 0; j < argc; j++) {
@@ -1921,7 +1947,6 @@ class MemoryGuard {
             argTypes.add(t);
             if (t.length > 0 && t != "var" && t != "void") { anyCheckable = true; }
         }
-        if (!anyCheckable) { return; }
         // The signature the argument count selects (last-declared first,
         // default parameters and variadic tails counting): the one whose
         // parameter types name the diagnostics when nothing accepts.
@@ -1937,7 +1962,14 @@ class MemoryGuard {
             if (selected < 0) { selected = s; }
             if (this.sigAcceptsArgs(s, argc, argTypes, n)) { anyAccepts = true; break; }
         }
-        if (!anyArityMatch || anyAccepts) { return; }
+        // Arity dispatch over the overload set: the name has collected
+        // signatures (lastNamed >= 0), but no declaration's parameter count
+        // accepts the call — an argument count no overload takes is a
+        // compile error, not a silent pass (the general free-call contract).
+        if (lastNamed >= 0 && !anyArityMatch) {
+            this.fail("OverloadArity", n.line, n.col, n.name, "no overload of '" + n.name + "' takes " + (string)argc + " argument(s)");
+        }
+        if (!anyCheckable || anyAccepts) { return; }
         if (selected < 0) { selected = lastNamed; }
         if (selected < 0) { return; }
         // First failing argument of the selected signature, in the same
@@ -2170,6 +2202,16 @@ class MemoryGuard {
                     this.fail("TypeMismatch", n.line, n.col, "", "expected a numeric operand, found a string");
                 }
             }
+            // Membership collection check: `x in collection` scans an
+            // array (the loop mirrors array indexOf); a provably-scalar
+            // right operand (a number, bool, or string variable) cannot be
+            // a collection. Untyped collections are never judged.
+            if (op == 37) {
+                string mct = this.inferStaticType(n.child(1));
+                if (mct.length > 0 && mct != "var" && !mct.endsWith("[]")) {
+                    this.fail("TypeMismatch", n.line, n.col, "", "expected an array, found " + this.gArticle(this.typeDisplayName(mct)));
+                }
+            }
             // Inc/dec on a member target is a member store too
             // (`obj.field++` is `obj.field = obj.field + 1`): the same
             // read-only prop rule applies.
@@ -2345,8 +2387,10 @@ class MemoryGuard {
                 if (lbody.kind == GND_BLOCK) {
                     // A braced lambda body is a statement list: its
                     // statements take the statement path (loop scope,
-                    // flow facts) exactly like a named function body.
-                    this.checkBlock(lbody);
+                    // flow facts) exactly like a named function body — and
+                    // share the lambda's parameter scope (no second block
+                    // level), like one too.
+                    this.checkStmtList(lbody);
                 } else {
                     this.checkExpr(lbody);
                 }
@@ -2492,13 +2536,16 @@ class MemoryGuard {
     // class's flattened fields stay in scope as an enclosing binding level
     // (the this-less member idiom resolves bare identifiers to fields), so
     // the local state is not reset — the method's own bindings get a fresh
-    // scope above them instead.
+    // scope above them instead. A function's parameters and body share one
+    // scope level: a body local of the same name as a parameter redeclares
+    // it, not shadows it (parameters and locals share the frame).
     private void checkFunction(Node n, bool inClass) {
         if (inClass) {
             this.pushScope();
         } else {
             this.vars = [];
             this.scopeEnds = [];
+            this.pushScope();
         }
         this.nonNullNames = [];
         this.unwrapDepth = 0;
@@ -2522,7 +2569,9 @@ class MemoryGuard {
         if (n.childCount() >= 2) {
             Node body = n.child(1);
             if (body.kind == GND_BLOCK) {
-                this.checkBlock(body);
+                // The body's statements live in the parameter scope (no
+                // second block level): checkStmtList, not checkBlock.
+                this.checkStmtList(body);
             } else {
                 // One-line `<< body` function: the expression IS the return
                 // value, coerced against the declared return type.
@@ -2553,15 +2602,24 @@ class MemoryGuard {
                 }
             }
         }
-        if (inClass) {
-            this.popScope();
-        }
+        this.popScope();
     }
 
     private void checkConst(Node n) {
         if (n.childCount() == 0) {
             this.fail("UnassignedConstDeclarationException", n.line, n.col, n.name, "const must be declared with a value");
         }
+    }
+
+    // Import statements share node kind 105 with enum declarations (the
+    // parser mints both): an import carries a `from` source in typeHint,
+    // the `*` marker, or no children at all, while a real enum carries its
+    // variant members as children. The same discriminator the codegen
+    // import registrar uses — a misread import would register its module
+    // name as a phantom enum and poison variant checks for its members.
+    private bool nodeIsImport(Node n) {
+        if (n.kind != GND_ENUM_DEF) { return false; }
+        return n.typeHint.length > 0 || n.isStatic || n.childCount() == 0;
     }
 
     private void checkTop(Node n) {
@@ -2571,7 +2629,7 @@ class MemoryGuard {
             this.checkConst(n);
         } else if (n.kind == GND_CLASS_DEF) {
             this.checkClass(n);
-        } else if (n.kind == GND_ENUM_DEF) {
+        } else if (n.kind == GND_ENUM_DEF && !this.nodeIsImport(n)) {
             this.checkEnumDef(n);
         } else if (n.kind == GND_VAR_DECL) {
             this.checkVarDecl(n);
@@ -2620,6 +2678,7 @@ class MemoryGuard {
             } else if (n.kind == GND_VAR_DECL) {
                 this.globalNames.add(n.name);
             } else if (n.kind == GND_STRUCT_DEF || n.kind == GND_ENUM_DEF || n.kind == GND_DEF || n.kind == GND_TYPE_ALIAS) {
+                if (this.nodeIsImport(n)) { continue; }
                 // Known user type names: class/struct/enum/def/typealias
                 // declarations. A bare unknown return-type spelling is not a
                 // Silver value type, so missing-return does not judge it.
@@ -2633,8 +2692,9 @@ class MemoryGuard {
                 }
             }
             // Enum variant table (exhaustiveness coverage): variants hang
-            // off the declaration's kind-106 children.
-            if (n.kind == GND_ENUM_DEF) {
+            // off the declaration's kind-106 children. Kind-105 import
+            // statements never join (nodeIsImport).
+            if (n.kind == GND_ENUM_DEF && !this.nodeIsImport(n)) {
                 this.enumNames.add(n.name);
                 this.enumStarts.add(this.enumVariantNames.length);
                 int cnt = 0;
