@@ -609,7 +609,10 @@ class Parser {
             // DOCS/259 -- an anonymous function body is an isolated scope:
             // enclosing fn-typed parameters and locals are not visible, so
             // its identifier uses are validated against its own locals, the
-            // file's globals, and the known symbol table.
+            // file's globals, and the known symbol table. Its calls are
+            // walked too (with the isolation still active): a free call
+            // inside the body that resolves against no declaration reports
+            // the missing function itself.
             string[] savedScope = this.fnPtrCallScope;
             this.fnPtrCallScope = [];
             this.anonWalkDepth++;
@@ -617,6 +620,7 @@ class Parser {
             string[] anonLocals = [];
             this.collectAnonBodyLocals(anonBody, anonLocals);
             this.checkAnonBodyIdentifiers(anonBody, anonLocals);
+            this.walkCallDiagnostics(anonBody);
             this.anonWalkDepth--;
             this.fnPtrCallScope = savedScope;
             return;
@@ -625,6 +629,7 @@ class Parser {
             // Recovery-built call nodes carry no source position and already
             // reported their own syntax error.
             if (!n.isMember) { this.checkPlainCallTarget(n); }
+            this.checkBuiltinPredicateArity(n);
             this.checkFsPathValueException(n);
         }
         // Struct/collect/class bodies are opaque to this pass: their member
@@ -988,6 +993,25 @@ class Parser {
         if (m == "isFile" || m == "isDirectory") { return true; }
         if (m == "size" || m == "listFiles") { return true; }
         return false;
+    }
+
+    // `startsWith(prefix)` / `endsWith(suffix)` take exactly ONE argument —
+    // that is the whole signature, in SPEC, in the docs, and in the
+    // interpreter. There is no offset overload. The code generators read
+    // only the first argument, so an extra one used to be dropped silently
+    // and the call answered as if it had never been written — a
+    // wrong-but-plausible answer. A user-declared function, method, or
+    // trait of the same name is not the built-in and is left alone.
+    private void checkBuiltinPredicateArity(Node call) {
+        if (!call.isMember) { return; }
+        string m = call.name;
+        if (m != "startsWith" && m != "endsWith") { return; }
+        int argc = call.childCount() - 1;
+        if (argc <= 1) { return; }
+        for (int i = 0; i < this.sigNames.length; i++) {
+            if (this.sigNames[i] == m) { return; }
+        }
+        this.recordError((string)call.line + ":" + (string)call.col + ": no overload of '" + m + "' takes " + (string)argc + " argument(s)");
     }
 
     private void checkFsPathValueException(Node call) {
@@ -3574,6 +3598,30 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         return lam;
     }
 
+    // The member after `.` / `?.` must name something: an identifier, or a
+    // tuple position as an integer literal (`t.0`). A number token ending
+    // in a bare trailing dot is the `t.0.toString()` re-lex of a tuple
+    // position — the dot is stripped back off. Anything else names the
+    // mistake instead of building a member the rest of the pipeline cannot
+    // explain.
+    private string memberNameAfterDot(Token name, string what) {
+        if (name.kind == 7) { return name.text; }
+        if (name.kind == 1) {
+            bool hasDot = false;
+            for (int i = 0; i < name.text.length; i++) {
+                if (name.text[i] == '.') { hasDot = true; break; }
+            }
+            if (!hasDot) { return name.text; }
+            if (name.text.length > 1 && name.text[name.text.length - 1] == '.') {
+                string r = "";
+                for (int j = 0; j < name.text.length - 1; j++) { r += name.text[j]; }
+                return r;
+            }
+        }
+        this.recordError((string)name.line + ":" + (string)name.col + ": expected identifier or integer literal after '" + what + "'");
+        return "_err";
+    }
+
     private Node parseExpr(int minPrec) {
         Node lhs = this.parsePrefix();
         while (true) {
@@ -3668,9 +3716,10 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             if (this.check(108)) {
                 this.advance();
                 Token name = this.advance();
+                string memberText = this.memberNameAfterDot(name, ".");
                 if (this.check(100)) {
                     Node call = new Node(); call.kind = 10;
-                    call.name = name.text;
+                    call.name = memberText;
                     call.isMember = true;
                     // Receiver-side position keeps post-parse diagnostics
                     // (VALUE_EXCEPTION.md path checks) pointed at this call.
@@ -3736,7 +3785,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     }
                 } else {
                     Node member = new Node(); member.kind = 13;
-                    member.name = name.text;
+                    member.name = memberText;
                     member.children.add(lhs);
                     lhs = member;
                 }
@@ -3752,10 +3801,11 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 // spilled once (see DOCS/273).
                 this.advance();
                 Token name = this.advance();
+                string qMemberText = this.memberNameAfterDot(name, "?.");
                 Node qmMember = null;
                 if (this.check(100)) {
                     Node call = new Node(); call.kind = 10;
-                    call.name = name.text;
+                    call.name = qMemberText;
                     call.isMember = true;
                     call.line = lhs.line; call.col = lhs.col;
                     call.children.add(lhs);
@@ -3773,7 +3823,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     qmMember = call;
                 } else {
                     Node member = new Node(); member.kind = 13;
-                    member.name = name.text;
+                    member.name = qMemberText;
                     member.children.add(lhs);
                     qmMember = member;
                 }
@@ -3925,12 +3975,16 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 if (fastRangeNot != null) { lhs = fastRangeNot ?? lhs; continue; }
                 Node bin = new Node(); bin.kind = 7; bin.op = 37;
                 bin.boolVal = true;
+                bin.line = notLine;
+                bin.col = notCol;
                 bin.children.add(lhs);
                 bin.children.add(rhs);
                 lhs = bin;
                 continue;
             }
             if (this.check(54) && !this.inMembershipOperand) {
+                int inLine = this.peek().line;
+                int inCol = this.peek().col;
                 this.advance(); // in
                 int savedInMem = this.inMembershipOperand;
                 this.inMembershipOperand = true;
@@ -3942,6 +3996,8 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 if (fastRange != null) { lhs = fastRange ?? lhs; continue; }
                 Node bin = new Node(); bin.kind = 7; bin.op = 37;
                 bin.boolVal = false;
+                bin.line = inLine;
+                bin.col = inCol;
                 bin.children.add(lhs);
                 bin.children.add(rhs);
                 lhs = bin;
