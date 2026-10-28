@@ -150,7 +150,13 @@ class Lexer {
         if (c == '/' && this.peekNext() != null) {
             char next = this.peekNext();
             if (next == '/') { this.advance(); this.skipLineComment(); return null; }
-            if (next == '*') { this.advance(); this.advance(); this.skipBlockComment(); return null; }
+            if (next == '*') {
+                this.advance(); this.advance();
+                if (!this.skipBlockComment()) {
+                    this.recordLexError("Unterminated block comment at line " + (string)ln + ", column " + (string)cl);
+                }
+                return null;
+            }
         }
 
         // The token position must point AT the opening quote (EXCEPTIONS
@@ -280,6 +286,11 @@ class Lexer {
             return new Token(149, "$", ln, cl);
         }
         if (c == '@') { return new Token(156, "@", ln, cl); }
+
+        // Every other byte has no token meaning: name it instead of
+        // silently dropping it (a dropped character shifts every later
+        // diagnostic and the parse invents shapes around the hole).
+        this.recordLexError("Unexpected character '" + (string)c + "' at line " + (string)ln + ", column " + (string)cl);
 
         }
         return null;
@@ -569,6 +580,12 @@ if (this.pos < this.srcLen) {
         }
         Token tok = new Token(1, s, ln, cl);
         if (base == 16) { tok.isHexNum = true; }
+        if (!this.numberSpellingValid(base, isFloat, s)) {
+            string prefix = "";
+            if (base == 16) { prefix = "0x"; }
+            else if (base == 2) { prefix = "0b"; }
+            this.recordLexError("Invalid number literal '" + prefix + s + "' at line " + (string)ln + ", column " + (string)cl);
+        }
         if (isFloat) {
             tok.intVal = s.toFloatBits();
         } else if (base == 10) {
@@ -594,6 +611,51 @@ if (this.pos < this.srcLen) {
             tok.intVal = val;
         }
         return tok;
+    }
+
+    // A scanned numeral must carry value digits for its base: `0x` / `0b`
+    // with nothing after the prefix (underscores alone carry no value), and
+    // a float exponent must name at least one digit (`1e`, `1e+`). Range
+    // overflow is deliberately NOT judged here — wide literals wrap by
+    // design (the hash offsets rely on the two's-complement wrap).
+    private bool numberSpellingValid(int base, bool isFloat, string s) {
+        if (base == 16 || base == 2) {
+            bool anyValueDigit = false;
+            for (int i = 0; i < s.length; i++) {
+                char d = s[i];
+                bool isDigit = (d >= '0' && d <= '9');
+                if (base == 16 && ((d >= 'a' && d <= 'f') || (d >= 'A' && d <= 'F'))) { isDigit = true; }
+                if (base == 2 && (d == '0' || d == '1')) { isDigit = true; }
+                if (isDigit) { anyValueDigit = true; break; }
+            }
+            return anyValueDigit;
+        }
+        if (isFloat) { return this.floatSpellingValid(s); }
+        return true;
+    }
+
+    // Decimal float spelling the scanner can produce:
+    // DIGITS [. DIGITS] [(e|E) [sign] DIGITS]. The dot's fraction may be
+    // empty only without an exponent (`1.` is a value; `1.e5` is not), and
+    // the exponent must end in at least one digit. `_` separators ride
+    // anywhere among the digits and are skipped.
+    private bool floatSpellingValid(string s) {
+        int i = 0;
+        int n = s.length;
+        while (i < n && ((s[i] >= '0' && s[i] <= '9') || s[i] == '_')) { i++; }
+        if (i < n && s[i] == '.') {
+            i++;
+            int fracStart = i;
+            while (i < n && ((s[i] >= '0' && s[i] <= '9') || s[i] == '_')) { i++; }
+            if (i < n && (s[i] == 'e' || s[i] == 'E') && i == fracStart) { return false; }
+        }
+        if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+            i++;
+            if (i < n && (s[i] == '+' || s[i] == '-')) { i++; }
+            if (i >= n) { return false; }
+            while (i < n && ((s[i] >= '0' && s[i] <= '9') || s[i] == '_')) { i++; }
+        }
+        return i == n;
     }
 
     private Token readIdent() {
