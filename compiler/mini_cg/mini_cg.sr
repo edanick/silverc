@@ -4707,6 +4707,10 @@ int strIdx = this.stringPatchIndices[i];
         string saved2 = this.arrayLitElemHint;
         this.arrayLitElemHint = "";
         this.genExpr(child);
+        if ((hint == "float" || hint == "float64" || hint == "double") && !this.isFloatLike(child)) {
+            this.emitCvtsi2sdRax();
+            this.asm.movqR64XMM(0, 0);
+        }
         this.arrayLitElemHint = saved2;
     }
 
@@ -4922,6 +4926,14 @@ int strIdx = this.stringPatchIndices[i];
                         this.asm.shlR64Imm(1, 3);
                         this.asm.addRR64(0, 1);
                         this.asm.movRMBase(0, 0, 0);
+                        string elementHint = this.arrayLitElemHint;
+                        if (elementHint == "float" || elementHint == "float64" || elementHint == "double") {
+                            string sourceElement = this.arrayElementType(this.inferExprType(child.child(0)));
+                            if (sourceElement != "float" && sourceElement != "float64" && sourceElement != "double") {
+                                this.emitCvtsi2sdRax();
+                                this.asm.movqR64XMM(0, 0);
+                            }
+                        }
                         // dst = alloc + 16 + idx*8
                         this.asm.movRMBase(1, 5, allocOff);
                         this.asm.addRI32(1, 16);
@@ -10778,6 +10790,10 @@ public void genNewCall(Node call) {
                 probeType = this.inferArrayLitType(probe);
                 if (probeType == "m") { probeType = ""; }
             }
+            if (wantMod == "math" && name == "sum" && probe.kind == 19) {
+                string numericType = this.inferNumericArrayType(probe);
+                if (numericType != "") { probeType = numericType; }
+            }
             if (probeType.length >= 2) {
                 if (probeType[probeType.length - 2] == '[' && probeType[probeType.length - 1] == ']') { probeArr = true; }
             }
@@ -11248,14 +11264,13 @@ public void genNewCall(Node call) {
                     argument = this.funcParamDefaults[this.funcParamStarts[funcIdx] + i];
                 }
                 if (argument != null) {
-                    this.genExpr(argument);
                     int parameter = this.funcParamStarts[funcIdx] + i;
-                    if (parameter < this.funcParamTypes.length) {
-                        string paramType = this.funcParamTypes[parameter];
-                        if ((paramType == "float" || paramType == "float64" || paramType == "double") && !this.isFloatLike(argument)) {
-                            this.emitCvtsi2sdRax();
-                            this.asm.movqR64XMM(0, 0);
-                        }
+                    string paramType = "";
+                    if (parameter < this.funcParamTypes.length) { paramType = this.funcParamTypes[parameter]; }
+                    this.genExprAsType(argument, paramType);
+                    if ((paramType == "float" || paramType == "float64" || paramType == "double") && !this.isFloatLike(argument)) {
+                        this.emitCvtsi2sdRax();
+                        this.asm.movqR64XMM(0, 0);
                     }
                 } else {
                     this.asm.xorRR64(0, 0);
@@ -16860,6 +16875,22 @@ public void genNewCall(Node call) {
     // shapes, "int[]" for empty (arbitrary leaf — empty renders "[]"
     // regardless), "" for fixed-size declarations. Mirrors silverc-rs
     // infer_literal_array_type (which spells leaves natively).
+    private string inferNumericArrayType(Node literal) {
+        bool floating = false;
+        for (int i = 0; i < literal.childCount(); i++) {
+            Node element = literal.child(i);
+            string elementType = "";
+            if (element.kind == 77 && element.childCount() > 0) {
+                elementType = this.arrayElementType(this.inferExprType(element.child(0)));
+            } else { elementType = this.inferExprType(element); }
+            if (elementType == "float" || elementType == "float64" || elementType == "double") { floating = true; }
+            else if (elementType != "int" && elementType != "int32" && elementType != "int64"
+                && elementType != "uint" && elementType != "uint64" && elementType != "byte") { return ""; }
+        }
+        if (floating) { return "float64[]"; }
+        return "int[]";
+    }
+
     public string inferArrayLitType(Node lit) {
         if (lit.op == 1 || lit.op == 2) { return ""; }
         int n = lit.childCount();
