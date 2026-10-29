@@ -937,12 +937,33 @@ void drvPrintDiagnostics(string[] msgs, string source, string entryName, bool us
     }
 }
 
+// True when the output path is held open by another process (a still-running
+// previous build). The writeBytes builtin opens with write access and no
+// sharing, and fails silently when the open is refused — so a one-byte probe
+// write leaves the file untouched exactly when something else holds it open
+// (the file's size never becomes the probe's single byte). On success the
+// probe truncated the file to one byte, which is harmless: drvWriteOutput
+// deletes and rewrites the output anyway.
+bool drvOutputLocked(string outputFile) {
+    if (!file.exists(outputFile)) { return false; }
+    int[] probe = [65];
+    file.writeBytes(outputFile, probe);
+    return file.size(outputFile) != 1;
+}
+
 // The single executable writer. An existing output is removed before the
 // write: truncating an executable the on-access scanner is still checking
 // (the previous build's output, seconds old) blocks until that scan ends —
 // ~250 ms per rebuild, larger than a whole warm cached build — while
-// removing it returns at once and the new file is written fresh.
+// removing it returns at once and the new file is written fresh. A running
+// process at this path refuses first: deleting the name would strand the
+// stale image as the live build.
 void drvWriteOutput(string outputFile, int[] peData) {
+    if (drvOutputLocked(outputFile)) {
+        eprintln("cannot write to a running process: \"" + outputFile + "\"");
+        eprintln("you have to either use a different file name for the output or close the process");
+        exit(1);
+    }
     if (file.exists(outputFile)) { file.delete(outputFile); }
     file.writeBytes(outputFile, peData);
 }
@@ -1329,6 +1350,15 @@ void main() {
     }
 
     string outputFile = flags.output;
+
+    // Refuse up front when an explicit -o target is a running process,
+    // instead of compiling first and stranding the stale image as the live
+    // build (defaulted project outputs get the same refusal at write time).
+    if (outputFile.length > 0 && drvOutputLocked(outputFile)) {
+        eprintln("cannot write to a running process: \"" + outputFile + "\"");
+        eprintln("you have to either use a different file name for the output or close the process");
+        exit(1);
+    }
 
     // Manifest-level forbidden_flags are checked before anything runs.
     string manifestText = "";
