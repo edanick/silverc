@@ -1183,14 +1183,22 @@ class MiniCg {
         return "";
     }
 
-    public string getLocalType(string name) {
+    private int findVisibleLocalIndex(string name) {
+        for (int i = this.scopeBindingIndices.length - 1; i >= 0; i--) {
+            int index = this.scopeBindingIndices[i];
+            if (this.localNames[index] == name) { return index; }
+        }
         for (int i = this.localNames.length - 1; i >= 0; i--) {
-            if (this.localNames[i] == name) {
-                if (i < this.localTypes.length) {
-                    return this.localTypes[i];
-                }
-                return "";
-            }
+            if (this.localNames[i] == name) { return i; }
+        }
+        return -1;
+    }
+
+    public string getLocalType(string name) {
+        int visible = this.findVisibleLocalIndex(name);
+        if (visible >= 0) {
+            if (visible < this.localTypes.length) { return this.localTypes[visible]; }
+            return "";
         }
         for (int i = 0; i < this.globalNames.length; i++) {
             if (this.globalNames[i] == name) {
@@ -1205,24 +1213,16 @@ class MiniCg {
     }
 
     public void setLocalType(string name, string typeName) {
-        for (int i = this.localNames.length - 1; i >= 0; i--) {
-            if (this.localNames[i] == name) {
-                while (this.localTypes.length <= i) {
-                    this.localTypes.add("");
-                }
-                this.localTypes[i] = typeName;
-                return;
-            }
+        int index = this.findVisibleLocalIndex(name);
+        if (index >= 0) {
+            while (this.localTypes.length <= index) { this.localTypes.add(""); }
+            this.localTypes[index] = typeName;
         }
     }
 
     public void setLocalOffset(string name, int off) {
-        for (int i = this.localNames.length - 1; i >= 0; i--) {
-            if (this.localNames[i] == name) {
-                this.localOffsets[i] = off;
-                return;
-            }
-        }
+        int index = this.findVisibleLocalIndex(name);
+        if (index >= 0) { this.localOffsets[index] = off; }
     }
 
     public string arrayElementType(string arrType) {
@@ -1890,19 +1890,8 @@ class MiniCg {
     }
 
     public int findLocal(string name) {
-        // Search from the most recent local backward. The flat local table has
-        // no lexical scopes and codegen appends temporaries as it goes, so a
-        // name can legitimately appear several times (e.g. every
-        // `catch (Exception e)` declares `e`). The most recent declaration is
-
-        // the one in scope for the code being generated now, which is what the
-        // forward scan used to get wrong: every catch after the first resolved
-        // to the FIRST catch's slot and read the first thrown value.
-        for (int i = this.localNames.length - 1; i >= 0; i--) {
-            if (this.localNames[i] == name) {
-                return this.localOffsets[i];
-            }
-        }
+        int index = this.findVisibleLocalIndex(name);
+        if (index >= 0) { return this.localOffsets[index]; }
         return 0;
     }
 
@@ -3910,8 +3899,10 @@ int strIdx = this.stringPatchIndices[i];
     }
 
     public void allocLocals(Node node) {
+        if (node.kind == 85) { return; }
         if (node.kind == 16) { this.localAllocationDepth++; }
     if (node.kind == 50) {
+        node.localBindingSlot = 0;
         this.allocLocal(node.name);
         while (this.localTypes.length < this.localNames.length) {
             this.localTypes.add("");
@@ -5508,6 +5499,7 @@ int strIdx = this.stringPatchIndices[i];
     // expression evaluates to.
     public void emitAnonFunction(string name, int labelId, Node body) {
         this.currentFunctionName = name;
+        this.currentReturnType = "void";
         this.localOffsets = [];
         this.localNames = [];
         this.localTypes = [];
