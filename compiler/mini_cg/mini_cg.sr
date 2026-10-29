@@ -3969,6 +3969,10 @@ int strIdx = this.stringPatchIndices[i];
     public void genBlock(Node block) {
         int scopeStart = this.scopeBindingIndices.length;
         for (int i = 0; i < block.childCount(); i++) { this.genStmt(block.child(i)); }
+        this.restoreScopedLocals(scopeStart);
+    }
+
+    private void restoreScopedLocals(int scopeStart) {
         while (this.scopeBindingIndices.length > scopeStart) {
             int index = this.scopeBindingIndices.pop();
             this.localNames[index] = this.scopeBindingNames.pop();
@@ -4497,6 +4501,7 @@ int strIdx = this.stringPatchIndices[i];
                 this.asm.jmpLabel(contLbl);
             }
         } else if (stmt.kind == 64) {
+            int iterationScopeStart = this.scopeBindingIndices.length;
             if (stmt.childCount() > 1) {
                 // Reject provably non-iterable receivers at compile time.
                 // The lowering below reads an array length header at [-8]
@@ -4531,7 +4536,12 @@ int strIdx = this.stringPatchIndices[i];
                 int idxOff = this.allocLocal("__foreach_idx");
                 this.asm.movRI64(0, 0);
                 this.asm.movMBaseR(5, 0, idxOff);
-                int vOff = this.findLocal(stmt.child(0).name);
+                Node iterationVariable = stmt.child(0);
+                this.activateScopedLocal(iterationVariable);
+                if (iterationVariable.typeHint == "var" || iterationVariable.typeHint == "") {
+                    this.setLocalType(iterationVariable.name, this.arrayElementType(this.inferExprType(stmt.child(1))));
+                }
+                int vOff = this.findLocal(iterationVariable.name);
                 this.asm.bindLabel(startLbl);
                 this.asm.movRMBase(0, 5, idxOff);
                 this.asm.movRMBase(1, 5, lenOff);
@@ -4561,6 +4571,7 @@ int strIdx = this.stringPatchIndices[i];
             this.popLoopStart();
             this.popLoopEnd();
             this.popLoopContinue();
+            this.restoreScopedLocals(iterationScopeStart);
         }
     }
 
