@@ -131,76 +131,102 @@ public float64 pow(float64 base, float64 exponent) {
     return exp(exponent * ln(base));
 }
 
-// Payne-Hanek reduction: 70 base-2^24 limbs of 2/pi cover every finite
-// binary64 exponent. Products of three limbs stay within signed int64.
-private float64 mathAngle(float64 value) {
-    if (!(value <= 1.7976931348623157e308 && value >= -1.7976931348623157e308)) { return mathNan(); }
-    float64 magnitude = value;
-    if (magnitude < 0.0) { magnitude = -magnitude; }
-    if (magnitude < 1000000.0) {
-        float64 turns = floor(value / 6.283185307179586 + 0.5);
-        return (value - turns * 6.2831853069365025) - turns * 0.0000000002430840202602477;
-    }
-    int[] digits = [10680707, 7228996, 1387004, 2578385, 16069853, 12639074, 9804092, 4427841, 16666979, 11263675, 12935607, 2387514, 4345298, 14681673, 3074569, 13734428, 16653803, 1880361, 10960616, 8533493, 3062596, 8710556, 7349940, 6258241, 3772886, 3769171, 3798172, 8675211, 12450088, 3874808, 9961438, 366607, 15675153, 9132554, 7151469, 3571407, 2607881, 12013382, 4155038, 6285869, 7677882, 13102053, 15825725, 473591, 9065106, 15363067, 6271263, 9264392, 5636912, 4652155, 7056368, 13614112, 10155062, 1944035, 9527646, 15080200, 6658437, 6231200, 6832269, 16767104, 5075751, 3212806, 1398474, 7579849, 6349435, 12618859, 4703257, 12806093, 14477321, 2786137];
-    int exponent = 0;
-    while (magnitude >= 2.0) { magnitude = magnitude * 0.5; exponent++; }
-    int significand = int(magnitude * 4503599627370496.0);
-    int[] parts = [significand & 16777215, (significand >> 24) & 16777215, significand >> 48];
-    int[] product = new int[73];
-    for (int i = 0; i < 70; i++) {
-        for (int j = 0; j < 3; j++) {
-            product[i + j] = product[i + j] + digits[69 - i] * parts[j];
-        }
-    }
-    for (int i = 0; i < 72; i++) {
-        product[i + 1] = product[i + 1] + (product[i] >> 24);
-        product[i] = product[i] & 16777215;
-    }
-    int point = 1680 - exponent + 52;
-    int quadrant = ((product[point / 24] >> (point % 24)) & 1)
-        + 2 * ((product[(point + 1) / 24] >> ((point + 1) % 24)) & 1);
-    float64 fraction = 0.0;
-    float64 weight = 0.5;
-    for (int i = 1; i <= 60; i++) {
-        int bit = point - i;
-        if (((product[bit / 24] >> (bit % 24)) & 1) != 0) { fraction = fraction + weight; }
-        weight = weight * 0.5;
-    }
-    if (fraction > 0.5) { fraction = fraction - 1.0; quadrant = (quadrant + 1) & 3; }
-    float64 angle = (float64(quadrant) + fraction) * 1.5707963267948966;
-    if (angle > 3.141592653589793) { angle = angle - 6.283185307179586; }
-    if (value < 0.0) { angle = -angle; }
-    return angle;
-}
-
-public float64 sin(float64 value) {
-    float64 x = mathAngle(value);
-    if (x > 1.5707963267948966) { x = 3.141592653589793 - x; }
-    if (x < -1.5707963267948966) { x = -3.141592653589793 - x; }
-    float64 term = x;
-    float64 result = x;
+private float64 mathSineSeries(float64 angle) {
+    if (angle == 0.0) { return angle; }
+    float64 term = angle;
+    float64 result = angle;
     for (int i = 1; i < 14; i++) {
-        term = -term * x * x / float64((2 * i) * (2 * i + 1));
+        term = -term * angle * angle / float64((2 * i) * (2 * i + 1));
         result = result + term;
     }
     return result;
 }
 
-public float64 cos(float64 value) {
-    float64 x = mathAngle(value);
-    float64 sign = 1.0;
-    if (x > 1.5707963267948966) { x = 3.141592653589793 - x; sign = -1.0; }
-    if (x < -1.5707963267948966) { x = -3.141592653589793 - x; sign = -1.0; }
+private float64 mathCosineSeries(float64 angle) {
     float64 term = 1.0;
     float64 result = 1.0;
     for (int i = 1; i < 14; i++) {
-        term = -term * x * x / float64((2 * i - 1) * (2 * i));
+        term = -term * angle * angle / float64((2 * i - 1) * (2 * i));
         result = result + term;
     }
-    return sign * result;
+    return result;
 }
 
-public float64 tan(float64 value) { return sin(value) / cos(value); }
+// Reduce to the nearest quadrant and evaluate only in [-pi/4, pi/4].
+// Never reconstruct a large angle: that loses tiny remainders near zeros
+// and tangent poles. Three split pi/2 terms retain ordinary-input precision;
+// 70 base-2^24 limbs of 2/pi cover every finite binary64 exponent.
+private float64 mathTrigonometric(float64 value, int operation) {
+    if (!(value <= 1.7976931348623157e308 && value >= -1.7976931348623157e308)) { return mathNan(); }
+    float64 magnitude = value;
+    if (magnitude < 0.0) { magnitude = -magnitude; }
+    float64 angle = value;
+    int quadrant = 0;
+    if (magnitude > 0.7853981633974483) {
+        if (magnitude < 1000000.0) {
+            int turns = int(floor(value * 0.6366197723675814 + 0.5));
+            quadrant = turns & 3;
+            angle = ((value - float64(turns) * 1.5707963267341256)
+                - float64(turns) * 0.00000000006077100506303966)
+                - float64(turns) * 0.0000000000000000000020222662487959506;
+        } else {
+            int[] digits = [10680707, 7228996, 1387004, 2578385, 16069853, 12639074, 9804092, 4427841, 16666979, 11263675, 12935607, 2387514, 4345298, 14681673, 3074569, 13734428, 16653803, 1880361, 10960616, 8533493, 3062596, 8710556, 7349940, 6258241, 3772886, 3769171, 3798172, 8675211, 12450088, 3874808, 9961438, 366607, 15675153, 9132554, 7151469, 3571407, 2607881, 12013382, 4155038, 6285869, 7677882, 13102053, 15825725, 473591, 9065106, 15363067, 6271263, 9264392, 5636912, 4652155, 7056368, 13614112, 10155062, 1944035, 9527646, 15080200, 6658437, 6231200, 6832269, 16767104, 5075751, 3212806, 1398474, 7579849, 6349435, 12618859, 4703257, 12806093, 14477321, 2786137];
+            int exponent = 0;
+            while (magnitude >= 2.0) { magnitude = magnitude * 0.5; exponent++; }
+            int significand = int(magnitude * 4503599627370496.0);
+            int[] parts = [significand & 16777215, (significand >> 24) & 16777215, significand >> 48];
+            int[] product = new int[73];
+            for (int i = 0; i < 70; i++) {
+                for (int j = 0; j < 3; j++) {
+                    product[i + j] = product[i + j] + digits[69 - i] * parts[j];
+                }
+            }
+            for (int i = 0; i < 72; i++) {
+                product[i + 1] = product[i + 1] + (product[i] >> 24);
+                product[i] = product[i] & 16777215;
+            }
+            int point = 1680 - exponent + 52;
+            quadrant = ((product[point / 24] >> (point % 24)) & 1)
+                + 2 * ((product[(point + 1) / 24] >> ((point + 1) % 24)) & 1);
+            int leading = point - 1;
+            float64 fraction = 0.0;
+            if (((product[leading / 24] >> (leading % 24)) & 1) != 0) {
+                fraction = -0.5;
+                quadrant = (quadrant + 1) & 3;
+            }
+            // Accumulate a signed fraction directly. Subtracting 1 from a
+            // rounded positive fraction would destroy near-integer low bits.
+            float64 weight = 0.25;
+            for (int i = 2; i <= 120; i++) {
+                int bit = point - i;
+                if (((product[bit / 24] >> (bit % 24)) & 1) != 0) { fraction = fraction + weight; }
+                weight = weight * 0.5;
+            }
+            if (value < 0.0) { fraction = -fraction; quadrant = (0 - quadrant) & 3; }
+            angle = fraction * 1.5707963267948966;
+        }
+    }
+    float64 sine = mathSineSeries(angle);
+    float64 cosine = mathCosineSeries(angle);
+    if (operation == 2) {
+        if ((quadrant & 1) != 0) { return -cosine / sine; }
+        return sine / cosine;
+    }
+    if (operation == 0) {
+        if (quadrant == 0) { return sine; }
+        if (quadrant == 1) { return cosine; }
+        if (quadrant == 2) { return -sine; }
+        return -cosine;
+    }
+    if (quadrant == 0) { return cosine; }
+    if (quadrant == 1) { return -sine; }
+    if (quadrant == 2) { return -cosine; }
+    return sine;
+}
+
+public float64 sin(float64 value) { return mathTrigonometric(value, 0); }
+public float64 cos(float64 value) { return mathTrigonometric(value, 1); }
+public float64 tan(float64 value) { return mathTrigonometric(value, 2); }
 
 public float64 hypot(float64 first, float64 second) {
     float64 a = first;
