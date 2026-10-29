@@ -4760,6 +4760,15 @@ int strIdx = this.stringPatchIndices[i];
         if (!this.isFloatLike(value)) { this.emitIntegerToDouble(this.isUint64Like(value)); }
     }
 
+    private void genTypedArgument(Node value, int functionIndex, int parameterIndex) {
+        string parameterType = "";
+        if (functionIndex >= 0 && functionIndex < this.funcParamStarts.length) {
+            int slot = this.funcParamStarts[functionIndex] + parameterIndex;
+            if (slot >= 0 && slot < this.funcParamTypes.length) { parameterType = this.funcParamTypes[slot]; }
+        }
+        this.genExprAsType(value, parameterType);
+    }
+
     public void genExprAsType(Node expr, string typeName) {
         if (expr.kind == 74 && this.isStructTypeName(typeName)) {
             this.genStructLiteral(expr, typeName);
@@ -10176,6 +10185,8 @@ public void genNewCall(Node call) {
     }
     int[] argRegs = [1, 2, 8, 9];
     int nargs = call.childCount();
+    int typedConstructor = this.findConstructor(call.name, nargs);
+    if (typedConstructor < 0) { typedConstructor = this.resolveMroConstructor(call.name, nargs); }
     int[] argTemps = [];
     for (int i = 0; i < nargs; i++) {
         bool convertedMessageArray = false;
@@ -10221,7 +10232,7 @@ public void genNewCall(Node call) {
             convertedMessageArray = true;
         }
         if (!convertedMessageArray) {
-            this.genExpr(call.child(i));
+            this.genTypedArgument(call.child(i), typedConstructor, i);
         }
         int t = this.allocLocal("__na");
         this.asm.movMBaseR(5, 0, t);
@@ -10445,7 +10456,7 @@ public void genNewCall(Node call) {
         int nargs = call.childCount();
         int[] argTemps = [];
         for (int i = 0; i < nargs; i++) {
-            this.genExpr(call.child(i));
+            this.genTypedArgument(call.child(i), ctorIdx, i);
             int t = this.allocLocal("__sa");
             this.asm.movMBaseR(5, 0, t);
             argTemps.add(t);
@@ -13874,14 +13885,14 @@ public void genNewCall(Node call) {
 
             } else if (i <= explicitArgs) {
                 if (packedArg != null && i == packIndex) {
-                    this.genExpr(packedArg);
+                    this.genTypedArgument(packedArg, funcIdx, i - 1);
                 } else {
-                    this.genExpr(call.child(i));
+                    this.genTypedArgument(call.child(i), funcIdx, i - 1);
                 }
             } else if (funcIdx >= 0 && funcIdx < this.funcParamStarts.length) {
                 int defaultIndex = this.funcParamStarts[funcIdx] + i - 1;
                 if (defaultIndex < this.funcParamDefaults.length) {
-                    this.genExpr(this.funcParamDefaults[defaultIndex]);
+                    this.genTypedArgument(this.funcParamDefaults[defaultIndex], funcIdx, i - 1);
                 } else {
                     this.asm.xorRR64(0, 0);
                 }
