@@ -188,6 +188,12 @@ class MiniCg {
     public prop string[] methodNames;
     public prop string currentClassName;
     public prop string currentFunctionName;
+    private prop string currentReturnType;
+    private prop int localAllocationDepth;
+    private prop int[] scopeBindingIndices;
+    private prop string[] scopeBindingNames;
+    private prop string[] scopeBindingTypes;
+    private prop int[] scopeBindingOffsets;
     public prop bool dynamicAsmActive;
     public prop string[] localTypes;
     // Whole-dict print kinds by variable ("string"/"float"/""), mirroring
@@ -422,6 +428,10 @@ class MiniCg {
         this.methodNames = [];
         this.currentClassName = "";
         this.currentFunctionName = "";
+        this.currentReturnType = "void";
+        this.localAllocationDepth = 0;
+        this.scopeBindingIndices = []; this.scopeBindingNames = [];
+        this.scopeBindingTypes = []; this.scopeBindingOffsets = [];
         this.dynamicAsmActive = false;
         this.hasMain = false;
         this.localTypes = [];
@@ -3535,6 +3545,7 @@ int strIdx = this.stringPatchIndices[i];
         }
     }    public void emitMethod(Node func, string className) {
     this.currentFunctionName = func.name;
+    this.currentReturnType = func.typeHint;
     int emitIdx = -1;
     for (int fi = 0; fi < this.funcNames.length; fi++) {
         if (this.funcOffsets[fi] == -1 && this.funcNames[fi] == func.name && this.funcClasses[fi] == className) {
@@ -3582,6 +3593,7 @@ int strIdx = this.stringPatchIndices[i];
     this.emitFunctionBody(func);
 }    public void emitFunction(Node func) {
     this.currentFunctionName = func.name;
+    this.currentReturnType = func.typeHint;
     if (func.name == "main") {
         this.mainLabelOffset = this.asm.buf.length;
         this.hasMain = true;
@@ -3785,7 +3797,7 @@ int strIdx = this.stringPatchIndices[i];
                 // stores the bare expression as the body. Evaluate it (result
                 // in RAX) and jump to the return label so the value is
                 // propagated to the caller.
-                this.genExpr(body);
+                this.genExprAsType(body, this.currentReturnType);
                 this.emitReturnJump();
             }
             if (this.stackSize != initialStackSize) {
@@ -3898,6 +3910,7 @@ int strIdx = this.stringPatchIndices[i];
     }
 
     public void allocLocals(Node node) {
+        if (node.kind == 16) { this.localAllocationDepth++; }
     if (node.kind == 50) {
         this.allocLocal(node.name);
         while (this.localTypes.length < this.localNames.length) {
@@ -3930,6 +3943,10 @@ int strIdx = this.stringPatchIndices[i];
                     this.localTypes[this.localTypes.length - 1] = "tuple";
                 }
             }
+            if (this.localAllocationDepth > 1) {
+                node.localBindingSlot = this.localNames.length;
+                this.localNames[node.localBindingSlot - 1] = "__pending_local_binding";
+            }
         } else if (node.kind == 73) {
             this.allocLocal(node.name);
             while (this.localTypes.length < this.localNames.length) {
@@ -3942,11 +3959,30 @@ int strIdx = this.stringPatchIndices[i];
         for (int i = 0; i < node.childCount(); i++) {
             this.allocLocals(node.child(i));
         }
+        if (node.kind == 16) { this.localAllocationDepth--; }
+    }
+
+    private void activateScopedLocal(Node statement) {
+        if (statement.localBindingSlot == 0) { return; }
+        int index = statement.localBindingSlot - 1;
+        string valueType = this.localTypes[index];
+        if ((statement.typeHint == "var" || statement.typeHint == "") && statement.childCount() > 0) {
+            string inferred = this.inferExprType(statement.child(0));
+            if (inferred != "" && inferred != "var") { valueType = inferred; }
+        }
+        this.scopeBindingIndices.add(index); this.scopeBindingNames.add(this.localNames[index]);
+        this.scopeBindingTypes.add(this.localTypes[index]); this.scopeBindingOffsets.add(this.localOffsets[index]);
+        this.localNames[index] = statement.name; this.localTypes[index] = valueType;
     }
 
     public void genBlock(Node block) {
-        for (int i = 0; i < block.childCount(); i++) {
-            this.genStmt(block.child(i));
+        int scopeStart = this.scopeBindingIndices.length;
+        for (int i = 0; i < block.childCount(); i++) { this.genStmt(block.child(i)); }
+        while (this.scopeBindingIndices.length > scopeStart) {
+            int index = this.scopeBindingIndices.pop();
+            this.localNames[index] = this.scopeBindingNames.pop();
+            this.localTypes[index] = this.scopeBindingTypes.pop();
+            this.localOffsets[index] = this.scopeBindingOffsets.pop();
         }
     }
 
@@ -3996,6 +4032,7 @@ int strIdx = this.stringPatchIndices[i];
             }
     } else if (stmt.kind == 50) {
         int off = this.findLocal(stmt.name);
+        if (stmt.localBindingSlot > 0) { off = this.localOffsets[stmt.localBindingSlot - 1]; }
         // Dict/object print tracking (member reads, whole-dict prints):
         // declared dicts use V's kind, `object` and untyped `var` classify
         // a literal initializer.
@@ -4059,7 +4096,7 @@ int strIdx = this.stringPatchIndices[i];
                     // `double d = n;` widens the integer to a real double
                     // (silverc-rs does this in its decl-init arm); without it
                     // the raw integer bits landed in the double slot.
-                    this.coerceDeclToDouble(stmt.typeHint, initNode);
+                    
                 }
                 if (stmt.isLive && off != 0 && this.isLiveHeapType(stmt.typeHint)) {
                     if (stmt.typeHint == "string" || stmt.typeHint == "string?") {
@@ -4103,7 +4140,9 @@ int strIdx = this.stringPatchIndices[i];
                     this.asm.movMBaseR(5, 0, off);
                 }
             }
-        }        } else if (stmt.kind == 73) {
+        }
+        this.activateScopedLocal(stmt);
+    } else if (stmt.kind == 73) {
             int aliasOff = this.findLocal(stmt.name);
             if (stmt.childCount() > 1) {
                 Node aliasTarget = stmt.child(1);
@@ -4135,7 +4174,7 @@ int strIdx = this.stringPatchIndices[i];
             // this lowering with `return` all along; without it the shortcut
             // emitted no code and control fell through the statement.
             if (stmt.childCount() > 0) {
-                this.genExpr(stmt.child(0));
+                this.genExprAsType(stmt.child(0), this.currentReturnType);
             } else {
                 this.asm.xorRR64(0, 0);
             }
@@ -4588,7 +4627,7 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.emitImm64(1, count);
         this.asm.movMBaseR(0, 1, 8);
         for (int i = 0; i < expr.childCount(); i++) {
-            this.genExpr(expr.child(i));
+            this.genExprAsType(expr.child(i), "byte");
             this.asm.movRMBase(1, 5, arrOff);
             this.asm.movMBaseR(1, 0, 16 + i * 8);
         }
@@ -4670,6 +4709,66 @@ int strIdx = this.stringPatchIndices[i];
     // degrading to dicts (whose layout reads back as garbage
     // through class field offsets). Anything else falls through to
     // genExpr unchanged.
+    private bool isScalarValueType(string typeName) {
+        return typeName == "int" || typeName == "int32" || typeName == "int64" || typeName == "uint" || typeName == "uint64"
+            || typeName == "float" || typeName == "float64" || typeName == "double" || typeName == "byte"
+            || typeName == "char" || typeName == "bool" || typeName == "string";
+    }
+
+    private void genPrimitiveConversion(Node value, string targetType) {
+        Node conversion = new Node(); conversion.kind = 10;
+        conversion.name = targetType; conversion.line = value.line; conversion.col = value.col;
+        conversion.children.add(value); this.genCall(conversion);
+    }
+
+    private void emitTruncateDouble() {
+        this.asm.emitU8(0xF2); this.asm.emitU8(0x48); this.asm.emitU8(0x0F);
+        this.asm.emitU8(0x2C); this.asm.emitU8(0xC0);
+    }
+
+    private void emitFloatingToInteger(bool unsignedValue) {
+        int invalid = this.newLabel(); int done = this.newLabel();
+        this.emitMovqXmmGpr(0, 0);
+        if (unsignedValue) { this.asm.emitImm64(1, 0xBFF0000000000000); }
+        else { this.asm.emitImm64(1, 0xC3E0000000000000); }
+        this.emitMovqXmmGpr(1, 1); this.asm.ucomisdXMM(0, 1);
+        if (unsignedValue) { this.asm.jbeLabel(invalid); } else { this.asm.jbLabel(invalid); }
+        if (unsignedValue) { this.asm.emitImm64(1, 0x43F0000000000000); }
+        else { this.asm.emitImm64(1, 0x43E0000000000000); }
+        this.emitMovqXmmGpr(1, 1); this.asm.ucomisdXMM(0, 1); this.asm.jaeLabel(invalid);
+        if (unsignedValue) {
+            int small = this.newLabel(); this.asm.emitImm64(1, 0x43E0000000000000);
+            this.emitMovqXmmGpr(1, 1); this.asm.ucomisdXMM(0, 1); this.asm.jbLabel(small);
+            this.asm.subsdXMM(0, 1); this.emitTruncateDouble();
+            this.asm.emitImm64(1, 0x8000000000000000); this.asm.orRR64(0, 1); this.asm.jmpLabel(done);
+            this.asm.bindLabel(small);
+        }
+        this.emitTruncateDouble(); this.asm.jmpLabel(done);
+        this.asm.bindLabel(invalid); this.emitThrowException("Floating to integer conversion is out of range");
+        this.asm.bindLabel(done);
+    }
+
+    private void emitIntegerToDouble(bool unsignedValue) {
+        if (unsignedValue) {
+            int small = this.newLabel(); int done = this.newLabel();
+            this.asm.cmpRI32(0, 0); this.asm.jgeLabel(small);
+            this.asm.movRR64(2, 0); this.asm.andRImm(2, 1);
+            this.asm.emitU8(0x48); this.asm.emitU8(0xC1); this.asm.emitU8(0xE8); this.asm.emitU8(1);
+            this.asm.orRR64(0, 2); this.emitCvtsi2sdRax(); this.asm.addsdXMM(0, 0); this.asm.jmpLabel(done);
+            this.asm.bindLabel(small); this.emitCvtsi2sdRax(); this.asm.bindLabel(done);
+        } else { this.emitCvtsi2sdRax(); }
+        this.asm.movqR64XMM(0, 0);
+    }
+
+    private void genFloatingConversion(Node value) {
+        if (this.inferExprType(value) == "string") {
+            Node parsed = new Node(); parsed.kind = 10; parsed.name = "toFloatBits";
+            parsed.isMember = true; parsed.children.add(value); this.genBuiltinMemberCall(parsed); return;
+        }
+        this.genExpr(value);
+        if (!this.isFloatLike(value)) { this.emitIntegerToDouble(this.isUint64Like(value)); }
+    }
+
     public void genExprAsType(Node expr, string typeName) {
         if (expr.kind == 74 && this.isStructTypeName(typeName)) {
             this.genStructLiteral(expr, typeName);
@@ -4679,9 +4778,21 @@ int strIdx = this.stringPatchIndices[i];
             string elemT = this.arrayElementType(typeName);
             string saved = this.arrayLitElemHint;
             this.arrayLitElemHint = elemT;
-            this.genExpr(expr);
+            if (typeName == "float" || typeName == "float64" || typeName == "double") {
+            this.genFloatingConversion(expr); return;
+        }
+        if (typeName == "byte" || typeName == "char" || ((typeName == "int" || typeName == "int32" || typeName == "int64" || typeName == "uint" || typeName == "uint64") && this.isFloatLike(expr))) {
+            this.genPrimitiveConversion(expr, typeName); return;
+        }
+        this.genExpr(expr);
             this.arrayLitElemHint = saved;
             return;
+        }
+        if (typeName == "float" || typeName == "float64" || typeName == "double") {
+            this.genFloatingConversion(expr); return;
+        }
+        if (typeName == "byte" || typeName == "char" || ((typeName == "int" || typeName == "int32" || typeName == "int64" || typeName == "uint" || typeName == "uint64") && this.isFloatLike(expr))) {
+            this.genPrimitiveConversion(expr, typeName); return;
         }
         this.genExpr(expr);
     }
@@ -4706,11 +4817,7 @@ int strIdx = this.stringPatchIndices[i];
         }
         string saved2 = this.arrayLitElemHint;
         this.arrayLitElemHint = "";
-        this.genExpr(child);
-        if ((hint == "float" || hint == "float64" || hint == "double") && !this.isFloatLike(child)) {
-            this.emitCvtsi2sdRax();
-            this.asm.movqR64XMM(0, 0);
-        }
+        this.genExprAsType(child, hint);
         this.arrayLitElemHint = saved2;
     }
 
@@ -6029,7 +6136,9 @@ int strIdx = this.stringPatchIndices[i];
                 }
             }
             if (!expr.isMember && cname == "char") { return "char"; }
-            if (!expr.isMember && (cname == "int" || cname == "int32" || cname == "int64")) { return "int"; }
+            if (!expr.isMember && (cname == "int" || cname == "int32" || cname == "int64" || cname == "uint")) { return "int"; }
+            if (!expr.isMember && cname == "uint64") { return "uint64"; }
+            if (!expr.isMember && cname == "byte") { return "byte"; }
             if (!expr.isMember && (cname == "float" || cname == "float64" || cname == "double")) { return "float64"; }
             if (!expr.isMember && cname == "bool") { return "bool"; }
             if (!expr.isMember && cname == "string_cast") { return "string"; }
@@ -6065,8 +6174,9 @@ int strIdx = this.stringPatchIndices[i];
                 if ((expr.child(0).name == "fs" || expr.child(0).name == "folder") && (cname == "getEntries" || cname == "entries" || cname == "list" || cname == "getFiles" || cname == "files" || cname == "getFolders" || cname == "folders")) {
                     return "string[]";
                 }
-                if (cname == "toInt64" || cname == "toInt" || cname == "toNumber") { return "int64"; }
-                if ((cname == "toFloat" || cname == "toFloat64") && (recvType == "float" || recvType == "float64" || recvType == "double" || recvType == "int" || recvType == "int32" || recvType == "int64" || recvType == "uint" || recvType == "bool" || recvType == "char")) { return "float64"; }
+                if ((cname == "toInt64" || cname == "toInt" || cname == "toNumber") && this.isScalarValueType(recvType)) { return "int64"; }
+                if (cname == "toString" && this.isScalarValueType(recvType)) { return "string"; }
+                if ((cname == "toFloat" || cname == "toFloat64") && this.isScalarValueType(recvType)) { return "float64"; }
                 if (cname == "toString" && (recvType == "string" || recvType == "char" || recvType == "int" || recvType == "int32" || recvType == "int64" || recvType == "uint" || recvType == "uint64" || recvType == "bool" || recvType == "float64")) {
                     return "string";
                 }
@@ -8663,7 +8773,7 @@ int strIdx = this.stringPatchIndices[i];
         } else if (name == "byte" && !call.isMember) {
             // Explicit checked conversion to the unsigned byte range.
             if (call.childCount() > 0) {
-                this.genExpr(call.child(0));
+                this.genPrimitiveConversion(call.child(0), "int");
                 int byteInvalid = this.newLabel();
                 int byteDone = this.newLabel();
                 this.asm.cmpRI32(0, 0);
@@ -8677,7 +8787,7 @@ int strIdx = this.stringPatchIndices[i];
             } else {
                 this.asm.xorRR64(0, 0);
             }
-        } else if (builtinName && (name == "int" || name == "int64" || name == "int32") && !call.isMember) {
+        } else if (builtinName && (name == "int" || name == "int64" || name == "int32" || name == "uint" || name == "uint64") && !call.isMember) {
             // int(...) / int64(...) / int32(...) conversion: strings parse
             // leading digits exactly like the bcache reference loops
             // (`bcDecRangeSigned`): an optional leading '-', digits
@@ -8821,50 +8931,19 @@ int strIdx = this.stringPatchIndices[i];
                 } else {
                     this.genExpr(arg);
                     if (this.isFloatLike(arg)) {
-                        // Float operands truncate toward zero: movq xmm0, rax
-                        // (66 REX.W 0F 6E C0, 64-bit -- the asm helper's 32-bit
-                        // form would zero-extend only EAX) then cvttsd2si
-                        // rax, xmm0 (F2 REX.W 0F 2C C0), matching silverc-rs
-                        // gen_int_conversion.
-                        this.asm.emitU8(0x66);
-                        this.asm.emitU8(0x48);
-                        this.asm.emitU8(0x0F);
-                        this.asm.emitU8(0x6E);
-                        this.asm.emitU8(0xC0);
-                        this.asm.emitU8(0xF2);
-                        this.asm.emitU8(0x48);
-                        this.asm.emitU8(0x0F);
-                        this.asm.emitU8(0x2C);
-                        this.asm.emitU8(0xC0);
+                        this.emitFloatingToInteger(name == "uint64");
                     }
                 }
             } else {
                 this.asm.xorRR64(0, 0);
             }
         } else if (builtinName && (name == "double" || name == "float" || name == "float64") && !call.isMember) {
-            // double(...) / float(...) / float64(...) conversion: integers widen
-            // to an IEEE-754 double bit pattern via cvtsi2sd; float operands
-            // pass through unchanged (mirrors silverc-rs gen_double_conversion).
-            // The old pass-through stub left the raw integer in RAX, so every
-            // float64(int) value was a denormal and no-arg float producers like
-            // timeWinNow() collapsed to the same wrong value.
-            if (call.childCount() > 0) {
-                Node arg = call.child(0);
-                this.genExpr(arg);
-                if (!this.isFloatLike(arg)) {
-                    // 64-bit cvtsi2sd xmm0, rax (see emitCvtsi2sdRax), then
-                    // movq rax, xmm0 to bring the bits back to the GP result
-                    // register -- mirrors silverc-rs gen_double_conversion.
-                    this.emitCvtsi2sdRax();
-                    this.asm.movqR64XMM(0, 0);
-                }
-            } else {
-                this.asm.xorRR64(0, 0);
-            }
+            if (call.childCount() > 0) { this.genFloatingConversion(call.child(0)); }
+            else { this.asm.xorRR64(0, 0); }
         } else if (builtinName && name == "char" && !call.isMember) {
             // char(...) conversion: low byte of the argument.
             if (call.childCount() > 0) {
-                this.genExpr(call.child(0));
+                this.genPrimitiveConversion(call.child(0), "int");
                 this.asm.andRImm(0, 0xFF);
             } else {
                 this.asm.xorRR64(0, 0);
@@ -8911,9 +8990,9 @@ int strIdx = this.stringPatchIndices[i];
                     this.asm.cmpRI32(0, 0);
                 } else if (bt == "float" || bt == "float64" || bt == "double") {
                     this.genExpr(barg);
-                    this.asm.movqXMMR64(0, 0);
+                    this.emitMovqXmmGpr(0, 0);
                     this.asm.xorRR64(2, 2);
-                    this.asm.movqXMMR64(1, 2);
+                    this.emitMovqXmmGpr(1, 2);
                     this.asm.ucomisdXMM(0, 1);
                 } else {
                     this.genExpr(barg);
@@ -11268,10 +11347,6 @@ public void genNewCall(Node call) {
                     string paramType = "";
                     if (parameter < this.funcParamTypes.length) { paramType = this.funcParamTypes[parameter]; }
                     this.genExprAsType(argument, paramType);
-                    if ((paramType == "float" || paramType == "float64" || paramType == "double") && !this.isFloatLike(argument)) {
-                        this.emitCvtsi2sdRax();
-                        this.asm.movqR64XMM(0, 0);
-                    }
                 } else {
                     this.asm.xorRR64(0, 0);
                 }
@@ -11919,6 +11994,7 @@ public void genNewCall(Node call) {
         if (!call.isMember || call.childCount() < 1) { return false; }
         string name = call.name;
         string recvType = this.inferExprType(call.child(0));
+        if ((name == "toString" || name == "toInt" || name == "toInt64" || name == "toFloat" || name == "toFloat64") && this.isScalarValueType(recvType)) { return true; }
         if (name == "toString") {
             if (recvType == "string" || recvType == "char" || recvType == "int" || recvType == "int32" || recvType == "int64" || recvType == "uint" || recvType == "uint64" || recvType == "bool" || recvType == "float64") {
                 return true;
@@ -11973,25 +12049,13 @@ public void genNewCall(Node call) {
             }
             return;
         }
-        if (name == "toInt" || name == "toInt64" || name == "toNumber") {
-            if (recvType == "int" || recvType == "int32" || recvType == "int64" || recvType == "bool" || recvType == "char") {
-                this.genExpr(recv);
-                return;
-            }
+        if ((name == "toInt" || name == "toInt64") && this.isScalarValueType(recvType)) {
+            Node conversion = new Node(); conversion.kind = 10; conversion.name = "int";
+            for (int i = 0; i < call.childCount(); i++) { conversion.children.add(call.child(i)); }
+            this.genCall(conversion); return;
         }
-        if (name == "toFloat" || name == "toFloat64") {
-            if (recvType == "float" || recvType == "float64") {
-                this.genExpr(recv);
-                return;
-            }
-            if (recvType == "int" || recvType == "int32" || recvType == "int64" || recvType == "uint" || recvType == "bool" || recvType == "char") {
-                // int -> double: 64-bit cvtsi2sd xmm0, rax (see
-                // emitCvtsi2sdRax) then movq rax, xmm0.
-                this.genExpr(recv);
-                this.emitCvtsi2sdRax();
-                this.asm.movqR64XMM(0, 0);
-                return;
-            }
+        if ((name == "toFloat" || name == "toFloat64") && this.isScalarValueType(recvType)) {
+            this.genFloatingConversion(recv); return;
         }
         if (name == "length") {
             // string.length() - call form of the .length field access.
@@ -15180,7 +15244,7 @@ public void genNewCall(Node call) {
         if (derefLhs.kind == 8 && derefLhs.op == 4 && derefLhs.childCount() > 0) {
             this.genExpr(derefLhs.child(0));
             this.asm.pushR64(0);
-            this.genExpr(rhs);
+            this.genExprAsType(rhs, this.inferExprType(lhs));
             this.asm.movRR64(1, 0);
             this.asm.popR64(0);
             this.asm.movMBaseR(0, 1, 0);
@@ -15215,10 +15279,10 @@ public void genNewCall(Node call) {
                 // elements box correctly.
                 string lhsArrType = this.getLocalType(lhs.name);
                 this.genExprAsType(rhs, lhsArrType);
-                this.coerceStoreToDouble(lhs, rhs);
+                
             } else {
-                this.genExpr(rhs);
-                this.coerceStoreToDouble(lhs, rhs);
+                this.genExprAsType(rhs, this.inferExprType(lhs));
+                
             }
             // Declared-then-assigned objects (`FBox b; b = new FBox();`) and
             // untyped vars (`var v; v = new C();`) get their class registered
@@ -15322,14 +15386,14 @@ public void genNewCall(Node call) {
                 int thisOff = this.findLocal("this");
                 int fieldOff = this.findFieldOffset(this.currentClassName, fieldName);
                 if (fieldOff < 0) {
-                    this.genExpr(rhs);
+                    this.genExprAsType(rhs, this.inferExprType(lhs));
                     return;
                 }
                 this.assertWritableField(this.currentClassName, fieldName, lhs);
 
                 if (this.checkVisibleStore(this.currentClassName, fieldName)) { return; }
-                this.genExpr(rhs);
-                this.coerceStoreToDouble(lhs, rhs);
+                this.genExprAsType(rhs, this.inferExprType(lhs));
+                
                 this.asm.pushR64(0);
                 this.asm.movRMBase(0, 5, thisOff);
                 this.asm.addRI32(0, fieldOff);
@@ -15346,13 +15410,13 @@ public void genNewCall(Node call) {
                 if (elemType != "") { lookupType = elemType; }
                 int fieldOff = this.findFieldOffset(lookupType, fieldName);
                 if (fieldOff < 0) {
-                    this.genExpr(rhs);
+                    this.genExprAsType(rhs, this.inferExprType(lhs));
                     return;
                 }
                 this.assertWritableField(lookupType, fieldName, lhs);
                 if (this.checkVisibleStore(lookupType, fieldName)) { return; }
-                this.genExpr(rhs);
-                this.coerceStoreToDouble(lhs, rhs);
+                this.genExprAsType(rhs, this.inferExprType(lhs));
+                
                 this.asm.pushR64(0);
                 if (off != 0) {
                     this.asm.movRMBase(0, 5, off);
@@ -15382,14 +15446,14 @@ public void genNewCall(Node call) {
                     if (this.checkVisibleStore(ownerType, fieldName)) { return; }
                     this.genExpr(obj);
                     this.asm.pushR64(0);
-                    this.genExpr(rhs);
-                    this.coerceStoreToDouble(lhs, rhs);
+                    this.genExprAsType(rhs, this.inferExprType(lhs));
+                    
                     this.asm.movRR64(12, 0);
                     this.asm.popR64(0);
                     this.asm.addRI32(0, fieldOff);
                     this.asm.movMBaseR(0, 12, 0);
                 } else {
-                    this.genExpr(rhs);
+                    this.genExprAsType(rhs, this.inferExprType(lhs));
                 }
                 return;
             }
@@ -15423,8 +15487,8 @@ public void genNewCall(Node call) {
                         if (rhs.kind == 74 && this.isStructTypeName(wFieldType)) {
                             this.genStructLiteral(rhs, wFieldType);
                         } else {
-                            this.genExpr(rhs);
-                            this.coerceStoreToDouble(lhs, rhs);
+                            this.genExprAsType(rhs, this.inferExprType(lhs));
+                            
                         }
                         this.asm.pushR64(0);
                         this.genArrayIndex(obj);
@@ -15434,7 +15498,7 @@ public void genNewCall(Node call) {
                         return;
                     }
                 }
-                this.genExpr(rhs);
+                this.genExprAsType(rhs, this.inferExprType(lhs));
                 return;
             }
         }
@@ -15470,8 +15534,8 @@ public void genNewCall(Node call) {
                     // struct object, not a dict.
                     this.genStructLiteral(rhs, idxElemType);
                 } else {
-                    this.genExpr(rhs);
-                    this.coerceStoreToDouble(lhs, rhs);
+                    this.genExprAsType(rhs, this.inferExprType(lhs));
+                    
                 }
                 this.asm.pushR64(0);
                 this.asm.movRMBase(11, 5, arrOff);
@@ -15506,8 +15570,8 @@ public void genNewCall(Node call) {
                     // base: same struct (not dict) boxing as the local arm.
                     this.genStructLiteral(rhs, idxElemType2);
                 } else {
-                    this.genExpr(rhs);
-                    this.coerceStoreToDouble(lhs, rhs);
+                    this.genExprAsType(rhs, this.inferExprType(lhs));
+                    
                 }
                 this.asm.movRR64(12, 0);
                 this.asm.popR64(0);
@@ -15520,7 +15584,7 @@ public void genNewCall(Node call) {
                 return;
             }
         }
-        this.genExpr(rhs);
+        this.genExprAsType(rhs, this.inferExprType(lhs));
     }
 
     public void genCoalesceAssign(Node bin) {
@@ -16050,7 +16114,7 @@ public void genNewCall(Node call) {
     }
 
     public bool isCharExpr(Node expr) {
-        if (expr.kind == 3) { return true; }
+        if (expr.kind == 3 || this.inferExprType(expr) == "char") { return true; }
         if (expr.kind == 75) {
             if (expr.childCount() > 0) { return this.isCharExpr(expr.child(0)); }
             return false;
@@ -16084,6 +16148,7 @@ public void genNewCall(Node call) {
     // arithmetic results, calls and consts stay signed there, so they stay
     // signed here too).
     public bool isUint64Like(Node expr) {
+        if (this.inferExprType(expr) == "uint64") { return true; }
         if (expr.kind == 75) {
             if (expr.childCount() > 0) { return this.isUint64Like(expr.child(0)); }
             return false;
@@ -16197,6 +16262,7 @@ public void genNewCall(Node call) {
             // IEEE-754 double bit pattern. silverc-rs's parser normalizes all
             // three spellings to double() and is_float_expr matches them here.
             if (!expr.isMember && (cn == "float" || cn == "double" || cn == "float64")) { return true; }
+            if ((cn == "toFloat" || cn == "toFloat64") && expr.isMember && expr.childCount() > 0 && this.isScalarValueType(this.inferExprType(expr.child(0)))) { return true; }
             if ((cn == "toFloat" || cn == "toFloat64") && expr.isMember && expr.childCount() > 0) {
                 string crt = this.inferExprType(expr.child(0));
                 if (crt == "float" || crt == "float64" || crt == "double"
@@ -17202,11 +17268,13 @@ public void genNewCall(Node call) {
                 if (strLike) { this.addFormatStr("%s\n"); }
                 else if (fltLike) { this.addFormatStr("%g\n"); }
                 else if (charLike) { this.addFormatStr("%c\n"); }
+                else if (this.isUint64Like(arg)) { this.addFormatStr("%llu\n"); }
                 else { this.addFormatStr("%lld\n"); }
             } else {
                 if (strLike) { this.addFormatStr("%s"); }
                 else if (fltLike) { this.addFormatStr("%g"); }
                 else if (charLike) { this.addFormatStr("%c"); }
+                else if (this.isUint64Like(arg)) { this.addFormatStr("%llu"); }
                 else { this.addFormatStr("%lld"); }
             }
             this.asm.popR64(2);
@@ -18303,7 +18371,7 @@ public void genNewCall(Node call) {
         this.asm.emitCallTeardown();
         int bufOff = this.allocLocal("__i2s_buf");
         this.asm.movMBaseR(5, 0, bufOff);
-        this.addFormatStr("%lld");
+        if (this.isUint64Like(expr)) { this.addFormatStr("%llu"); } else { this.addFormatStr("%lld"); }
         this.asm.movRMBase(8, 5, valOff);
         this.asm.movRR64(2, 1);
         this.asm.movRMBase(1, 5, bufOff);
