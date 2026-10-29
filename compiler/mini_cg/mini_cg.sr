@@ -10782,6 +10782,10 @@ public void genNewCall(Node call) {
                 if (probeType[probeType.length - 2] == '[' && probeType[probeType.length - 1] == ']') { probeArr = true; }
             }
         }
+        // Either floating argument selects math's floating comparison overload.
+        if (wantMod == "math" && (name == "min" || name == "max") && probeB != null) {
+            if (this.isFloatLike(probeB)) { probeFloat = true; }
+        }
         for (int i = 0; i < this.funcNames.length; i++) {
             // A module-qualified call (wantMod set) matches only globals
             // collected from the named module; every other caller keeps the
@@ -11233,14 +11237,26 @@ public void genNewCall(Node call) {
             // would otherwise clobber the volatile argument registers
             // (rcx/rdx/r8/r9) already holding earlier arguments.
             for (int i = 0; i < totalArgs; i++) {
+                Node argument = null;
                 if (i < explicitArgs) {
                     if (packedArg != null && i == packIndex) {
-                        this.genExpr(packedArg);
+                        argument = packedArg;
                     } else {
-                        this.genExpr(call.child(i + argStart));
+                        argument = call.child(i + argStart);
                     }
                 } else if (funcIdx < this.funcParamStarts.length && this.funcParamStarts[funcIdx] + i < this.funcParamDefaults.length) {
-                    this.genExpr(this.funcParamDefaults[this.funcParamStarts[funcIdx] + i]);
+                    argument = this.funcParamDefaults[this.funcParamStarts[funcIdx] + i];
+                }
+                if (argument != null) {
+                    this.genExpr(argument);
+                    int parameter = this.funcParamStarts[funcIdx] + i;
+                    if (parameter < this.funcParamTypes.length) {
+                        string paramType = this.funcParamTypes[parameter];
+                        if ((paramType == "float" || paramType == "float64" || paramType == "double") && !this.isFloatLike(argument)) {
+                            this.emitCvtsi2sdRax();
+                            this.asm.movqR64XMM(0, 0);
+                        }
+                    }
                 } else {
                     this.asm.xorRR64(0, 0);
                 }

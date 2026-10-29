@@ -1,210 +1,255 @@
 mod export math;
 
-// DOCS -- public `math` module (see UNIFIED_CORE_LIBRARY.md).
-// This is the pure-Silver numeric module: no win32 layer at all -- every
-// body is plain Silver arithmetic and the module opens with no DLL import
-// (not even msvcrt). With no DLL work there is nothing to gate and no `os`
-// import; the public functions are the only functions, their bodies inline.
-//
-// BODIES: sin/cos call pow/fact, pow calls expHelper, expHelper calls ln,
-// round calls floor/ceil, and sqrt/ln call the bare `abs`, which resolves
-// to the float64 overload (probed: routing those inner abs calls to the int
-// overload changes ln's iteration count and with it the observable
-// results).
-//
-// DISPATCH NOTE (per compiler): silverc-rs answers every qualified
-// `math.<fn>(...)` call with its native builtins before any symbol lookup
-// -- codegen.rs lowers a `math.`-prefixed call straight into
-// stdlib::math::gen_math_call (msvcrt IAT sentinels for cos/sin/tan/pow/
-// sqrt/floor/ceil/round/ln/log10, inline sign-bit clear for abs, rand for
-// random, inline compares for max/min, a GP loop for sum, a compile-time
-// constant fold for eval) -- and "math" is in rs's builtin_modules_set, so
-// `import * from math;` never resolves to a file and this file is never
-// read there. The self-hosted compiler has no math intercept at all: "math"
-// is only on the driver's hand-prepend/visibility lists
-// (compiler_driver.sr / visibility.sr), the source is collected from
-// std/math.sr, and the qualified calls dispatch to these globals directly.
-// Each compiler therefore runs its own implementation with its own
-// user-observable results.
-//
-// FLOAT64 PARITY NOTE: the numeric results travel as IEEE-754 bit patterns
-// in GP registers end-to-end (see mini_cg float paths / rs codegen float
-// handling). The self-hosted observable results -- including its float64
-// lowering quirks (float compound assignment inside loops, the overload tie
-// that sends the inner abs calls to the float body, float64 constants
-// printing via the int const path) -- are pinned by probe tests. The PI/E
-// constants are pure data, never gate-hop, and their self-hosted print
-// behavior is part of the pinned surface. tan/log10/hypot are `<<`
-// one-liner globals (ungated pure delegation to this module's own
-// primitives); eval() and the MathEvalParser class are likewise pure Silver
-// -- integer arithmetic, string indexing and throw only.
-
+// Pure Silver numeric routines. Range reduction keeps intermediate values
+// bounded; iterative arithmetic uses explicit floating-point assignments.
+// round resolves exact halves toward positive infinity on every backend.
 public const float64 PI = 3.141592653589793;
+public const float64 pi = 3.141592653589793;
 public const float64 E = 2.718281828459045;
 
-public float64 abs(float64 x) {
-    if (x < 0.0) { return -x; }
-    return x;
+private float64 mathInfinity() {
+    float64 large = 1e308;
+    return large * large;
 }
 
-public int abs(int x) {
-    if (x < 0) { return -x; }
-    return x;
+private float64 mathNan() {
+    float64 zero = 0.0;
+    return zero / zero;
 }
 
-private float64 fact(int n) {
-    float64 r = 1.0;
-    for (int i = 2; i <= n; i++) { r *= float64(i); }
-    return r;
+public float64 abs(float64 value) {
+    if (value == 0.0) { return 0.0; }
+    if (value < 0.0) { return -value; }
+    return value;
 }
 
-public float64 sin(float64 x) {
-    float64 r = 0.0;
-    int sign = 1;
-    for (int i = 0; i < 15; i++) {
-        int n = 2 * i + 1;
-        float64 term = pow(x, n) / fact(n);
-        if (sign > 0) { r += term; } else { r -= term; }
-        sign = -sign;
+public int abs(int value) {
+    if (value < 0) { return -value; }
+    return value;
+}
+
+public float64 sqrt(float64 value) {
+    if (!(value >= 0.0)) { return mathNan(); }
+    if (value == 0.0 || value > 1.7976931348623157e308) { return value; }
+    float64 scale = 1.0;
+    while (value > 4.0) { value = value * 0.25; scale = scale * 2.0; }
+    while (value < 1.0) { value = value * 4.0; scale = scale * 0.5; }
+    float64 guess = 1.0;
+    for (int i = 0; i < 9; i++) { guess = 0.5 * (guess + value / guess); }
+    return guess * scale;
+}
+
+public float64 floor(float64 value) {
+    // At and beyond 2^52 every finite double is already integral. Avoid
+    // converting these values (or infinities/NaN) to a signed integer.
+    if (!(value > -4503599627370496.0 && value < 4503599627370496.0)) { return value; }
+    int n = int(value);
+    float64 result = float64(n);
+    if (result > value) { return result - 1.0; }
+    return result;
+}
+
+public float64 ceil(float64 value) {
+    if (!(value > -4503599627370496.0 && value < 4503599627370496.0)) { return value; }
+    int n = int(value);
+    float64 result = float64(n);
+    if (result < value) { return result + 1.0; }
+    return result;
+}
+
+public float64 round(float64 value) {
+    float64 lower = floor(value);
+    if (value - lower < 0.5) { return lower; }
+    return ceil(value);
+}
+
+public float64 ln(float64 value) {
+    if (!(value >= 0.0)) { return mathNan(); }
+    if (value == 0.0) { return -mathInfinity(); }
+    if (value > 1.7976931348623157e308) { return value; }
+    int power = 0;
+    while (value > 2.0) { value = value * 0.5; power++; }
+    while (value < 1.0) { value = value * 2.0; power--; }
+    float64 y = (value - 1.0) / (value + 1.0);
+    float64 square = y * y;
+    float64 term = y;
+    float64 result = y;
+    for (int i = 3; i < 61; i += 2) {
+        term = term * square;
+        result = result + term / float64(i);
     }
-    return r;
+    return 2.0 * result + float64(power) * 0.6931471805599453;
 }
 
-public float64 cos(float64 x) {
-    float64 r = 0.0;
-    int sign = 1;
-    for (int i = 0; i < 15; i++) {
-        int n = 2 * i;
-        float64 term = pow(x, n) / fact(n);
-        if (sign > 0) { r += term; } else { r -= term; }
-        sign = -sign;
-    }
-    return r;
-}
+public float64 log(float64 value) { return ln(value); }
+public float64 log10(float64 value) { return ln(value) / 2.302585092994046; }
 
-public float64 tan(float64 x) << sin(x) / cos(x);
-
-public float64 pow(float64 base, float64 exp) {
-    if (exp == 0.0) { return 1.0; }
-    if (exp == 1.0) { return base; }
-    if (exp == 2.0) { return base * base; }
-    bool negExp = exp < 0.0;
-    if (negExp) { exp = -exp; }
-    int e = (int)exp;
-    float64 frac = exp - float64(e);
-    float64 r = 1.0;
-    for (int i = 0; i < e; i++) { r *= base; }
-    if (frac > 0.0) {
-        r *= expHelper(base, frac, 20);
-    }
-    if (negExp) { r = 1.0 / r; }
-    return r;
-}
-
-private float64 expHelper(float64 base, float64 exp, int terms) {
-    float64 lnBase = ln(base);
-    float64 x = lnBase * exp;
-    float64 r = 1.0;
+public float64 exp(float64 value) {
+    if (!(value <= mathInfinity() && value >= -mathInfinity())) { return value; }
+    if (value > 709.782712893384) { return mathInfinity(); }
+    if (value < -745.1332191019411) { return 0.0; }
+    float64 quotient = value / 0.6931471805599453;
+    if (quotient < 0.0) { quotient = quotient - 0.5; }
+    else { quotient = quotient + 0.5; }
+    int power = int(quotient);
+    float64 remainder = (value - float64(power) * 0.6931471803691238)
+        - float64(power) * 0.00000000019082149292705877;
+    float64 result = 1.0;
     float64 term = 1.0;
-    for (int i = 1; i <= terms; i++) {
-        term *= x / float64(i);
-        r += term;
+    for (int i = 1; i <= 20; i++) {
+        term = term * (remainder / float64(i));
+        result = result + term;
     }
-    return r;
+    while (power > 0) { result = result * 2.0; power--; }
+    while (power < 0) { result = result * 0.5; power++; }
+    return result;
 }
 
-public float64 sqrt(float64 x) {
-    if (x <= 0.0) { return 0.0; }
-    float64 guess = x / 2.0;
-    for (int i = 0; i < 50; i++) {
-        float64 next = (guess + x / guess) / 2.0;
-        if (abs(next - guess) < 1e-15) { break; }
-        guess = next;
+public float64 pow(float64 base, float64 exponent) {
+    if (exponent == 0.0 || base == 1.0) { return 1.0; }
+    if (!(base <= mathInfinity() && base >= -mathInfinity() && exponent <= mathInfinity() && exponent >= -mathInfinity())) { return mathNan(); }
+    if (base == 0.0) {
+        if (exponent < 0.0) { return mathInfinity(); }
+        return 0.0;
     }
-    return guess;
+    if (exponent > -9223372036854775808.0 && exponent < 9223372036854775807.0) {
+        int power = int(exponent);
+        if (float64(power) == exponent) {
+            if (power < 0) { base = 1.0 / base; power = -power; }
+            float64 result = 1.0;
+            while (power > 0) {
+                if ((power & 1) != 0) { result = result * base; }
+                power = power >> 1;
+                if (power > 0) { base = base * base; }
+            }
+            return result;
+        }
+        if (base < 0.0) { return mathNan(); }
+    }
+    // Exponents beyond the signed integer range are even binary64 integers.
+    if (base == -1.0) { return 1.0; }
+    if (base < 0.0) { return exp(exponent * ln(-base)); }
+    return exp(exponent * ln(base));
 }
 
-public float64 floor(float64 x) {
-    int n = (int)x;
-    if (float64(n) > x) { return float64(n - 1); }
-    return float64(n);
+// Payne-Hanek reduction: 70 base-2^24 limbs of 2/pi cover every finite
+// binary64 exponent. Products of three limbs stay within signed int64.
+private float64 mathAngle(float64 value) {
+    if (!(value <= 1.7976931348623157e308 && value >= -1.7976931348623157e308)) { return mathNan(); }
+    float64 magnitude = value;
+    if (magnitude < 0.0) { magnitude = -magnitude; }
+    if (magnitude < 1000000.0) {
+        float64 turns = floor(value / 6.283185307179586 + 0.5);
+        return (value - turns * 6.2831853069365025) - turns * 0.0000000002430840202602477;
+    }
+    int[] digits = [10680707, 7228996, 1387004, 2578385, 16069853, 12639074, 9804092, 4427841, 16666979, 11263675, 12935607, 2387514, 4345298, 14681673, 3074569, 13734428, 16653803, 1880361, 10960616, 8533493, 3062596, 8710556, 7349940, 6258241, 3772886, 3769171, 3798172, 8675211, 12450088, 3874808, 9961438, 366607, 15675153, 9132554, 7151469, 3571407, 2607881, 12013382, 4155038, 6285869, 7677882, 13102053, 15825725, 473591, 9065106, 15363067, 6271263, 9264392, 5636912, 4652155, 7056368, 13614112, 10155062, 1944035, 9527646, 15080200, 6658437, 6231200, 6832269, 16767104, 5075751, 3212806, 1398474, 7579849, 6349435, 12618859, 4703257, 12806093, 14477321, 2786137];
+    int exponent = 0;
+    while (magnitude >= 2.0) { magnitude = magnitude * 0.5; exponent++; }
+    int significand = int(magnitude * 4503599627370496.0);
+    int[] parts = [significand & 16777215, (significand >> 24) & 16777215, significand >> 48];
+    int[] product = new int[73];
+    for (int i = 0; i < 70; i++) {
+        for (int j = 0; j < 3; j++) {
+            product[i + j] = product[i + j] + digits[69 - i] * parts[j];
+        }
+    }
+    for (int i = 0; i < 72; i++) {
+        product[i + 1] = product[i + 1] + (product[i] >> 24);
+        product[i] = product[i] & 16777215;
+    }
+    int point = 1680 - exponent + 52;
+    int quadrant = ((product[point / 24] >> (point % 24)) & 1)
+        + 2 * ((product[(point + 1) / 24] >> ((point + 1) % 24)) & 1);
+    float64 fraction = 0.0;
+    float64 weight = 0.5;
+    for (int i = 1; i <= 60; i++) {
+        int bit = point - i;
+        if (((product[bit / 24] >> (bit % 24)) & 1) != 0) { fraction = fraction + weight; }
+        weight = weight * 0.5;
+    }
+    if (fraction > 0.5) { fraction = fraction - 1.0; quadrant = (quadrant + 1) & 3; }
+    float64 angle = (float64(quadrant) + fraction) * 1.5707963267948966;
+    if (angle > 3.141592653589793) { angle = angle - 6.283185307179586; }
+    if (value < 0.0) { angle = -angle; }
+    return angle;
 }
 
-public float64 ceil(float64 x) {
-    int n = (int)x;
-    if (float64(n) < x) { return float64(n + 1); }
-    return float64(n);
+public float64 sin(float64 value) {
+    float64 x = mathAngle(value);
+    if (x > 1.5707963267948966) { x = 3.141592653589793 - x; }
+    if (x < -1.5707963267948966) { x = -3.141592653589793 - x; }
+    float64 term = x;
+    float64 result = x;
+    for (int i = 1; i < 14; i++) {
+        term = -term * x * x / float64((2 * i) * (2 * i + 1));
+        result = result + term;
+    }
+    return result;
 }
 
-public float64 round(float64 x) {
-    float64 f = x - floor(x);
-    if (f < 0.5) { return floor(x); }
-    return ceil(x);
+public float64 cos(float64 value) {
+    float64 x = mathAngle(value);
+    float64 sign = 1.0;
+    if (x > 1.5707963267948966) { x = 3.141592653589793 - x; sign = -1.0; }
+    if (x < -1.5707963267948966) { x = -3.141592653589793 - x; sign = -1.0; }
+    float64 term = 1.0;
+    float64 result = 1.0;
+    for (int i = 1; i < 14; i++) {
+        term = -term * x * x / float64((2 * i - 1) * (2 * i));
+        result = result + term;
+    }
+    return sign * result;
 }
 
-public float64 max(float64 a, float64 b) {
-    if (a > b) { return a; }
-    return b;
+public float64 tan(float64 value) { return sin(value) / cos(value); }
+
+public float64 hypot(float64 first, float64 second) {
+    float64 a = abs(first);
+    float64 b = abs(second);
+    if (a > 1.7976931348623157e308 || b > 1.7976931348623157e308) { return mathInfinity(); }
+    if (a < b) { float64 temp = a; a = b; b = temp; }
+    if (a == 0.0) { return b; }
+    float64 ratio = b / a;
+    return a * sqrt(1.0 + ratio * ratio);
 }
 
-public float64 min(float64 a, float64 b) {
-    if (a < b) { return a; }
-    return b;
+public float64 max(float64 first, float64 second) {
+    if (first > second) { return first; }
+    return second;
+}
+public float64 min(float64 first, float64 second) {
+    if (first < second) { return first; }
+    return second;
+}
+public int max(int first, int second) {
+    if (first > second) { return first; }
+    return second;
+}
+public int min(int first, int second) {
+    if (first < second) { return first; }
+    return second;
 }
 
-public int max(int a, int b) {
-    if (a > b) { return a; }
-    return b;
+private class MathRandomState {
+    public prop int seed;
+    construct { this.seed = 42; }
 }
-
-public int min(int a, int b) {
-    if (a < b) { return a; }
-    return b;
-}
+private MathRandomState mathRandomState = new MathRandomState();
 
 public float64 random() {
-    int seed = 42;
-    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
-    return float64(seed) / 2147483648.0;
+    mathRandomState.seed = (mathRandomState.seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    return float64(mathRandomState.seed) / 2147483648.0;
 }
 
-public float64 ln(float64 x) {
-    if (x <= 0.0) { return -1e308; }
-    float64 y = (x - 1.0) / (x + 1.0);
-    float64 r = 0.0;
-    float64 term = y;
-    for (int i = 1; i < 100; i += 2) {
-        r += term / float64(i);
-        if (abs(term / float64(i)) < 1e-15) { break; }
-        term *= y * y;
-    }
-    return 2.0 * r;
+public float64 sum(float64[] values) {
+    float64 result = 0.0;
+    for (int i = 0; i < values.length; i++) { result = result + values[i]; }
+    return result;
 }
-
-public float64 log10(float64 x) << ln(x) / 2.302585092994046;
-
-public float64 exp(float64 x) {
-    float64 r = 1.0;
-    float64 term = 1.0;
-    for (int i = 1; i <= 30; i++) {
-        term *= x / float64(i);
-        r += term;
-    }
-    return r;
-}
-
-public float64 hypot(float64 a, float64 b) << sqrt(a * a + b * b);
-
-public float64 sum(float64[] arr) {
-    float64 s = 0.0;
-    for (int i = 0; i < arr.length; i++) { s += arr[i]; }
-    return s;
-}
-
-public int sum(int[] arr) {
-    int s = 0;
-    for (int i = 0; i < arr.length; i++) { s += arr[i]; }
-    return s;
+public int sum(int[] values) {
+    int result = 0;
+    for (int i = 0; i < values.length; i++) { result = result + values[i]; }
+    return result;
 }
 
 // math.eval(expression) evaluates a string containing a mathematical
@@ -213,9 +258,8 @@ public int sum(int[] arr) {
 // + - * / % == != < <= > >= with standard Silver precedence. It never
 // executes Silver statements or arbitrary code.
 //
-// Division by zero surfaces the native divide-by-zero exception; malformed
-// expressions and values that cannot be parsed raise a math evaluation
-// exception (throw 1).
+// Division by zero, malformed input, and integer overflow raise a math
+// evaluation exception (throw 1).
 class MathEvalParser {
     string src;
     int pos;
@@ -255,19 +299,19 @@ class MathEvalParser {
             this.skipWs();
             char c = this.peek();
             if (c == '=' && this.pos + 1 < this.src.length && this.src[this.pos + 1] == '=') {
-                this.pos += 2;
+                this.pos = this.pos + 2;
                 int right = this.parseAdd();
                 if (left == right) { left = 1; } else { left = 0; }
             } else if (c == '!' && this.pos + 1 < this.src.length && this.src[this.pos + 1] == '=') {
-                this.pos += 2;
+                this.pos = this.pos + 2;
                 int right = this.parseAdd();
                 if (left != right) { left = 1; } else { left = 0; }
             } else if (c == '<' && this.pos + 1 < this.src.length && this.src[this.pos + 1] == '=') {
-                this.pos += 2;
+                this.pos = this.pos + 2;
                 int right = this.parseAdd();
                 if (left <= right) { left = 1; } else { left = 0; }
             } else if (c == '>' && this.pos + 1 < this.src.length && this.src[this.pos + 1] == '=') {
-                this.pos += 2;
+                this.pos = this.pos + 2;
                 int right = this.parseAdd();
                 if (left >= right) { left = 1; } else { left = 0; }
             } else if (c == '<') {
@@ -284,6 +328,31 @@ class MathEvalParser {
         }
     }
 
+    int add(int left, int right) {
+        if (right > 0 && left > 9223372036854775807 - right) { throw 1; }
+        if (right < 0 && left < (-9223372036854775807 - 1) - right) { throw 1; }
+        return left + right;
+    }
+
+    int subtract(int left, int right) {
+        if (right < 0 && left > 9223372036854775807 + right) { throw 1; }
+        if (right > 0 && left < (-9223372036854775807 - 1) + right) { throw 1; }
+        return left - right;
+    }
+
+    int multiply(int left, int right) {
+        int minimum = -9223372036854775807 - 1;
+        int maximum = 9223372036854775807;
+        if (left > 0) {
+            if (right > 0 && left > maximum / right) { throw 1; }
+            if (right < 0 && right < minimum / left) { throw 1; }
+        } else if (left < 0) {
+            if (right > 0 && left < minimum / right) { throw 1; }
+            if (right < 0 && left < maximum / right) { throw 1; }
+        }
+        return left * right;
+    }
+
     int parseAdd() {
         int left = this.parseMul();
         while (true) {
@@ -292,11 +361,11 @@ class MathEvalParser {
             if (c == '+') {
                 this.pos++;
                 int right = this.parseMul();
-                left += right;
+                left = this.add(left, right);
             } else if (c == '-') {
                 this.pos++;
                 int right = this.parseMul();
-                left -= right;
+                left = this.subtract(left, right);
             } else {
                 return left;
             }
@@ -311,15 +380,18 @@ class MathEvalParser {
             if (c == '*') {
                 this.pos++;
                 int right = this.parseUnary();
-                left = left * right;
+                left = this.multiply(left, right);
             } else if (c == '/') {
                 this.pos++;
                 int right = this.parseUnary();
+                if (right == 0 || (left == (-9223372036854775807 - 1) && right == -1)) { throw 1; }
                 left = left / right;
             } else if (c == '%') {
                 this.pos++;
                 int right = this.parseUnary();
-                left = left % right;
+                if (right == 0) { throw 1; }
+                if (right == -1) { left = 0; }
+                else { left = left % right; }
             } else {
                 return left;
             }
@@ -331,13 +403,35 @@ class MathEvalParser {
         char c = this.peek();
         if (c == '-') {
             this.pos++;
-            return 0 - this.parseUnary();
+            this.skipWs();
+            char next = this.peek();
+            if (next >= '0' && next <= '9') { return this.parseNumber(true); }
+            int value = this.parseUnary();
+            if (value == (-9223372036854775807 - 1)) { throw 1; }
+            return 0 - value;
         }
         if (c == '+') {
             this.pos++;
             return this.parseUnary();
         }
         return this.parsePrimary();
+    }
+
+    int parseNumber(bool negative) {
+        int value = 0;
+        while (this.pos < this.src.length) {
+            char digit = this.src[this.pos];
+            if (digit < '0' || digit > '9') { break; }
+            int next = digit - '0';
+            // Accumulate negative literals negatively so INT64_MIN is valid.
+            if (negative) {
+                value = this.subtract(this.multiply(value, 10), next);
+            } else {
+                value = this.add(this.multiply(value, 10), next);
+            }
+            this.pos++;
+        }
+        return value;
     }
 
     int parsePrimary() {
@@ -353,19 +447,7 @@ class MathEvalParser {
             }
             throw 1;
         }
-        if (c >= '0' && c <= '9') {
-            int value = 0;
-            while (this.pos < this.src.length) {
-                char d = this.src[this.pos];
-                if (d >= '0' && d <= '9') {
-                    value = value * 10 + (d - '0');
-                    this.pos++;
-                } else {
-                    break;
-                }
-            }
-            return value;
-        }
+        if (c >= '0' && c <= '9') { return this.parseNumber(false); }
         throw 1;
     }
 }
