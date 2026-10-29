@@ -4781,6 +4781,7 @@ int strIdx = this.stringPatchIndices[i];
     }
 
     public void genExprAsType(Node expr, string typeName) {
+        if (typeName == "string" && this.isCharLike(expr)) { this.genCharToString(expr); return; }
         if (expr.kind == 74 && this.isStructTypeName(typeName)) {
             this.genStructLiteral(expr, typeName);
             return;
@@ -5371,10 +5372,12 @@ int strIdx = this.stringPatchIndices[i];
             this.genExpr(expr.child(0));
             this.asm.cmpRI32(0, 0);
             this.asm.jeLabel(elseLbl);
-            this.genExpr(expr.child(1));
+            string branchType = "";
+            if (this.isFloatLike(expr.child(1)) || this.isFloatLike(expr.child(2))) { branchType = "double"; }
+            this.genExprAsType(expr.child(1), branchType);
             this.asm.jmpLabel(endLbl);
             this.asm.bindLabel(elseLbl);
-            this.genExpr(expr.child(2));
+            this.genExprAsType(expr.child(2), branchType);
             this.asm.bindLabel(endLbl);
         } else if (kind == 20) {
             this.genMatch(expr);
@@ -8470,7 +8473,7 @@ int strIdx = this.stringPatchIndices[i];
                 }
             }
         }
-        this.genExpr(valNode);
+        this.genExprAsType(valNode, this.arrayElementType(this.inferExprType(arrNode)));
         int valOff = this.allocLocal("__arr_add_val");
         this.asm.movMBaseR(5, 0, valOff);
         int needGrow = this.newLabel();
@@ -16181,6 +16184,9 @@ public void genNewCall(Node call) {
     }
 
     public bool isFloatLike(Node expr) {
+        if (expr.kind == 65 && expr.childCount() >= 3) {
+            return this.isFloatLike(expr.child(1)) || this.isFloatLike(expr.child(2));
+        }
         // True for expressions that evaluate to a float64/float/double: float
         // literals (kind 1), float locals/fields, and arithmetic on floats.
         // These must be printed with %g (the IEEE-754 bits travel in the same
