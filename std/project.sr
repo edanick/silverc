@@ -1430,6 +1430,37 @@ string projectExpandCollections(string source, string root, string collections) 
     return lineParts.join("");
 }
 
+// Add one source file to the counted set. The key is the separator-
+// normalized spelling: the manifest spells a source dir its own way
+// (`"src/core"`), so the same file reached through the entry and through
+// the walk carries two different strings.
+void projectCountFile(string file, ProjectVisited seen) {
+    string key = path.normalize(file);
+    if (seen.contains(key)) { return; }
+    seen.add(key);
+}
+
+// Number of source files the manifest collects: the entry plus every `.sr`
+// file under the `sources` dirs, minus `exclude`. A directory listing only
+// — no file is read, lexed or parsed — so the progress total costs a
+// fraction of the compile (MEMORY.md M1: no counting pre-pass).
+int projectSourceFileCount(string root, string entry, string[] sources, string[] excludes) {
+    ProjectVisited seen = new ProjectVisited();
+    if (entry.length > 0) {
+        string[] got = projectAddEntry(root, entry, excludes);
+        for (int i = 0; i < got.length; i++) {
+            projectCountFile(got[i], seen);
+        }
+    }
+    for (int s = 0; s < sources.length; s++) {
+        string[] got2 = projectAddEntry(root, sources[s], excludes);
+        for (int k = 0; k < got2.length; k++) {
+            projectCountFile(got2[k], seen);
+        }
+    }
+    return seen.paths.length;
+}
+
 string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild, int[] countOut) {
     string manifest = file.readString(projectPath);
     string root = projectDirname(projectPath);
@@ -1438,15 +1469,19 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild,
     string collections = projectManifestValue(manifest, "collections");
 
     string entryPath = projectJoin(root, entry);
-    // Progress (STDERR): no counting pre-pass (it re-read and re-filtered
-    // every file just for the total). Collection reports indeterminate
-    // `[N/N]` lines while running; the exact total is pinned below, and the
-    // success-line count returns in countOut.
-    ProgressReporter progress = new ProgressReporter(1);
+    // Progress (STDERR): the module total is known up front — the manifest's
+    // source files (the entry plus the `sources` walk, minus `exclude`),
+    // counted from a directory listing. No counting pre-pass reads or
+    // re-parses anything (MEMORY.md M1): the import walk below may collect
+    // fewer files (an unimported one) or more (a std module a bundle pulls
+    // in), so the reporter raises the total as it goes and the exact count
+    // is pinned below.
+    string[] excludes = projectManifestArray(manifest, "exclude");
+    int moduleTotal = projectSourceFileCount(root, entry, sources, excludes);
+    ProgressReporter progress = new ProgressReporter(moduleTotal);
     ProjectVisited visited = new ProjectVisited();
     string collected = projectCollect(entryPath, root, sources, visited, emitMarkers, progress, debugBuild);
     progress.setTotal(progress.processedCount());
-    progress.finish();
     // TRC traces: `--debug` builds only. Every trace (and the `aggLen`
     // counter it reads) sits in a `#on DEBUG` region, so the preprocessor
     // blanks the whole trace out of release builds and no trace code reaches

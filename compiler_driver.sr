@@ -1457,11 +1457,14 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
 
     string source = file.readString(inputFile);
     if (inputIsProject) {
-        // No counting pre-pass (it re-read and re-filtered every file just
-        // for the progress total). Collection reports indeterminate `[N/N]`
-        // lines while running; the exact success-line count comes back from
-        // the single projectBuildSource pass in buildCount.
-        progress = new ProgressReporter(1);
+        // Progress (STDERR): the per-module lines are printed by the project
+        // module's own reporter (projectBuildSource), which knows the module
+        // total up front (a directory listing — no counting pre-pass, see
+        // MEMORY.md M1). This reporter only carries the codegen/emission
+        // phases, so it starts with an unknown total; the exact success-line
+        // count comes back from the single projectBuildSource pass in
+        // buildCount.
+        progress = new ProgressReporter(0);
         int[] buildCount = [];
         buildCount.add(0);
         // DOCS/260 — the .srp aggregate (markers + per-file sources) was
@@ -1583,12 +1586,14 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
         // file next to the input, under std/, or under silveri/src is
         // collected the same way. Native modules (fs/json/yaml/os + the
         // special-cased std libs above) are never read from disk.
-        // Progress (STDERR): no counting pre-pass (it re-read and
-        // re-filtered every file just for the total). Collection reports
-        // indeterminate `[N/N]` lines while running; the exact total is
-        // pinned once the single pass below finishes.
+        // Progress (STDERR): the module total is NOT known up front here — a
+        // standalone build resolves its imports as it goes, so the count only
+        // exists once the walk is over. The lines therefore carry the count
+        // alone (no count, no percentage): no counting pre-pass re-reads and
+        // re-filters every file just for the total (MEMORY.md M1). The exact
+        // total is pinned once the single pass below finishes.
         string[] moduleErrors = [];
-        progress = new ProgressReporter(1);
+        progress = new ProgressReporter(0);
         progress.moduleDone(inputFile);
         source = collectImports(source, inputFile, "", moduleErrors, flags.cacheBytecode || flags.cacheObject, progress, flags.debugBuild, exeDir);
         if (moduleErrors.length > 0) {
@@ -1603,7 +1608,6 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
         }
         progress.setTotal(progress.processedCount());
         moduleCount = progress.processedCount();
-        progress.finish();
     }
 
     // Version-metadata and subsystem inputs shared by the monolithic, object,

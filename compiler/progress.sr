@@ -4,15 +4,16 @@ import * from time;
 
 // Compilation progress reporting (ported from silverc-rs src/progress.rs,
 // commit 74a3fe4). Prints one STDERR line per module processed so the user
-// sees how far a compile has advanced: files done / files total, percentage
-// complete, and an estimated time remaining. STDERR is used on purpose —
-// stdout stays clean for program output (`print`, `threads.length`, ...).
+// sees how far a compile has advanced: files done / files total, the
+// percentage of the whole compile, and an estimated time remaining. STDERR
+// is used on purpose — stdout stays clean for program output (`print`,
+// `threads.length`, ...).
 //
-// `total` starts indeterminate (1): no counting pre-pass walks the program
-// to measure it first (that doubled all I/O, tokens and ASTs). Collection
-// reports each module as it finishes (`[N/N]` lines while collecting) and
-// the driver pins the exact total afterwards via setTotal, so the last line
-// still reads 100% and the success line keeps its exact module count.
+// `total` is the module count when it is known up front: a project build
+// counts its source files from a directory listing (never a re-parse — see
+// MEMORY.md M1), so its lines carry a real percentage. A standalone build
+// resolves its imports as it goes, so its count is 0 (unknown) and its
+// lines carry the count alone — never a made-up percentage.
 //
 // Timing rides the universal std time module: time.now() is QPC (monotonic,
 // float64 ms since boot-referenced counter), so successive readings are
@@ -21,6 +22,51 @@ import * from time;
 // wall-clock changes). Every site here is an elapsed delta, so the stamps
 // are held as float64 and truncated to whole milliseconds at use sites
 // (mirroring the driver's `int(time.now() - start)` shape).
+
+// True when `text` starts with `prefix`.
+bool progressHasPrefix(string text, string prefix) {
+    if (text.length < prefix.length) { return false; }
+    for (int i = 0; i < prefix.length; i++) {
+        if (text[i] != prefix[i]) { return false; }
+    }
+    return true;
+}
+
+// The separator the module paths are shown with: the host OS's own (`\` on
+// Windows, `/` on Linux and Mac). The shown paths are paths on the machine
+// running the compiler, so the host owns their spelling.
+char progressPathSeparator() {
+    #on WINDOWS
+    return '\\';
+    #else
+    return '/';
+    #off
+}
+
+// Display form of a module path: the Windows verbatim prefix (`\\?\`) is
+// dropped and every separator becomes the host OS's own.
+//
+// The compiler collects module paths from several sources — canonicalized
+// `\\?\`-prefixed paths, manifest spellings that carry `/` (`"src/core"`),
+// exe-relative joins — so the raw path mixes separators and prefixes. The
+// progress line is the one place every module path is shown, so it
+// normalizes once here instead of leaving the mess to the reader.
+string progressDisplayPath(string path) {
+    string rest = path;
+    if (progressHasPrefix(rest, "\\\\?\\")) {
+        rest = rest.substring(4, rest.length);
+    }
+    char sep = progressPathSeparator();
+    char other = '/';
+    if (sep == '/') { other = '\\'; }
+    string out = "";
+    for (int i = 0; i < rest.length; i++) {
+        char c = rest[i];
+        if (c == other) { out += (string)sep; }
+        else { out += (string)c; }
+    }
+    return out;
+}
 
 class ProgressReporter {
     private prop int total;
@@ -32,6 +78,8 @@ class ProgressReporter {
     private prop float64 parseDoneTick;
     private prop bool parseDoneSet;
 
+    // `total` is the module count when it is known up front, 0 when it is
+    // not (a standalone build resolves its imports as it goes).
     construct (int total) {
         this.total = total;
         this.processed = 0;
@@ -70,14 +118,6 @@ class ProgressReporter {
         if (this.enabled) {
             this.printLine(name);
         }
-    }
-
-    // Final "<pct>% done" line after the last module.
-    public void finish() {
-        if (!this.enabled) { return; }
-        int total = this.total;
-        if (total < this.processed) { total = this.processed; }
-        eprintln((string)this.percentOf(total) + "% done");
     }
 
     // Mark the parsing phase as finished. The codegen start line reports how
@@ -138,15 +178,21 @@ class ProgressReporter {
     }
 
     private void printLine(string name) {
+        string shown = progressDisplayPath(name);
+        if (this.total == 0) {
+            // Total unknown (a standalone build resolves its imports as it
+            // goes, so the count is only known once it is over): show the
+            // count alone rather than a fake "100% done" on every module.
+            eprintln("[" + (string)this.processed + "] module " + shown);
+            return;
+        }
         int total = this.total;
         if (total < this.processed) { total = this.processed; }
         int pct = this.percentOf(total);
         if (this.processed >= total) {
-            eprintln("[" + (string)this.processed + "/" + (string)total + "] module " + name + " 100% done");
-        } else if (this.processed == 0) {
-            eprintln("[" + (string)this.processed + "/" + (string)total + "] module " + name + " " + (string)pct + "% ~estimating... left");
+            eprintln("[" + (string)this.processed + "/" + (string)total + "] module " + shown + " " + (string)pct + "%");
         } else {
-            eprintln("[" + (string)this.processed + "/" + (string)total + "] module " + name + " " + (string)pct + "% ~" + this.eta() + " left");
+            eprintln("[" + (string)this.processed + "/" + (string)total + "] module " + shown + " " + (string)pct + "% ~" + this.eta() + " left");
         }
     }
 
