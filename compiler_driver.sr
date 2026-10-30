@@ -28,6 +28,14 @@ import * from progress;
 import * from visibility;
 import * from preprocess;
 import * from macx64;
+
+// LINUX (additive): the raw libc calls the driver needs to read the
+// running image's own path (/proc/self/maps) -- a proc file reports size
+// 0, so the size-based fs reader returns nothing for it. The Windows and
+// Mac builds keep the argv[0] directory and import nothing new.
+#on LINUX
+import * from linux.libc;
+#off
 // Timing and pid identity ride the universal std modules (time -> QPC behind
 // its own #on WINDOWS regions; sysinfo -> GetCurrentProcessId likewise). No
 // bare win32 import remains in the driver: the only raw OS surface left is
@@ -147,6 +155,78 @@ string tryReadFile(string path) {
         result = "";
     }
     return result;
+}
+
+// The directory of the running compiler image, or "" when it cannot be
+// read.
+//
+// argv[0] is a bare command name when the compiler runs through PATH, so it
+// carries no directory and the exe tree would stay unfound. The kernel
+// always knows the running image: on LINUX the first line of
+// /proc/self/maps names it (the image path is that line's last
+// whitespace-separated field). The caller falls back to the cwd-relative
+// module ladder when this returns "".
+//
+// LINUX (additive): the WINDOWS path keeps the argv[0] directory, so the
+// Windows bytes and behavior are untouched.
+string drvSelfDir() {
+    #on LINUX
+    string first = drvReadFirstLine("/proc/self/maps");
+    if (first.length == 0) { return ""; }
+    // The image path is the line's last whitespace-separated field.
+    int fieldStart = -1;
+    int tokenStart = -1;
+    for (int mi = 0; mi < first.length; mi++) {
+        char ch = first[mi];
+        if (ch == ' ' || ch == '\t') {
+            if (tokenStart >= 0) { fieldStart = tokenStart; tokenStart = -1; }
+        } else {
+            if (tokenStart < 0) { tokenStart = mi; }
+        }
+    }
+    if (tokenStart >= 0) { fieldStart = tokenStart; }
+    if (fieldStart < 0) { return ""; }
+    string image = projectSlice(first, fieldStart, first.length);
+    int sep = -1;
+    for (int pi = image.length - 1; pi >= 0; pi--) {
+        if (image[pi] == '/') { sep = pi; break; }
+    }
+    if (sep <= 0) { return ""; }
+    return projectSlice(image, 0, sep);
+    #off
+    return "";
+}
+
+// The first line of a file, read through the raw libc path. A proc file
+// reports size 0, so the size-based fs reader returns nothing for it: the
+// file is opened and read directly instead.
+//
+// LINUX (additive): the WINDOWS path reads nothing.
+string drvReadFirstLine(string path) {
+    #on LINUX
+    int fd = open(path, 0, 0);
+    if (fd < 0) { return ""; }
+    int[] chunk = new int[512];
+    int n = read(fd, chunk, 4096);
+    close(fd);
+    if (n <= 0) { return ""; }
+    string line = "";
+    for (int i = 0; i < n; i++) {
+        int b = drvChunkByte(chunk, i);
+        if (b == 10) { break; }
+        line += (char)b;
+    }
+    return line;
+    #off
+    return "";
+}
+
+// One byte of a packed int[] chunk (the libc buffer convention: eight
+// bytes per int, little-endian).
+int drvChunkByte(int[] chunk, int index) {
+    int slot = index / 8;
+    if (slot >= chunk.length) { return 0; }
+    return (chunk[slot] >> ((index % 8) * 8)) & 0xFF;
 }
 
 // DOCS/260 — run the `#on`/`#else`/`#off` preprocessor over one file's text.
@@ -1412,6 +1492,10 @@ void main() {
         }
         if (exeLast >= 0) { exeDir = projectSlice(exeArg, 0, exeLast); }
     }
+    // A bare command name (the compiler reached through PATH) carries no
+    // directory, so the exe tree is read from the running image itself: an
+    // installed silverc then still finds the std tree it shipped with.
+    if (exeDir.length == 0) { exeDir = drvSelfDir(); }
     if (flags.watch) {
         runWatchLoop(flags, inputIsProject, manifestText, outputFile, exeDir);
         exit(0);
