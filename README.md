@@ -15,10 +15,8 @@ one language for many possibilities.
 
 ## macOS Port
 
-- **Copyright:** © 2026 StavA
-- Enabling support for Silver on macOS
+- **Credit:** Stav A (2026) - Mac OS support, initial QA of the Mac OS version.
 - Enabling Silver compiler support on macOS (Rosetta x86_64 backend)
-- Maintainer and QA of the macOS version (unit tests)
 - Programming language creator: Edan M.
 
 ## Quick start
