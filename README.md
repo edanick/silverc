@@ -13,10 +13,10 @@ one language for many possibilities.
 - **Version:** 0.7.9.4
 - **Copyright:** © 2025 Edan M.
 
-## macOS Port
+## Mac OS Version
 
 - **Credit:** Stav A (2026) - Mac OS support, initial QA of the Mac OS version.
-- Enabling Silver compiler support on macOS (Rosetta x86_64 backend)
+- Enabling Silver compiler support on Mac OS (Rosetta x86_64 backend)
 - Programming language creator: Edan M.
 
 ## Quick start
