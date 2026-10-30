@@ -1447,17 +1447,27 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild,
     string collected = projectCollect(entryPath, root, sources, visited, emitMarkers, progress, debugBuild);
     progress.setTotal(progress.processedCount());
     progress.finish();
+    // TRC traces: `--debug` builds only. Every trace (and the `aggLen`
+    // counter it reads) sits in a `#on DEBUG` region, so the preprocessor
+    // blanks the whole trace out of release builds and no trace code reaches
+    // the parser there.
+    #on DEBUG
     eprintln("TRC nm begin");
+    #off
     NativeModules nmBuild = projectParseNativeModules(manifest);
     string stripped = projectStripDirectivesCustom(collected, nmBuild);
+    #on DEBUG
     eprintln("TRC strip done " + (string)stripped.length);
+    #off
     // One pieces buffer for the remaining stages (stripped aggregate, shipped
     // std inlines, library sources): a single terminal join replaces the old
     // chain of whole-aggregate `+=` copies. aggLen tracks the joined length
     // for the TRC traces below.
     ProjectPieces agg = new ProjectPieces();
     agg.add(stripped);
+    #on DEBUG
     int aggLen = stripped.length;
+    #off
 
     // `.qs` libraries listed under `imports` are not auto-imported; declaring
     // one only makes it available. Each bundle is read and split once (stems
@@ -1466,7 +1476,9 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild,
     // the code resolve to the library.
     string[] imports = projectManifestArray(manifest, "imports");
     string[] allBundleStems = [];
+    #on DEBUG
     eprintln("TRC stems begin " + (string)imports.length);
+    #off
     // Shipped std SOURCE modules already collected for consumed bundles
     // (keyed by module name, so every spelling dedups): two libraries
     // needing `net` inline it once.
@@ -1479,19 +1491,25 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild,
     for (int ki = 0; ki < imports.length; ki++) {
         string qsPath = projectJoin(root, imports[ki]);
         string qsContent = file.readString(qsPath);
+        #on DEBUG
         eprintln("TRC libsrc begin " + (string)ki + " " + (string)qsContent.length);
+        #off
         QsParts qsFirst = projectQsSplit(qsContent);
         for (int sj = 0; sj < qsFirst.stems.length; sj++) {
             allBundleStems.add(qsFirst.stems[sj]);
         }
+        #on DEBUG
         eprintln("TRC libsrc extracted " + (string)qsFirst.sources.length);
+        #off
         bundleParts.add(qsFirst);
     }
     for (int bi2 = 0; bi2 < bundleParts.length; bi2++) {
         QsParts qsParts = bundleParts[bi2];
         if (qsParts.sources.length > 0) {
             for (int si = 0; si < qsParts.sources.length; si++) {
+                #on DEBUG
                 eprintln("TRC scan " + (string)bi2 + "." + (string)si + " len " + (string)qsParts.sources[si].length + " body " + (string)aggLen);
+                #off
                 // DOCS/261 v1: a bundle needing an undeclared custom module
                 // fails naming the declaration. Bare sources naming project
                 // files, sibling bundle modules, or std modules are Silver
@@ -1545,7 +1563,9 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild,
                                         string stdText = projectCollect(stdPath, stdRoot, stdDirs, visited, emitMarkers, progress, debugBuild);
                                         agg.add(stdText);
                                         agg.add("\n");
+                                        #on DEBUG
                                         aggLen += stdText.length + 1;
+                                        #off
                                     }
                                 }
                             }
@@ -1559,7 +1579,9 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild,
                 }
                 agg.add(libSrc);
                 agg.add("\n");
+                #on DEBUG
                 aggLen += libSrc.length + 1;
+                #off
             }
         }
     }
