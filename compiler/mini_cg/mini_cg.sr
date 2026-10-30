@@ -9002,12 +9002,11 @@ int strIdx = this.stringPatchIndices[i];
             // value — 0 for ints/chars/bytes/bools, 0.0 for floats, ""
             // for strings via strlen (DOCS/113). This is also what the
             // C-style `(bool) x` cast lowers to in the parser. The float
-            // branch compares with ucomisd + jne, so NaN behaves exactly
-            // as `f != 0.0` does.
+            // branch ignores the sign bit so both zeros are false and
+            // all nonzero magnitudes, including NaN, are true.
             if (call.childCount() > 0) {
                 Node barg = call.child(0);
-                string bt = this.inferExprType(barg);
-                if (bt == "string") {
+                if (this.isStringLike(barg)) {
                     this.genExpr(barg);
                     this.asm.movRR64(1, 0);
                     this.addImportPatch("ucrtbase.dll", "strlen");
@@ -9018,12 +9017,10 @@ int strIdx = this.stringPatchIndices[i];
                     this.asm.callR64(0);
                     this.asm.emitCallTeardown();
                     this.asm.cmpRI32(0, 0);
-                } else if (bt == "float" || bt == "float64" || bt == "double") {
+                } else if (this.isFloatLike(barg)) {
                     this.genExpr(barg);
-                    this.emitMovqXmmGpr(0, 0);
-                    this.asm.xorRR64(2, 2);
-                    this.emitMovqXmmGpr(1, 2);
-                    this.asm.ucomisdXMM(0, 1);
+                    this.asm.shlR64Imm(0, 1);
+                    this.asm.cmpRI32(0, 0);
                 } else {
                     this.genExpr(barg);
                     this.asm.cmpRI32(0, 0);
@@ -14509,12 +14506,18 @@ public void genNewCall(Node call) {
             }
             int t = this.newLabel();
             int e = this.newLabel();
+            int f = this.newLabel();
+            if (cmpFlt) {
+                if (op == 6) { this.emitJccRel32(0x8A, t); }
+                else { this.emitJccRel32(0x8A, f); }
+            }
             if (op == 5) { this.asm.jeLabel(t); }
             else if (op == 6) { this.asm.jneLabel(t); }
             else if (op == 7) { if (cmpFlt) { this.emitJccRel32(0x82, t); } else if (cmpU64) { this.asm.jbLabel(t); } else { this.asm.jlLabel(t); } }
             else if (op == 8) { if (cmpFlt) { this.emitJccRel32(0x86, t); } else if (cmpU64) { this.asm.jbeLabel(t); } else { this.asm.jleLabel(t); } }
             else if (op == 9) { if (cmpFlt) { this.emitJccRel32(0x87, t); } else if (cmpU64) { this.asm.jaLabel(t); } else { this.asm.jgLabel(t); } }
             else if (op == 10) { if (cmpFlt) { this.emitJccRel32(0x83, t); } else if (cmpU64) { this.asm.jaeLabel(t); } else { this.asm.jgeLabel(t); } }
+            this.asm.bindLabel(f);
             this.asm.movRI64(0, 0);
             this.asm.jmpLabel(e);
             this.asm.bindLabel(t);
