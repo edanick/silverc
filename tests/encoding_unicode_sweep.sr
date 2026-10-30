@@ -1,0 +1,130 @@
+import encoding;
+
+// EXHAUSTIVE Unicode sweep: EVERY code point each encoding supports must
+// survive a round trip through the codec, byte for byte.
+//
+// The repertoire: all 1,112,064 Unicode scalar values (0x00..0x10FFFF minus
+// the 2,048 surrogates, which are not characters). The sweep runs in the
+// COMPILED suites only (silverc-rs/tests/suite, silverc/tests): a million
+// code points through an interpreted codec takes minutes, so the portable
+// root test (tests/text_encoding_roundtrip.sr) covers the single-byte
+// encodings exhaustively and the multi-byte ones at their boundaries.
+
+int failures = 0;
+
+void check(bool ok, string what) {
+    if (!ok) {
+        eprintln("FAIL: " + what);
+        failures++;
+    }
+}
+
+byte[] allocBytes(int count) {
+    return new byte[count];
+}
+
+int[] allocInts(int count) {
+    return new int[count];
+}
+
+// The n-th Unicode scalar value: the scalar values are the code points
+// with the surrogate block (0xD800..0xDFFF) skipped.
+int scalarAt(int index) {
+    int cp = index;
+    if (cp >= 0xD800) { cp = cp + 0x800; }
+    return cp;
+}
+
+void main() {
+    int scalarCount = 0x110000 - 0x800;
+
+    // UTF-8: every code point, encoded and decoded back.
+    int utf8Count = 0;
+    int utf8Bytes = 0;
+    for (int i = 0; i < scalarCount; i++) {
+        int cp = scalarAt(i);
+        int[] one = allocInts(1);
+        one[0] = cp;
+        int need = encoding.utf8Length(one);
+        if (need < 0) {
+            check(false, "utf8 length of " + cp.toString());
+            break;
+        }
+        byte[] buf = allocBytes(need);
+        int n = encoding.utf8Encode(one, buf);
+        if (n != need) {
+            check(false, "utf8 encode of " + cp.toString());
+            break;
+        }
+        int[] back = allocInts(1);
+        int m = encoding.utf8Decode(buf, back);
+        if (m != 1 || back[0] != cp) {
+            check(false, "utf8 round trip of " + cp.toString());
+            break;
+        }
+        utf8Bytes += need;
+        utf8Count++;
+    }
+    check(utf8Count == scalarCount, "utf8 encodes every code point");
+    check(utf8Bytes == 4382592, "utf8 total byte count");
+
+    // UTF-16, both byte orders.
+    int utf16Count = 0;
+    for (int i = 0; i < scalarCount; i++) {
+        int cp = scalarAt(i);
+        int[] one = allocInts(1);
+        one[0] = cp;
+        int need = encoding.utf16Length(one);
+        byte[] buf = allocBytes(need);
+        int n = encoding.utf16LeEncode(one, buf);
+        int[] back = allocInts(1);
+        int m = encoding.utf16LeDecode(buf, back);
+        if (n != need || m != 1 || back[0] != cp) {
+            check(false, "utf16le round trip of " + cp.toString());
+            break;
+        }
+        byte[] bufBe = allocBytes(need);
+        int nBe = encoding.utf16BeEncode(one, bufBe);
+        int[] backBe = allocInts(1);
+        int mBe = encoding.utf16BeDecode(bufBe, backBe);
+        if (nBe != need || mBe != 1 || backBe[0] != cp) {
+            check(false, "utf16be round trip of " + cp.toString());
+            break;
+        }
+        utf16Count++;
+    }
+    check(utf16Count == scalarCount, "utf16 encodes every code point");
+
+    // UTF-32, both byte orders.
+    int utf32Count = 0;
+    for (int i = 0; i < scalarCount; i++) {
+        int cp = scalarAt(i);
+        int[] one = allocInts(1);
+        one[0] = cp;
+        byte[] buf = allocBytes(4);
+        int n = encoding.utf32LeEncode(one, buf);
+        int[] back = allocInts(1);
+        int m = encoding.utf32LeDecode(buf, back);
+        if (n != 4 || m != 1 || back[0] != cp) {
+            check(false, "utf32le round trip of " + cp.toString());
+            break;
+        }
+        byte[] bufBe = allocBytes(4);
+        int nBe = encoding.utf32BeEncode(one, bufBe);
+        int[] backBe = allocInts(1);
+        int mBe = encoding.utf32BeDecode(bufBe, backBe);
+        if (nBe != 4 || mBe != 1 || backBe[0] != cp) {
+            check(false, "utf32be round trip of " + cp.toString());
+            break;
+        }
+        utf32Count++;
+    }
+    check(utf32Count == scalarCount, "utf32 encodes every code point");
+
+    if (failures == 0) {
+        printline("unicode exhaustive sweep OK");
+    } else {
+        eprintln("unicode exhaustive sweep FAILED (" + failures.toString() + ")");
+        exit(1);
+    }
+}

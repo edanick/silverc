@@ -1,10 +1,13 @@
 #on WINDOWS
 import * from win32.ws2_32;
+import { connect as dllConnect, listen as dllListen } from win32.ws2_32;
 import { memcpy } from win32.msvcrt;
 #on LINUX
 import * from linux.libc;
+import { connect as dllConnect, listen as dllListen } from linux.libc;
 #on MAC
 import * from mac.libsystem;
+import { connect as dllConnect, listen as dllListen } from mac.libsystem;
 #off
 
 mod export net;
@@ -16,22 +19,26 @@ mod export net;
 // functions whose WINDOWS and non-Windows bodies are identical are
 // region-free passthroughs delegating to the region-holding function.
 // One unified function name per operation, no win-prefixed helpers,
-// no wrapper indirection, no alias imports.
+// no wrapper indirection.
 //
 // NAME-COLLISION FINDING (probed on both compilers): the module's own public
 // free functions `connect(string, int)` and `listen(int)` share their names
 // with the ws2_32 exports `connect`/`listen`, and user-defined symbols win
-// resolution over DLL exports in the flat namespace. Any bare
-// `connect(sock, sa, 16)` / `listen(sock, 10)` inside a region body
-// therefore re-enters the module function (arity dispatch: same-arity user
-// decl intercepts; no-arity-match user decl is a hard type-check error).
-// The two raw exports are thus UNREACHABLE by their real names inside this
-// module -- a compiler-level finding. Every ws2_32 export used here reaches
-// the DLL: the module's own connect(string, int) / listen(int) declarations
-// win only their own arity (resolution prefers the DLL export when no user
-// declaration accepts the argument count -- true on both compilers), so
-// openTcp/bindListen call connect(sock, sa, 16) / listen(sock, 10) directly.
-// Every OTHER export used here
+// resolution over DLL exports in the flat namespace. A bare
+// `connect(sock, sa, 16)` inside a region body therefore re-enters the
+// module function -- the arity dispatch finds no 2-argument user overload
+// and the self-hosted compiler's guard rejects the call outright
+// ("no overload of 'connect' takes 3 argument(s)"), so the raw export was
+// UNREACHABLE by its real name inside this module -- a compiler-level
+// finding that made this module uncompilable by the self-hosted compiler.
+//
+// THE FIX (import aliasing): the two colliding exports are imported under
+// local names `dllConnect` / `dllListen` (the `X as Y` import-alias form,
+// already used by fs.sr for `rename as renameFile`), and the raw call sites
+// use those aliases. The DLL export is reached under a name that no user
+// declaration in this module claims, so the arity dispatch is unambiguous on
+// every compiler and the guard no longer sees a bogus overload. Every OTHER
+// export used here
 // (WSAStartup, socket, bind, accept, recv, send, closesocket, inet_addr)
 // shares its name with no free function in this module, so the bare calls
 // reach the DLL directly (class names do not block: `socket(2,1,0)` resolves
@@ -255,16 +262,22 @@ public int acceptRaw(int fd) {
 
 // Sends the string's bytes on the raw descriptor (packed into an int[]
 // qword buffer; byte[] must not cross a DLL boundary). No-op on len <= 0.
-public void sendRaw(int fd, string data) {
+//
+// SEND-ALL (data integrity): a single send() may accept FEWER bytes than
+// requested (the kernel buffer filled up). The old one-shot send() silently
+// dropped the tail -- a truncated packet on the wire. This loops until the
+// whole payload is handed to the kernel, and returns the number of bytes
+// accepted (-1 on a hard error, 0 for an empty payload).
+public int sendRaw(int fd, string data) {
     int len = data.length;
-    if (len <= 0) { return; }
+    if (len <= 0) { return 0; }
     int slots = (len + 7) / 8;
     int[] packedBuf = new int[slots];
     for (int i = 0; i < len; i++) {
         int b = int(data[i]);
         packedBuf[i / 8] = packedBuf[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
     }
-    send(fd, packedBuf, len, 0);
+    return sendAllRaw(fd, packedBuf, len);
 }
 
 // Sends a byte[] payload on the raw descriptor: every byte is packed into an
@@ -273,16 +286,44 @@ public void sendRaw(int fd, string data) {
 // Exists for wire formats whose bytes are produced as byte[] -- e.g. ws
 // frames (encodeFrame), which may legitimately contain 0x00 bytes that a
 // Silver string cannot carry. No-op on len <= 0.
-public void sendBytesRaw(int fd, byte[] data) {
+//
+// SEND-ALL (data integrity): loops until the whole payload is accepted --
+// see sendRaw for why the one-shot send() was wrong. Returns the byte count
+// accepted (-1 on a hard error).
+public int sendBytesRaw(int fd, byte[] data) {
     int len = data.length;
-    if (len <= 0) { return; }
+    if (len <= 0) { return 0; }
     int slots = (len + 7) / 8;
     int[] packedBuf = new int[slots];
     for (int i = 0; i < len; i++) {
         int b = data[i] & 0xFF;
         packedBuf[i / 8] = packedBuf[i / 8] | (b << ((i % 8) * 8));
     }
-    send(fd, packedBuf, len, 0);
+    return sendAllRaw(fd, packedBuf, len);
+}
+
+// SEND-ALL helper: hands a packed qword buffer to send() until the whole
+// `len` bytes are accepted. A short send() (kernel buffer full) resumes at
+// the next byte, so no payload byte is ever dropped. The buffer is re-packed
+// from the surviving offset on each round because send() takes the buffer's
+// base address (a Silver int[] has no interior pointer arithmetic).
+private int sendAllRaw(int fd, int[] packedBuf, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int remaining = len - sent;
+        int slots = (remaining + 7) / 8;
+        int[] chunk = new int[slots];
+        for (int i = 0; i < remaining; i++) {
+            int src = sent + i;
+            int b = (packedBuf[src / 8] >> ((src % 8) * 8)) & 0xFF;
+            chunk[i / 8] = chunk[i / 8] | (b << ((i % 8) * 8));
+        }
+        int n = send(fd, chunk, remaining, 0);
+        if (n > 2147483647) { n -= 4294967296; }
+        if (n <= 0) { return -1; }
+        sent += n;
+    }
+    return sent;
 }
 
 // Length-capped variant of sendRaw: sends the first `len` bytes of `data`
@@ -290,8 +331,11 @@ public void sendBytesRaw(int fd, byte[] data) {
 // send a prefix of a known string -- e.g. ftp's server greeting, which
 // writes the first 20 of its 22 bytes ("220 FTP Server ready" without the
 // CRLF).
-public void sendRawLen(int fd, string data, int len) {
-    if (len <= 0) { return; }
+//
+// SEND-ALL (data integrity): loops until the whole prefix is accepted --
+// see sendRaw. Returns the byte count accepted (-1 on a hard error).
+public int sendRawLen(int fd, string data, int len) {
+    if (len <= 0) { return 0; }
     if (len > data.length) { len = data.length; }
     int slots = (len + 7) / 8;
     int[] packedBuf = new int[slots];
@@ -299,22 +343,113 @@ public void sendRawLen(int fd, string data, int len) {
         int b = int(data[i]);
         packedBuf[i / 8] = packedBuf[i / 8] | ((b & 0xFF) << ((i % 8) * 8));
     }
-    send(fd, packedBuf, len, 0);
+    return sendAllRaw(fd, packedBuf, len);
 }
 
 // Receives up to maxLen bytes from the raw descriptor and returns them as a
 // string ("" on error or clean close).
+//
+// TEXT PATH (NUL-limited): a Silver string cannot carry a NUL byte -- the
+// runtime string is NUL-terminated -- so a payload with an embedded 0x00
+// truncates here. Use recvBytesRaw for binary payloads (images, video,
+// audio, any protocol with NUL bytes in it). recvRaw stays the text-shaped
+// entry point for line/field protocols.
 public string recvRaw(int fd, int maxLen) {
     if (maxLen <= 0) { return ""; }
+    byte[] bytes = recvBytesRaw(fd, maxLen);
+    int n = bytes.length;
+    if (n <= 0) { return ""; }
+    string result = "";
+    for (int i = 0; i < n; i++) {
+        char c = char(bytes[i] & 0xFF);
+        result += (string)c;
+    }
+    return result;
+}
+
+// Receives up to maxLen bytes from the raw descriptor and returns them as a
+// byte[] of the EXACT received length (an empty array on error or clean
+// close).
+//
+// BINARY-SAFE (data integrity): the bytes travel as byte values 0..255 --
+// no string is involved, so an embedded 0x00 survives the round trip. This
+// is the receive counterpart of sendBytesRaw and the only lossless way to
+// read a binary payload off the wire. The returned array's length IS the
+// received byte count (a short read returns a shorter array).
+public byte[] recvBytesRaw(int fd, int maxLen) {
+    if (maxLen <= 0) { return []; }
     int slots = (maxLen + 7) / 8;
     int[] buf = new int[slots];
     int n = recv(fd, buf, maxLen, 0);
     if (n > 2147483647) { n -= 4294967296; }
+    if (n <= 0) { return []; }
+    byte[] out = netAllocBytes(n);
+    for (int i = 0; i < n; i++) {
+        int b = (buf[i / 8] >> ((i % 8) * 8)) & 0xFF;
+        out[i] = b;
+    }
+    return out;
+}
+
+// Runtime-sized byte[] allocation routed through a return statement.
+// The self-hosted compiler mis-lowers `byte[] x = new byte[expr];`
+// DECLARATION initializers as one-element byte-array literals, so every
+// runtime-sized byte[] is built here and returned; the caller's
+// `byte[] out = netAllocBytes(n);` init is a plain call and takes the normal
+// path. silverc-rs lowers both shapes correctly; this detour is
+// byte-for-byte equivalent there.
+private byte[] netAllocBytes(int count) {
+    return new byte[count];
+}
+
+// Receives EXACTLY `count` bytes from the raw descriptor and returns them
+// as a byte[] (an empty array if the peer closed early or the read timed
+// out before `count` bytes arrived).
+//
+// EXACT-LENGTH READ (data integrity): TCP is a STREAM, not a message
+// channel -- one recv() returns whatever has arrived so far, which may be
+// a fraction of the payload (a 2 KB packet routinely arrives as three
+// reads). A protocol that frames its messages by length MUST read exactly
+// that many bytes; recvBytesRaw alone cannot express that, and a caller
+// that assumes "one recv = one message" silently gets truncated frames.
+// This loops until the full count is in hand.
+//
+// The read stops early (returning what it has) when recv() reports end of
+// stream (0) or an error/timeout (-1) -- arm setRecvTimeoutRaw on the
+// descriptor to bound the wait.
+public byte[] recvBytesExactRaw(int fd, int count) {
+    if (count <= 0) { return []; }
+    byte[] out = netAllocBytes(count);
+    int filled = 0;
+    while (filled < count) {
+        int[] buf = new int[(count - filled + 7) / 8];
+        int n = recv(fd, buf, count - filled, 0);
+        if (n > 2147483647) { n -= 4294967296; }
+        if (n <= 0) { break; }
+        for (int i = 0; i < n; i++) {
+            int b = (buf[i / 8] >> ((i % 8) * 8)) & 0xFF;
+            out[filled + i] = b;
+        }
+        filled += n;
+    }
+    if (filled == count) { return out; }
+    // Short read: hand back only the bytes that actually arrived.
+    byte[] partial = netAllocBytes(filled);
+    for (int i = 0; i < filled; i++) { partial[i] = out[i]; }
+    return partial;
+}
+
+// Receives EXACTLY `count` bytes and returns them as a string ("" on a
+// short read). The text-shaped counterpart of recvBytesExactRaw: same
+// exact-length contract, same NUL limitation (a Silver string cannot carry
+// a NUL byte -- use recvBytesExactRaw for binary payloads).
+public string recvRawExact(int fd, int count) {
+    byte[] bytes = recvBytesExactRaw(fd, count);
+    int n = bytes.length;
     if (n <= 0) { return ""; }
     string result = "";
     for (int i = 0; i < n; i++) {
-        int b = (buf[i / 8] >> ((i % 8) * 8)) & 0xFF;
-        char c = char(b);
+        char c = char(bytes[i] & 0xFF);
         result += (string)c;
     }
     return result;
@@ -377,7 +512,7 @@ int openTcp(string host, int port) {
     int[] sa = new int[2];
     sa[0] = 2 | (pHi << 16) | (pLo << 24) | ((ip & 0xFFFFFFFF) << 32);
     sa[1] = 0;
-    int c = connect(sock, sa, 16);
+    int c = dllConnect(sock, sa, 16);
     if (c < 0 || c > 2147483647) {
         closesocket(sock);
         return -1;
@@ -393,7 +528,7 @@ int openTcp(string host, int port) {
     int[] sa = new int[2];
     sa[0] = 2 | (pHi << 16) | (pLo << 24) | ((ip & 0xFFFFFFFF) << 32);
     sa[1] = 0;
-    int c = connect(sock, sa, 16);
+    int c = dllConnect(sock, sa, 16);
     if (c < 0 || c > 2147483647) {
         close(sock);
         return -1;
@@ -421,7 +556,7 @@ int bindListen(int port) {
         closesocket(sock);
         return -1;
     }
-    int l = listen(sock, 10);
+    int l = dllListen(sock, 10);
     if (l < 0 || l > 2147483647) {
         closesocket(sock);
         return -1;
@@ -440,7 +575,7 @@ int bindListen(int port) {
         close(sock);
         return -1;
     }
-    int l = listen(sock, 10);
+    int l = dllListen(sock, 10);
     if (l < 0 || l > 2147483647) {
         close(sock);
         return -1;
@@ -596,4 +731,136 @@ int parseDotted(string host) {
         start = end + 1;
     }
     return ip;
+}
+
+// ---- UDP (datagram) primitives ---------------------------------------------
+// UDP is connectionless: there is no accept/connect handshake, datagrams
+// are addressed per-send, and one sendto() delivers exactly one datagram
+// (no partial writes, no stream reassembly). A game server that must not
+// lose packets uses UDP; one that must not reorder or duplicate them uses
+// TCP.
+//
+// SOCK_DGRAM = 2 (POSIX and Windows agree). AF_INET = 2. A sockaddr_in is
+// the same 16-byte struct the TCP path already packs into an int[2]:
+// family u16, port u16 (big endian), IPv4 u32, 8 zero bytes.
+
+// Creates a UDP socket (SOCK_DGRAM) and returns the raw descriptor, or -1
+// on failure. The socket is unbound: use udpBindRaw to give it a local port.
+public int udpOpenRaw() {
+    #on WINDOWS
+    byte[] wsa = new byte[408];
+    WSAStartup(0x0202, wsa);
+    int sock = socket(2, 2, 0);
+    if (sock < 0) { return -1; }
+    return sock;
+    #else
+    int sock = socket(2, 2, 0);
+    if (sock < 0) { return -1; }
+    return sock;
+    #off
+    return -1;
+}
+
+// Creates a UDP socket bound to INADDR_ANY:port and returns the raw
+// descriptor, or -1 on failure. A bound UDP socket receives datagrams sent
+// to that port (a "listener" in UDP terms).
+public int udpBindRaw(int port) {
+    #on WINDOWS
+    byte[] wsa = new byte[408];
+    WSAStartup(0x0202, wsa);
+    int sock = socket(2, 2, 0);
+    if (sock < 0) { return -1; }
+    int pHi = (port >> 8) & 0xFF;
+    int pLo = port & 0xFF;
+    int[] sa = new int[2];
+    sa[0] = 2 | (pHi << 16) | (pLo << 24);
+    sa[1] = 0;
+    int b = bind(sock, sa, 16);
+    if (b < 0 || b > 2147483647) {
+        closesocket(sock);
+        return -1;
+    }
+    return sock;
+    #else
+    int sock = socket(2, 2, 0);
+    if (sock < 0) { return -1; }
+    int pHi = (port >> 8) & 0xFF;
+    int pLo = port & 0xFF;
+    int[] sa = new int[2];
+    sa[0] = 2 | (pHi << 16) | (pLo << 24);
+    sa[1] = 0;
+    int b = bind(sock, sa, 16);
+    if (b < 0 || b > 2147483647) {
+        close(sock);
+        return -1;
+    }
+    return sock;
+    #off
+    return -1;
+}
+
+// Sends one datagram to host:port. The payload is byte-exact (0x00 bytes
+// included); it is packed into an int[] qword buffer because a byte[] must
+// not cross a DLL boundary packed. Returns the byte count sent, or -1 on
+// failure.
+//
+// One datagram per call: a datagram larger than the network MTU is
+// rejected by the OS rather than fragmented silently -- check the return
+// value.
+public int udpSendToRaw(int fd, string host, int port, byte[] data) {
+    int len = data.length;
+    if (len <= 0) { return 0; }
+    int ip = parseDotted(host);
+    if (ip < 0) { return -1; }
+    int pHi = (port >> 8) & 0xFF;
+    int pLo = port & 0xFF;
+    int[] sa = new int[2];
+    sa[0] = 2 | (pHi << 16) | (pLo << 24) | ((ip & 0xFFFFFFFF) << 32);
+    sa[1] = 0;
+    int slots = (len + 7) / 8;
+    int[] packedBuf = new int[slots];
+    for (int i = 0; i < len; i++) {
+        int b = data[i] & 0xFF;
+        packedBuf[i / 8] = packedBuf[i / 8] | (b << ((i % 8) * 8));
+    }
+    int n = sendto(fd, packedBuf, len, 0, sa, 16);
+    if (n > 2147483647) { n -= 4294967296; }
+    return n;
+}
+
+// Receives one datagram (up to maxLen bytes) and returns it as a byte[] of
+// the exact received length (an empty array on error or timeout). The
+// sender's address is written into `fromAddr` when it is non-null: slot 0
+// holds the IPv4 address, slot 1 the port (both in host order).
+//
+// BINARY-SAFE (data integrity): the datagram's bytes are returned as byte
+// values 0..255 with no string involved, so an embedded 0x00 survives.
+public byte[] udpRecvFromRaw(int fd, int maxLen, int[] fromAddr) {
+    if (maxLen <= 0) { return []; }
+    int slots = (maxLen + 7) / 8;
+    int[] buf = new int[slots];
+    int[] peerRaw = new int[2];
+    // sockaddr_in is 16 bytes; recvfrom writes the real length back here.
+    int[] peerLen = new int[1];
+    peerLen[0] = 16;
+    int n = recvfrom(fd, buf, maxLen, 0, peerRaw, peerLen);
+    if (n > 2147483647) { n -= 4294967296; }
+    if (n <= 0) { return []; }
+    if (fromAddr != null) {
+        // sockaddr_in (16 bytes): family u16, port u16 (NETWORK order --
+        // big endian), IPv4 u32 (network order), 8 zero bytes. The qword
+        // holds them little-endian, so the port's two bytes are swapped
+        // relative to the 16-bit value: byte 2 is the HIGH byte.
+        int raw = peerRaw[0];
+        int portHi = (raw >> 16) & 0xFF;
+        int portLo = (raw >> 24) & 0xFF;
+        fromAddr[0] = (raw >> 32) & 0xFFFFFFFF;
+        fromAddr[1] = (portHi << 8) | portLo;
+    }
+    byte[] out = netAllocBytes(n);
+    for (int i = 0; i < n; i++) {
+        int b = (buf[i / 8] >> ((i % 8) * 8)) & 0xFF;
+        out[i] = b;
+    }
+    return out;
 }

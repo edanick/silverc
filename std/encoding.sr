@@ -1,5 +1,394 @@
 mod export encoding;
 
+import * from hash;
+
+// Text encodings for the wire.
+//
+// WHY THIS MODULE EXISTS: a Silver `string` is a byte buffer -- its chars
+// are BYTE values (0..255), not Unicode code points. A "text encoding"
+// therefore maps between a string of bytes and a byte sequence in a named
+// encoding. The encodings here are the ones that matter for a network
+// protocol:
+//
+//   ASCII        7-bit, 128 characters (0x00..0x7F)
+//   Latin-1      8-bit, 256 characters (0x00..0xFF) -- one byte per char
+//   UTF-8        1..4 bytes per code point, 1,112,064 code points
+//   UTF-16LE     2 bytes per code unit, little endian (BMP + surrogates)
+//   UTF-16BE     2 bytes per code unit, big endian (BMP + surrogates)
+//   UTF-32LE     4 bytes per code point, little endian
+//   UTF-32BE     4 bytes per code point, big endian
+//
+// A STRING'S OWN BYTES: since a string's chars are bytes, `toBytes` on a
+// string yields exactly the bytes it holds, and `fromBytes` maps bytes back
+// to chars 1:1. That pair IS Latin-1 (ISO-8859-1). The UTF-8/16/32 codecs
+// work on CODE POINTS (ints), because those encodings are defined over
+// code points, not over bytes.
+//
+// BINARY-SAFE: the byte-oriented entry points (base64EncodeBytes,
+// hexEncodeBytes, and every codec) take and return byte[] / int[] -- never
+// a string -- so an embedded NUL survives the round trip. The string-shaped
+// entry points (base64Encode, hexEncode, ...) exist for TEXT and go through
+// toBytes, which stops at the first NUL.
+
+// ---- ASCII (0x00..0x7F) ---------------------------------------------------
+
+// Encodes a string's chars as ASCII bytes. A char above 0x7F is not
+// representable in ASCII and is rejected: the function returns -1 (strict
+// mode) so the caller can detect the loss instead of getting a silently
+// mangled payload. `out` must have room for data.length bytes.
+public int asciiEncode(string data, byte[] out) {
+    int n = data.length;
+    if (out.length < n) { return -1; }
+    for (int i = 0; i < n; i++) {
+        int c = data[i] & 0xFF;
+        if (c > 0x7F) { return -1; }
+        out[i] = c;
+    }
+    return n;
+}
+
+// Decodes ASCII bytes into a string. Bytes above 0x7F are not ASCII; they
+// decode to '?' so the result is always a valid string. Returns the number
+// of chars written (the byte count).
+public int asciiDecode(byte[] data, string[] out) {
+    int n = data.length;
+    string result = "";
+    for (int i = 0; i < n; i++) {
+        int c = data[i] & 0xFF;
+        if (c > 0x7F) { c = 63; }
+        result += char(c).toString();
+    }
+    out[0] = result;
+    return n;
+}
+
+// True when every byte of `data` is a valid ASCII byte (0x00..0x7F).
+public bool isAscii(byte[] data) {
+    for (int i = 0; i < data.length; i++) {
+        if ((data[i] & 0xFF) > 0x7F) { return false; }
+    }
+    return true;
+}
+
+// ---- Latin-1 / ISO-8859-1 (0x00..0xFF) -------------------------------------
+
+// Latin-1 IS the byte-per-char mapping: a string's chars ARE its bytes.
+// toBytes/fromBytes is therefore the Latin-1 codec. These names exist so a
+// caller can say what it means.
+
+// The Latin-1 bytes of a string (one byte per char, 0x00..0xFF).
+public byte[] latin1Encode(string data) {
+    byte[] out = encodingAllocBytes(data.length);
+    for (int i = 0; i < data.length; i++) {
+        out[i] = data[i] & 0xFF;
+    }
+    return out;
+}
+
+// A string from Latin-1 bytes (one char per byte, 0x00..0xFF).
+public string latin1Decode(byte[] data) {
+    string result = "";
+    for (int i = 0; i < data.length; i++) {
+        result += char(data[i] & 0xFF).toString();
+    }
+    return result;
+}
+
+// ---- UTF-8 ------------------------------------------------------------------
+
+// Encodes code points as UTF-8 bytes. A code point is one Unicode scalar
+// value (0..0x10FFFF); surrogate values (0xD800..0xDFFF) are not scalar
+// values and are rejected. Returns the byte count, or -1 on a bad code
+// point or a too-small output buffer.
+public int utf8Encode(int[] points, byte[] out) {
+    int need = utf8Length(points);
+    if (need < 0) { return -1; }
+    if (out.length < need) { return -1; }
+    int at = 0;
+    for (int i = 0; i < points.length; i++) {
+        int cp = points[i];
+        if (cp < 0 || cp > 0x10FFFF) { return -1; }
+        if (cp >= 0xD800 && cp <= 0xDFFF) { return -1; }
+        if (cp < 0x80) {
+            out[at] = cp;
+            at++;
+        } else if (cp < 0x800) {
+            out[at] = 0xC0 | ((cp >> 6) & 0x1F);
+            out[at + 1] = 0x80 | (cp & 0x3F);
+            at += 2;
+        } else if (cp < 0x10000) {
+            out[at] = 0xE0 | ((cp >> 12) & 0x0F);
+            out[at + 1] = 0x80 | ((cp >> 6) & 0x3F);
+            out[at + 2] = 0x80 | (cp & 0x3F);
+            at += 3;
+        } else {
+            out[at] = 0xF0 | ((cp >> 18) & 0x07);
+            out[at + 1] = 0x80 | ((cp >> 12) & 0x3F);
+            out[at + 2] = 0x80 | ((cp >> 6) & 0x3F);
+            out[at + 3] = 0x80 | (cp & 0x3F);
+            at += 4;
+        }
+    }
+    return at;
+}
+
+// Decodes UTF-8 bytes into code points. Returns the code point count, or
+// -1 on malformed input (a bad lead byte, a truncated sequence, an
+// overlong encoding, a surrogate, or a value above 0x10FFFF).
+public int utf8Decode(byte[] data, int[] out) {
+    int n = data.length;
+    int at = 0;
+    int count = 0;
+    while (at < n) {
+        int b0 = data[at] & 0xFF;
+        int cp = 0;
+        int extra = 0;
+        if (b0 < 0x80) {
+            cp = b0;
+            extra = 0;
+        } else if ((b0 & 0xE0) == 0xC0) {
+            cp = b0 & 0x1F;
+            extra = 1;
+        } else if ((b0 & 0xF0) == 0xE0) {
+            cp = b0 & 0x0F;
+            extra = 2;
+        } else if ((b0 & 0xF8) == 0xF0) {
+            cp = b0 & 0x07;
+            extra = 3;
+        } else {
+            return -1;
+        }
+        if (at + extra >= n) { return -1; }
+        for (int i = 1; i <= extra; i++) {
+            int cont = data[at + i] & 0xFF;
+            if ((cont & 0xC0) != 0x80) { return -1; }
+            cp = (cp << 6) | (cont & 0x3F);
+        }
+        // Overlong forms and out-of-range values are invalid UTF-8.
+        if (extra == 1 && cp < 0x80) { return -1; }
+        if (extra == 2 && cp < 0x800) { return -1; }
+        if (extra == 3 && cp < 0x10000) { return -1; }
+        if (cp > 0x10FFFF) { return -1; }
+        if (cp >= 0xD800 && cp <= 0xDFFF) { return -1; }
+        if (count >= out.length) { return -1; }
+        out[count] = cp;
+        count++;
+        at += extra + 1;
+    }
+    return count;
+}
+
+// The UTF-8 byte length of a code point sequence, or -1 on a bad code
+// point (out of range, or a surrogate).
+public int utf8Length(int[] points) {
+    int total = 0;
+    for (int i = 0; i < points.length; i++) {
+        int cp = points[i];
+        if (cp < 0 || cp > 0x10FFFF) { return -1; }
+        if (cp >= 0xD800 && cp <= 0xDFFF) { return -1; }
+        if (cp < 0x80) { total += 1; }
+        else if (cp < 0x800) { total += 2; }
+        else if (cp < 0x10000) { total += 3; }
+        else { total += 4; }
+    }
+    return total;
+}
+
+// ---- UTF-16 (little endian and big endian) --------------------------------
+
+// Encodes code points as UTF-16 bytes. Code points above 0xFFFF are
+// encoded as a surrogate pair (0xD800..0xDBFF high, 0xDC00..0xDFFF low).
+// Returns the byte count, or -1 on a bad code point or a too-small buffer.
+public int utf16LeEncode(int[] points, byte[] out) {
+    return utf16EncodeCommon(points, out, true);
+}
+
+// Big-endian UTF-16.
+public int utf16BeEncode(int[] points, byte[] out) {
+    return utf16EncodeCommon(points, out, false);
+}
+
+// The shared UTF-16 encoder body: `littleEndian` picks the byte order.
+// Code points above the BMP become a surrogate pair.
+private int utf16EncodeCommon(int[] points, byte[] out, bool littleEndian) {
+    int need = utf16Length(points);
+    if (need < 0) { return -1; }
+    if (out.length < need) { return -1; }
+    int at = 0;
+    for (int i = 0; i < points.length; i++) {
+        int cp = points[i];
+        if (cp < 0 || cp > 0x10FFFF) { return -1; }
+        if (cp >= 0xD800 && cp <= 0xDFFF) { return -1; }
+        if (cp < 0x10000) {
+            at = utf16PutUnit(out, at, cp, littleEndian);
+        } else {
+            int v = cp - 0x10000;
+            int high = 0xD800 + (v >> 10);
+            int low = 0xDC00 + (v & 0x3FF);
+            at = utf16PutUnit(out, at, high, littleEndian);
+            at = utf16PutUnit(out, at, low, littleEndian);
+        }
+    }
+    return at;
+}
+
+// Writes one UTF-16 code unit in the requested byte order; returns the
+// next free byte offset.
+private int utf16PutUnit(byte[] out, int at, int unit, bool littleEndian) {
+    if (littleEndian) {
+        out[at] = unit & 0xFF;
+        out[at + 1] = (unit >> 8) & 0xFF;
+    } else {
+        out[at] = (unit >> 8) & 0xFF;
+        out[at + 1] = unit & 0xFF;
+    }
+    return at + 2;
+}
+
+// Decodes UTF-16 bytes into code points. A valid surrogate PAIR decodes to
+// the supplementary code point; an unpaired surrogate is invalid (-1).
+// Returns the code point count, or -1 on malformed input.
+public int utf16LeDecode(byte[] data, int[] out) {
+    return utf16DecodeCommon(data, out, true);
+}
+
+// Big-endian UTF-16.
+public int utf16BeDecode(byte[] data, int[] out) {
+    return utf16DecodeCommon(data, out, false);
+}
+
+// The shared UTF-16 decoder body: `littleEndian` picks the byte order.
+private int utf16DecodeCommon(byte[] data, int[] out, bool littleEndian) {
+    int n = data.length;
+    if (n % 2 != 0) { return -1; }
+    int count = 0;
+    int at = 0;
+    while (at < n) {
+        int unit = utf16GetUnit(data, at, littleEndian);
+        at += 2;
+        int cp = unit;
+        if (unit >= 0xD800 && unit <= 0xDBFF) {
+            // A high surrogate must be followed by a low surrogate.
+            if (at + 2 > n) { return -1; }
+            int low = utf16GetUnit(data, at, littleEndian);
+            if (low < 0xDC00 || low > 0xDFFF) { return -1; }
+            at += 2;
+            cp = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+        } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+            // A low surrogate with no high surrogate is invalid.
+            return -1;
+        }
+        if (count >= out.length) { return -1; }
+        out[count] = cp;
+        count++;
+    }
+    return count;
+}
+
+// Reads one UTF-16 code unit in the requested byte order.
+private int utf16GetUnit(byte[] data, int at, bool littleEndian) {
+    int lo = data[at] & 0xFF;
+    int hi = data[at + 1] & 0xFF;
+    if (littleEndian) { return lo | (hi << 8); }
+    return (lo << 8) | hi;
+}
+
+// The UTF-16 byte length of a code point sequence, or -1 on a bad code
+// point. Code points above the BMP need two code units (4 bytes).
+public int utf16Length(int[] points) {
+    int total = 0;
+    for (int i = 0; i < points.length; i++) {
+        int cp = points[i];
+        if (cp < 0 || cp > 0x10FFFF) { return -1; }
+        if (cp >= 0xD800 && cp <= 0xDFFF) { return -1; }
+        if (cp < 0x10000) { total += 2; }
+        else { total += 4; }
+    }
+    return total;
+}
+
+// ---- UTF-32 (little endian and big endian) --------------------------------
+
+// Encodes code points as UTF-32 bytes (4 bytes per code point, no
+// surrogates -- a surrogate is not a scalar value and is rejected).
+public int utf32LeEncode(int[] points, byte[] out) {
+    return utf32EncodeCommon(points, out, true);
+}
+
+// Big-endian UTF-32.
+public int utf32BeEncode(int[] points, byte[] out) {
+    return utf32EncodeCommon(points, out, false);
+}
+
+// The shared UTF-32 encoder body: `littleEndian` picks the byte order.
+private int utf32EncodeCommon(int[] points, byte[] out, bool littleEndian) {
+    int need = points.length * 4;
+    if (out.length < need) { return -1; }
+    int at = 0;
+    for (int i = 0; i < points.length; i++) {
+        int cp = points[i];
+        if (cp < 0 || cp > 0x10FFFF) { return -1; }
+        if (cp >= 0xD800 && cp <= 0xDFFF) { return -1; }
+        if (littleEndian) {
+            out[at] = cp & 0xFF;
+            out[at + 1] = (cp >> 8) & 0xFF;
+            out[at + 2] = (cp >> 16) & 0xFF;
+            out[at + 3] = (cp >> 24) & 0xFF;
+        } else {
+            out[at] = (cp >> 24) & 0xFF;
+            out[at + 1] = (cp >> 16) & 0xFF;
+            out[at + 2] = (cp >> 8) & 0xFF;
+            out[at + 3] = cp & 0xFF;
+        }
+        at += 4;
+    }
+    return at;
+}
+
+// Decodes UTF-32 bytes into code points. Returns the code point count, or
+// -1 on malformed input (a length that is not a multiple of 4, a surrogate,
+// or a value above 0x10FFFF).
+public int utf32LeDecode(byte[] data, int[] out) {
+    return utf32DecodeCommon(data, out, true);
+}
+
+// Big-endian UTF-32.
+public int utf32BeDecode(byte[] data, int[] out) {
+    return utf32DecodeCommon(data, out, false);
+}
+
+// The shared UTF-32 decoder body: `littleEndian` picks the byte order.
+private int utf32DecodeCommon(byte[] data, int[] out, bool littleEndian) {
+    int n = data.length;
+    if (n % 4 != 0) { return -1; }
+    int count = 0;
+    int at = 0;
+    while (at < n) {
+        int b0 = data[at] & 0xFF;
+        int b1 = data[at + 1] & 0xFF;
+        int b2 = data[at + 2] & 0xFF;
+        int b3 = data[at + 3] & 0xFF;
+        int cp = 0;
+        if (littleEndian) {
+            cp = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        } else {
+            cp = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+        }
+        if (cp > 0x10FFFF) { return -1; }
+        if (cp >= 0xD800 && cp <= 0xDFFF) { return -1; }
+        if (count >= out.length) { return -1; }
+        out[count] = cp;
+        count++;
+        at += 4;
+    }
+    return count;
+}
+
+// ---- base64 (RFC 4648) -----------------------------------------------------
+
+// Base64-encodes a string's bytes. TEXT shape: the string's bytes stop at
+// the first NUL (toBytes is strlen-based) -- use base64EncodeBytes for
+// binary data.
 public string base64Encode(string data) {
     byte[] bytes = data.toBytes();
     int len = bytes.length;
@@ -23,16 +412,40 @@ public string base64Encode(string data) {
         out[idx + 3] = c4;
     }
     string result = "";
-    for (int i = 0; i < outLen; i++) { result += char(out[i]); }
+    for (int i = 0; i < outLen; i++) { result += char(out[i]).toString(); }
     return result;
 }
 
+// Base64-encodes BINARY bytes (0x00 included). This is the shape a
+// protocol needs when the payload is not text.
+public string base64EncodeBytes(byte[] bytes) {
+    int len = bytes.length;
+    int outLen = ((len + 2) / 3) * 4;
+    byte[] out = new byte[outLen];
+    string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (int i = 0; i < len; i += 3) {
+        int b = (bytes[i] & 0xFF) << 16;
+        b |= (i + 1 < len ? (bytes[i + 1] & 0xFF) : 0) << 8;
+        b |= (i + 2 < len ? (bytes[i + 2] & 0xFF) : 0);
+        int idx = i / 3 * 4;
+        out[idx] = chars[(b >> 18) & 0x3F];
+        out[idx + 1] = chars[(b >> 12) & 0x3F];
+        int c3 = (i + 1 < len) ? chars[(b >> 6) & 0x3F] : '=';
+        out[idx + 2] = c3;
+        int c4 = (i + 2 < len) ? chars[b & 0x3F] : '=';
+        out[idx + 3] = c4;
+    }
+    string result = "";
+    for (int i = 0; i < outLen; i++) { result += char(out[i] & 0xFF).toString(); }
+    return result;
+}
+
+// Single correct RFC 4648 decode for this home (§6): accumulator shape
+// shared with crypto.sr's cryptoBase64Decode -- stops at '=' padding,
+// skips bytes outside the alphabet, so invalid input decodes clean
+// instead of emitting garbage bytes. The old block shape OR-ed -1 for
+// non-alphabet bytes and diverged from crypto on such input.
 public string base64Decode(string data) {
-    // Single correct RFC 4648 decode for this home (§6): accumulator shape
-    // shared with crypto.sr's cryptoBase64Decode — stops at '=' padding,
-    // skips bytes outside the alphabet, so invalid input decodes clean
-    // instead of emitting garbage bytes. The old block shape OR-ed -1 for
-    // non-alphabet bytes and diverged from crypto on such input.
     string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     string result = "";
     int acc = 0;
@@ -52,10 +465,40 @@ public string base64Decode(string data) {
         bits += 6;
         if (bits >= 8) {
             bits -= 8;
-            result += char((acc >> bits) & 0xFF);
+            result += char((acc >> bits) & 0xFF).toString();
         }
     }
     return result;
+}
+
+// Decodes base64 into BINARY bytes (0x00 included).
+public byte[] base64DecodeBytes(string data) {
+    string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    byte[] out = encodingAllocBytes(data.length / 4 * 3);
+    int acc = 0;
+    int bits = 0;
+    int count = 0;
+    for (int i = 0; i < data.length; i++) {
+        char c = data[i];
+        if (c == '=') { break; }
+        int code = -1;
+        for (int k = 0; k < chars.length; k++) {
+            if (chars[k] == c) { code = k; break; }
+        }
+        if (code < 0) { continue; }
+        acc = (acc << 6) | code;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (count < out.length) {
+                out[count] = (acc >> bits) & 0xFF;
+                count++;
+            }
+        }
+    }
+    byte[] trimmed = encodingAllocBytes(count);
+    for (int i = 0; i < count; i++) { trimmed[i] = out[i]; }
+    return trimmed;
 }
 
 public string base64UrlEncode(string data) {
@@ -69,6 +512,10 @@ public string base64UrlDecode(string data) {
     return base64Decode(b64);
 }
 
+// ---- hex -------------------------------------------------------------------
+
+// Hex-encodes a string's bytes. TEXT shape (stops at the first NUL) -- use
+// hexEncodeBytes for binary data.
 public string hexEncode(string data) {
     byte[] bytes = data.toBytes();
     string hex = "0123456789abcdef";
@@ -76,6 +523,18 @@ public string hexEncode(string data) {
     for (int i = 0; i < bytes.length; i++) {
         result += hex[(bytes[i] >> 4) & 0x0F];
         result += hex[bytes[i] & 0x0F];
+    }
+    return result;
+}
+
+// Hex-encodes BINARY bytes (0x00 included).
+public string hexEncodeBytes(byte[] bytes) {
+    string hex = "0123456789abcdef";
+    string result = "";
+    for (int i = 0; i < bytes.length; i++) {
+        int b = bytes[i] & 0xFF;
+        result += hex[(b >> 4) & 0x0F];
+        result += hex[b & 0x0F];
     }
     return result;
 }
@@ -92,44 +551,92 @@ public string hexDecode(string data) {
         out[i] = (high << 4) | low;
     }
     string result = "";
-    for (int i = 0; i < len; i++) { result += char(out[i]); }
+    for (int i = 0; i < len; i++) { result += char(out[i] & 0xFF).toString(); }
     return result;
 }
 
+// Decodes hex into BINARY bytes (0x00 included).
+public byte[] hexDecodeBytes(string data) {
+    int len = data.length / 2;
+    byte[] out = encodingAllocBytes(len);
+    for (int i = 0; i < len; i++) {
+        int high = hexVal(data[i * 2]);
+        int low = hexVal(data[i * 2 + 1]);
+        out[i] = (high << 4) | low;
+    }
+    return out;
+}
+
+// ---- UTF-8 byte helpers ----------------------------------------------------
+
+// The UTF-8 bytes of a string. A string's chars ARE bytes, so this is the
+// identity mapping over the string's bytes (the Latin-1 reading).
 public byte[] toUtf8(string s) { return s.toBytes(); }
+
+// A string from UTF-8 bytes. Each byte becomes one char (the Latin-1
+// reading); use the utf8Decode codec for real UTF-8 code points.
 public string fromUtf8(byte[] bytes) {
     string result = "";
-    for (int i = 0; i < bytes.length; i++) { result += char(bytes[i]); }
+    for (int i = 0; i < bytes.length; i++) { result += char(bytes[i] & 0xFF).toString(); }
     return result;
 }
 
+// The code points of a string's bytes: each byte is one code point
+// (0..0x255). This is the Latin-1 reading of a string.
 public int[] toCodePoints(string s) {
     int[] points = [];
-    for (int i = 0; i < s.length; i++) { points.push((int)s[i]); }
+    for (int i = 0; i < s.length; i++) {
+        points.push((int)s[i] & 0xFF);
+    }
     return points;
 }
 
-public string detect(byte[] bytes) { return "utf-8"; }
+// The code points of a string's bytes: each byte is one code point
+// (0..0x255). This is the Latin-1 reading of a string.
+public int[] codePointsOf(string data) {
+    int[] points = [];
+    for (int i = 0; i < data.length; i++) {
+        points.push(data[i] & 0xFF);
+    }
+    return points;
+}
 
+// The encoding of a byte payload: "utf-8" when the bytes are valid UTF-8,
+// "latin-1" otherwise.
+public string detect(byte[] bytes) {
+    int[] points = encodingAllocInts(bytes.length);
+    if (utf8Decode(bytes, points) >= 0) { return "utf-8"; }
+    return "latin-1";
+}
+
+// The uppercase hex spelling of a byte array.
 public string toHexString(byte[] data) {
     string result = "";
     string hex = "0123456789ABCDEF";
     for (int i = 0; i < data.length; i++) {
-        result += hex[(data[i] >> 4) & 0x0F];
-        result += hex[data[i] & 0x0F];
+        int b = data[i] & 0xFF;
+        result += hex[(b >> 4) & 0x0F];
+        result += hex[b & 0x0F];
     }
     return result;
 }
 
+// The bytes of an uppercase/lower-case hex string.
 public byte[] fromHexString(string hex) {
     int len = hex.length / 2;
-    byte[] out = new byte[len];
+    byte[] out = encodingAllocBytes(len);
     for (int i = 0; i < len; i++) {
-        int hi = hex[i * 2];
-        int lo = hex[i * 2 + 1];
-        out[i] = (hexVal(hi) << 4) | hexVal(lo);
+        int hi = hexVal(hex[i * 2]);
+        int lo = hexVal(hex[i * 2 + 1]);
+        out[i] = (hi << 4) | lo;
     }
     return out;
+}
+
+// The FNV-1 hash of a byte array, as a decimal string -- the standard
+// integrity check for a payload that crossed the wire.
+public string checksum(byte[] data) {
+    return hash.fnv1(data).toString();
 }
 
 // Single nibble-value home for hexDecode/fromHexString (§6): one
@@ -137,4 +644,15 @@ public byte[] fromHexString(string hex) {
 private int hexVal(int c) {
     if (c <= '9') { return c - '0'; }
     return (c & 0xDF) - 'A' + 10;
+}
+
+// Runtime-sized byte[] allocation routed through a return statement: the
+// self-hosted compiler mis-lowers `byte[] x = new byte[expr];` DECLARATION
+// initializers as one-element byte-array literals.
+private byte[] encodingAllocBytes(int count) {
+    return new byte[count];
+}
+
+private int[] encodingAllocInts(int count) {
+    return new int[count];
 }
