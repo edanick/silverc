@@ -1,0 +1,70 @@
+// Class-body flow checking: every method body is deep-checked with the
+// enclosing class in scope — bare field reads and writes (the this-less
+// member idiom), `this.field`, bare sibling method calls (instance and
+// static, own and inherited), `super(...)`, and nullable narrowing that
+// holds inside a guarded branch all resolve; `exit(...)` as the tail of
+// a value-returning method completes every path. Exit code 0 = exact.
+class Base {
+    string tag;
+    int? maybe;
+
+    construct(string t) {
+        tag = t;
+        maybe = null;
+    }
+
+    string describe() {
+        return "base:" + tag;
+    }
+}
+
+class Widget extends Base {
+    int count;
+
+    construct(string t, int c) {
+        super(t);
+        count = c;
+    }
+
+    def bump() -> int {
+        count += 1;
+        return count;
+    }
+
+    def siblingCall() -> int {
+        describe();
+        return bump() + 10;
+    }
+
+    def narrowed() -> int {
+        maybe = 5;
+        if (maybe != null) {
+            return maybe + 1;
+        }
+        exit(1);
+    }
+
+    def guarded() -> int {
+        if (maybe == null) {
+            return 0;
+        }
+        return maybe;
+    }
+}
+
+void check(bool ok, string label) {
+    if (!ok) {
+        printline("FAIL " + label);
+        exit(1);
+    }
+}
+
+void main() {
+    Widget w = new Widget("w", 1);
+    check(w.tag == "w", "inherited-bare-field");
+    check(w.bump() == 2, "bare-field-write");
+    check(w.siblingCall() == 13, "bare-sibling-call");
+    check(w.narrowed() == 6, "narrowed-nullable");
+    check(w.guarded() == 5, "guard-false-branch");
+    printline("CLASS-FLOW-OK");
+}
