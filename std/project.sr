@@ -903,131 +903,143 @@ bool projectQsWord(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
 }
 
+// End index (exclusive) of the string / char literal whose opening quote
+// sits at `start`. Backslash escapes are honored (an escaped quote does not
+// close the literal). An interpolation string (`$"..."`) closes at its quote
+// only at brace depth zero, so a `"` inside `{ ... }` is part of the literal;
+// a plain string or char literal closes at its first unescaped quote.
+int projectMinifyLiteralEnd(string source, int start, char quote, bool interp) {
+    int srcLen = source.length;
+    int i = start + 1;
+    int braceDepth = 0;
+    while (i < srcLen) {
+        char cc = source[i];
+        if (cc == '\\' && i + 1 < srcLen) { i += 2; continue; }
+        if (interp) {
+            if (cc == '{') { braceDepth++; i++; continue; }
+            if (cc == '}' && braceDepth > 0) { braceDepth--; i++; continue; }
+        }
+        if (cc == quote && braceDepth == 0) { return i + 1; }
+        i++;
+    }
+    // Unterminated literal: the rest of the source is the literal.
+    return srcLen;
+}
+
 // Strip whitespace and comments from Silver source, keeping it lexable:
 // whitespace runs become a single space and a space is kept only where two
 // word tokens would merge. String, interpolation-string and char literals are
 // preserved verbatim.
+//
+// The output is assembled from source SLICES (one per plain run, one per
+// literal) and joined once. The runtime never frees intermediates, so the
+// older char-by-char `out += (string)cc` rebuilt a growing string and leaked
+// roughly L^2/2 bytes per file -- 2 GB for a 130 KB source -- which OOM'd the
+// compiler into a NULL-write access violation while packing a large library
+// bundle (the GUI library's 34 modules). Slices + one join are linear.
 string projectMinify(string source) {
-    string out = "";
+    string[] parts = [];
     bool pendingSpace = false;
+    bool haveLast = false;
+    char lastChar = ' ';
+    int srcLen = source.length;
     int i = 0;
-    while (i < source.length) {
+    int runStart = 0;
+    while (i < srcLen) {
         char c = source[i];
+        // Whitespace closes the plain run; the space itself is dropped and
+        // only re-inserted when the next word token needs it.
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            if (i > runStart) {
+                parts.add(projectSlice(source, runStart, i));
+                haveLast = true;
+                lastChar = source[i - 1];
+            }
+            runStart = i + 1;
             pendingSpace = true;
             i++;
             continue;
         }
-        if (c == '/' && i + 1 < source.length && source[i + 1] == '/') {
+        // A line comment closes the run and is dropped with its text.
+        if (c == '/' && i + 1 < srcLen && source[i + 1] == '/') {
+            if (i > runStart) {
+                parts.add(projectSlice(source, runStart, i));
+                haveLast = true;
+                lastChar = source[i - 1];
+            }
+            int j = i + 2;
+            while (j < srcLen && source[j] != '\n') { j++; }
+            runStart = j;
             pendingSpace = true;
-            i += 2;
-            while (i < source.length && source[i] != '\n') { i++; }
+            i = j;
             continue;
         }
-        if (c == '/' && i + 1 < source.length && source[i + 1] == '*') {
-            pendingSpace = true;
-            i += 2;
+        // A block comment closes the run and is dropped with its text.
+        if (c == '/' && i + 1 < srcLen && source[i + 1] == '*') {
+            if (i > runStart) {
+                parts.add(projectSlice(source, runStart, i));
+                haveLast = true;
+                lastChar = source[i - 1];
+            }
+            int j = i + 2;
             int depth = 1;
-            while (i < source.length && depth > 0) {
-                if (i + 1 < source.length && source[i] == '/' && source[i + 1] == '*') {
+            while (j < srcLen && depth > 0) {
+                if (j + 1 < srcLen && source[j] == '/' && source[j + 1] == '*') {
                     depth++;
-                    i += 2;
-                } else if (i + 1 < source.length && source[i] == '*' && source[i + 1] == '/') {
+                    j += 2;
+                } else if (j + 1 < srcLen && source[j] == '*' && source[j + 1] == '/') {
                     depth--;
-                    i += 2;
+                    j += 2;
                 } else {
-                    i++;
+                    j++;
                 }
             }
+            runStart = j;
+            pendingSpace = true;
+            i = j;
             continue;
         }
-        if (c == '$' && i + 1 < source.length && source[i + 1] == '"') {
-            if (pendingSpace && out.length > 0 && projectQsWord(out[out.length - 1])) {
-                out += " ";
+        // A literal (interpolation string, string, char) is copied verbatim.
+        int litEnd = -1;
+        if (c == '$' && i + 1 < srcLen && source[i + 1] == '"') {
+            litEnd = projectMinifyLiteralEnd(source, i + 1, '"', true);
+        } else if (c == '"') {
+            litEnd = projectMinifyLiteralEnd(source, i, '"', false);
+        } else if (c == '\'') {
+            litEnd = projectMinifyLiteralEnd(source, i, '\'', false);
+        }
+        if (litEnd > 0) {
+            // The plain run before the literal closes here.
+            if (i > runStart) {
+                parts.add(projectSlice(source, runStart, i));
+                haveLast = true;
+                lastChar = source[i - 1];
             }
+            // A literal after whitespace keeps one space when the previous
+            // token ended in a word character.
+            if (pendingSpace && haveLast && projectQsWord(lastChar)) { parts.add(" "); }
+            parts.add(projectSlice(source, i, litEnd));
+            haveLast = true;
+            lastChar = source[litEnd - 1];
             pendingSpace = false;
-            out += "$";
-            out += "\"";
-            i += 2;
-            int braceDepth = 0;
-            while (i < source.length) {
-                char cc = source[i];
-                if (cc == '"' && braceDepth == 0) {
-                    out += (string)cc;
-                    i++;
-                    break;
-                }
-                if (cc == '{') { braceDepth++; }
-                else if (cc == '}' && braceDepth > 0) { braceDepth--; }
-                else if (cc == '\\' && i + 1 < source.length) {
-                    out += (string)cc;
-                    out += (string)source[i + 1];
-                    i += 2;
-                    continue;
-                }
-                out += (string)cc;
-                i++;
-            }
+            i = litEnd;
+            runStart = i;
             continue;
         }
-        if (c == '"') {
-            if (pendingSpace && out.length > 0 && projectQsWord(out[out.length - 1])) {
-                out += " ";
-            }
-            pendingSpace = false;
-            out += (string)c;
-            i++;
-            while (i < source.length) {
-                char cc = source[i];
-                if (cc == '"') {
-                    out += (string)cc;
-                    i++;
-                    break;
-                }
-                if (cc == '\\' && i + 1 < source.length) {
-                    out += (string)cc;
-                    out += (string)source[i + 1];
-                    i += 2;
-                    continue;
-                }
-                out += (string)cc;
-                i++;
-            }
-            continue;
-        }
-        if (c == '\'') {
-            if (pendingSpace && out.length > 0 && projectQsWord(out[out.length - 1])) {
-                out += " ";
-            }
-            pendingSpace = false;
-            out += (string)c;
-            i++;
-            while (i < source.length) {
-                char cc = source[i];
-                if (cc == '\'') {
-                    out += (string)cc;
-                    i++;
-                    break;
-                }
-                if (cc == '\\' && i + 1 < source.length) {
-                    out += (string)cc;
-                    out += (string)source[i + 1];
-                    i += 2;
-                    continue;
-                }
-                out += (string)cc;
-                i++;
-            }
-            continue;
-        }
-        if (pendingSpace && out.length > 0 && projectQsWord(out[out.length - 1]) && projectQsWord(c)) {
-            out += " ";
+        // Plain text: a word character right after pendingSpace keeps one
+        // space, exactly like the older per-character build did.
+        if (pendingSpace && haveLast && projectQsWord(lastChar) && projectQsWord(c)) {
+            parts.add(" ");
         }
         pendingSpace = false;
-        out += (string)c;
+        haveLast = true;
+        lastChar = c;
         i++;
     }
-    return out;
+    if (runStart < srcLen) {
+        parts.add(projectSlice(source, runStart, srcLen));
+    }
+    return parts.join("");
 }
 
 // `root\src\Auth.sr` -> `src/Auth.sr` (forward slashes, no root prefix).

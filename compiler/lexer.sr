@@ -298,20 +298,31 @@ class Lexer {
 
     private Token readStringToken() {
         int ln = this.line; int cl = this.col;
-        string s = "";
+        // The literal body is copied as source SLICES (one per verbatim run)
+        // and joined once. The runtime never frees intermediates, so the older
+        // per-character `s += (string)ch` leaked about L^2/2 bytes for the
+        // literal -- roughly 900 MB for Dynamo's 42 KB one-line markup string
+        // -- and the leak piled up across every literal in a project.
+        string[] parts = [];
         bool closed = false;
+        int runStart = this.pos;
         while (this.pos < this.srcLen) {
             char ch = this.src[this.pos]; this.advance();
-            if (ch == '"') { closed = true; break; }
+            if (ch == '"') {
+                // The closing quote is not part of the body.
+                if (this.pos - 1 > runStart) { parts.add(this.src.substring(runStart, this.pos - 1 - runStart)); }
+                closed = true; break;
+            }
             if (ch == '\\') {
+                if (this.pos - 1 > runStart) { parts.add(this.src.substring(runStart, this.pos - 1 - runStart)); }
                 if (this.pos < this.srcLen) {
                     char esc = this.src[this.pos]; this.advance();
-                    if (esc == 'n') { s += "\n"; }
-                    else if (esc == 't') { s += "\t"; }
-                    else if (esc == '0') { s += "\0"; }
-                    else if (esc == 'r') { s += "\r"; }
-                    else if (esc == '\\') { s += "\\"; }
-                    else if (esc == '\"') { s += "\""; }
+                    if (esc == 'n') { parts.add("\n"); }
+                    else if (esc == 't') { parts.add("\t"); }
+                    else if (esc == '0') { parts.add("\0"); }
+                    else if (esc == 'r') { parts.add("\r"); }
+                    else if (esc == '\\') { parts.add("\\"); }
+                    else if (esc == '\"') { parts.add("\""); }
                     else if (esc == 'x') {
                         // Hex escape \xHH: decode 1-2 hex digits into a raw
                         // byte (ANSI codes like \x1B are the primary use).
@@ -330,17 +341,20 @@ class Lexer {
                         }
                         if (nd > 0) {
                             char xc = hv;
-                            s += (string)xc;
+                            parts.add((string)xc);
                         } else {
-                            s += "\\x";
+                            parts.add("\\x");
                         }
                     }
-                    else { s += "\\" + esc; }
+                    else { parts.add("\\" + esc); }
                 }
-            } else {
-                s += (string)ch;
+                runStart = this.pos;
+                continue;
             }
         }
+        // Unterminated literal: the rest of the source is the body.
+        if (!closed && this.srcLen > runStart) { parts.add(this.src.substring(runStart, this.srcLen - runStart)); }
+        string s = parts.join("");
         // SYNTAX_EXCEPTIONS.md — an unterminated literal reports the opening
         // line with the column of its last character.
         if (!closed) {
@@ -363,20 +377,28 @@ class Lexer {
     // outer string terminates only at a `"` seen at brace-depth zero.
     private Token readInterpStringToken(int ln, int cl) {
         Token tok = new Token(168, "$", ln, cl);
-        string text = "";
+        // Literal runs are copied as source SLICES and joined once: the
+        // runtime never frees intermediates, so the older per-character
+        // `text += (string)ch` leaked about L^2/2 bytes per literal.
+        string[] textParts = [];
         bool closed = false;
+        int runStart = this.pos;
         while (this.pos < this.srcLen) {
             char ch = this.src[this.pos]; this.advance();
-            if (ch == '"') { closed = true; break; }
+            if (ch == '"') {
+                if (this.pos - 1 > runStart) { textParts.add(this.src.substring(runStart, this.pos - 1 - runStart)); }
+                closed = true; break;
+            }
             if (ch == '\\') {
+                if (this.pos - 1 > runStart) { textParts.add(this.src.substring(runStart, this.pos - 1 - runStart)); }
                 if (this.pos < this.srcLen) {
                     char esc = this.src[this.pos]; this.advance();
-                    if (esc == 'n') { text += "\n"; }
-                    else if (esc == 't') { text += "\t"; }
-                    else if (esc == '0') { text += "\0"; }
-                    else if (esc == 'r') { text += "\r"; }
-                    else if (esc == '\\') { text += "\\"; }
-                    else if (esc == '\"') { text += "\""; }
+                    if (esc == 'n') { textParts.add("\n"); }
+                    else if (esc == 't') { textParts.add("\t"); }
+                    else if (esc == '0') { textParts.add("\0"); }
+                    else if (esc == 'r') { textParts.add("\r"); }
+                    else if (esc == '\\') { textParts.add("\\"); }
+                    else if (esc == '\"') { textParts.add("\""); }
                     else if (esc == 'x') {
                         int hv = 0;
                         int nd = 0;
@@ -391,18 +413,29 @@ class Lexer {
                             hv = hv * 16 + dv;
                             nd++;
                         }
-                        if (nd > 0) { char xc = hv; text += (string)xc; }
-                        else { text += "\\x"; }
+                        if (nd > 0) { char xc = hv; textParts.add((string)xc); }
+                        else { textParts.add("\\x"); }
                     }
-                    else { text += "\\" + esc; }
+                    else { textParts.add("\\" + esc); }
                 }
+                runStart = this.pos;
                 continue;
             }
             if (ch == '{') {
-                if (this.peek() == '{') { this.advance(); text += "{"; continue; }
-                if (text.length > 0) {
-                    tok.ipKinds.add(0); tok.ipTexts.add(text); tok.ipLines.add(0); tok.ipCols.add(0);
-                    text = "";
+                if (this.peek() == '{') {
+                    this.advance();
+                    if (this.pos - 2 > runStart) { textParts.add(this.src.substring(runStart, this.pos - 2 - runStart)); }
+                    textParts.add("{");
+                    runStart = this.pos;
+                    continue;
+                }
+                // The literal run before the hole closes here; the hole text
+                // is captured raw below.
+                if (this.pos - 1 > runStart) { textParts.add(this.src.substring(runStart, this.pos - 1 - runStart)); }
+                string lit = textParts.join("");
+                textParts = [];
+                if (lit.length > 0) {
+                    tok.ipKinds.add(0); tok.ipTexts.add(lit); tok.ipLines.add(0); tok.ipCols.add(0);
                 }
                 int hLine = this.line;
                 int hCol = this.col - 1;
@@ -436,15 +469,23 @@ class Lexer {
                 }
                 if (!holeClosed) { closed = false; break; }
                 tok.ipKinds.add(1); tok.ipTexts.add(hole); tok.ipLines.add(hLine); tok.ipCols.add(hCol);
+                runStart = this.pos;
                 continue;
             }
             if (ch == '}') {
-                if (this.peek() == '}') { this.advance(); text += "}"; continue; }
-                text += "}";
+                if (this.peek() == '}') {
+                    this.advance();
+                    if (this.pos - 2 > runStart) { textParts.add(this.src.substring(runStart, this.pos - 2 - runStart)); }
+                    textParts.add("}");
+                    runStart = this.pos;
+                    continue;
+                }
+                // A lone `}` stays literal text: it stays in the run.
                 continue;
             }
-            text += (string)ch;
         }
+        if (!closed && this.srcLen > runStart) { textParts.add(this.src.substring(runStart, this.srcLen - runStart)); }
+        string text = textParts.join("");
         if (text.length > 0) {
             tok.ipKinds.add(0); tok.ipTexts.add(text); tok.ipLines.add(0); tok.ipCols.add(0);
         }
