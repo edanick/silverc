@@ -73,6 +73,7 @@ class MiniCg {
     public prop string[] constStringValues;
     public prop int[] constIsString;
     public prop string[] constTypes;
+    private prop Node[] constInitializers;
     public prop string[] funcRetTypes;
     public prop int[] funcOffsets;
     public prop int[] funcParamStarts;
@@ -361,6 +362,7 @@ class MiniCg {
         this.constStringValues = [];
         this.constIsString = [];
         this.constTypes = [];
+        this.constInitializers = [];
         this.funcRetTypes = [];
         this.funcOffsets = [];
         this.funcParamStarts = [];
@@ -2409,6 +2411,8 @@ int strIdx = this.stringPatchIndices[i];
             if (pi.kind == 104) {
                 this.constNames.add(pi.name);
                 this.constTypes.add(pi.typeHint);
+                while (this.constInitializers.length < this.constNames.length) { this.constInitializers.add(null); }
+                if (pi.childCount() > 0) { this.constInitializers[this.constNames.length - 1] = pi.child(0); }
                 if (pi.childCount() > 0 && pi.child(0).kind == 0) {
                     this.constValues.add(pi.child(0).intVal);
                     this.constStringValues.add("");
@@ -5225,7 +5229,8 @@ int strIdx = this.stringPatchIndices[i];
                 break;
             }
         }
-        if (isConst) {
+        if (isConst && this.findLocal(expr.name) == 0 && this.findGlobal(expr.name) < 0) {
+            if (this.genTypedConstant(constIdx)) { return; }
             if (constIdx < this.constIsString.length && this.constIsString[constIdx] == 1) {
                 int strIdx = this.addString(constString);
                 int sp = this.asm.buf.length;
@@ -5722,6 +5727,14 @@ int strIdx = this.stringPatchIndices[i];
         }
     }
 
+    private bool genTypedConstant(int index) {
+        if (index >= this.constInitializers.length) { return false; }
+        Node initializer = this.constInitializers[index];
+        if (initializer == null) { return false; }
+        this.genExprAsType(initializer, this.constTypes[index]);
+        return true;
+    }
+
     public void genMemberAccess(Node expr) {
         Node obj = expr.child(0);
         string fieldName = expr.name;
@@ -5798,6 +5811,7 @@ int strIdx = this.stringPatchIndices[i];
             if (!objIsLocal && !objIsClass && !objIsEnum) {
                 for (int ci = 0; ci < this.constNames.length; ci++) {
                     if (this.constNames[ci] == fieldName) {
+                        if (this.genTypedConstant(ci)) { return; }
                         if (ci < this.constIsString.length && this.constIsString[ci] == 1) {
                             int strIdx = this.addString(this.constStringValues[ci]);
                             int sp = this.asm.buf.length;
@@ -6080,7 +6094,8 @@ int strIdx = this.stringPatchIndices[i];
         if (expr.kind == 6) {
             if (expr.name == "this") { return this.currentClassName; }
             for (int ci = 0; ci < this.constNames.length; ci++) {
-                if (this.constNames[ci] == expr.name) {
+                if (this.constNames[ci] == expr.name && this.findLocal(expr.name) == 0) {
+                    if (ci < this.constTypes.length && this.constTypes[ci] != "") { return this.constTypes[ci]; }
                     if (ci < this.constIsString.length && this.constIsString[ci] == 1) {
                         return "string";
                     }
@@ -16058,6 +16073,7 @@ public void genNewCall(Node call) {
             if (t == "") {
                 for (int ci = 0; ci < this.constNames.length; ci++) {
                     if (this.constNames[ci] == expr.name) {
+                        if (ci < this.constTypes.length && this.constTypes[ci] == "string") { return true; }
                         if (ci < this.constStringValues.length && this.constStringValues[ci] != "") {
                             return true;
                         }
