@@ -2412,12 +2412,35 @@ class Parser {
             while (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } ft += "[]"; }
             ft = this.parsePointerSuffix(ft);
             if (this.check(123)) { this.advance(); ft += "?"; }
-            if (this.check(7) && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 106) {
+            // A field declaration: `Type name;` or `Type name = value;`.
+            // The initializer is optional, so the probe accepts either the
+            // semicolon or the `=` that starts one.
+            if (this.check(7) && this.pos + 1 < this.tokens.length
+                && (this.tokens[this.pos + 1].kind == 106 || this.tokens[this.pos + 1].kind == 110)) {
                 Node field = new Node();
                 field.kind = 50;
                 field.typeHint = ft;
                 field.name = this.advance().text;
                 field.isInternal = memberInternal;
+                // A STATIC field has class-level storage, not an instance
+                // slot: the backend keeps one shared value per declaration
+                // and reads and writes it as `ClassName.field`.
+                field.isStatic = memberStatic;
+                if (this.check(110)) {
+                    // A field initializer: the value is set when the
+                    // instance is built (an instance field) or once, with
+                    // the global initializers (a static field).
+                    this.advance();
+                    // The initializer is parsed into a local first: the
+                    // nested call as a direct call argument is not lowered
+                    // reliably by this backend (the argument is dropped).
+                    Node fieldInit = this.parseExpr(0);
+                    // The child is appended through the field directly:
+                    // `field.addChild(x)` loses the element (the array
+                    // growth inside the method does not write the new
+                    // pointer back into the field).
+                    field.children.add(fieldInit);
+                }
                 this.expect(106);
                 return field;
             }

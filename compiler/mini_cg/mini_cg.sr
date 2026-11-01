@@ -179,6 +179,15 @@ class MiniCg {
     public prop int[] classFieldStarts;
     public prop int[] classFieldCounts;
     public prop string[] classFieldNames;
+    // STATIC class fields: "Class.field" -> the index of the global slot
+    // that holds the shared value. A static field has class-level storage,
+    // so it is not part of the instance layout.
+    public prop dict<string, int> staticFieldGlobal;
+    // The STATIC field declarations collected with the class layout; their
+    // global slots are allocated after the user globals.
+    public prop string[] staticFieldKeys;
+    public prop string[] staticFieldTypes;
+    public prop Node[] staticFieldInits;
     public prop int[] classFieldOffsets;
     public prop string[] classFieldTypes;
     public prop bool[] classFieldReadOnly;
@@ -420,6 +429,10 @@ class MiniCg {
         this.classFieldStarts = [];
         this.classFieldCounts = [];
         this.classFieldNames = [];
+        this.staticFieldGlobal = {};
+        this.staticFieldKeys = [];
+        this.staticFieldTypes = [];
+        this.staticFieldInits = [];
         this.classFieldOffsets = [];
         this.classFieldTypes = [];
         this.classFieldReadOnly = [];
@@ -573,7 +586,7 @@ class MiniCg {
                         this.classFieldReadOnly.add(false);
                         this.classFieldVisible.add(false);
                         this.classFieldOwner.add(sitem.name);
-                        Node snoInit = new Node();
+                        Node snoInit = new Node(); snoInit.kind = 255;
                         this.classFieldInits.add(snoInit);
                         scnt++;
                     }
@@ -615,6 +628,32 @@ class MiniCg {
                         for (int j = 0; j < citem.childCount(); j++) {
                             Node member = citem.child(j);
                             if (member.kind == 50) {
+                                if (member.isStatic) {
+                                    // A STATIC field has class-level storage:
+                                    // one global slot shared by every
+                                    // instance, read and written as
+                                    // `ClassName.field`. It takes no
+                                    // instance slot; the slot itself is
+                                    // allocated after the user globals (see
+                                    // allocateStaticFieldGlobals).
+                                    string sfKey = "__static_" + citem.name + "_" + member.name;
+                                    if (!this.staticFieldGlobal.contains(sfKey)) {
+                                        string sfType = member.typeHint;
+                                        if ((sfType == "var" || sfType == "") && member.childCount() > 0) {
+                                            sfType = this.inferExprType(member.child(0));
+                                        }
+                                        this.staticFieldKeys.add(sfKey);
+                                        this.staticFieldTypes.add(sfType);
+                                        if (member.childCount() > 0) {
+                                            this.staticFieldInits.add(member.child(0));
+                                        } else {
+                                            Node sfMissing = new Node(); sfMissing.kind = 255;
+                                            this.staticFieldInits.add(sfMissing);
+                                        }
+                                        this.staticFieldGlobal[sfKey] = -1;
+                                    }
+                                    continue;
+                                }
                                 bool shadowed = false;
                                 for (int s = 0; s < cnt; s++) {
                                     if (this.classFieldNames[start + s] == member.name) {
@@ -628,10 +667,12 @@ class MiniCg {
                                     this.classFieldReadOnly.add(member.isReadOnly);
                                     this.classFieldVisible.add(member.isVisible);
                                     this.classFieldOwner.add(citem.name);
-                                    if (member.isReadOnly && member.childCount() > 0) {
+                                    if (member.childCount() > 0) {
+                                        // A field initializer: it runs when the
+                                        // instance is built.
                                         this.classFieldInits.add(member.child(0));
                                     } else {
-                                        Node noInit = new Node();
+                                        Node noInit = new Node(); noInit.kind = 255;
                                         this.classFieldInits.add(noInit);
                                     }
                                     cnt++;
@@ -1919,6 +1960,8 @@ class MiniCg {
         if (this.findGlobal(lhs.name) >= 0) { return; }
         if (this.currentClassName != "") {
             if (this.findFieldOffset(this.currentClassName, lhs.name) >= 0) { return; }
+            // A bare STATIC field of the enclosing class.
+            if (this.staticFieldGlobal.contains("__static_" + this.currentClassName + "_" + lhs.name)) { return; }
         }
         printline((string)lhs.line + ":" + (string)lhs.col + ": Undefined variable '" + lhs.name + "'");
         exit(1);
@@ -2579,6 +2622,18 @@ int strIdx = this.stringPatchIndices[i];
             this.globalOffsets.add(this.globalOffsets.length * 8);
             Node macArgvMissing = new Node(); macArgvMissing.kind = 255;
             this.globalInits.add(macArgvMissing);
+        }
+        // The STATIC class fields take their global slots here, after the
+        // user globals: one slot per declaration, shared by every instance
+        // of the class.
+        for (int sfi = 0; sfi < this.staticFieldKeys.length; sfi++) {
+            string sfKey = this.staticFieldKeys[sfi];
+            if (this.staticFieldGlobal[sfKey] >= 0) { continue; }
+            this.globalNames.add(sfKey);
+            this.globalTypes.add(this.staticFieldTypes[sfi]);
+            this.globalOffsets.add(this.globalOffsets.length * 8);
+            this.globalInits.add(this.staticFieldInits[sfi]);
+            this.staticFieldGlobal[sfKey] = this.globalNames.length - 1;
         }
         if (this.globalNames.length > 0) {
             this.globalAreaSize = this.globalNames.length * 8;
@@ -5257,6 +5312,11 @@ int strIdx = this.stringPatchIndices[i];
                 int gi = this.findGlobal(expr.name);
                 if (gi >= 0) {
                     this.genGlobalLoad(gi);
+                } else if (this.currentClassName != ""
+                           && this.staticFieldGlobal.contains("__static_" + this.currentClassName + "_" + expr.name)) {
+                    // A bare STATIC field of the enclosing class: `total`
+                    // inside a method of Counter means `Counter.total`.
+                    this.genGlobalLoad(this.staticFieldGlobal["__static_" + this.currentClassName + "_" + expr.name]);
                 } else if (this.currentClassName != "") {
                     // Bare class field read: `field` inside a method resolves
                     // to `this.field` (parity with silverc-rs gen_expr).  The
@@ -5865,6 +5925,12 @@ int strIdx = this.stringPatchIndices[i];
             this.genDictIndexGet(idxNode);
             return;
         }
+        // A STATIC class field: `ClassName.field` reads the class-level
+        // slot (one value shared by every instance of the class).
+        if (obj.kind == 6 && this.staticFieldGlobal.contains("__static_" + obj.name + "_" + fieldName)) {
+            this.genGlobalLoad(this.staticFieldGlobal["__static_" + obj.name + "_" + fieldName]);
+            return;
+        }
         if (obj.kind == 6 && obj.name == "this") {
             int thisOff = this.findLocal("this");
             int fieldOff = this.findFieldOffset(this.currentClassName, fieldName);
@@ -6443,6 +6509,15 @@ int strIdx = this.stringPatchIndices[i];
     public string inferMemberAccessType(Node expr) {
         Node obj = expr.child(0);
         string fieldName = expr.name;
+        // A STATIC class field: `ClassName.field` carries the field's
+        // declared type, so a chained call on it (`Counter.count.toString()`)
+        // binds like any other typed receiver.
+        if (obj.kind == 6) {
+            string sfKey = "__static_" + obj.name + "_" + fieldName;
+            for (int sfi = 0; sfi < this.staticFieldKeys.length; sfi++) {
+                if (this.staticFieldKeys[sfi] == sfKey) { return this.staticFieldTypes[sfi]; }
+            }
+        }
         // os.name / os.version / os.build → string
         if (obj.kind == 6 && obj.name == "os") { return "string"; }
         // Module-qualified global const (e.g. math.PI): report its declared
@@ -10200,10 +10275,11 @@ public void genNewCall(Node call) {
             int fstart = this.classFieldStarts[fi];
             int fcnt = this.classFieldCounts[fi];
             for (int fj = 0; fj < fcnt; fj++) {
-                // Readonly slots always carry their initializer (the parser
-                // requires it); other slots are never read here.
-                if (this.classFieldReadOnly[fstart + fj]) {
-                    Node finit = this.classFieldInits[fstart + fj];
+                // A field initializer runs when the instance is built:
+                // read-only props always carry one (the parser requires
+                // it), and an ordinary field may declare one too.
+                Node finit = this.classFieldInits[fstart + fj];
+                if (finit.kind != 255) {
                     this.genExpr(finit);
                     this.asm.movRMBase(1, 5, tmpOff);
                     this.asm.addRI32(1, this.classFieldOffsets[fstart + fj]);
@@ -15552,6 +15628,11 @@ public void genNewCall(Node call) {
                 }
             } else if (gi >= 0) {
                 this.genGlobalStore(gi);
+            } else if (this.currentClassName != ""
+                       && this.staticFieldGlobal.contains("__static_" + this.currentClassName + "_" + lhs.name)) {
+                // A bare STATIC field of the enclosing class: `total = v`
+                // inside a method of Counter writes `Counter.total`.
+                this.genGlobalStore(this.staticFieldGlobal["__static_" + this.currentClassName + "_" + lhs.name]);
             } else if (this.currentClassName != "") {
                 // Bare class field write: `field = value` inside a method
                 // resolves to `this.field = value` (parity with silverc-rs).
@@ -15618,6 +15699,13 @@ public void genNewCall(Node call) {
                 this.asm.addRI32(0, fieldOff);
                 this.asm.popR64(1);
                 this.asm.movMBaseR(0, 1, 0);
+                return;
+            }
+            if (obj.kind == 6 && this.staticFieldGlobal.contains("__static_" + obj.name + "_" + fieldName)) {
+                // A STATIC class field: `ClassName.field = value` writes
+                // the class-level slot (one value shared by every instance).
+                this.genExprAsType(rhs, this.inferExprType(lhs));
+                this.genGlobalStore(this.staticFieldGlobal["__static_" + obj.name + "_" + fieldName]);
                 return;
             }
             if (obj.kind == 6) {
