@@ -358,6 +358,21 @@ class NameChecker {
             }
             return;
         }
+        if (n.kind == ncKindMember || (n.kind == ncKindCall && n.isMember)) {
+            // A member access `X.f` / method call `X.f(...)` reads its
+            // receiver in the one position a module name is ever used.
+            // The `.srp` project flow strips the `import` and `mod export`
+            // lines out of the aggregate before it is parsed (the module's
+            // items join the program as plain top-level declarations), so
+            // no import node or export name binds `time` in `time.now()`.
+            // Bind the receiver name — the same shape codegen's module
+            // dispatch keys on — before descending into it. Permissive by
+            // design: an over-approximation can only silence a diagnostic,
+            // never invent one.
+            if (n.childCount() > 0 && n.child(0).kind == ncKindIdent) {
+                scope.add(n.child(0).name);
+            }
+        }
         for (int i = 0; i < n.childCount(); i++) {
             this.walk(n.child(i), scope);
         }
