@@ -26,6 +26,7 @@ import * from objcache;
 import * from watcher;
 import * from progress;
 import * from visibility;
+import * from namecheck;
 import * from preprocess;
 import * from macx64;
 
@@ -1909,6 +1910,23 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
     if (pout.errors.length > 0) {
         drvPrintDiagnostics(pout.errors, source, inputFile, flags.cacheBytecode);
         exit(1);
+    }
+
+    // Static name analysis: a name that nothing binds must not reach the
+    // backend. The emitter used to lower it to a garbage value, so a typo
+    // (or a name the emitter forgot to declare) surfaced as a wrong number
+    // at run time instead of a diagnostic. The pass reports every such read
+    // before the program is emitted.
+    {
+        NameChecker nc = new NameChecker();
+        nc.checkProgram(ast, pout.modExportNames);
+        if (nc.errors.length > 0) {
+            printline("[" + inputFile + "]");
+            for (int nceI = 0; nceI < nc.errors.length; nceI++) {
+                printline(nc.errors[nceI]);
+            }
+            exit(1);
+        }
     }
 
     // DOCS/258 -- `internal` project-boundary enforcement. A standalone

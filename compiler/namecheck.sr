@@ -1,0 +1,395 @@
+mod export namecheck;
+
+import * from node;
+
+// ----------------------------------------------------------------------
+// Static name analysis.
+//
+// A name that NOTHING binds must never reach the backend: the emitter
+// used to lower it to a garbage value, so a typo (or a name the emitter
+// forgot to declare) surfaced as a wrong number at run time. This pass
+// reports every such read before the program is emitted.
+//
+// The analysis is deliberately PERMISSIVE: a name counts as bound when
+// ANY of these holds:
+//   - it is a program-level declaration (function, class, struct, enum,
+//     global, constant, `def` type alias, imported name, module name),
+//   - it is an enum variant,
+//   - it is bound anywhere in the enclosing function (parameter, local,
+//     pattern binding, catch variable, lambda parameter, range variable),
+//   - it is a field of the enclosing class (the bare `field` idiom),
+//   - it is a builtin or a native module name.
+//
+// An over-approximation can only SILENCE a diagnostic, never invent one:
+// the pass reports a name only when no binding of any kind exists.
+// ----------------------------------------------------------------------
+
+// Node kinds (the parser's numbers; kept here so the pass reads as a
+// table instead of a scatter of magic numbers).
+int ncKindIdent = 6;
+int ncKindBinary = 7;
+int ncKindCall = 10;
+int ncKindMember = 13;
+int ncKindPair = 18;
+int ncKindMatchArm = 21;
+int ncKindVarDecl = 50;
+int ncKindTry = 59;
+int ncKindDestructure = 71;
+int ncKindAlias = 73;
+int ncKindStructLit = 74;
+int ncKindDestructure2 = 79;
+int ncKindLambda = 80;
+int ncKindObjectInit = 88;
+int ncKindFunction = 100;
+int ncKindStruct = 101;
+int ncKindClass = 102;
+int ncKindConst = 104;
+int ncKindModule = 105;
+int ncKindDef = 110;
+
+// Binary operators whose LEFT side is an assignment target rather than a
+// read: `x = v`, `x += v`, `x ??= v`.
+bool ncIsAssignOp(int op) {
+    return op == 20 || op == 14 || op == 15 || op == 16 || op == 17 || op == 38;
+}
+
+// Names the language binds itself: the builtin functions, the primitive
+// type names used as conversion calls, and the native module receivers.
+// They are ordinary identifiers in most positions, so a program may use
+// one as a variable; the pass never reports them.
+bool ncBuiltinName(string name) {
+    if (name == "print" || name == "printline") { return true; }
+    if (name == "eprint" || name == "eprintln") { return true; }
+    if (name == "debug" || name == "debugline") { return true; }
+    if (name == "exit" || name == "input") { return true; }
+    if (name == "sleep" || name == "assert") { return true; }
+    if (name == "strlen" || name == "now") { return true; }
+    if (name == "cargs" || name == "getCommandLine") { return true; }
+    if (name == "swap" || name == "prefix") { return true; }
+    if (name == "string" || name == "int" || name == "int32" || name == "int64") { return true; }
+    if (name == "uint" || name == "uint64" || name == "float" || name == "float64") { return true; }
+    if (name == "double" || name == "bool" || name == "byte" || name == "char") { return true; }
+    if (name == "void" || name == "var" || name == "object" || name == "any") { return true; }
+    if (name == "true" || name == "false" || name == "null") { return true; }
+    if (name == "this" || name == "self") { return true; }
+    if (name == "Value" || name == "Token" || name == "Node") { return true; }
+    if (name == "Evaluator" || name == "Env" || name == "Lexer" || name == "Parser") { return true; }
+    // Native module receivers.
+    if (name == "fs" || name == "file" || name == "folder") { return true; }
+    if (name == "json" || name == "yaml" || name == "env" || name == "url") { return true; }
+    if (name == "hash" || name == "path" || name == "bom" || name == "console") { return true; }
+    if (name == "math" || name == "http" || name == "keyboard" || name == "mouse") { return true; }
+    if (name == "llmai" || name == "LLMAI" || name == "binary_metadata") { return true; }
+    if (name == "process" || name == "notifications" || name == "os") { return true; }
+    if (name == "project" || name == "exception" || name == "threads") { return true; }
+    return false;
+}
+
+// A usable identifier: a letter or underscore followed by letters, digits
+// or underscores. The parser's fallthrough turns an unexpected token into
+// an identifier node carrying that token's text (a stray `;` becomes the
+// name ";"), and such a name is never a real binding.
+bool ncValidName(string name) {
+    if (name.length == 0) { return false; }
+    char first = name[0];
+    if (!((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_')) {
+        return false;
+    }
+    for (int i = 1; i < name.length; i++) {
+        char c = name[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+// Every name bound inside one function: parameters, locals, pattern
+// bindings, catch variables and lambda parameters. Collected over the
+// WHOLE function body, not per block: an over-approximation can only
+// silence a diagnostic, never invent one.
+class NcScope {
+    public prop string[] names;
+
+    construct {
+        this.names = [];
+    }
+
+    public void add(string name) {
+        if (name.length == 0) { return; }
+        this.names.add(name);
+    }
+
+    public bool has(string name) {
+        for (int i = 0; i < this.names.length; i++) {
+            if (this.names[i] == name) { return true; }
+        }
+        return false;
+    }
+}
+
+// The name analysis over one parsed program.
+class NameChecker {
+    public prop string[] errors;
+
+    // Program-level names: functions, classes, structs, enums, globals,
+    // constants, type aliases, imported names and module names.
+    private prop string[] declNames;
+    // Class fields, kept per declaring class so a method of that class
+    // resolves the bare `field` idiom.
+    private prop string[] fieldClasses;
+    private prop string[] fieldNames;
+    // Declaring class -> its parent classes, so a subclass method also
+    // resolves an inherited field by its bare name. One entry per
+    // (child, parent) pair.
+    private prop string[] parentChildren;
+    private prop string[] parentNames;
+
+    construct {
+        this.errors = [];
+        this.declNames = [];
+        this.fieldClasses = [];
+        this.fieldNames = [];
+        this.parentChildren = [];
+        this.parentNames = [];
+    }
+
+    // Check one parsed program. `modNames` are the `mod export X;` module
+    // names (the parser records them beside the program, not inside it).
+    public void checkProgram(Node[] program, string[] modNames) {
+        for (int m = 0; m < modNames.length; m++) {
+            this.declNames.add(modNames[m]);
+        }
+        for (int i = 0; i < program.length; i++) {
+            this.collectItem(program[i]);
+        }
+        for (int i = 0; i < program.length; i++) {
+            this.checkItem(program[i], "");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Declarations
+    // ------------------------------------------------------------------
+
+    private void collectItem(Node item) {
+        if (item.kind == ncKindFunction) {
+            this.declNames.add(item.name);
+            // A top-level `int x = 1;` lives in the program's global block.
+            if (item.name == "main" && item.childCount() > 1) {
+                Node body = item.child(1);
+                for (int b = 0; b < body.childCount(); b++) {
+                    Node stmt = body.child(b);
+                    if (stmt.kind == ncKindVarDecl) {
+                        this.declNames.add(stmt.name);
+                    }
+                }
+            }
+        } else if (item.kind == ncKindClass || item.kind == ncKindStruct) {
+            this.declNames.add(item.name);
+            for (int p = 0; p < item.parentClasses.length; p++) {
+                this.parentChildren.add(item.name);
+                this.parentNames.add(item.parentClasses[p]);
+            }
+            for (int m = 0; m < item.childCount(); m++) {
+                Node member = item.child(m);
+                if (member.kind == ncKindVarDecl) {
+                    this.fieldClasses.add(item.name);
+                    this.fieldNames.add(member.name);
+                }
+            }
+        } else if (item.kind == ncKindConst || item.kind == ncKindVarDecl
+                   || item.kind == ncKindDef) {
+            this.declNames.add(item.name);
+        } else if (item.kind == ncKindModule) {
+            // An import node and an enum node share this kind. Both bind
+            // names: an import binds its source module and the names it
+            // pulls in, an enum binds its type name and its variants.
+            if (item.name.length > 0) { this.declNames.add(item.name); }
+            if (item.typeHint.length > 0) { this.declNames.add(item.typeHint); }
+            for (int c = 0; c < item.childCount(); c++) {
+                Node child = item.child(c);
+                if (child.name.length > 0) { this.declNames.add(child.name); }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Usage walk
+    // ------------------------------------------------------------------
+
+    private void checkItem(Node item, string className) {
+        if (item.kind == ncKindFunction) {
+            NcScope scope = new NcScope();
+            if (item.childCount() > 0) {
+                Node params = item.child(0);
+                for (int p = 0; p < params.childCount(); p++) {
+                    scope.add(params.child(p).name);
+                }
+            }
+            this.addClassFields(scope, className);
+            if (item.childCount() > 1) {
+                this.collectLocals(item.child(1), scope);
+                this.walk(item.child(1), scope);
+            }
+        } else if (item.kind == ncKindClass || item.kind == ncKindStruct) {
+            for (int m = 0; m < item.childCount(); m++) {
+                Node member = item.child(m);
+                if (member.kind == ncKindFunction) {
+                    this.checkItem(member, item.name);
+                } else if (member.kind == ncKindVarDecl && member.childCount() > 0) {
+                    // A field initializer is an expression in the class scope.
+                    NcScope scope = new NcScope();
+                    this.addClassFields(scope, item.name);
+                    this.walk(member.child(0), scope);
+                }
+            }
+        } else if (item.kind == ncKindVarDecl && item.childCount() > 0) {
+            // A global initializer.
+            NcScope scope = new NcScope();
+            this.walk(item.child(0), scope);
+        }
+    }
+
+    // The bare `field` idiom: inside a class method, `total` means
+    // `this.total`. The DECLARING class's fields bind here, and so do the
+    // fields it inherits (a subclass method reads an inherited field by
+    // its bare name too).
+    private void addClassFields(NcScope scope, string className) {
+        if (className.length == 0) { return; }
+        for (int i = 0; i < this.fieldClasses.length; i++) {
+            if (this.fieldClasses[i] == className) {
+                scope.add(this.fieldNames[i]);
+            }
+        }
+        for (int p = 0; p < this.parentChildren.length; p++) {
+            if (this.parentChildren[p] != className) { continue; }
+            this.addClassFields(scope, this.parentNames[p]);
+        }
+    }
+
+    private void collectLocals(Node n, NcScope scope) {
+        if (n.kind == ncKindVarDecl || n.kind == ncKindAlias) {
+            scope.add(n.name);
+        } else if (n.kind == ncKindDestructure || n.kind == ncKindDestructure2) {
+            // The LAST child is the value expression; the rest are names.
+            for (int i = 0; i + 1 < n.childCount(); i++) {
+                scope.add(n.child(i).name);
+            }
+        } else if (n.kind == ncKindTry && n.name.length > 0) {
+            scope.add(n.name);
+        } else if (n.kind == ncKindLambda) {
+            // The LAST child is the body; the rest are parameter names.
+            for (int i = 0; i + 1 < n.childCount(); i++) {
+                scope.add(n.child(i).name);
+            }
+        } else if (n.kind == ncKindMatchArm && n.childCount() > 0) {
+            this.collectPatternLocals(n.child(0), scope);
+        }
+        for (int i = 0; i < n.childCount(); i++) {
+            this.collectLocals(n.child(i), scope);
+        }
+    }
+
+    private void collectPatternLocals(Node p, NcScope scope) {
+        if (p.kind == 0 && p.name.length > 0 && p.name != "_") {
+            scope.add(p.name);
+        }
+        for (int i = 0; i < p.childCount(); i++) {
+            this.collectPatternLocals(p.child(i), scope);
+        }
+    }
+
+    private void walk(Node n, NcScope scope) {
+        if (n.kind == ncKindIdent) {
+            this.checkIdent(n, scope);
+            return;
+        }
+        if (n.kind == ncKindBinary) {
+            // An assignment's LEFT side is a target, not a read: it must be
+            // a declared name, but it is not a use of an unbound one.
+            if (ncIsAssignOp(n.op) && n.childCount() > 0) {
+                this.checkTarget(n.child(0), scope);
+            }
+            for (int i = 0; i < n.childCount(); i++) {
+                this.walk(n.child(i), scope);
+            }
+            return;
+        }
+        if (n.kind == ncKindPair) {
+            // A key/value pair: the key names a field, it is not a read.
+            if (n.childCount() > 1) { this.walk(n.child(1), scope); }
+            return;
+        }
+        if (n.kind == ncKindStructLit) {
+            for (int i = 0; i < n.childCount(); i++) {
+                Node pair = n.child(i);
+                if (pair.childCount() > 1) { this.walk(pair.child(1), scope); }
+            }
+            return;
+        }
+        if (n.kind == ncKindObjectInit) {
+            // The leading children are constructor arguments; the rest are
+            // field/value pairs whose key names a field.
+            int nargs = n.op;
+            if (nargs < 0) { nargs = 0; }
+            if (nargs > n.childCount()) { nargs = n.childCount(); }
+            for (int i = 0; i < nargs; i++) {
+                this.walk(n.child(i), scope);
+            }
+            for (int i = nargs; i < n.childCount(); i++) {
+                Node pair = n.child(i);
+                if (pair.kind == ncKindPair && pair.childCount() > 1) {
+                    this.walk(pair.child(1), scope);
+                } else {
+                    this.walk(pair, scope);
+                }
+            }
+            return;
+        }
+        if (n.kind == ncKindLambda) {
+            // The parameter names are names, not reads; the body is code.
+            for (int i = 0; i + 1 < n.childCount(); i++) {
+                scope.add(n.child(i).name);
+            }
+            for (int i = 0; i < n.childCount(); i++) {
+                this.walk(n.child(i), scope);
+            }
+            return;
+        }
+        for (int i = 0; i < n.childCount(); i++) {
+            this.walk(n.child(i), scope);
+        }
+    }
+
+    // A read of a name that nothing binds: the defect this pass exists for.
+    private void checkIdent(Node n, NcScope scope) {
+        string name = n.name;
+        if (!ncValidName(name)) { return; }
+        if (scope.has(name)) { return; }
+        if (this.declNames.contains(name)) { return; }
+        if (ncBuiltinName(name)) { return; }
+        this.errors.add((string)n.line + ":" + (string)n.col + ": Undefined variable '" + name + "'");
+    }
+
+    // An assignment target: the name must be bound somewhere (a local, a
+    // global or a field), otherwise the store lands nowhere. A target that
+    // binds nothing yet CREATES the name (the emitter gives an unbound
+    // assignment a fresh global slot), so it joins the scope instead of
+    // being reported.
+    private void checkTarget(Node n, NcScope scope) {
+        if (n.kind != ncKindIdent) { return; }
+        string name = n.name;
+        if (!ncValidName(name)) { return; }
+        if (scope.has(name)) { return; }
+        if (this.declNames.contains(name)) { return; }
+        if (ncBuiltinName(name)) { return; }
+        bool isField = false;
+        for (int i = 0; i < this.fieldNames.length; i++) {
+            if (this.fieldNames[i] == name) { isField = true; break; }
+        }
+        if (isField) { return; }
+        scope.add(name);
+    }
+}
