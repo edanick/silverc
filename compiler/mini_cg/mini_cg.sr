@@ -6239,7 +6239,7 @@ int strIdx = this.stringPatchIndices[i];
                 if ((cname == "toUpper" || cname == "upper") && recvType == "string") {
                     return "string";
                 }
-                if ((cname == "substr" || cname == "substring") && recvType == "string") {
+                if ((cname == "substr" || cname == "substring" || cname == "slice") && recvType == "string") {
                     return "string";
                 }
                 if (cname == "length" && recvType == "string") {
@@ -12050,7 +12050,7 @@ public void genNewCall(Node call) {
             }
         }
         if (recvType == "string") {
-            if (name == "contains" || name == "isDigits" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "lastIndexOf" || name == "substr" || name == "substring" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toFloatBits" || name == "toBytes" || name == "repeat") {
+            if (name == "contains" || name == "isDigits" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "lastIndexOf" || name == "substr" || name == "substring" || name == "slice" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toFloatBits" || name == "toBytes" || name == "repeat") {
                 return true;
             }
         }
@@ -12877,6 +12877,118 @@ public void genNewCall(Node call) {
             this.asm.xorRR64(2, 2);
             this.asm.movMBaseByteR(0, 2, 0);
             this.asm.movRMBase(0, 5, sbDst);
+            return;
+        }
+        if (name == "slice") {
+            // slice(start, end) - the END is EXCLUSIVE (SPEC: `.slice(start..end)`),
+            // unlike substr/substring whose second argument is a LENGTH. A
+            // missing end slices to the end of the string; an end past the
+            // string is clamped to it, and an end before the start yields the
+            // empty string.
+            int slRecv = this.allocLocal("__sl_recv");
+            int slStart = this.allocLocal("__sl_start");
+            int slEnd = this.allocLocal("__sl_end");
+            int slTotal = this.allocLocal("__sl_total");
+            int slLen = this.allocLocal("__sl_len");
+            int slDst = this.allocLocal("__sl_dst");
+            int slI = this.allocLocal("__sl_i");
+            this.genExpr(recv);
+            this.asm.movMBaseR(5, 0, slRecv);
+            if (call.childCount() >= 2) {
+                this.genExpr(call.child(1));
+                this.asm.movMBaseR(5, 0, slStart);
+            } else {
+                this.asm.movRI64(0, 0);
+                this.asm.movMBaseR(5, 0, slStart);
+            }
+            // total = strlen(recv)
+            this.asm.movRMBase(1, 5, slRecv);
+            this.addImportPatch("ucrtbase.dll", "strlen");
+            int slSL = 0xDEADBEEFCAFEBADD;
+            this.asm.emitImm64(0, slSL);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movMBaseR(5, 0, slTotal);
+            // end = the second argument, or the whole string.
+            if (call.childCount() >= 3) {
+                this.genExpr(call.child(2));
+                this.asm.movMBaseR(5, 0, slEnd);
+            } else {
+                this.asm.movRMBase(0, 5, slTotal);
+                this.asm.movMBaseR(5, 0, slEnd);
+            }
+            // end = min(end, total)
+            this.asm.movRMBase(0, 5, slEnd);
+            this.asm.movRMBase(1, 5, slTotal);
+            this.asm.cmpRR64(0, 1);
+            int slEndClamp = this.newLabel();
+            this.asm.jleLabel(slEndClamp);
+            this.asm.movRMBase(0, 5, slTotal);
+            this.asm.movMBaseR(5, 0, slEnd);
+            this.asm.bindLabel(slEndClamp);
+            // len = end - start; an end before the start collapses to empty.
+            this.asm.movRMBase(0, 5, slEnd);
+            this.asm.movRMBase(1, 5, slStart);
+            this.asm.cmpRR64(0, 1);
+            int slRangeOk = this.newLabel();
+            int slLenReady = this.newLabel();
+            this.asm.jgeLabel(slRangeOk);
+            this.asm.movRI64(0, 0);
+            this.asm.movMBaseR(5, 0, slLen);
+            this.asm.jmpLabel(slLenReady);
+            this.asm.bindLabel(slRangeOk);
+            this.asm.movRMBase(0, 5, slEnd);
+            this.asm.movRMBase(1, 5, slStart);
+            this.asm.subRR64(0, 1);
+            this.asm.movMBaseR(5, 0, slLen);
+            this.asm.bindLabel(slLenReady);
+            // dst = malloc(len + 1)
+            this.asm.movRMBase(1, 5, slLen);
+            this.asm.addRI32(1, 1);
+            this.addImportPatch("msvcrt.dll", "malloc");
+            int slMA = 0xDEADBEEFCAFEBADE;
+            this.asm.emitImm64(0, slMA);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movMBaseR(5, 0, slDst);
+            // copy loop
+            this.asm.xorRR64(0, 0);
+            this.asm.movMBaseR(5, 0, slI);
+            int slLoop = this.newLabel();
+            int slDone = this.newLabel();
+            this.asm.bindLabel(slLoop);
+            this.asm.movRMBase(0, 5, slI);
+            this.asm.movRMBase(1, 5, slLen);
+            this.asm.cmpRR64(0, 1);
+            this.asm.jgeLabel(slDone);
+            // byte = recv[start + i]
+            this.asm.movRMBase(0, 5, slRecv);
+            this.asm.movRMBase(11, 5, slStart);
+            this.asm.addRR64(0, 11);
+            this.asm.movRMBase(11, 5, slI);
+            this.asm.addRR64(0, 11);
+            this.asm.movzxByteMBase(2, 0, 0);
+            // dst[i] = byte
+            this.asm.movRMBase(0, 5, slDst);
+            this.asm.movRMBase(11, 5, slI);
+            this.asm.addRR64(0, 11);
+            this.asm.movMBaseByteR(0, 2, 0);
+            this.asm.movRMBase(0, 5, slI);
+            this.asm.addRI32(0, 1);
+            this.asm.movMBaseR(5, 0, slI);
+            this.asm.jmpLabel(slLoop);
+            this.asm.bindLabel(slDone);
+            // NUL terminate
+            this.asm.movRMBase(0, 5, slDst);
+            this.asm.movRMBase(11, 5, slI);
+            this.asm.addRR64(0, 11);
+            this.asm.xorRR64(2, 2);
+            this.asm.movMBaseByteR(0, 2, 0);
+            this.asm.movRMBase(0, 5, slDst);
             return;
         }
         if (name == "pad" || name == "padLeft" || name == "padRight") {
