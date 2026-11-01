@@ -14592,11 +14592,14 @@ public void genNewCall(Node call) {
         if (op == 1) {
             string lt = this.inferExprType(bin.child(0));
             string rt = this.inferExprType(bin.child(1));
-            // Only a real string operand makes `+` string concatenation.
+            // Only a real string operand makes `+` string concatenation
+            // (isStringLike, mirroring the bootstrap is_string_expr Add
+            // arm): a chained index on a string[]-returning method call
+            // (`"a=" + d.keys()[0]`) must concat as text, not add pointers.
             // A char operand alone (`'a' + 1`, `'a' + 'b'`) is integer
             // arithmetic on the code point; treating char as string there
             // silently produced garbage from the string-concat path.
-            if (lt == "string" || rt == "string") {
+            if (lt == "string" || rt == "string" || this.isStringLike(bin.child(0)) || this.isStringLike(bin.child(1))) {
                 this.genStringConcat(bin);
                 return;
             }
@@ -14623,9 +14626,9 @@ public void genNewCall(Node call) {
         // to the bootstrap `is_string_expr` lowering in codegen.rs).
         if (op >= 5 && op <= 10) {
 
-            string eqLt = this.inferExprType(bin.child(0));
-            string eqRt = this.inferExprType(bin.child(1));
-            if (eqLt == "string" && eqRt == "string") {
+            bool eqLt = this.isStringLike(bin.child(0));
+            bool eqRt = this.isStringLike(bin.child(1));
+            if (eqLt && eqRt) {
                 this.genExpr(bin.child(0));
                 this.asm.pushR64(0);
                 this.genExpr(bin.child(1));
@@ -16457,6 +16460,20 @@ public void genNewCall(Node call) {
                 if (expr.child(1).kind == 2) { keyText = expr.child(1).strVal; }
                 return this.dictReadKind(expr.child(0), keyText) == "string";
             }
+            // An index chained on a string[]-returning builtin method call
+            // (`d.keys()[0]`, `d.values()[0]`, `s.split(",")[1]`,
+            // `s.lines()[i]`) must format as text: keys are NUL-terminated
+            // at runtime and values carry the dict's whole kind, so without
+            // this the element pointer printed as a decimal integer
+            // (mirrors the silverc-rs is_string_expr Index arm).
+            if (expr.childCount() > 0 && expr.child(0).kind == 10 && expr.child(0).isMember && expr.child(0).childCount() > 0) {
+                string recvT = this.inferExprType(expr.child(0).child(0));
+                if (this.isDictOrObjectType(recvT)) {
+                    if (expr.child(0).name == "keys") { return true; }
+                    if (expr.child(0).name == "values") { return this.dictReadKind(expr.child(0).child(0), "") == "string"; }
+                }
+                if ((expr.child(0).name == "split" || expr.child(0).name == "lines") && recvT == "string") { return true; }
+            }
             string t = this.inferExprType(expr);
             return t == "string";
         }
@@ -16473,6 +16490,14 @@ public void genNewCall(Node call) {
         }
         if (expr.kind == 75) {
             // DOCS/273 safe chain classifies like the guarded access.
+            if (expr.childCount() > 0) { return this.isStringLike(expr.child(0)); }
+            return false;
+        }
+        if (expr.kind == 23) {
+            // A parenthesized expression classifies like its operand:
+            // `("a=" + d.keys()[0]) == "a=x"` must strcmp (not compare
+            // pointers), and interp holes wrap complex expressions in
+            // parens (`$"h={(d.keys()[0])}"`).
             if (expr.childCount() > 0) { return this.isStringLike(expr.child(0)); }
             return false;
         }
@@ -16598,6 +16623,12 @@ public void genNewCall(Node call) {
                 string keyText = "";
                 if (expr.child(1).kind == 2) { keyText = expr.child(1).strVal; }
                 return this.dictReadKind(expr.child(0), keyText) == "float";
+            }
+            // A chained index on `d.values()[0]` carries the dict's whole
+            // value kind, so a float-valued dict's element holds a double
+            // bit pattern (mirrors the silverc-rs is_float_expr Index arm).
+            if (expr.childCount() > 0 && expr.child(0).kind == 10 && expr.child(0).isMember && expr.child(0).name == "values" && expr.child(0).childCount() > 0 && this.isDictOrObjectType(this.inferExprType(expr.child(0).child(0)))) {
+                return this.dictReadKind(expr.child(0).child(0), "") == "float";
             }
             string t = this.inferExprType(expr);
             if (t == "float" || t == "float64" || t == "double") { return true; }
