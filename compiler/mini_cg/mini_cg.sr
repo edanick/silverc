@@ -15959,6 +15959,17 @@ public void genNewCall(Node call) {
         this.genExpr(lhs);
     }
 
+    // One step of a float64 increment/decrement: the double's bits sit in
+    // RAX on entry; load them into XMM0, add (or subtract) 1.0, and leave
+    // the new bits in XMM0. The caller moves them back with movqR64XMM.
+    public void emitFloatIncDec(bool plus) {
+        this.emitMovqXmmGpr(0, 0);
+        this.asm.movRI64(0, 1);
+        this.emitCvtsi2sdXmmGpr(1, 0);
+        if (plus) { this.asm.addsdXMM(0, 1); }
+        else { this.asm.subsdXMM(0, 1); }
+    }
+
     public void genPostIncDec(Node bin, bool plus) {
         // Post-increment `x++` / post-decrement `x--` must evaluate to the
         // OLD value of the target while storing old +/- 1 (parity with the
@@ -15970,12 +15981,23 @@ public void genNewCall(Node call) {
             this.rejectGlobalWriteInAnonBody(lhs);
             int off = this.findLocal(lhs.name);
             int gi = this.findGlobal(lhs.name);
+            // A `float`/`float64` target holds the IEEE-754 bit pattern:
+            // adding 1 to the BITS is not adding 1 to the value (the double
+            // whose bits are 1 is 4.94e-324, so a float64 loop counter never
+            // reached its bound). Route through SSE so the VALUE moves.
+            bool floatTarget = this.isFloatLike(lhs);
             if (off != 0) {
                 this.asm.movRMBase(0, 5, off);
                 if (this.isRefParam(lhs.name)) { this.asm.movRMBase(0, 0, 0); }
                 this.asm.pushR64(0);
-                if (plus) { this.asm.addRI32(0, 1); }
-                else { this.asm.subRI32(0, 1); }
+                if (floatTarget) {
+                    this.emitFloatIncDec(plus);
+                    this.asm.movqR64XMM(0, 0);
+                } else if (plus) {
+                    this.asm.addRI32(0, 1);
+                } else {
+                    this.asm.subRI32(0, 1);
+                }
                 if (this.isRefParam(lhs.name)) {
                     this.asm.pushR64(0);
                     this.asm.movRMBase(0, 5, off);
@@ -15990,8 +16012,14 @@ public void genNewCall(Node call) {
             if (gi >= 0) {
                 this.genGlobalLoad(gi);
                 this.asm.pushR64(0);
-                if (plus) { this.asm.addRI32(0, 1); }
-                else { this.asm.subRI32(0, 1); }
+                if (floatTarget) {
+                    this.emitFloatIncDec(plus);
+                    this.asm.movqR64XMM(0, 0);
+                } else if (plus) {
+                    this.asm.addRI32(0, 1);
+                } else {
+                    this.asm.subRI32(0, 1);
+                }
                 this.genGlobalStore(gi);
                 this.asm.popR64(0);
                 return;
@@ -16396,6 +16424,12 @@ public void genNewCall(Node call) {
             if (fop == 25 || fop == 38) {
                 if (this.isFloatLike(expr.child(0))) { return true; }
                 if (this.isFloatLike(expr.child(1))) { return true; }
+            }
+            // `x++` / `x--` on a float yields the double's bit pattern, so
+            // the expression itself must classify as a float (it prints as
+            // a number, not as the raw bits).
+            if (fop == 35 || fop == 36) {
+                if (this.isFloatLike(expr.child(0))) { return true; }
             }
         }
         if (expr.kind == 75) {
