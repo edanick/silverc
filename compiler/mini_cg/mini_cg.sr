@@ -6239,7 +6239,8 @@ int strIdx = this.stringPatchIndices[i];
                 if ((cname == "toUpper" || cname == "upper") && recvType == "string") {
                     return "string";
                 }
-                if ((cname == "substr" || cname == "substring" || cname == "slice") && recvType == "string") {
+                if ((cname == "substr" || cname == "substring" || cname == "slice"
+                     || cname == "stripPrefix" || cname == "stripSuffix") && recvType == "string") {
                     return "string";
                 }
                 if (cname == "length" && recvType == "string") {
@@ -12050,7 +12051,7 @@ public void genNewCall(Node call) {
             }
         }
         if (recvType == "string") {
-            if (name == "contains" || name == "isDigits" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "lastIndexOf" || name == "substr" || name == "substring" || name == "slice" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toFloatBits" || name == "toBytes" || name == "repeat") {
+            if (name == "contains" || name == "isDigits" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "lastIndexOf" || name == "substr" || name == "substring" || name == "slice" || name == "stripPrefix" || name == "stripSuffix" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toFloatBits" || name == "toBytes" || name == "repeat") {
                 return true;
             }
         }
@@ -12944,51 +12945,120 @@ public void genNewCall(Node call) {
             this.asm.subRR64(0, 1);
             this.asm.movMBaseR(5, 0, slLen);
             this.asm.bindLabel(slLenReady);
-            // dst = malloc(len + 1)
-            this.asm.movRMBase(1, 5, slLen);
-            this.asm.addRI32(1, 1);
-            this.addImportPatch("msvcrt.dll", "malloc");
-            int slMA = 0xDEADBEEFCAFEBADE;
-            this.asm.emitImm64(0, slMA);
+            // dst = malloc(len + 1), then copy the range out.
+            this.genStringRangeCopy(slRecv, slStart, slLen);
+            return;
+        }
+        if (name == "stripPrefix" || name == "stripSuffix") {
+            // stripPrefix(prefix) / stripSuffix(suffix) (DOCS/106): drop the
+            // affix when the string carries it, otherwise answer the string
+            // unchanged. The affix match is byte-exact.
+            bool stripAtStart = name == "stripPrefix";
+            if (call.childCount() < 2) {
+                this.genExpr(recv);
+                return;
+            }
+            int spRecv = this.allocLocal("__sp_recv");
+            int spAffix = this.allocLocal("__sp_affix");
+            int spRecvLen = this.allocLocal("__sp_recv_len");
+            int spAffixLen = this.allocLocal("__sp_affix_len");
+            int spI = this.allocLocal("__sp_i");
+            int spStart = this.allocLocal("__sp_start");
+            int spLen = this.allocLocal("__sp_len");
+            this.genExpr(recv);
+            this.asm.movMBaseR(5, 0, spRecv);
+            this.genExpr(call.child(1));
+            this.asm.movMBaseR(5, 0, spAffix);
+            this.asm.movRMBase(1, 5, spRecv);
+            this.addImportPatch("ucrtbase.dll", "strlen");
+            int spLen1 = 0xDEADBEEFCAFEBAD7;
+            this.asm.emitImm64(0, spLen1);
             this.asm.movRMBase(0, 0, 0);
             this.asm.emitCallSetup(0);
             this.asm.callR64(0);
             this.asm.emitCallTeardown();
-            this.asm.movMBaseR(5, 0, slDst);
-            // copy loop
-            this.asm.xorRR64(0, 0);
-            this.asm.movMBaseR(5, 0, slI);
-            int slLoop = this.newLabel();
-            int slDone = this.newLabel();
-            this.asm.bindLabel(slLoop);
-            this.asm.movRMBase(0, 5, slI);
-            this.asm.movRMBase(1, 5, slLen);
+            this.asm.movMBaseR(5, 0, spRecvLen);
+            this.asm.movRMBase(1, 5, spAffix);
+            this.addImportPatch("ucrtbase.dll", "strlen");
+            int spLen2 = 0xDEADBEEFCAFEBAD6;
+            this.asm.emitImm64(0, spLen2);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movMBaseR(5, 0, spAffixLen);
+            int spKeep = this.newLabel();
+            int spMatch = this.newLabel();
+            int spDone = this.newLabel();
+            // An affix longer than the string never matches.
+            this.asm.movRMBase(0, 5, spAffixLen);
+            this.asm.movRMBase(1, 5, spRecvLen);
             this.asm.cmpRR64(0, 1);
-            this.asm.jgeLabel(slDone);
-            // byte = recv[start + i]
-            this.asm.movRMBase(0, 5, slRecv);
-            this.asm.movRMBase(11, 5, slStart);
+            this.asm.jgLabel(spKeep);
+            // The compared range: the affix sits at the string's start
+            // (stripPrefix) or at its end (stripSuffix).
+            if (stripAtStart) {
+                this.asm.movRI64(0, 0);
+                this.asm.movMBaseR(5, 0, spStart);
+            } else {
+                this.asm.movRMBase(0, 5, spRecvLen);
+                this.asm.movRMBase(1, 5, spAffixLen);
+                this.asm.subRR64(0, 1);
+                this.asm.movMBaseR(5, 0, spStart);
+            }
+            // Compare the affix bytes.
+            this.asm.xorRR64(0, 0);
+            this.asm.movMBaseR(5, 0, spI);
+            int spLoop = this.newLabel();
+            int spBad = this.newLabel();
+            int spOk = this.newLabel();
+            this.asm.bindLabel(spLoop);
+            this.asm.movRMBase(0, 5, spI);
+            this.asm.movRMBase(1, 5, spAffixLen);
+            this.asm.cmpRR64(0, 1);
+            this.asm.jgeLabel(spOk);
+            this.asm.movRMBase(11, 5, spI);
+            this.asm.movRMBase(0, 5, spRecv);
+            this.asm.movRMBase(2, 5, spStart);
+            this.asm.addRR64(2, 11);
+            this.asm.addRR64(0, 2);
+            this.asm.movzxByteMBase(0, 0, 0);
+            this.asm.movRR64(1, 0);
+            this.asm.movRMBase(0, 5, spAffix);
+            this.asm.movRMBase(11, 5, spI);
             this.asm.addRR64(0, 11);
-            this.asm.movRMBase(11, 5, slI);
-            this.asm.addRR64(0, 11);
-            this.asm.movzxByteMBase(2, 0, 0);
-            // dst[i] = byte
-            this.asm.movRMBase(0, 5, slDst);
-            this.asm.movRMBase(11, 5, slI);
-            this.asm.addRR64(0, 11);
-            this.asm.movMBaseByteR(0, 2, 0);
-            this.asm.movRMBase(0, 5, slI);
+            this.asm.movzxByteMBase(0, 0, 0);
+            this.asm.cmpRR64(0, 1);
+            this.asm.jneLabel(spBad);
+            this.asm.movRMBase(0, 5, spI);
             this.asm.addRI32(0, 1);
-            this.asm.movMBaseR(5, 0, slI);
-            this.asm.jmpLabel(slLoop);
-            this.asm.bindLabel(slDone);
-            // NUL terminate
-            this.asm.movRMBase(0, 5, slDst);
-            this.asm.movRMBase(11, 5, slI);
-            this.asm.addRR64(0, 11);
-            this.asm.xorRR64(2, 2);
-            this.asm.movMBaseByteR(0, 2, 0);
-            this.asm.movRMBase(0, 5, slDst);
+            this.asm.movMBaseR(5, 0, spI);
+            this.asm.jmpLabel(spLoop);
+            this.asm.bindLabel(spBad);
+            this.asm.jmpLabel(spKeep);
+            this.asm.bindLabel(spOk);
+            // The affix matched: the answer is the rest of the string.
+            if (stripAtStart) {
+                this.asm.movRMBase(0, 5, spAffixLen);
+                this.asm.movMBaseR(5, 0, spStart);
+                this.asm.movRMBase(0, 5, spRecvLen);
+                this.asm.movRMBase(1, 5, spAffixLen);
+                this.asm.subRR64(0, 1);
+                this.asm.movMBaseR(5, 0, spLen);
+            } else {
+                this.asm.movRI64(0, 0);
+                this.asm.movMBaseR(5, 0, spStart);
+                this.asm.movRMBase(0, 5, spRecvLen);
+                this.asm.movRMBase(1, 5, spAffixLen);
+                this.asm.subRR64(0, 1);
+                this.asm.movMBaseR(5, 0, spLen);
+            }
+            this.genStringRangeCopy(spRecv, spStart, spLen);
+            this.asm.jmpLabel(spDone);
+            this.asm.bindLabel(spKeep);
+            // No match: the string answers unchanged.
+            this.asm.movRMBase(0, 5, spRecv);
+            this.asm.bindLabel(spDone);
             return;
         }
         if (name == "pad" || name == "padLeft" || name == "padRight") {
@@ -15968,6 +16038,60 @@ public void genNewCall(Node call) {
         this.emitCvtsi2sdXmmGpr(1, 0);
         if (plus) { this.asm.addsdXMM(0, 1); }
         else { this.asm.subsdXMM(0, 1); }
+    }
+
+    // Copy `len` bytes from the string at `recvOff`, starting at
+    // `startOff`, into a fresh NUL-terminated heap string and leave its
+    // pointer in RAX. The one home for "cut a range out of a string":
+    // slice, stripPrefix and stripSuffix all lower through it.
+    public void genStringRangeCopy(int recvOff, int startOff, int lenOff) {
+        int rcDst = this.allocLocal("__rc_dst");
+        int rcI = this.allocLocal("__rc_i");
+        // dst = malloc(len + 1)
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.addRI32(1, 1);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        int rcMA = 0xDEADBEEFCAFEBADF;
+        this.asm.emitImm64(0, rcMA);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, rcDst);
+        // copy loop
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, rcI);
+        int rcLoop = this.newLabel();
+        int rcDone = this.newLabel();
+        this.asm.bindLabel(rcLoop);
+        this.asm.movRMBase(0, 5, rcI);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(rcDone);
+        // byte = recv[start + i]
+        this.asm.movRMBase(0, 5, recvOff);
+        this.asm.movRMBase(11, 5, startOff);
+        this.asm.addRR64(0, 11);
+        this.asm.movRMBase(11, 5, rcI);
+        this.asm.addRR64(0, 11);
+        this.asm.movzxByteMBase(2, 0, 0);
+        // dst[i] = byte
+        this.asm.movRMBase(0, 5, rcDst);
+        this.asm.movRMBase(11, 5, rcI);
+        this.asm.addRR64(0, 11);
+        this.asm.movMBaseByteR(0, 2, 0);
+        this.asm.movRMBase(0, 5, rcI);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, rcI);
+        this.asm.jmpLabel(rcLoop);
+        this.asm.bindLabel(rcDone);
+        // NUL terminate
+        this.asm.movRMBase(0, 5, rcDst);
+        this.asm.movRMBase(11, 5, rcI);
+        this.asm.addRR64(0, 11);
+        this.asm.xorRR64(2, 2);
+        this.asm.movMBaseByteR(0, 2, 0);
+        this.asm.movRMBase(0, 5, rcDst);
     }
 
     public void genPostIncDec(Node bin, bool plus) {
