@@ -6257,6 +6257,16 @@ int strIdx = this.stringPatchIndices[i];
                 if (expr.child(0).name == "path" && (cname == "join" || cname == "guardForWindows" || cname == "stem")) {
                     return "string";
                 }
+                // DOCS/66 + DOCS/69 parity (silverc-rs is_string_expr): the
+                // json text accessors/constructors return NUL-terminated heap
+                // text and getNumber answers an int; without this the pointer
+                // stringified as a decimal integer in concat/print positions.
+                if (expr.child(0).name == "json" && (cname == "getString" || cname == "stringValue")) {
+                    return "string";
+                }
+                if (expr.child(0).name == "json" && cname == "getNumber") {
+                    return "int";
+                }
                 if (expr.child(0).name == "url" && (cname == "isUrl" || cname == "isFtp" || cname == "isFtps")) {
                     return "bool";
                 }
@@ -8873,6 +8883,13 @@ int strIdx = this.stringPatchIndices[i];
         bool recvIsUserSymbol = false;
         if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6) {
             recvIsUserSymbol = this.isUserSymbol(call.child(0).name);
+        }
+        // json.set(dict, key, value) is std/json.sr's keyed insert (DOCS/66).
+        // The dict-write kind tracking never sees module calls, so record the
+        // per-key print kind here (same shape as genDictIndexSet): a later
+        // json.stringify renders the stored value by its static kind.
+        if (call.isMember && name == "set" && call.childCount() >= 4 && call.child(0).kind == 6 && !recvIsUserSymbol && call.child(0).name == "json" && call.child(1).kind == 6 && call.child(2).kind == 2) {
+            this.noteDictWrite(call.child(1).name, call.child(2).strVal, this.classifyDictValue(call.child(3)));
         }
         if ((name == "__binaryMetadataStatus" || name == "__binaryMetadataStatusNative") && !call.isMember) {
             this.genBinaryMetadataStatus(call);
@@ -17066,6 +17083,11 @@ public void genNewCall(Node call) {
     // printing treat them alike (mirrors silverc-rs is_dict_or_object_type).
     public bool isDictOrObjectType(string t) {
         if (t == "object" || t == "object?") { return true; }
+        // DOCS/66: `JsonValue` is the dynamic JSON holder; it lowers to
+        // the same dict runtime layout as `object` (json.parse builds a
+        // real dict), so member access and methods treat it alike
+        // (mirrors silverc-rs is_dict_or_object_type).
+        if (t == "JsonValue") { return true; }
         return this.isDictType(t);
     }
 
@@ -18170,7 +18192,8 @@ public void genNewCall(Node call) {
         int sumNoComma = this.newLabel();
         this.asm.jeLabel(sumNoComma);
         this.asm.movRMBase(0, 5, totalOff);
-        this.asm.addRI32(0, 1);
+        // Comma separator is ", " (silverc-rs emit_json_assemble parity).
+        this.asm.addRI32(0, 2);
         this.asm.movMBaseR(5, 0, totalOff);
         this.asm.bindLabel(sumNoComma);
         if (ml) {
@@ -18191,14 +18214,11 @@ public void genNewCall(Node call) {
         this.asm.callR64(0);
         this.asm.emitCallTeardown();
         this.asm.movRMBase(1, 5, totalOff);
-        this.asm.addRI32(0, 3);
+        // Key overhead is 4: '"' key '"' ':' ' ' in both modes
+        // (silverc-rs emit_json_assemble parity).
+        this.asm.addRI32(0, 4);
         this.asm.addRR64(0, 1);
         this.asm.movMBaseR(5, 0, totalOff);
-        if (ml) {
-            this.asm.movRMBase(0, 5, totalOff);
-            this.asm.addRI32(0, 1);
-            this.asm.movMBaseR(5, 0, totalOff);
-        }
         // value length by kind
         this.genJsonLoadEntryValue(dOff, iOff);
         this.asm.movRMBase(0, 5, kindOff);
@@ -18290,8 +18310,11 @@ public void genNewCall(Node call) {
         this.asm.movRMBase(1, 5, posOff);
         this.asm.movRI64(2, 44);
         this.asm.movMBaseByteR(1, 2, 0);
+        this.asm.movRMBase(1, 5, posOff);
+        this.asm.movRI64(2, 32);
+        this.asm.movMBaseByteR(1, 2, 1);
         this.asm.movRMBase(0, 5, posOff);
-        this.asm.incR64(0);
+        this.asm.addRI32(0, 2);
         this.asm.movMBaseR(5, 0, posOff);
         this.asm.bindLabel(fillNoComma);
         if (ml) {
@@ -18326,8 +18349,7 @@ public void genNewCall(Node call) {
         // kind code for this entry
         this.genJsonEntryKind(kindsOff, iOff, fallbackCode, kindOff);
         // sprintf(pos, "\"%s\": ...", key); pos += ret
-        string keyFmt = "\"%s\":";
-        if (ml) { keyFmt = "\"%s\": "; }
+        string keyFmt = "\"%s\": ";
         int keyFmtIdx = this.addString(keyFmt);
         this.asm.movRMBase(1, 5, posOff);
         int kfs = this.asm.buf.length;

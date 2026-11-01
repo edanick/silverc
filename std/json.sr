@@ -245,6 +245,53 @@ public object parse(string jsonStr) {
     return p.parseValue();
 }
 
+// DOCS/66 typed accessors and constructors over the dict values parse
+// builds. Values are read into TYPED locals (an `object` local loses the
+// classification and binds the raw payload); a missing key reads 0/null
+// and answers the empty default, never a fault.
+
+public string getString(object obj, string key) {
+    if (obj == null) { return ""; }
+    string v = obj[key];
+    if (v == null) { return ""; }
+    return v;
+}
+
+// Numbers parse as float64 (parseNumber) and land in the dict slot as
+// raw IEEE-754 bits; a `float64` read of the slot converts the payload
+// as an integer, so the bits are decoded manually:
+// value = (-1)^s * 2^(e-1023) * (2^52 + m), truncated toward zero.
+public int getNumber(object obj, string key) {
+    if (obj == null) { return 0; }
+    int64 bits = obj[key];
+    if (bits == 0) { return 0; }
+    int64 exp = (bits >> 52) & 2047;
+    if (exp == 0) { return 0; }
+    int64 mant = (bits & 4503599627370495) | 4503599627370496;
+    int e = int(exp) - 1023;
+    int64 mag = 0;
+    if (e >= 52) {
+        mag = mant << (e - 52);
+    } else {
+        mag = mant >> (52 - e);
+    }
+    if (bits < 0) { mag = -mag; }
+    return int(mag);
+}
+
+public object objectValue() {
+    dict<string, object> obj = {};
+    return obj;
+}
+
+public object stringValue(string text) {
+    return text;
+}
+
+public void set(object obj, string key, object value) {
+    obj[key] = value;
+}
+
 public void load(string filepath, object obj) {
     string content = fs.readString(filepath);
     JsonParser p = new JsonParser(content);
