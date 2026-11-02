@@ -6275,6 +6275,20 @@ int strIdx = this.stringPatchIndices[i];
             string recvType = "";
             if (expr.isMember && expr.childCount() > 0) {
                 recvType = this.inferExprType(expr.child(0));
+                // Builtin dict projection (`d.keys()` / `d.values()`): a
+                // fresh array of the projected element kind. Without this
+                // the call result was untyped, so print/concat formatted
+                // the raw data pointer instead of the array text
+                // (silverc-rs dict_projection_elem).
+                if (cname == "keys" && this.isDictOrObjectType(recvType)) {
+                    return "string[]";
+                }
+                if (cname == "values" && this.isDictOrObjectType(recvType)) {
+                    string vt = this.dictValueType(recvType);
+                    if (vt == "") { vt = this.dictReadKind(expr.child(0), ""); }
+                    if (vt == "") { vt = "int"; }
+                    return vt + "[]";
+                }
                 // env.get / env.getenv / env.getEnv return the environment
                 // value as a string.  Without this, `env.get(k) == "v"`
                 // inferred an unknown type and lowered to pointer comparison
@@ -17226,6 +17240,215 @@ public void genNewCall(Node call) {
         else { this.emitArrayText("]"); }
     }
 
+    // Materialize the address of a NUL-terminated string literal in RAX
+    // (the string table patch fills the emitted immediate).
+    public void emitStringLiteralAddr(string text) {
+        int strIdx = this.addString(text);
+        int sp = this.asm.buf.length;
+        this.asm.emitImm64(0, 0);
+        this.stringPatchOffsets.add(sp + 2);
+        this.stringPatchIndices.add(strIdx);
+    }
+
+    // Append the NUL-terminated string whose pointer is in RAX to the
+    // buffer whose pointer lives in the local slot `bufOff`; `bufOff` is
+    // updated to the freshly allocated buffer. Mirrors the interpreter's
+    // `result += piece` (silveri/src/value.sr arrayToString).
+    public void emitAppendString(int bufOff) {
+        int pieceOff = this.allocLocal("__ap_piece");
+        this.asm.movMBaseR(5, 0, pieceOff);
+        // n1 = strlen(buffer)
+        this.asm.movRMBase(1, 5, bufOff);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int n1Off = this.allocLocal("__ap_n1");
+        this.asm.movMBaseR(5, 0, n1Off);
+        // n2 = strlen(piece)
+        this.asm.movRMBase(1, 5, pieceOff);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int n2Off = this.allocLocal("__ap_n2");
+        this.asm.movMBaseR(5, 0, n2Off);
+        // size = n1 + n2 + 1 (both texts plus the terminator)
+        this.asm.movRMBase(0, 5, n1Off);
+        this.asm.movRMBase(1, 5, n2Off);
+        this.asm.addRR64(0, 1);
+        this.asm.addRI32(0, 1);
+        this.asm.movRR64(1, 0);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int newOff = this.allocLocal("__ap_new");
+        this.asm.movMBaseR(5, 0, newOff);
+        // copy the old buffer (n1 bytes; the terminator comes with the
+        // piece copy below)
+        this.asm.movRMBase(1, 5, newOff);
+        this.asm.movRMBase(2, 5, bufOff);
+        this.asm.movRMBase(8, 5, n1Off);
+        this.addImportPatch("msvcrt.dll", "memcpy");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD9);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        // copy the piece (n2 bytes + terminator) right after it
+        this.asm.movRMBase(1, 5, newOff);
+        this.asm.movRMBase(2, 5, n1Off);
+        this.asm.addRR64(1, 2);
+        this.asm.movRMBase(2, 5, pieceOff);
+        this.asm.movRMBase(8, 5, n2Off);
+        this.asm.addRI32(8, 1);
+        this.addImportPatch("msvcrt.dll", "memcpy");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD9);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        // buffer = new
+        this.asm.movRMBase(0, 5, newOff);
+        this.asm.movMBaseR(5, 0, bufOff);
+    }
+
+    // Decimal text for the integer already in RAX (value-based variant of
+    // genIntToString): sprintf(buf, "%lld", value).
+    public void genIntValueToString() {
+        int valOff = this.allocLocal("__i2s_val");
+        this.asm.movMBaseR(5, 0, valOff);
+        this.asm.movRI64(1, 32);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int bufOff = this.allocLocal("__i2s_buf");
+        this.asm.movMBaseR(5, 0, bufOff);
+        this.addFormatStr("%lld");
+        this.asm.movRMBase(8, 5, valOff);
+        this.asm.movRR64(2, 1);
+        this.asm.movRMBase(1, 5, bufOff);
+        this.addImportPatch("msvcrt.dll", "sprintf");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(0, 5, bufOff);
+    }
+
+    // Text for the float64 already in RAX (value-based variant of
+    // genFloatToString): sprintf(buf, "%g", bits).
+    public void genFloatValueToString() {
+        int valOff = this.allocLocal("__f2s_val");
+        this.asm.movMBaseR(5, 0, valOff);
+        this.asm.movRI64(1, 64);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int bufOff = this.allocLocal("__f2s_buf");
+        this.asm.movMBaseR(5, 0, bufOff);
+        this.addFormatStr("%g");
+        this.asm.movRMBase(8, 5, valOff);
+        this.asm.movRR64(2, 1);
+        this.asm.movRMBase(1, 5, bufOff);
+        // LINUX SysV backend (additive): %g always needs XMM0/AL=1.
+        if (this.isLinuxTarget()) {
+            this.emitLinuxSprintfStaged(true);
+        } else {
+            this.addImportPatch("msvcrt.dll", "sprintf");
+            this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD6);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+        }
+        this.asm.movRMBase(0, 5, bufOff);
+    }
+
+    // Render an array value as text (`[a, b]`) into a fresh heap string;
+    // RAX holds the NUL-terminated text on return. Mirrors the
+    // interpreter's arrayToString (silveri/src/value.sr) and the flat
+    // print renderer (genArrayPrintValue): strings are quoted, floats use
+    // %g, every other element prints decimal. Used where an array must
+    // appear as text (string concatenation).
+    public void genArrayToString(Node arg) {
+        string elemT = this.arrayPrintElemType(arg);
+        bool strElem = elemT == "string";
+        bool fltElem = elemT == "float" || elemT == "float64" || elemT == "double";
+        this.genExpr(arg);
+        int arrOff = this.allocLocal("__ats_arr");
+        this.asm.movMBaseR(5, 0, arrOff);
+        this.asm.movRMBase(0, 5, arrOff);
+        this.asm.movRMBase(0, 0, -8);
+        int lenOff = this.allocLocal("__ats_len");
+        this.asm.movMBaseR(5, 0, lenOff);
+        int iOff = this.allocLocal("__ats_i");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        // buffer = "["
+        int bufOff = this.allocLocal("__ats_buf");
+        this.emitStringLiteralAddr("[");
+        this.asm.movMBaseR(5, 0, bufOff);
+        int loopStart = this.newLabel();
+        int loopEnd = this.newLabel();
+        int noSep = this.newLabel();
+        this.asm.bindLabel(loopStart);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(loopEnd);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(noSep);
+        this.emitStringLiteralAddr(", ");
+        this.emitAppendString(bufOff);
+        this.asm.bindLabel(noSep);
+        // element = [arr + i * 8]
+        this.asm.movRMBase(1, 5, arrOff);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.addRR64(1, 0);
+        this.asm.movRMBase(0, 1, 0);
+        if (strElem) {
+            int elOff = this.allocLocal("__ats_el");
+            this.asm.movMBaseR(5, 0, elOff);
+            this.emitStringLiteralAddr("\"");
+            this.emitAppendString(bufOff);
+            this.asm.movRMBase(0, 5, elOff);
+            this.emitAppendString(bufOff);
+            this.emitStringLiteralAddr("\"");
+            this.emitAppendString(bufOff);
+        } else if (fltElem) {
+            this.genFloatValueToString();
+            this.emitAppendString(bufOff);
+        } else {
+            this.genIntValueToString();
+            this.emitAppendString(bufOff);
+        }
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(loopStart);
+        this.asm.bindLabel(loopEnd);
+        this.emitStringLiteralAddr("]");
+        this.emitAppendString(bufOff);
+        this.asm.movRMBase(0, 5, bufOff);
+    }
+
     // True for dict types and the dynamic `object` type: both lower to
     // the same key/value runtime layout, so member access, methods and
     // printing treat them alike (mirrors silverc-rs is_dict_or_object_type).
@@ -17623,6 +17846,14 @@ public void genNewCall(Node call) {
             if (expr.isMember && expr.childCount() > 0) {
                 if (expr.name == "split" || expr.name == "lines") { return "string[]"; }
                 if (expr.name == "toBytes") { return "byte[]"; }
+                // Builtin dict projection (`d.keys()` / `d.values()`).
+                if (expr.name == "keys" || expr.name == "values") {
+                    string dt = this.inferExprType(expr.child(0));
+                    if (this.isDictOrObjectType(dt)) {
+                        string vt = this.inferExprType(expr);
+                        if (vt != "") { return vt; }
+                    }
+                }
                 if (expr.name == "add" || expr.name == "push" || expr.name == "slice" || expr.name == "map" || expr.name == "reverse" || expr.name == "unique" || expr.name == "distinct" || expr.name == "sort" || expr.name == "filter" || expr.name == "concat" || expr.name == "flat" || expr.name == "take" || expr.name == "skip" || expr.name == "chunk" || expr.name == "zip" || expr.name == "partition") {
                     return this.nestedArrayTypeOf(expr.child(0));
                 }
@@ -19303,6 +19534,10 @@ public void genNewCall(Node call) {
             // gen_string_concat is_float_expr -> gen_float_format); routing
             // them through genIntToString printed the raw bit pattern.
             this.genFloatToString(bin.child(1));
+        } else if (this.isArrayValue(bin.child(1))) {
+            // An array operand renders as its text form (`[a, b]`),
+            // matching the interpreter's arrayToString.
+            this.genArrayToString(bin.child(1));
         } else {
             this.genIntToString(bin.child(1));
         }
@@ -19316,6 +19551,10 @@ public void genNewCall(Node call) {
             this.genExpr(bin.child(0));
         } else if (this.isFloatLike(bin.child(0))) {
             this.genFloatToString(bin.child(0));
+        } else if (this.isArrayValue(bin.child(0))) {
+            // An array operand renders as its text form (`[a, b]`),
+            // matching the interpreter's arrayToString.
+            this.genArrayToString(bin.child(0));
         } else {
             this.genIntToString(bin.child(0));
         }
