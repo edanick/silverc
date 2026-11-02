@@ -1,0 +1,79 @@
+// Arrays are reference types: an array that grows inside a callee must
+// be grown in the CALLER too. The growth reallocates the heap block, and
+// a by-value parameter used to leave the caller pinned to the old,
+// shorter block (a fill of 12 answered 8). Parameters are bound by
+// reference and every array lowering derefs the parameter slot once.
+void fill(string[] s, int n) {
+    for (int i = 0; i < n; i++) {
+        s.add("v" + i.toString());
+    }
+}
+
+// `s += x` growth routes through the same push lowering and must also
+// rebind the caller's variable.
+void growAssign(string[] s, int n) {
+    for (int i = 0; i < n; i++) { s += "w" + i.toString(); }
+}
+
+// Index stores through a parameter write the caller's live block.
+void markFirst(string[] s, string v) {
+    s[0] = v;
+}
+
+class Box {
+    public prop string[] items;
+    construct() { this.items = []; }
+    public void fill(int n) {
+        for (int i = 0; i < n; i++) { this.items.add("f" + i.toString()); }
+    }
+}
+
+void main() {
+    // Growth through a by-value parameter reaches the caller.
+    string[] s = [];
+    fill(s, 12);
+    if (s.length != 12) {
+        printline("growth lost: " + s.length.toString());
+        exit(1);
+    }
+    if (s[0] != "v0" || s[11] != "v11") {
+        printline("elements wrong: " + s[0] + " " + s[11]);
+        exit(1);
+    }
+    // The callee reads the same live array it is growing.
+    string[] t = [];
+    fill(t, 3);
+    if (t.length != 3 || t[2] != "v2") {
+        printline("callee saw a stale array");
+        exit(1);
+    }
+    // Growth in the same frame still works.
+    string[] here = [];
+    for (int i = 0; i < 12; i++) { here.add("x"); }
+    if (here.length != 12) {
+        printline("same-frame growth wrong: " + here.length.toString());
+        exit(1);
+    }
+    // Growth through a field receiver still works.
+    Box b = new Box();
+    b.fill(9);
+    if (b.items.length != 9) {
+        int got = b.items.length;
+        printline("field growth wrong: " + got.toString());
+        exit(1);
+    }
+    // `+=` growth through a parameter rebinds the caller.
+    string[] w = [];
+    growAssign(w, 5);
+    if (w.length != 5 || w[0] != "w0" || w[4] != "w4") {
+        printline("plus-assign growth lost: " + w.length.toString());
+        exit(1);
+    }
+    // Index stores through a parameter reach the caller's block.
+    markFirst(w, "W");
+    if (w[0] != "W") {
+        printline("index store through parameter lost");
+        exit(1);
+    }
+    printline("ok");
+}

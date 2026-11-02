@@ -2867,7 +2867,7 @@ int strIdx = this.stringPatchIndices[i];
 
     public void collectRefParams(Node func) {
         // Populate this.refParams with the names of the current function's
-        // parameters that some call site passes as `&arg`.
+        // parameters that some call site passes as `&arg`...
         this.refParams = [];
         if (func.childCount() < 1) { return; }
         Node params = func.child(0);
@@ -2884,6 +2884,24 @@ int strIdx = this.stringPatchIndices[i];
                     if (pt.length > 0 && pt[pt.length - 1] == '*') { continue; }
                     this.refParams.add(params.child(idx).name);
                 }
+            }
+        }
+        // Arrays are reference types (DOCS/19): a growing `add`/`push`
+        // reallocates the heap block, and a by-value parameter would pin
+        // the caller's variable to the old block (a fill of 12 answered
+        // 8). Bind EVERY array-typed parameter by reference through the
+        // same refParams machinery an explicit `&arg` parameter uses —
+        // all reads/writes deref once and growth write-backs reach the
+        // caller's variable. Call sites pass the argument variable's
+        // slot address (see genArrayArgAddress).
+        for (int pi = 0; pi < params.childCount(); pi++) {
+            string apt = params.child(pi).typeHint;
+            if (apt.length >= 2 && apt[apt.length - 2] == '[' && apt[apt.length - 1] == ']') {
+                bool alreadyRef = false;
+                for (int ri2 = 0; ri2 < this.refParams.length; ri2++) {
+                    if (this.refParams[ri2] == params.child(pi).name) { alreadyRef = true; }
+                }
+                if (!alreadyRef) { this.refParams.add(params.child(pi).name); }
             }
         }
     }
@@ -4838,6 +4856,20 @@ int strIdx = this.stringPatchIndices[i];
             int slot = this.funcParamStarts[functionIndex] + parameterIndex;
             if (slot >= 0 && slot < this.funcParamTypes.length) { parameterType = this.funcParamTypes[slot]; }
         }
+        // Arrays are reference types: an array-typed parameter receives the
+        // argument variable's slot ADDRESS (the `&arg` ABI, see genUserCall)
+        // so growth inside the callee rebinds the caller's variable. This
+        // covers the construct/super argument loops that do not go through
+        // the free-call/member-call loops. Non-variable shapes fall back to
+        // a value temp whose address is passed instead.
+        if (this.paramIsArrayAt(functionIndex, parameterIndex)) {
+            if (this.genArrayArgAddress(value)) { return; }
+            this.genExprAsType(value, parameterType);
+            int arrValTmp = this.allocLocal("__arrarg_val");
+            this.asm.movMBaseR(5, 0, arrValTmp);
+            this.asm.leaRBase(0, 5, arrValTmp);
+            return;
+        }
         this.genExprAsType(value, parameterType);
     }
 
@@ -6685,6 +6717,11 @@ int strIdx = this.stringPatchIndices[i];
         if (arrNode.kind == 6 && this.findLocal(arrNode.name) != 0) {
             int arrOff = this.findLocal(arrNode.name);
             this.asm.movRMBase(0, 5, arrOff);
+            // Array-typed parameters are passed by reference: the slot holds
+            // the caller's variable address, so deref once before indexing.
+            if (this.isRefParam(arrNode.name)) {
+                this.asm.movRMBase(0, 0, 0);
+            }
             this.asm.pushR64(0);
             this.genExpr(idxNode);
             this.asm.movRR64(1, 0);
@@ -8560,7 +8597,14 @@ int strIdx = this.stringPatchIndices[i];
             int origOff = this.findLocal(arrNode.name);
             int gArr = this.findGlobal(arrNode.name);
             if (origOff != 0) {
-                this.asm.movMBaseR(5, 0, origOff);
+                if (this.isRefParam(arrNode.name)) {
+                    // The parameter slot holds the CALLER's variable
+                    // address: never overwrite it in place (that would
+                    // destroy the reference), and the value is unchanged
+                    // here, so there is nothing to write back yet.
+                } else {
+                    this.asm.movMBaseR(5, 0, origOff);
+                }
             } else if (gArr >= 0) {
                 this.genGlobalStore(gArr);
             }
@@ -8675,7 +8719,14 @@ int strIdx = this.stringPatchIndices[i];
         if (arrNode.kind == 6) {
             int origOff2 = this.findLocal(arrNode.name);
             if (origOff2 != 0) {
-                this.asm.movMBaseR(5, 0, origOff2);
+                if (this.isRefParam(arrNode.name)) {
+                    // Growth moved the heap block: rebind the CALLER's
+                    // variable through the by-reference parameter.
+                    this.asm.movRMBase(1, 5, origOff2);
+                    this.asm.movMBaseR(1, 0, 0);
+                } else {
+                    this.asm.movMBaseR(5, 0, origOff2);
+                }
             }
         } else if (arrNode.kind == 13) {
             Node arrObj2 = arrNode.child(0);
@@ -11176,6 +11227,36 @@ public void genNewCall(Node call) {
         this.emitAbiCallTeardown();
     }
 
+    // True when the function at table index `funcIdx` declares its
+    // `paramIdx`-th parameter as an array type (they bind by reference —
+    // see collectRefParams).
+    public bool paramIsArrayAt(int funcIdx, int paramIdx) {
+        if (funcIdx < 0 || funcIdx >= this.funcParamStarts.length) { return false; }
+        int p = this.funcParamStarts[funcIdx] + paramIdx;
+        if (p < 0 || p >= this.funcParamTypes.length) { return false; }
+        string pt = this.funcParamTypes[p];
+        return pt.length >= 2 && pt[pt.length - 2] == '[' && pt[pt.length - 1] == ']';
+    }
+
+    // Arrays bind by reference at call sites: when the callee's parameter
+    // is array-typed, the argument must be the ADDRESS of the array
+    // variable's slot — exactly what the `&arg` spelling emits. A
+    // parameter that is itself bound by reference forwards the address
+    // it HOLDS (one indirection, not two). Emits the address into RAX
+    // and returns true only for a plain local variable argument; any
+    // other shape falls back to normal evaluation.
+    public bool genArrayArgAddress(Node arg) {
+        if (arg.kind != 6) { return false; }
+        int off = this.findLocal(arg.name);
+        if (off == 0) { return false; }
+        if (this.isRefParam(arg.name)) {
+            this.asm.movRMBase(0, 5, off);
+        } else {
+            this.asm.leaRBase(0, 5, off);
+        }
+        return true;
+    }
+
     public void genUserCall(Node call) {
         string name = call.name;
         // Module-qualified call (e.g. json_runtime.get(x, "y") inside a class
@@ -11466,6 +11547,42 @@ public void genNewCall(Node call) {
                     }
                 } else if (funcIdx < this.funcParamStarts.length && this.funcParamStarts[funcIdx] + i < this.funcParamDefaults.length) {
                     argument = this.funcParamDefaults[this.funcParamStarts[funcIdx] + i];
+                }
+                // Arrays are reference types: an array-typed parameter
+                // receives the argument variable's slot ADDRESS (the
+                // `&arg` ABI) so growth inside the callee rebinds the
+                // caller's variable. Non-variable shapes (call results,
+                // literals, globals, field reads) fall back to a value
+                // temp whose address is passed instead. The temp keeps
+                // the DECLARED element type so literal elements convert
+                // (math.sum([1, 2.5, 3]) boxes its ints as float64).
+                if (argument != null
+                        && this.paramIsArrayAt(funcIdx, i)) {
+                    if (argument.kind == 6 && this.genArrayArgAddress(argument)) {
+                        int slot0 = i + slotBias;
+                        if (slot0 < callNreg) {
+                            this.asm.movMBaseR(4, 0, spillBase + slot0 * 8);
+                        } else {
+                            this.asm.movMBaseR(4, 0, callBase + (slot0 - callNreg) * 8);
+                        }
+                        continue;
+                    }
+                    string arrParamType0 = "";
+                    int arrParamSlot0 = this.funcParamStarts[funcIdx] + i;
+                    if (arrParamSlot0 >= 0 && arrParamSlot0 < this.funcParamTypes.length) {
+                        arrParamType0 = this.funcParamTypes[arrParamSlot0];
+                    }
+                    this.genExprAsType(argument, arrParamType0);
+                    int arrValTmp0 = this.allocLocal("__arrarg_val");
+                    this.asm.movMBaseR(5, 0, arrValTmp0);
+                    this.asm.leaRBase(0, 5, arrValTmp0);
+                    int slot1 = i + slotBias;
+                    if (slot1 < callNreg) {
+                        this.asm.movMBaseR(4, 0, spillBase + slot1 * 8);
+                    } else {
+                        this.asm.movMBaseR(4, 0, callBase + (slot1 - callNreg) * 8);
+                    }
+                    continue;
                 }
                 if (argument != null) {
                     int parameter = this.funcParamStarts[funcIdx] + i;
@@ -14183,7 +14300,26 @@ public void genNewCall(Node call) {
         }
         this.funcCallArgCount += totalArgs;
         for (int i = 0; i < totalArgs; i++) {
-            if (i == 0) {
+            // Arrays are reference types: an array-typed parameter
+            // receives the argument variable's slot ADDRESS (the `&arg`
+            // ABI) so growth inside the callee rebinds the caller's
+            // variable. Non-variable shapes fall back to a value temp
+            // whose address is passed instead.
+            bool arrParamByRef = i >= 1 && i <= explicitArgs && packedArg == null
+                && this.paramIsArrayAt(funcIdx, i - 1);
+            bool passedVarAddr = false;
+            if (arrParamByRef) {
+                passedVarAddr = this.genArrayArgAddress(call.child(i));
+                if (!passedVarAddr) {
+                    // genTypedArgument already evaluates the value into a
+                    // temp and answers the temp's ADDRESS for array params.
+                    this.genTypedArgument(call.child(i), funcIdx, i - 1);
+                    passedVarAddr = true;
+                }
+            }
+            if (arrParamByRef) {
+                // The address is already in RAX; fall through to the spill.
+            } else if (i == 0) {
                 this.genExpr(call.child(0));
 
             } else if (i <= explicitArgs) {
@@ -15866,6 +16002,11 @@ public void genNewCall(Node call) {
                 }
                 this.asm.pushR64(0);
                 this.asm.movRMBase(11, 5, arrOff);
+                // Array-typed parameters are by-reference: the slot holds
+                // the caller's variable address, deref before storing.
+                if (this.isRefParam(arrNode.name)) {
+                    this.asm.movRMBase(11, 11, 0);
+                }
                 this.asm.popR64(12);
                 this.asm.popR64(0);
                 if (!arrIsStrideOne) { this.asm.shlR64Imm(0, 3); }
