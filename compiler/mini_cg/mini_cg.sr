@@ -11246,10 +11246,17 @@ public void genNewCall(Node call) {
     // and returns true only for a plain local variable argument; any
     // other shape falls back to normal evaluation.
     public bool genArrayArgAddress(Node arg) {
-        if (arg.kind != 6) { return false; }
-        int off = this.findLocal(arg.name);
+        // An explicit address-of argument (`f(&x)`, kind 8 / op 3) already
+        // asks for by-reference passing: the address it names IS the
+        // argument. Unwrap it to the named variable so a by-reference
+        // variable forwards the address it HOLDS (one indirection, not
+        // two).
+        Node target = arg;
+        if (arg.kind == 8 && arg.op == 3 && arg.childCount() > 0) { target = arg.child(0); }
+        if (target.kind != 6) { return false; }
+        int off = this.findLocal(target.name);
         if (off == 0) { return false; }
-        if (this.isRefParam(arg.name)) {
+        if (this.isRefParam(target.name)) {
             this.asm.movRMBase(0, 5, off);
         } else {
             this.asm.leaRBase(0, 5, off);
@@ -11558,7 +11565,7 @@ public void genNewCall(Node call) {
                 // (math.sum([1, 2.5, 3]) boxes its ints as float64).
                 if (argument != null
                         && this.paramIsArrayAt(funcIdx, i)) {
-                    if (argument.kind == 6 && this.genArrayArgAddress(argument)) {
+                    if (this.genArrayArgAddress(argument)) {
                         int slot0 = i + slotBias;
                         if (slot0 < callNreg) {
                             this.asm.movMBaseR(4, 0, spillBase + slot0 * 8);

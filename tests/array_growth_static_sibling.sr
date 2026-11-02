@@ -1,0 +1,102 @@
+// Arrays are reference types: an array that grows inside a callee must
+// be grown in the CALLER too, through EVERY call shape.
+//
+// The bare static sibling call (a static method of the enclosing class
+// invoked by its bare name) used to pass the argument BY VALUE while the
+// callee bound its array-typed parameter BY REFERENCE: the callee then
+// dereferenced a data pointer as if it were an address and the program
+// died on garbage. Every call shape that can reach a user function must
+// pass an array-typed argument as an ADDRESS.
+class Store {
+    public static void fill(string[] s, int n) {
+        for (int i = 0; i < n; i++) {
+            s.add("v" + i.toString());
+        }
+    }
+
+    // A bare sibling call to the static method above.
+    public static void growSibling(string[] s) {
+        fill(s, 12);
+    }
+
+    // A bare sibling call to an INSTANCE method with an array parameter.
+    public void growInstance(string[] s) {
+        take(s, 3);
+    }
+
+    public void take(string[] s, int n) {
+        for (int i = 0; i < n; i++) {
+            s.add("i" + i.toString());
+        }
+    }
+}
+
+void main() {
+    // 1. Class-qualified static call.
+    string[] a = [];
+    Store.fill(a, 12);
+    if (a.length != 12) {
+        printline("lost growth: " + a.length.toString());
+        exit(1);
+    }
+    if (a[0] != "v0" || a[11] != "v11") {
+        printline("elements wrong: " + a[0] + " " + a[11]);
+        exit(1);
+    }
+
+    // 2. Bare sibling static call (the shape that broke).
+    string[] b = [];
+    Store.growSibling(b);
+    if (b.length != 12) {
+        printline("sibling static lost growth: " + b.length.toString());
+        exit(1);
+    }
+    if (b[11] != "v11") {
+        printline("sibling static elements wrong: " + b[11]);
+        exit(1);
+    }
+
+    // 3. Bare sibling instance call.
+    Store st = new Store();
+    string[] c = [];
+    st.growInstance(c);
+    if (c.length != 3) {
+        printline("sibling instance lost growth: " + c.length.toString());
+        exit(1);
+    }
+    if (c[2] != "i2") {
+        printline("sibling instance elements wrong: " + c[2]);
+        exit(1);
+    }
+
+    // 4. Instance method through an expression receiver.
+    string[] d = [];
+    Store other = new Store();
+    other.take(d, 5);
+    if (d.length != 5) {
+        printline("instance call lost growth: " + d.length.toString());
+        exit(1);
+    }
+
+    // 5. A non-variable argument shape still works (the callee gets the
+    //    address of a value temp; growth stays local to that temp).
+    fill2(makeThree());
+    if (makeThree().length != 3) {
+        printline("temporary argument broken");
+        exit(1);
+    }
+
+    printline("ok");
+}
+
+string[] makeThree() {
+    string[] t = [];
+    t.add("a");
+    t.add("b");
+    t.add("c");
+    return t;
+}
+
+void fill2(string[] s) {
+    s.add("d");
+}
