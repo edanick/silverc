@@ -216,6 +216,13 @@ class MiniCg {
     public prop string[] dictFieldVars;
     public prop string[] dictFieldKeys;
     public prop string[] dictFieldKinds;
+    // Per-key dynamic class ("var" + "key" triples) for a dict whose
+    // value type is `object`: the class of the instance stored under
+    // that key, so `m["k"].v` binds that class's field slot instead of
+    // the dict layout. Mirrors silverc-rs dict_field_classes.
+    public prop string[] dictFieldClassVars;
+    public prop string[] dictFieldClassKeys;
+    public prop string[] dictFieldClassNames;
     // Object-record variables (struct literals, declared `object` unless
     // built from a string-keyed dict literal): whole-value prints render
     // `{...}` like the interpreter, plain dicts render `dict{...}`.
@@ -455,6 +462,9 @@ class MiniCg {
         this.dictFieldVars = [];
         this.dictFieldKeys = [];
         this.dictFieldKinds = [];
+        this.dictFieldClassVars = [];
+        this.dictFieldClassKeys = [];
+        this.dictFieldClassNames = [];
         this.objectVars = [];
         this.forwardCalls = [];
 
@@ -3637,7 +3647,11 @@ int strIdx = this.stringPatchIndices[i];
     this.dictValueNames = [];
     this.dictValueKinds = [];
     this.dictFieldVars = [];
+    this.dictFieldKeys = [];
     this.dictFieldKinds = [];
+    this.dictFieldClassVars = [];
+    this.dictFieldClassKeys = [];
+    this.dictFieldClassNames = [];
     this.objectVars = [];
     this.stackSize = 0;
     this.currentClassName = className;
@@ -3691,6 +3705,9 @@ int strIdx = this.stringPatchIndices[i];
     this.dictFieldVars = [];
     this.dictFieldKeys = [];
     this.dictFieldKinds = [];
+    this.dictFieldClassVars = [];
+    this.dictFieldClassKeys = [];
+    this.dictFieldClassNames = [];
     this.objectVars = [];
     this.stackSize = 0;
     this.currentClassName = "";
@@ -6000,6 +6017,14 @@ int strIdx = this.stringPatchIndices[i];
                 string elemType = this.arrayElementType(varType);
                 string lookupType = varType;
                 if (elemType != "") { lookupType = elemType; }
+                // An `object`-typed local holds a value whose class is only
+                // known at runtime: the recorded dynamic class binds the
+                // field's slot (the unique-name fallback below covered
+                // only fields whose name is unique across all classes).
+                if (lookupType == "object") {
+                    string dynType = this.objectDynamicTypeOf(obj.name);
+                    if (dynType != "") { lookupType = dynType; }
+                }
                 int fieldOff = this.findFieldOffset(lookupType, fieldName);
                 if (fieldOff < 0) {
                     // A self-hosted compiler can temporarily lose the class
@@ -6030,6 +6055,19 @@ int strIdx = this.stringPatchIndices[i];
                 // Dict/object-VALUED dicts keep the `d.key` semantics: the
                 // field is a key lookup on the value dict.
                 string dvType = this.dictValueType(arrType).trim();
+                // The value stored under this key may be a class
+                // instance (the dict's value type is `object`): the
+                // class recorded for the key binds the field's slot.
+                string keyClass = this.dictIndexClassOf(arrNode, obj.child(1));
+                if (keyClass != "" && !this.isDictOrObjectType(keyClass)) {
+                    this.genDictIndexGet(obj);
+                    int fieldOff = this.findFieldOffset(keyClass, fieldName);
+                    if (fieldOff < 0) { fieldOff = this.findFieldOffsetInAllClasses(fieldName); }
+                    if (fieldOff >= 0) {
+                        this.asm.movRMBase(0, 0, fieldOff);
+                    }
+                    return;
+                }
                 if (this.isDictOrObjectType(dvType)) {
                     Node nestedIdx = new Node();
                     nestedIdx.kind = 24;
@@ -6228,7 +6266,15 @@ int strIdx = this.stringPatchIndices[i];
         if (expr.kind == 24) {
             Node arrNode = expr.child(0);
             string arrType = this.inferExprType(arrNode);
-            if (this.isDictType(arrType)) { return this.dictValueType(arrType); }
+            if (this.isDictType(arrType)) {
+                // A dict whose value type is `object` may hold class
+                // instances: the class recorded for the key (on the
+                // write) is the value's real type, and it is what a
+                // field read through the key must bind.
+                string keyClass = this.dictIndexClassOf(arrNode, expr.child(1));
+                if (keyClass != "") { return keyClass; }
+                return this.dictValueType(arrType);
+            }
             if (arrType == "string") { return "char"; }
             return this.arrayElementType(arrType);
         }
@@ -8955,6 +9001,9 @@ int strIdx = this.stringPatchIndices[i];
         // json.stringify renders the stored value by its static kind.
         if (call.isMember && name == "set" && call.childCount() >= 4 && call.child(0).kind == 6 && !recvIsUserSymbol && call.child(0).name == "json" && call.child(1).kind == 6 && call.child(2).kind == 2) {
             this.noteDictWrite(call.child(1).name, call.child(2).strVal, this.classifyDictValue(call.child(3)));
+            // The stored value may be a class instance: record its class
+            // for the key, so a read through the key binds it.
+            this.trackDictKeyClass(call.child(1).name, call.child(2).strVal, this.classOfExpr(call.child(3)));
         }
         if ((name == "__binaryMetadataStatus" || name == "__binaryMetadataStatusNative") && !call.isMember) {
             this.genBinaryMetadataStatus(call);
@@ -9794,6 +9843,10 @@ int strIdx = this.stringPatchIndices[i];
             string keyText = "";
             if (keyNode.kind == 2) { keyText = keyNode.strVal; }
             this.noteDictWrite(dictNode.name, keyText, rhsKind);
+            // The dict's value type may be `object`: remember the class
+            // of the instance stored under this key, so a read through
+            // the key (`m["k"].v`) binds that class's field slot.
+            this.trackDictKeyClass(dictNode.name, keyText, this.classOfExpr(rhs));
         }
         this.genExpr(dictNode);
         int dBase = this.allocLocal("__ds_base");
@@ -17578,6 +17631,58 @@ public void genNewCall(Node call) {
         if (this.isStringLike(e)) { return "string"; }
         if (this.isFloatLike(e)) { return "float"; }
         return "";
+    }
+
+    // The class an expression holds, or "" when it holds no class
+    // instance (a scalar, a dict record, an unknown shape).
+    public string classOfExpr(Node e) {
+        string t = this.inferExprType(e);
+        for (int i = 0; i < this.classNames.length; i++) {
+            if (this.classNames[i] == t) { return t; }
+        }
+        return "";
+    }
+
+    // Record the class stored under a dict key (upsert; "" drops it).
+    public void trackDictKeyClass(string name, string key, string cls) {
+        this.dropDictKeyClass(name, key);
+        if (key != "" && cls != "") {
+            this.dictFieldClassVars.add(name);
+            this.dictFieldClassKeys.add(key);
+            this.dictFieldClassNames.add(cls);
+        }
+    }
+
+    public void dropDictKeyClass(string name, string key) {
+        string[] nv = [];
+        string[] nk = [];
+        string[] nc = [];
+        for (int i = 0; i < this.dictFieldClassVars.length; i++) {
+            if (this.dictFieldClassVars[i] != name || this.dictFieldClassKeys[i] != key) {
+                nv.add(this.dictFieldClassVars[i]);
+                nk.add(this.dictFieldClassKeys[i]);
+                nc.add(this.dictFieldClassNames[i]);
+            }
+        }
+        this.dictFieldClassVars = nv;
+        this.dictFieldClassKeys = nk;
+        this.dictFieldClassNames = nc;
+    }
+
+    // The class stored under a dict key, else "".
+    public string dictKeyClassOf(string name, string key) {
+        for (int i = 0; i < this.dictFieldClassVars.length; i++) {
+            if (this.dictFieldClassVars[i] == name && this.dictFieldClassKeys[i] == key) { return this.dictFieldClassNames[i]; }
+        }
+        return "";
+    }
+
+    // The class stored under `base[key]` when the base is a plain
+    // identifier and the key a literal, else "".
+    public string dictIndexClassOf(Node base, Node keyNode) {
+        if (base.kind != 6) { return ""; }
+        if (keyNode.kind != 2) { return ""; }
+        return this.dictKeyClassOf(base.name, keyNode.strVal);
     }
 
     // Whole-kind of a dict/object literal: "string" only when every value
