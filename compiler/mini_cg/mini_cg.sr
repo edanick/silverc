@@ -5920,6 +5920,22 @@ int strIdx = this.stringPatchIndices[i];
                 if (this.enumNames[ei] == obj.name) { objIsEnum = true; }
             }
             if (!objIsLocal && !objIsClass && !objIsEnum) {
+                // Module-qualified global variable (`events.global`): a
+                // module-level var registers under its bare name only, so
+                // the qualified spelling maps to that shared slot (parity
+                // with silverc-rs 3c61b87). Without this the read fell
+                // through to the dict/struct-field lowering, which
+                // evaluates the module name to null and faults, and method
+                // calls on it silently no-op'd. The guards above keep a
+                // shadowing local or class winning; findGlobal keeps a
+                // same-named global value winning.
+                if (this.findGlobal(obj.name) < 0) {
+                    int gvIdx = this.findGlobal(fieldName);
+                    if (gvIdx >= 0) {
+                        this.genGlobalLoad(gvIdx);
+                        return;
+                    }
+                }
                 for (int ci = 0; ci < this.constNames.length; ci++) {
                     if (this.constNames[ci] == fieldName) {
                         if (this.genTypedConstant(ci)) { return; }
@@ -6636,6 +6652,18 @@ int strIdx = this.stringPatchIndices[i];
                 if (this.enumNames[ei] == obj.name) { objIsEnum = true; }
             }
             if (!objIsLocal && !objIsClass && !objIsEnum) {
+                // Module-qualified global variable (`events.global`): the
+                // var's class is recorded under its bare name (parity with
+                // silverc-rs 3c61b87), so field offsets and method
+                // dispatch through the qualified spelling resolve exactly
+                // like the bare one. Guards mirror genMemberAccess.
+                if (this.findGlobal(obj.name) < 0) {
+                    int gvi = this.findGlobal(fieldName);
+                    if (gvi >= 0) {
+                        if (gvi < this.globalTypes.length) { return this.globalTypes[gvi]; }
+                        return "";
+                    }
+                }
                 for (int ci = 0; ci < this.constNames.length; ci++) {
                     if (this.constNames[ci] == fieldName) {
                         if (ci < this.constTypes.length && this.constTypes[ci] != "") { return this.constTypes[ci]; }
