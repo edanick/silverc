@@ -1,0 +1,117 @@
+// The events std module (redesigned around zero-arg `void ()` handlers)
+// is a pub/sub emitter: handlers are registered with on/once/onAsync and
+// fired by emit, which dispatches exact-name handlers first, then
+// `"prefix.*"` wildcard handlers (built by splitting the emitted name on
+// "."), then once-handlers — draining them after the first fire. A
+// handler has no parameters: it reads the event off the emitter's
+// public `currentEvent` field. Each handler runs under its own
+// try/catch; a throw routes to the onError handler, which reads
+// `errorEventName` and `errorException`. listener.off() and off(name)
+// remove registrations; the 3-arg emit ignores the context and
+// delegates; events.global is the module-level shared emitter.
+import * from events;
+
+int onCount = 0;
+int wildCount = 0;
+int onceCount = 0;
+int asyncCount = 0;
+int plainCount = 0;
+int errCount = 0;
+int globalCount = 0;
+int goneCount = 0;
+int dataOk = 0;
+
+emitter bus = new emitter();
+
+class Kaboom {
+    string message;
+    construct(string msg) { this.message = msg; }
+}
+
+void expect(bool got, string what) {
+    if (!got) {
+        printline("events check failed: " + what);
+        exit(1);
+    }
+}
+
+void kaboom() { throw new Kaboom("handler exploded"); }
+
+void main() {
+    bus.onError((void () {
+        errCount++;
+        printline("error " + bus.errorEventName + ": " + bus.errorException.message);
+    }));
+
+    bus.on("chat.msg", (void () {
+        onCount++;
+        string d = bus.currentEvent.data;
+        if (d == "hello") {
+            dataOk++;
+        }
+        printline("on " + bus.currentEvent.name + " data=" + d);
+    }));
+
+    bus.on("chat.*", (void () {
+        wildCount++;
+        printline("wild " + bus.currentEvent.name);
+    }));
+
+    bus.onAsync("async.tick", (void () {
+        asyncCount++;
+    }));
+
+    bus.once("boot.done", (void () {
+        onceCount++;
+    }));
+
+    bus.on("plain", (void () {
+        plainCount++;
+    }));
+
+    listener gone = bus.on("gone.evt", (void () {
+        goneCount++;
+    }));
+
+    bus.on("boom", (void () {
+        kaboom();
+    }));
+
+    bus.emit("chat.msg", "hello");
+    expect(onCount == 1, "exact handler fired");
+    expect(wildCount == 1, "wildcard handler fired");
+    expect(dataOk == 1, "currentEvent.data round-trips");
+
+    bus.emit("chat.msg", "again");
+    expect(onCount == 2, "exact handler fires per emit");
+
+    bus.emit("boot.done", null);
+    bus.emit("boot.done", null);
+    expect(onceCount == 1, "once fires exactly once");
+
+    bus.emit("async.tick", null);
+    expect(asyncCount == 1, "onAsync fires like on");
+
+    bus.emit("plain", null, "ignored-context");
+    expect(plainCount == 1, "3-arg emit delegates to 2-arg emit");
+
+    gone.off();
+    bus.emit("gone.evt", null);
+    expect(goneCount == 0, "listener.off removes the handler");
+
+    bus.off("chat.msg");
+    bus.emit("chat.msg", "silent");
+    expect(onCount == 2, "off(name) removes the handler");
+    expect(wildCount == 3, "wildcard survives off of the exact name");
+
+    bus.emit("boom", null);
+    expect(errCount == 1, "a throwing handler routes to onError");
+
+    events.global.on("g.evt", (void () {
+        globalCount++;
+    }));
+    events.global.emit("g.evt", null);
+    expect(globalCount == 1, "events.global dispatches");
+
+    printline("ok");
+}
