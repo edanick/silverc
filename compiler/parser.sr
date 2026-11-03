@@ -3625,9 +3625,14 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
     // The member after `.` / `?.` must name something: an identifier, or a
     // tuple position as an integer literal (`t.0`). A number token ending
     // in a bare trailing dot is the `t.0.toString()` re-lex of a tuple
-    // position — the dot is stripped back off. Anything else names the
-    // mistake instead of building a member the rest of the pipeline cannot
-    // explain.
+    // position — the dot is stripped back off. Keyword tokens name a member
+    // by their text, mirroring the bootstrap's member-name leniency
+    // (its `expect_member_name` accepts any keyword, e.g. std/regex.sr's
+    // `pattern.match(...)` call sites); the excluded keywords match the
+    // bootstrap's list exactly — `throw` (64), `finally` (65), `protected`
+    // (164) and `typealias` (165) stay reserved after the dot. Anything
+    // else names the mistake instead of building a member the rest of the
+    // pipeline cannot explain.
     private string memberNameAfterDot(Token name, string what) {
         if (name.kind == 7) { return name.text; }
         // `collect` and `found` are contextual keywords (a declaration shape
@@ -3636,6 +3641,13 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         // that called `this.collect(...)` before the keyword existed still
         // parses.
         if (name.kind == 33 || name.kind == 34) { return name.text; }
+        // Keyword members by text (10..60 = if..extends, 150..155 = local..
+        // shared, 167 = internal, 5/6 = true/false/null), the same set the
+        // bootstrap's expect_member_name admits.
+        if ((name.kind >= 10 && name.kind <= 60) || (name.kind >= 150 && name.kind <= 155)
+            || name.kind == 167 || name.kind == 5 || name.kind == 6) {
+            return name.text;
+        }
         if (name.kind == 1) {
             bool hasDot = false;
             for (int i = 0; i < name.text.length; i++) {
