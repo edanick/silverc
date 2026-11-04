@@ -1,11 +1,14 @@
-// The regex std module provides a simple wildcard matcher: `.` and `?`
-// match any single character, `*` matches any run of characters, `+`
-// matches a non-empty run. `test` matches the whole input against the
-// pattern; `match`/`findAll`/`replace` anchor at the earliest position
-// where the whole remaining suffix matches, so star-led patterns are the
-// predictable shape. `regex.split` delegates to the string split. The
-// member call sites exercise keyword-named methods (`pattern.match`)
-// after the dot.
+// The regex std module is a regular-expression engine (DOCS/175):
+// literals, `.`, character classes with ranges and negation, the anchors
+// `^`/`$`, alternation, named capture groups `(?<name>...)`, the classes
+// \d \w \s (and their negations), escapes, and the greedy quantifiers
+// * + ? on any atom. test/match/findAll/replace SEARCH (unanchored);
+// match() answers a match object (null when nothing matched) whose
+// group(name) reads a named capture and text() the whole match.
+// regex.split treats the delimiter as a pattern (a literal separator
+// behaves exactly as its text). Mirrors the bootstrap suite fixture
+// silverc-rs/tests/suite/regex.sr; the import is a true self-import, so
+// it falls through to std/regex.sr.
 import * from regex;
 
 void expect(bool got, string what) {
@@ -16,43 +19,59 @@ void expect(bool got, string what) {
 }
 
 void main() {
-    pattern dot = regex.compile("h.llo");
-    expect(dot.test("hello"), "h.llo matches hello");
-    expect(dot.test("hallo"), "h.llo matches hallo");
-    expect(!dot.test("hllo"), "h.llo rejects a missing character");
-    expect(!dot.test("hello!"), "h.llo rejects trailing text");
+    // The DOCS' own example: a search, not a whole-match test.
+    regex.pattern digits = regex.compile("\\d+");
+    expect(digits.test("abc123"), "\\d+ finds digits inside text");
+    expect(!digits.test("abc"), "\\d+ rejects text without digits");
 
-    pattern star = regex.compile("ab*");
-    expect(!star.test("a"), "ab* needs the literal b");
-    expect(star.test("ab"), "ab* matches ab");
-    expect(star.test("abzzz"), "ab* matches trailing run");
+    expect(digits.findAll("a1 b22 c333").length == 3, "findAll finds every run");
+    string[] all = digits.findAll("a1 b22 c333");
+    expect(all[0] == "1" && all[1] == "22" && all[2] == "333", "findAll run values");
+    expect(digits.replace("hello 123 world 45", "X") == "hello X world X", "replace substitutes every match");
+    expect(digits.match("ab77cd").text() == "77", "match finds the first run");
 
-    pattern plus = regex.compile("ab+");
-    expect(plus.test("abz"), "ab+ matches a non-empty run");
-    expect(!plus.test("a"), "ab+ rejects a bare a");
+    // Named capture groups (the DOCS' example verbatim).
+    regex.pattern email = regex.compile("(?<name>\\w+)@(?<domain>\\w+\\.\\w+)");
+    regex.match result = email.match("alice@example.com");
+    expect(result != null, "the email pattern matches");
+    expect(result.group("name") == "alice", "name group");
+    expect(result.group("domain") == "example.com", "domain group");
+    expect(result.text() == "alice@example.com", "text is the whole match");
+    expect(regex.compile("zzz").match("abc") == null, "no match answers null");
 
-    pattern any = regex.compile("h?llo");
-    expect(any.test("hello"), "h?llo matches hello");
-    expect(!any.test("hllo"), "h?llo rejects a missing character");
+    // Anchors.
+    regex.pattern anchored = regex.compile("^x+y$");
+    expect(anchored.test("xxxy"), "^x+y$ matches xxxy");
+    expect(!anchored.test("axxxy"), "^x+y$ rejects a leading character");
 
-    pattern all = regex.compile("*");
-    expect(all.test("anything"), "* matches everything");
-    expect(all.match("hey") == "hey", "match returns the whole hit");
+    // Alternation.
+    regex.pattern alt = regex.compile("cat|dog");
+    expect(alt.test("hotdog"), "alternation finds dog inside hotdog");
+    expect(alt.match("catapult").text() == "cat", "the first alternative wins");
 
-    pattern lead = regex.compile("a*");
-    expect(lead.match("anana") == "anana", "match grows from the first hit");
-    string[] hits = lead.findAll("banana");
-    expect(hits.length == 1, "findAll finds the anana hit");
-    expect(hits[0] == "anana", "findAll returns the hit text");
+    // Character classes, ranges and negation.
+    expect(regex.compile("[a-c]+").match("zzabc").text() == "abc", "class range");
+    expect(regex.compile("[^0-9]+").match("12ab34").text() == "ab", "negated class");
+    expect(regex.compile("\\s+").match("a  b").text() == "  ", "the \\s class");
 
-    pattern tail = regex.compile("o*");
-    expect(tail.replace("hello world", "O") == "hellO", "replace swaps the hit");
-    pattern none = regex.compile("z*");
-    expect(none.replace("apple", "Q") == "apple", "replace leaves a miss alone");
+    // Quantifiers on any atom, including groups.
+    expect(regex.compile("colou?r").test("color"), "? makes the u optional");
+    expect(regex.compile("colou?r").test("colour"), "? keeps the u");
+    expect(regex.compile("(ab)+").match("zababy").text() == "abab", "+ on a group");
 
-    string[] parts = regex.split("a,b,c", ",");
-    expect(parts.length == 3, "split makes three parts");
-    expect(parts[0] == "a" && parts[1] == "b" && parts[2] == "c", "split keeps the parts");
+    // `.` matches any character.
+    expect(regex.compile("a.c").match("abc").text() == "abc", ". matches b");
+    expect(regex.compile("a.c").match("axc").text() == "axc", ". matches x");
+
+    // split: pattern delimiters and literal delimiters.
+    string[] parts = regex.split("a1b22c", "\\d+");
+    expect(parts.length == 3 && parts[0] == "a" && parts[1] == "b" && parts[2] == "c", "split on a pattern");
+    expect(regex.split("a,b,c", ",").length == 3, "split on a literal");
+
+    // Greedy backtracking: the longest run wins, shorter on failure.
+    expect(regex.compile("a*").match("aaab").text() == "aaa", "greedy star");
+    expect(regex.compile("<.*>").match("<a><b>").text() == "<a><b>", "greedy dot-star spans");
+    expect(regex.compile("ab*b").match("abbb").text() == "abbb", "a greedy star yields to the tail");
 
     printline("ok");
 }
