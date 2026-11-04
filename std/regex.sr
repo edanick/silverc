@@ -1,98 +1,597 @@
 mod export regex;
 
+// A regular-expression engine (DOCS/175). Patterns support literals, `.`,
+// character classes with ranges and negation (`[a-z]`, `[^0-9]`), the
+// anchors `^` and `$`, alternation `|`, captures — named `(?<name>...)`
+// and plain `(...)` — the classes \d \D \w \W \s \S, the escapes
+// \n \t \r \f \0 and any escaped metacharacter, and the greedy
+// quantifiers `*` `+` `?` on any atom. test / match / findAll / replace
+// SEARCH the input (unanchored); match() answers a match object (null
+// when nothing matched) whose group(name) reads a named capture. The
+// matcher is a backtracking engine: every trial snapshots the capture
+// values and restores them when the trial fails.
+
+private string WORD_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+private string SPACE_CHARS = " \t\n\r\f";
+
+private string[] copyStrings(string[] src) {
+    string[] out = [];
+    for (int i = 0; i < src.length; i++) {
+        out.push(src[i]);
+    }
+    return out;
+}
+
+class cursor {
+    public int i;
+
+    construct(int i) {
+        this.i = i;
+    }
+}
+
+class node {
+    public string kind;
+    public string ch;
+    public string chars;
+    public string pairs;
+    public bool negate;
+    public node child;
+    public node[] items;
+    public node[] alts;
+    public string name;
+
+    construct(string kind) {
+        this.kind = kind;
+        this.ch = "";
+        this.chars = "";
+        this.pairs = "";
+        this.negate = false;
+        this.child = null;
+        this.items = [];
+        this.alts = [];
+        this.name = "";
+    }
+}
+
 class match {
-    private kvp<string, string> groups;
+    private string whole;
+    private string[] names;
+    private string[] values;
 
+    construct(string whole, string[] names, string[] values) {
+        this.whole = whole;
+        this.names = names;
+        this.values = values;
+    }
 
-    public string group(string name) { return groups.get(name); }
+    public string text() {
+        return this.whole;
+    }
+
+    public string group() {
+        return this.whole;
+    }
+
+    public string group(string name) {
+        for (int i = 0; i < this.names.length; i++) {
+            if (this.names[i] == name) {
+                return this.values[i];
+            }
+        }
+        return "";
+    }
+}
+
+class hit {
+    public int start;
+    public int end;
+    public string[] values;
+
+    construct(int start, int end, string[] values) {
+        this.start = start;
+        this.end = end;
+        this.values = values;
+    }
+}
+
+class runstate {
+    public string input;
+    public string[] names;
+    public string[] values;
+
+    construct(string input, string[] names) {
+        this.input = input;
+        this.names = names;
+        this.values = [];
+        for (int i = 0; i < names.length; i++) {
+            this.values.push("");
+        }
+    }
 }
 
 class pattern {
     private string raw;
+    private node root;
+    private string[] groupNames;
 
-    construct(string raw) { this.raw = raw; }
-
-    public bool test(string input) {
-        return simpleMatch(this.raw, input);
+    construct(string raw) {
+        this.raw = raw;
+        this.groupNames = [];
+        cursor cur = new cursor(0);
+        this.root = this.parseAlt(cur);
     }
 
-    public string match(string input) {
-        string m = findMatch(this.raw, input);
-        return m;
+    public bool test(string input) {
+        hit h = this.find(input, 0);
+        return h != null;
+    }
+
+    public regex.match match(string input) {
+        hit h = this.find(input, 0);
+        if (h == null) {
+            return null;
+        }
+        return new match(input.substr(h.start, h.end - h.start), this.groupNames, h.values);
     }
 
     public string[] findAll(string input) {
         string[] results = [];
-        string remaining = input;
-        while (true) {
-            string m = findMatch(this.raw, remaining);
-            if (m == "") { break; }
-            results.push(m);
-            int idx = remaining.indexOf(m);
-            if (idx < 0) { break; }
-            remaining = remaining.substr(idx + m.length);
+        int pos = 0;
+        while (pos <= input.length) {
+            hit h = this.find(input, pos);
+            if (h == null) {
+                break;
+            }
+            results.push(input.substr(h.start, h.end - h.start));
+            if (h.end > h.start) {
+                pos = h.end;
+            } else {
+                pos = h.start + 1;
+            }
         }
         return results;
     }
 
     public string replace(string input, string replacement) {
         string result = "";
-        string remaining = input;
-        while (true) {
-            string m = findMatch(this.raw, remaining);
-            if (m == "") { result += remaining; break; }
-            int idx = remaining.indexOf(m);
-            result += remaining.substr(0, idx) + replacement;
-            remaining = remaining.substr(idx + m.length);
+        int pos = 0;
+        while (pos <= input.length) {
+            hit h = this.find(input, pos);
+            if (h == null) {
+                break;
+            }
+            result += input.substr(pos, h.start - pos) + replacement;
+            if (h.end > h.start) {
+                pos = h.end;
+            } else {
+                if (h.end < input.length) {
+                    result += input.substr(h.end, 1);
+                }
+                pos = h.end + 1;
+            }
+        }
+        if (pos <= input.length) {
+            result += input.substr(pos);
         }
         return result;
     }
-}
 
-public pattern compile(string raw) { return new pattern(raw); }
-
-public string[] split(string input, string delim) {
-    return input.split(delim);
-}
-
-private bool simpleMatch(string pat, string input) {
-    int textI = 0;
-    int patI = 0;
-    int textLen = input.length;
-    int patLen = pat.length;
-    int textStar = -1;
-    int patStar = -1;
-
-    while (textI < textLen) {
-        if (patI < patLen && (pat[patI] == input[textI] || pat[patI] == '.')) {
-            textI++; patI++;
-        } else if (patI < patLen && pat[patI] == '*') {
-            textStar = textI; patStar = patI; patI++;
-        } else if (patI < patLen && pat[patI] == '+') {
-            textStar = textI + 1; patStar = patI; patI++;
-        } else if (patI < patLen && pat[patI] == '?') {
-            textI++; patI++;
-        } else if (patStar >= 0) {
-            textStar++; textI = textStar; patI = patStar + 1;
-        } else {
-            return false;
-        }
-    }
-    while (patI < patLen && pat[patI] == '*') { patI++; }
-    return patI == patLen;
-}
-
-private string findMatch(string pat, string input) {
-    for (int start = 0; start < input.length; start++) {
-        string sub = input.substr(start);
-        if (simpleMatch(pat, sub)) {
-            int end = start;
-            string result = "";
-            for (int i = 0; i < sub.length && simpleMatch(pat, sub.substr(0, i + 1)); i++) {
-                result = sub.substr(0, i + 1);
+    public hit find(string input, int fromPos) {
+        for (int start = fromPos; start <= input.length; start++) {
+            runstate s = new runstate(input, this.groupNames);
+            int end = this.matchNode(this.root, s, start);
+            if (end >= 0) {
+                return new hit(start, end, copyStrings(s.values));
             }
-            return result;
+        }
+        return null;
+    }
+
+    private int matchNode(node n, runstate s, int pos) {
+        string t = s.input;
+        int len = t.length;
+        if (n.kind == "char") {
+            if (pos < len && t[pos] == n.ch[0]) {
+                return pos + 1;
+            }
+            return -1;
+        }
+        if (n.kind == "any") {
+            if (pos < len && t[pos] != '\n') {
+                return pos + 1;
+            }
+            return -1;
+        }
+        if (n.kind == "class") {
+            if (pos < len && this.classHas(n, t[pos])) {
+                return pos + 1;
+            }
+            return -1;
+        }
+        if (n.kind == "bol") {
+            if (pos == 0) {
+                return pos;
+            }
+            return -1;
+        }
+        if (n.kind == "eol") {
+            if (pos == len) {
+                return pos;
+            }
+            return -1;
+        }
+        if (n.kind == "seq") {
+            return this.matchSeq(n.items, 0, s, pos);
+        }
+        if (n.kind == "group") {
+            // A group in value position (the child of a quantifier, an
+            // alternation branch's wrapper, ...): match the body, record
+            // the capture on success, restore on failure.
+            string[] saved = copyStrings(s.values);
+            int r = this.matchNode(n.child, s, pos);
+            if (r < 0) {
+                s.values = saved;
+                return -1;
+            }
+            if (n.name != "") {
+                this.store(s, n.name, s.input.substr(pos, r - pos));
+            }
+            return r;
+        }
+        if (n.kind == "alt") {
+            for (int i = 0; i < n.alts.length; i++) {
+                string[] saved = copyStrings(s.values);
+                int r = this.matchNode(n.alts[i], s, pos);
+                if (r >= 0) {
+                    return r;
+                }
+                s.values = saved;
+            }
+            return -1;
+        }
+        return -1;
+    }
+
+    private int matchSeq(node[] items, int idx, runstate s, int pos) {
+        if (idx >= items.length) {
+            return pos;
+        }
+        node it = items[idx];
+        if (it.kind == "star" || it.kind == "plus" || it.kind == "opt") {
+            int min = 0;
+            if (it.kind == "plus") {
+                min = 1;
+            }
+            int cap = 1000000000;
+            if (it.kind == "opt") {
+                cap = 1;
+            }
+            return this.matchQuant(items, idx, it, s, pos, 0, min, cap);
+        }
+        if (it.kind == "group") {
+            string[] saved = copyStrings(s.values);
+            int r = this.matchNode(it.child, s, pos);
+            if (r < 0) {
+                return -1;
+            }
+            if (it.name != "") {
+                this.store(s, it.name, s.input.substr(pos, r - pos));
+            }
+            int rest = this.matchSeq(items, idx + 1, s, r);
+            if (rest < 0) {
+                s.values = saved;
+                return -1;
+            }
+            return rest;
+        }
+        int r = this.matchNode(it, s, pos);
+        if (r < 0) {
+            return -1;
+        }
+        return this.matchSeq(items, idx + 1, s, r);
+    }
+
+    private int matchQuant(node[] items, int idx, node q, runstate s, int pos, int sofar, int min, int cap) {
+        if (sofar < cap) {
+            string[] saved = copyStrings(s.values);
+            int next = this.matchNode(q.child, s, pos);
+            if (next > pos) {
+                int r = this.matchQuant(items, idx, q, s, next, sofar + 1, min, cap);
+                if (r >= 0) {
+                    return r;
+                }
+                s.values = saved;
+            } else if (next == pos) {
+                // An empty child match satisfies the quantifier once and
+                // never repeats (the loop guard); try the continuation.
+                if (sofar + 1 >= min) {
+                    int r = this.matchSeq(items, idx + 1, s, pos);
+                    if (r >= 0) {
+                        return r;
+                    }
+                }
+                s.values = saved;
+            } else {
+                s.values = saved;
+            }
+        }
+        if (sofar >= min) {
+            return this.matchSeq(items, idx + 1, s, pos);
+        }
+        return -1;
+    }
+
+    private void store(runstate s, string name, string value) {
+        for (int i = 0; i < s.names.length; i++) {
+            if (s.names[i] == name) {
+                s.values[i] = value;
+                return;
+            }
         }
     }
-    return "";
+
+    private bool classHas(node n, char c) {
+        bool has = false;
+        for (int i = 0; i < n.chars.length; i++) {
+            if (n.chars[i] == c) {
+                has = true;
+                break;
+            }
+        }
+        if (!has) {
+            for (int i = 0; i + 1 < n.pairs.length; i += 2) {
+                if (c >= n.pairs[i] && c <= n.pairs[i + 1]) {
+                    has = true;
+                    break;
+                }
+            }
+        }
+        if (n.negate) {
+            return !has;
+        }
+        return has;
+    }
+
+    private string peek(cursor cur) {
+        if (cur.i < this.raw.length) {
+            return this.raw.substr(cur.i, 1);
+        }
+        return "";
+    }
+
+    private string peekAt(cursor cur, int k) {
+        if (cur.i + k < this.raw.length) {
+            return this.raw.substr(cur.i + k, 1);
+        }
+        return "";
+    }
+
+    private string take(cursor cur) {
+        string t = this.raw.substr(cur.i, 1);
+        cur.i++;
+        return t;
+    }
+
+    private node charNode(string ch) {
+        node n = new node("char");
+        n.ch = ch;
+        return n;
+    }
+
+    private node classNode(string chars) {
+        node n = new node("class");
+        n.chars = chars;
+        return n;
+    }
+
+    private node parseAlt(cursor cur) {
+        node first = this.parseSeq(cur);
+        if (this.peek(cur) != "|") {
+            return first;
+        }
+        node alt = new node("alt");
+        alt.alts.push(first);
+        while (this.peek(cur) == "|") {
+            cur.i++;
+            alt.alts.push(this.parseSeq(cur));
+        }
+        return alt;
+    }
+
+    private node parseSeq(cursor cur) {
+        node seq = new node("seq");
+        while (true) {
+            string c = this.peek(cur);
+            if (c == "" || c == "|" || c == ")") {
+                break;
+            }
+            node atom = this.parseAtom(cur);
+            string q = this.peek(cur);
+            if (q == "*") {
+                cur.i++;
+                node w = new node("star");
+                w.child = atom;
+                atom = w;
+            } else if (q == "+") {
+                cur.i++;
+                node w = new node("plus");
+                w.child = atom;
+                atom = w;
+            } else if (q == "?") {
+                cur.i++;
+                node w = new node("opt");
+                w.child = atom;
+                atom = w;
+            }
+            seq.items.push(atom);
+        }
+        return seq;
+    }
+
+    private node parseAtom(cursor cur) {
+        string c = this.peek(cur);
+        if (c == "(") {
+            cur.i++;
+            node g = new node("group");
+            if (this.peek(cur) == "?") {
+                cur.i++;
+                string c2 = this.peek(cur);
+                if (c2 == ":") {
+                    cur.i++;
+                } else if (c2 == "<") {
+                    cur.i++;
+                    string nm = "";
+                    while (this.peek(cur) != "" && this.peek(cur) != ">" && this.peek(cur) != ")") {
+                        nm += this.peek(cur);
+                        cur.i++;
+                    }
+                    if (this.peek(cur) == ">") {
+                        cur.i++;
+                    }
+                    g.name = nm;
+                    this.groupNames.push(nm);
+                }
+            }
+            g.child = this.parseAlt(cur);
+            if (this.peek(cur) == ")") {
+                cur.i++;
+            }
+            return g;
+        }
+        if (c == "[") {
+            cur.i++;
+            node cls = new node("class");
+            if (this.peek(cur) == "^") {
+                cur.i++;
+                cls.negate = true;
+            }
+            bool first = true;
+            while (true) {
+                string a = this.peek(cur);
+                if (a == "") {
+                    break;
+                }
+                if (a == "]" && !first) {
+                    cur.i++;
+                    break;
+                }
+                first = false;
+                string one = this.take(cur);
+                if (one == "\\" && this.peek(cur) != "") {
+                    string e = this.take(cur);
+                    if (e == "d") {
+                        cls.chars += "0123456789";
+                    } else if (e == "w") {
+                        cls.chars += WORD_CHARS;
+                    } else if (e == "s") {
+                        cls.chars += SPACE_CHARS;
+                    } else if (e == "n") {
+                        cls.chars += "\n";
+                    } else if (e == "t") {
+                        cls.chars += "\t";
+                    } else if (e == "r") {
+                        cls.chars += "\r";
+                    } else {
+                        cls.chars += e;
+                    }
+                } else if (this.peek(cur) == "-" && this.peekAt(cur, 1) != "" && this.peekAt(cur, 1) != "]") {
+                    cur.i++;
+                    string hi = this.take(cur);
+                    cls.pairs += one + hi;
+                } else {
+                    cls.chars += one;
+                }
+            }
+            return cls;
+        }
+        if (c == ".") {
+            cur.i++;
+            return new node("any");
+        }
+        if (c == "^") {
+            cur.i++;
+            return new node("bol");
+        }
+        if (c == "$") {
+            cur.i++;
+            return new node("eol");
+        }
+        if (c == "\\") {
+            cur.i++;
+            string e = this.take(cur);
+            if (e == "") {
+                return this.charNode("\\");
+            }
+            if (e == "d") {
+                return this.classNode("0123456789");
+            }
+            if (e == "D") {
+                node n = this.classNode("0123456789");
+                n.negate = true;
+                return n;
+            }
+            if (e == "w") {
+                return this.classNode(WORD_CHARS);
+            }
+            if (e == "W") {
+                node n = this.classNode(WORD_CHARS);
+                n.negate = true;
+                return n;
+            }
+            if (e == "s") {
+                return this.classNode(SPACE_CHARS);
+            }
+            if (e == "S") {
+                node n = this.classNode(SPACE_CHARS);
+                n.negate = true;
+                return n;
+            }
+            if (e == "n") {
+                return this.charNode("\n");
+            }
+            if (e == "t") {
+                return this.charNode("\t");
+            }
+            if (e == "r") {
+                return this.charNode("\r");
+            }
+            if (e == "f") {
+                return this.charNode("\f");
+            }
+            if (e == "0") {
+                return this.charNode("\0");
+            }
+            return this.charNode(e);
+        }
+        cur.i++;
+        return this.charNode(c);
+    }
+}
+
+public pattern compile(string raw) {
+    return new pattern(raw);
+}
+
+// The delimiter is a PATTERN: a literal separator behaves exactly as its
+// text (every literal character matches itself), and metacharacters work
+// (`regex.split(s, "\\s+")` splits on runs of spaces).
+public string[] split(string input, string delim) {
+    pattern sep = new pattern(delim);
+    string[] parts = [];
+    int pos = 0;
+    while (pos <= input.length) {
+        hit h = sep.find(input, pos);
+        if (h == null) {
+            break;
+        }
+        parts.push(input.substr(pos, h.start - pos));
+        if (h.end > h.start) {
+            pos = h.end;
+        } else {
+            pos = h.start + 1;
+        }
+    }
+    parts.push(input.substr(pos));
+    return parts;
 }
