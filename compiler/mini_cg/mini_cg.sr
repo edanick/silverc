@@ -62,6 +62,17 @@ class MiniCg {
     // layout (which faulted on class memory).
     public prop string[] objectDynNames;
     public prop string[] objectDynTypes;
+    // `found` foundations (SPEC section 8): a foundation is a TYPE a class
+    // may list among its parents; it carries no fields and no code, so it
+    // contributes nothing to a class layout and is never a super() target.
+    // Member tables hold the signatures every implementing class must
+    // provide (name, argument count, return type).
+    public prop string[] foundNames;
+    public prop int[] foundMemberStarts;
+    public prop int[] foundMemberCounts;
+    public prop string[] foundMemberNames;
+    public prop int[] foundMemberArgCounts;
+    public prop string[] foundMemberReturns;
     // Owning module per collected function (parallel to funcNames): the
     // `mod export` name of the file that declared it, "" for the entry file
     // and synthetic helpers. A module-qualified call (`datetime.now()`)
@@ -371,6 +382,12 @@ class MiniCg {
         this.funcNames = [];
         this.objectDynNames = [];
         this.objectDynTypes = [];
+        this.foundNames = [];
+        this.foundMemberStarts = [];
+        this.foundMemberCounts = [];
+        this.foundMemberNames = [];
+        this.foundMemberArgCounts = [];
+        this.foundMemberReturns = [];
         this.funcClasses = [];
         this.funcModules = [];
         this.constNames = [];
@@ -544,6 +561,22 @@ class MiniCg {
         // first listed parent for the single-parent readers.
         for (int i = 0; i < program.length; i++) {
             Node item = program[i];
+            if (item.kind == 254) {
+                // A `found` foundation is a type, not a layout
+                // contributor: register its name and the member
+                // signatures an implementing class must provide.
+                this.foundNames.add(item.name);
+                this.foundMemberStarts.add(this.foundMemberNames.length);
+                int mcount = 0;
+                for (int mi = 0; mi < item.childCount(); mi++) {
+                    Node sig = item.child(mi);
+                    this.foundMemberNames.add(sig.name);
+                    this.foundMemberArgCounts.add(sig.child(0).childCount());
+                    this.foundMemberReturns.add(sig.typeHint);
+                    mcount++;
+                }
+                this.foundMemberCounts.add(mcount);
+            }
             if (item.kind == 102 || item.kind == 101) {
                 this.classNames.add(item.name);
                 this.classParentClasses.add(item.parentClass);
@@ -563,6 +596,7 @@ class MiniCg {
         // Inheritance errors read like the bootstrap type checker: unknown
         // parents, duplicates, self-parents, and cycles abort compilation.
         this.validateInheritance(program);
+        this.validateFoundations(program);
         // Second pass: collect fields and methods with inheritance, resolved
         // iteratively so forward parent references work. A subclass
         // concatenates its parents' expanded slots in listed order (a field
@@ -610,6 +644,9 @@ class MiniCg {
                     int plist = this.classParentStarts[ci];
                     int pcnt = this.classParentCounts[ci];
                     for (int k = 0; k < pcnt; k++) {
+                        // A foundation parent contributes no slots, so it
+                        // never blocks the layout.
+                        if (this.isFoundationName(this.classParentList[plist + k])) { continue; }
                         int pidx = this.classIndexOf(this.classParentList[plist + k]);
                         if (pidx < 0 || layoutDone[pidx] == 0) {
                             parentsReady = false;
@@ -756,7 +793,7 @@ class MiniCg {
                         exit(1);
                         return;
                     }
-                    if (this.classIndexOf(pname) < 0) {
+                    if (this.classIndexOf(pname) < 0 && !this.isFoundationName(pname)) {
                         printline((string)item.line + ":" + (string)item.col + ": Unknown type '" + pname + "'");
                         exit(1);
                         return;
@@ -786,6 +823,165 @@ class MiniCg {
                 }
             }
         }
+    }
+
+    // True when the name is a `found` foundation (SPEC 8): an interface
+    // type a class may list among its parents. A foundation-typed local is
+    // a dynamic holder exactly like an `object`-typed one.
+    public bool isFoundationName(string t) {
+        for (int i = 0; i < this.foundNames.length; i++) {
+            if (this.foundNames[i] == t) { return true; }
+        }
+        return false;
+    }
+
+    // True when `class_name` implements the foundation `foundation`: the
+    // foundation is among the class's parents, or among the parents of one
+    // of its class ancestors (foundation parents carry no ancestry).
+    public bool classImplementsFoundation(string className, string foundation) {
+        string[] seen = [];
+        string[] stack = [];
+        stack.add(className);
+        while (stack.length > 0) {
+            string name = stack.pop();
+            bool already = false;
+            for (int s = 0; s < seen.length; s++) {
+                if (seen[s] == name) { already = true; }
+            }
+            if (already) { continue; }
+            seen.add(name);
+            int idx = this.classIndexOf(name);
+            if (idx < 0) { continue; }
+            for (int k = 0; k < this.classParentCounts[idx]; k++) {
+                string p = this.classParentList[this.classParentStarts[idx] + k];
+                if (p == foundation) { return true; }
+                stack.add(p);
+            }
+        }
+        return false;
+    }
+
+    // Foundation enforcement (SPEC 8, parity with the bootstrap type
+    // checker): a class that lists a foundation among its parents must
+    // provide every member the foundation declares (name, argument count,
+    // return type), and a foundation type may not appear where the class
+    // of the value cannot be known (a parameter, a field, a return type) --
+    // Silver has no virtual dispatch, so the call would have no
+    // implementation to dispatch on.
+    public void validateFoundations(Node[] program) {
+        for (int i = 0; i < program.length; i++) {
+            Node item = program[i];
+            if (item.kind == 254) { continue; }
+            if (item.kind == 100) {
+                // A foundation-typed return value names no implementation.
+                if (this.isFoundationName(item.typeHint)) {
+                    printline((string)item.line + ":" + (string)item.col + ": foundation '" + item.typeHint + "' has no implementation: Silver has no virtual dispatch, so a foundation type names no class (use it for a variable that holds one implementing class)");
+                    exit(1);
+                    return;
+                }
+                if (item.childCount() > 0) {
+                    Node params = item.child(0);
+                    for (int pi = 0; pi < params.childCount(); pi++) {
+                        Node p = params.child(pi);
+                        if (this.isFoundationName(p.typeHint)) {
+                            printline((string)item.line + ":" + (string)item.col + ": foundation '" + p.typeHint + "' has no implementation: Silver has no virtual dispatch, so a foundation type names no class (use it for a variable that holds one implementing class)");
+                            exit(1);
+                            return;
+                        }
+                    }
+                }
+            }
+            if (item.kind == 102) {
+                for (int mi = 0; mi < item.childCount(); mi++) {
+                    Node member = item.child(mi);
+                    if (member.kind == 50 && this.isFoundationName(member.typeHint)) {
+                        int fl = member.line;
+                        int fc = member.col;
+                        if (fl == 0) { fl = item.line; fc = item.col; }
+                        printline((string)fl + ":" + (string)fc + ": foundation '" + member.typeHint + "' has no implementation: Silver has no virtual dispatch, so a foundation type names no class (use it for a variable that holds one implementing class)");
+                        exit(1);
+                        return;
+                    }
+                }
+                for (int a = 0; a < item.parentClasses.length; a++) {
+                    string p = item.parentClasses[a];
+                    int fi = -1;
+                    for (int fn = 0; fn < this.foundNames.length; fn++) {
+                        if (this.foundNames[fn] == p) { fi = fn; }
+                    }
+                    if (fi < 0) { continue; }
+                    int start = this.foundMemberStarts[fi];
+                    int count = this.foundMemberCounts[fi];
+                    for (int m = 0; m < count; m++) {
+                        string mname = this.foundMemberNames[start + m];
+                        int wantedArgs = this.foundMemberArgCounts[start + m];
+                        string wantedRet = this.foundMemberReturns[start + m];
+                        Node impl = this.classMethodNamed(program, item.name, mname);
+                        if (impl == null) {
+                            printline((string)item.line + ":" + (string)item.col + ": class '" + item.name + "' does not implement member '" + mname + "' of foundation '" + p + "'");
+                            exit(1);
+                            return;
+                        }
+                        // The implementing method must accept the
+                        // foundation's argument count (defaults and a
+                        // variadic tail may widen what it accepts).
+                        Node iparams = impl.child(0);
+                        bool variadicTail = iparams.childCount() > 0 && iparams.child(iparams.childCount() - 1).isVariadic;
+                        int fixedLen = iparams.childCount();
+                        if (variadicTail) { fixedLen = fixedLen - 1; }
+                        int minArgs = 0;
+                        for (int d = 0; d < fixedLen; d++) {
+                            if (iparams.child(d).childCount() == 0) { minArgs++; }
+                        }
+                        bool accepts = wantedArgs >= minArgs && (variadicTail || wantedArgs <= iparams.childCount());
+                        if (!accepts) {
+                            printline((string)item.line + ":" + (string)item.col + ": class '" + item.name + "' implements member '" + mname + "' of foundation '" + p + "' with a different number of arguments (" + (string)wantedArgs + " expected)");
+                            exit(1);
+                            return;
+                        }
+                        // The return type must answer the foundation's
+                        // declared type.
+                        if (wantedRet != "" && wantedRet != "var" && impl.typeHint != wantedRet) {
+                            printline((string)item.line + ":" + (string)item.col + ": class '" + item.name + "' implements member '" + mname + "' of foundation '" + p + "' with the wrong return type (expected '" + wantedRet + "', got '" + impl.typeHint + "')");
+                            exit(1);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // The method `class_name` (or one of its class ancestors) declares
+    // under the name `method`, if any. Foundation parents carry no
+    // implementation, so the walk follows class parents only.
+    public Node? classMethodNamed(Node[] program, string className, string method) {
+        string[] seen = [];
+        string[] stack = [];
+        stack.add(className);
+        while (stack.length > 0) {
+            string name = stack.pop();
+            bool already = false;
+            for (int s = 0; s < seen.length; s++) {
+                if (seen[s] == name) { already = true; }
+            }
+            if (already) { continue; }
+            seen.add(name);
+            for (int i = 0; i < program.length; i++) {
+                if (program[i].kind == 102 && program[i].name == name) {
+                    Node cls = program[i];
+                    for (int mi = 0; mi < cls.childCount(); mi++) {
+                        if (cls.child(mi).kind == 100 && cls.child(mi).name == method) {
+                            return cls.child(mi);
+                        }
+                    }
+                    for (int pi = 0; pi < cls.parentClasses.length; pi++) {
+                        stack.add(cls.parentClasses[pi]);
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     // Iterative depth-first cycle search from class table index `root`
@@ -4151,6 +4347,39 @@ int strIdx = this.stringPatchIndices[i];
             if (initIsClass && (stmt.typeHint == "object" || stmt.typeHint == "" || stmt.typeHint == "var")) {
                 this.recordObjectDynamicType(stmt.name, initType);
             }
+            // A foundation-typed local holds ONE implementing class: the
+            // recorded dynamic class is what field reads and method calls
+            // through it dispatch on. A class that does not implement the
+            // foundation is refused.
+            if (this.isFoundationName(stmt.typeHint)) {
+                if (!initIsClass) {
+                    printline((string)stmt.line + ":" + (string)stmt.col + ": a variable of foundation type '" + stmt.typeHint + "' must be initialized with a class that implements it");
+                    exit(1);
+                    return;
+                }
+                if (!this.classImplementsFoundation(initType, stmt.typeHint)) {
+                    // The bootstrap reports the refusing span on the
+                    // initializer expression (`new Robot(3)`).
+                    int el = stmt.line;
+                    int ec = stmt.col;
+                    if (stmt.childCount() > 0 && stmt.child(0).line > 0) {
+                        el = stmt.child(0).line;
+                        ec = stmt.child(0).col;
+                    }
+                    printline((string)el + ":" + (string)ec + ": class '" + initType + "' does not implement foundation '" + stmt.typeHint + "'");
+                    exit(1);
+                    return;
+                }
+                this.recordObjectDynamicType(stmt.name, initType);
+            }
+        }
+        // A foundation-typed declaration without an initializer names no
+        // implementing class: every call through it would have no
+        // implementation to dispatch on.
+        if (this.isFoundationName(stmt.typeHint) && stmt.childCount() == 0) {
+            printline((string)stmt.line + ":" + (string)stmt.col + ": a variable of foundation type '" + stmt.typeHint + "' must be initialized with a class that implements it");
+            exit(1);
+            return;
         }
         if (stmt.childCount() > 0) {
                 Node initNode = stmt.child(0);
@@ -6041,11 +6270,12 @@ int strIdx = this.stringPatchIndices[i];
                 string elemType = this.arrayElementType(varType);
                 string lookupType = varType;
                 if (elemType != "") { lookupType = elemType; }
-                // An `object`-typed local holds a value whose class is only
-                // known at runtime: the recorded dynamic class binds the
-                // field's slot (the unique-name fallback below covered
-                // only fields whose name is unique across all classes).
-                if (lookupType == "object") {
+                // An `object`-typed (or foundation-typed) local holds a value
+                // whose class is only known at runtime: the recorded dynamic
+                // class binds the field's slot (the unique-name fallback
+                // below covered only fields whose name is unique across all
+                // classes).
+                if (lookupType == "object" || this.isFoundationName(lookupType)) {
                     string dynType = this.objectDynamicTypeOf(obj.name);
                     if (dynType != "") { lookupType = dynType; }
                 }
@@ -6266,10 +6496,11 @@ int strIdx = this.stringPatchIndices[i];
             }
             string localType = this.getLocalType(expr.name);
             if (localType != "") {
-                // Object-typed local holding a class instance: adopt the
-                // recorded dynamic type so member access binds the class
-                // (field reads/method calls) rather than the dict layout.
-                if (localType == "object") {
+                // Object-typed (or foundation-typed) local holding a class
+                // instance: adopt the recorded dynamic type so member access
+                // binds the class (field reads/method calls) rather than the
+                // dict layout.
+                if (localType == "object" || this.isFoundationName(localType)) {
                     string dynType = this.objectDynamicTypeOf(expr.name);
                     if (dynType != "") { return dynType; }
                 }
@@ -10710,11 +10941,20 @@ public void genNewCall(Node call) {
         // so `this` passes unshifted.
         if (this.currentFunctionName != "construct") { return; }
 
-        // Find parent class of the current class.
+        // Find parent class of the current class. A foundation among the
+        // parents carries no constructor, so the first CLASS parent is the
+        // super() target.
         string parentClass = "";
         for (int i = 0; i < this.classNames.length; i++) {
             if (this.classNames[i] == this.currentClassName) {
                 parentClass = this.classParentClasses[i];
+                for (int k = 0; k < this.classParentCounts[i]; k++) {
+                    string p = this.classParentList[this.classParentStarts[i] + k];
+                    if (!this.isFoundationName(p)) {
+                        parentClass = p;
+                        break;
+                    }
+                }
             }
         }
         if (parentClass == "") { return; }
@@ -15826,6 +16066,27 @@ public void genNewCall(Node call) {
         if (lhs.kind == 6) {
             this.requireResolvableAssignTarget(lhs);
             this.rejectGlobalWriteInAnonBody(lhs);
+            // A foundation-typed variable keeps the ONE implementing class
+            // it was declared with: a second class would leave the call
+            // through it without a single implementation to dispatch on.
+            string lhsFoundation = this.getLocalType(lhs.name);
+            if (this.isFoundationName(lhsFoundation)) {
+                string rhsClass = this.inferExprType(rhs);
+                if (rhsClass != "" && this.isClassName(rhsClass)) {
+                    if (!this.classImplementsFoundation(rhsClass, lhsFoundation)) {
+                        printline((string)bin.line + ":" + (string)bin.col + ": class '" + rhsClass + "' does not implement foundation '" + lhsFoundation + "'");
+                        exit(1);
+                        return;
+                    }
+                    string heldCls = this.objectDynamicTypeOf(lhs.name);
+                    if (heldCls != "" && rhsClass != heldCls) {
+                        printline((string)bin.line + ":" + (string)bin.col + ": a variable of foundation type '" + lhsFoundation + "' holds '" + heldCls + "' and cannot also hold '" + rhsClass + "': Silver has no virtual dispatch, so the call through it has one implementation");
+                        exit(1);
+                        return;
+                    }
+                    this.recordObjectDynamicType(lhs.name, rhsClass);
+                }
+            }
             int off = this.findLocal(lhs.name);
             int gi = this.findGlobal(lhs.name);
             if (rhs.kind == 74) {

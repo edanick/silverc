@@ -1403,6 +1403,7 @@ class Parser {
         if (this.check(29)) { return this.flagInternal(this.parseStruct(), internalItem); }
         if (this.check(30)) { return this.flagInternal(this.parseClass(), internalItem); }
         if (this.check(31)) { return this.parseEnum(); }
+        if (this.check(33)) { return this.parseFound(); }
         // Unknown keyword at top level (e.g. a typo like `impor`), with a
         // did-you-mean suggestion when it resembles a real keyword.  Recovery
         // resyncs to the next statement boundary so the damaged region does
@@ -2135,6 +2136,84 @@ class Parser {
         return node;
     }
 
+    // A `found` foundation (SPEC section 8, DOCS/36): the interface shape
+    // a class implements by listing the foundation among its parents. The
+    // body carries member SIGNATURES only (`string greet();`) -- no fields,
+    // no code -- so each member parses as a body-less kind-100 node whose
+    // child(0) is the parameter list (mirrors the bootstrap's Item::Found).
+    private Node parseFound() {
+        Token foundStart = this.peek();
+        this.expect(33);
+        Node node = new Node();
+        node.kind = 254;
+        node.line = foundStart.line;
+        node.col = foundStart.col;
+        node.name = this.advance().text;
+        this.registerDeclaredType(node.name);
+        this.expect(102);
+        while (!this.check(103) && !this.check(0)) {
+            Node member = new Node();
+            member.kind = 100;
+            Token memberStart = this.peek();
+            member.line = memberStart.line;
+            member.col = memberStart.col;
+            // Return type: same spelling surface as parseFunction's
+            // (dotted tail, generic args, `[]`, pointer suffix, `?`).
+            string retType = this.advance().text;
+            retType = this.dottedTypeTail(retType);
+            if (this.check(120)) {
+                while (!this.check(121) && !this.check(106) && !this.check(103)) {
+                    retType += this.advance().text;
+                }
+                if (this.check(121)) { retType += ">"; this.advance(); }
+            }
+            while (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } retType += "[]"; }
+            retType = this.parsePointerSuffix(retType);
+            if (this.check(123)) { this.advance(); retType += "?"; }
+            member.typeHint = retType;
+            member.name = this.advance().text;
+            this.expect(100);
+            Node params = new Node();
+            bool sawParam = false;
+            while (!this.check(101) && !this.check(0)) {
+                if (this.check(107)) {
+                    this.advance();
+                } else if (sawParam) {
+                    Token prevT = this.tokens[this.pos - 1];
+                    this.recordError("you forgot a comma \",\" at line " + (string)prevT.line + ", column " + (prevT.col + this.tokenSrcLen(prevT)).toString());
+                }
+                if (!this.tokenStartsParam(this.peek().kind)) { break; }
+                Node param = new Node();
+                string pt = this.advance().text;
+                pt = this.dottedTypeTail(pt);
+                while (this.check(104)) { this.advance(); if (this.check(105)) { this.advance(); } pt += "[]"; }
+                pt = this.parsePointerSuffix(pt);
+                if (this.check(123)) { this.advance(); pt += "?"; }
+                if (this.check(147)) {
+                    // Variadic tail `Type ... name` (DOCS/112), same as a
+                    // function parameter.
+                    this.advance();
+                    pt += "[]";
+                    param.isVariadic = true;
+                }
+                param.typeHint = pt;
+                param.name = this.advance().text;
+                if (this.check(110)) {
+                    this.advance();
+                    param.children.add(this.parseExpr(0));
+                }
+                params.children.add(param);
+                sawParam = true;
+            }
+            this.expect(101);
+            member.children.add(params);
+            this.expectSemi();
+            node.children.add(member);
+        }
+        this.expect(103);
+        return node;
+    }
+
     private Node? parseClassMember() {
         // `internal:` / `public:` / `private:` section markers (DOCS/258):
         // a bare modifier followed by `:` toggles the default visibility for
@@ -2307,6 +2386,11 @@ class Parser {
             this.advance();
             Node field = new Node();
             field.kind = 50;
+            // The field's own position (first type token) so codegen
+            // diagnostics on it name the member, not the class item.
+            Token fieldStart = this.peek();
+            field.line = fieldStart.line;
+            field.col = fieldStart.col;
             bool leadProp = this.parseLeadStar();
             string ft = this.advance().text;
             ft = this.dottedTypeTail(ft);
@@ -2425,6 +2509,12 @@ class Parser {
                 field.typeHint = ft;
                 field.name = this.advance().text;
                 field.isInternal = memberInternal;
+                // The field's own position (its name token) so codegen
+                // diagnostics on it name the member, not the class item.
+                if (field.name != "" && this.pos > 0) {
+                    field.line = this.tokens[this.pos - 1].line;
+                    field.col = this.tokens[this.pos - 1].col;
+                }
                 // A STATIC field has class-level storage, not an instance
                 // slot: the backend keeps one shared value per declaration
                 // and reads and writes it as `ClassName.field`.
@@ -4132,10 +4222,18 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                 Token opTok = this.peek();
                 this.recordError((string)opTok.line + ":" + (string)opTok.col + ": Invalid assignment target");
             }
+            Token opTok = this.peek();
             this.advance();
             Node rhs = this.parseExpr(nextMin);
             Node bin = new Node(); bin.kind = 7;
             bin.op = this.tokenToOp(op);
+            // An assignment carries the operator's position so codegen
+            // diagnostics on it (e.g. a foundation-holder conflict) name
+            // the source spot instead of 0:0.
+            if (op == 110) {
+                bin.line = opTok.line;
+                bin.col = opTok.col;
+            }
             bin.children.add(lhs);
             bin.children.add(rhs);
             // Fast path (STANDARDS.md 21): `"a" + "b"` folds to one string
