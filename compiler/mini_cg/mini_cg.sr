@@ -314,6 +314,12 @@ class MiniCg {
     // placeholders, patched to IMAGE_BASE + text_rva + label position.
     public prop int[] anonRelocLabelIds;
     public prop int[] anonRelocPatchOffsets;
+    // (function name, imm64 patch position) pairs for `mov rax, <function
+    // address>` placeholders emitted when a bare user-function name appears
+    // in value position (DOCS/259 function values). Patched after all
+    // functions emit, exactly like the anon address relocs above.
+    public prop string[] fnAddrRefNames;
+    public prop int[] fnAddrRefPatchOffsets;
     // Function-typed parameters (`void () name`) of the function currently
     // being emitted; invoking one emits an indirect call through the
     // parameter slot's stored address.
@@ -556,6 +562,8 @@ class MiniCg {
         this.pendingAnonBodies = [];
         this.anonRelocLabelIds = [];
         this.anonRelocPatchOffsets = [];
+        this.fnAddrRefNames = [];
+        this.fnAddrRefPatchOffsets = [];
         this.fnPtrParamNames = [];
         this.userModuleNames = [];
         this.linuxBackend = new MiniCgLinux();
@@ -3006,6 +3014,9 @@ int strIdx = this.stringPatchIndices[i];
         // DOCS/259: emit queued anonymous function bodies as standalone
         // functions and patch their address placeholders to absolute VAs.
         this.drainAnonFunctions();
+        // Patch bare-name function-reference placeholders (the function
+        // table is complete only now, after every body has emitted).
+        this.patchFnAddrRefs();
         if (this.globalNames.length > 0) {
             this.emitGlobalInitStub();
         }
@@ -5623,24 +5634,29 @@ int strIdx = this.stringPatchIndices[i];
                     // A bare STATIC field of the enclosing class: `total`
                     // inside a method of Counter means `Counter.total`.
                     this.genGlobalLoad(this.staticFieldGlobal["__static_" + this.currentClassName + "_" + expr.name]);
-                } else if (this.currentClassName != "") {
+                } else if (this.currentClassName != "" && this.findFieldOffset(this.currentClassName, expr.name) >= 0) {
                     // Bare class field read: `field` inside a method resolves
                     // to `this.field` (parity with silverc-rs gen_expr).  The
                     // old fallback loaded [rbp+0] - the saved frame pointer -
                     // which corrupted the frame on writes and produced garbage
                     // values on reads.
                     int fieldOff = this.findFieldOffset(this.currentClassName, expr.name);
-                    if (fieldOff >= 0) {
-                        int thisOff = this.findLocal("this");
-                        if (thisOff != 0) {
-                            this.asm.movRMBase(0, 5, thisOff);
-                            this.asm.movRMBase(0, 0, fieldOff);
-                        } else {
-                            this.asm.xorRR64(0, 0);
-                        }
+                    int thisOff = this.findLocal("this");
+                    if (thisOff != 0) {
+                        this.asm.movRMBase(0, 5, thisOff);
+                        this.asm.movRMBase(0, 0, fieldOff);
                     } else {
-                        this.asm.movRMBase(0, 5, 0);
+                        this.asm.xorRR64(0, 0);
                     }
+                } else if (this.findUserFunctionRef(expr.name)) {
+                    // A bare user-function name in VALUE position is a
+                    // function reference (`bus.on("ping", handler)`): its
+                    // value is the function's address, patched exactly like
+                    // an anonymous-function literal (DOCS/259 function
+                    // values). Only reached when no local, global, constant,
+                    // class or static field claims the name — those keep
+                    // winning. Mirrors silverc-rs func_labels.
+                    this.genFunctionAddressRef(expr.name);
                 } else {
                     this.asm.movRMBase(0, 5, 0);
                 }
@@ -5819,6 +5835,56 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.emitImm64(0, 0xDEADBEEFCAFEF00D);
         this.anonRelocLabelIds.add(lbl);
         this.anonRelocPatchOffsets.add(sp + 2);
+    }
+
+    // True when `name` names a free user function of this unit (a method
+    // needs a receiver and never appears bare in value position).
+    public bool findUserFunctionRef(string name) {
+        for (int i = 0; i < this.funcNames.length; i++) {
+            if (this.funcNames[i] == name && this.funcClasses[i] == "") { return true; }
+        }
+        return false;
+    }
+
+    // Evaluate a bare user-function name to its address: a `mov rax, imm64`
+    // placeholder patched after all functions emit (see patchFnAddrRefs),
+    // exactly the relocation an anonymous-function literal uses.
+    public void genFunctionAddressRef(string name) {
+        int sp = this.asm.buf.length;
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEF11E);
+        this.fnAddrRefNames.add(name);
+        this.fnAddrRefPatchOffsets.add(sp + 2);
+    }
+
+    // Patch every bare-name function-address placeholder to the resolved
+    // function's absolute VA (code is placed at text_rva, same base math
+    // as the anon relocs in drainAnonFunctions).
+    public void patchFnAddrRefs() {
+        for (int r = 0; r < this.fnAddrRefNames.length; r++) {
+            int targetOff = -1;
+            for (int j = 0; j < this.funcNames.length; j++) {
+                if (this.funcNames[j] == this.fnAddrRefNames[r] && this.funcClasses[j] == "") {
+                    targetOff = this.funcOffsets[j];
+                }
+            }
+            if (targetOff < 0) { continue; }
+            int64 va = 0x140000000 + 0x1000 + targetOff;
+            if (this.isLinuxTarget()) {
+                va = this.elfCodeVaddr() + targetOff;
+            }
+            if (this.isMacX64Target()) {
+                va = 4294967296 + 4096 + targetOff;
+            }
+            int pos = this.fnAddrRefPatchOffsets[r];
+            this.asm.buf[pos] = va & 0xFF;
+            this.asm.buf[pos + 1] = (va >> 8) & 0xFF;
+            this.asm.buf[pos + 2] = (va >> 16) & 0xFF;
+            this.asm.buf[pos + 3] = (va >> 24) & 0xFF;
+            this.asm.buf[pos + 4] = (va >> 32) & 0xFF;
+            this.asm.buf[pos + 5] = (va >> 40) & 0xFF;
+            this.asm.buf[pos + 6] = (va >> 48) & 0xFF;
+            this.asm.buf[pos + 7] = (va >> 56) & 0xFF;
+        }
     }
 
     // Owner recorded for an anonymous label at queue time ("" when never

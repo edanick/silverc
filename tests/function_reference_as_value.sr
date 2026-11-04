@@ -1,0 +1,76 @@
+// A bare user-function name in value position is a function reference
+// (DOCS/259 function values): it can be stored in a `void ()` field,
+// passed as a `void ()` argument, and called indirectly — the same
+// machinery the inline `(void () { ... })` literal uses. Locals,
+// globals, constants, enum variants and class/static names keep winning
+// over a same-named function. Self-hosted-suite mirror of
+// silverc-rs/tests/suite/function_reference_as_value.sr.
+
+class note {
+    public string name;
+
+    construct(string name) {
+        this.name = name;
+    }
+}
+
+class watcher {
+    public string name;
+    public void () callback;
+
+    construct(string name, void () callback) {
+        this.name = name;
+        this.callback = callback;
+    }
+}
+
+class bus {
+    private watcher[] watchers;
+    public note current;
+
+    construct {
+        this.watchers = [];
+    }
+
+    public void on(string name, void () callback) {
+        this.watchers.push(new watcher(name, callback));
+    }
+
+    public void fire(string name) {
+        this.current = new note(name);
+        for (int i = 0; i < this.watchers.length; i++) {
+            if (this.watchers[i].name == name) {
+                this.watchers[i].callback();
+            }
+        }
+    }
+}
+
+bus route = new bus();
+int fired = 0;
+
+void onPing() {
+    if (route.current.name != "ping") { exit(1); }
+    fired++;
+}
+
+void take(void () cb) {
+    cb();
+}
+
+void main() {
+    route.on("ping", onPing);
+    route.fire("ping");
+
+    void () direct = onPing;
+    direct();
+
+    take(onPing);
+
+    route.on("inline", (void () {
+        printline("inline fired");
+    }));
+    route.fire("inline");
+
+    if (fired != 3) { exit(1); }
+}
