@@ -1,0 +1,81 @@
+// An object payload flows into an `object`-typed class field and is read
+// back through every receiver shape: a local (`e.data.user`), a chain
+// through a module-level emitter (`bus.currentEvent.data.user`) and a
+// plain object local as the control. The read must yield the record's
+// own entry ("Alice", not an address), and the print kind comes from the
+// literal's shape — a string key prints as text, an int key prints
+// decimal, and a key the unit types inconsistently keeps the
+// per-variable verdict of each record's own literal (never %s on a
+// non-pointer, which would crash). Self-hosted-suite mirror of
+// silverc-rs/tests/suite/object_payload_through_field.sr; the emitter
+// classes are inlined (same shape as std/events.sr) because a suite file
+// that imports `events` resolves beside-the-source to a sibling test.
+
+class note {
+    public string name;
+    public object data;
+
+    construct(string name, object data) {
+        this.name = name;
+        this.data = data;
+    }
+}
+
+class watcher {
+    public string name;
+    public void () callback;
+
+    construct(string name, void () callback) {
+        this.name = name;
+        this.callback = callback;
+    }
+}
+
+class localbus {
+    private watcher[] watchers;
+
+    construct {
+        this.watchers = [];
+    }
+
+    public note currentEvent;
+
+    public void on(string name, void () callback) {
+        this.watchers.push(new watcher(name, callback));
+    }
+
+    public void emit(string name, object data) {
+        this.currentEvent = new note(name, data);
+        for (int i = 0; i < this.watchers.length; i++) {
+            if (this.watchers[i].name == name) {
+                this.watchers[i].callback();
+            }
+        }
+    }
+}
+
+localbus bus = new localbus();
+
+void main() {
+    object direct = {user: "Alice"};
+    if (direct.user != "Alice") { exit(1); }
+
+    note e = new note("x", {user: "Bob"});
+    if (e.data.user != "Bob") { exit(1); }
+
+    bus.on("user.login", (void () {
+        if (bus.currentEvent.name != "user.login") { exit(1); }
+        if (bus.currentEvent.data.user != "Alice") { exit(1); }
+    }));
+    bus.emit("user.login", {user: "Alice"});
+
+    bus.on("counted", (void () {
+        if (bus.currentEvent.data.count != 7) { exit(1); }
+    }));
+    bus.emit("counted", {count: 7});
+
+    object mix = {k: "str"};
+    object mix2 = {k: 9};
+    if (mix.k != "str") { exit(1); }
+    if (mix2.k != 9) { exit(1); }
+}

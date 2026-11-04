@@ -227,6 +227,16 @@ class MiniCg {
     public prop string[] dictFieldVars;
     public prop string[] dictFieldKeys;
     public prop string[] dictFieldKinds;
+    // Per-key print kinds for object-record KEYS, collected unit-wide from
+    // every `{ k: v }` object literal (key name -> kind). A record flowing
+    // through an `object`-typed FIELD (`bus.currentEvent.data`) has no
+    // per-variable entry — the variable-keyed tables cannot follow it — so
+    // reads fall back to the literal's recorded shape. A key different
+    // literals type differently is recorded "" (decimal fallback): the read
+    // value stays correct, only the format degrades. Mirrors silverc-rs
+    // object_key_kinds.
+    public prop string[] objectKeyKindKeys;
+    public prop string[] objectKeyKindKinds;
     // Per-key dynamic class ("var" + "key" triples) for a dict whose
     // value type is `object`: the class of the instance stored under
     // that key, so `m["k"].v` binds that class's field slot instead of
@@ -479,6 +489,8 @@ class MiniCg {
         this.dictFieldVars = [];
         this.dictFieldKeys = [];
         this.dictFieldKinds = [];
+        this.objectKeyKindKeys = [];
+        this.objectKeyKindKinds = [];
         this.dictFieldClassVars = [];
         this.dictFieldClassKeys = [];
         this.dictFieldClassNames = [];
@@ -2943,6 +2955,14 @@ int strIdx = this.stringPatchIndices[i];
                     }
                 }
             }
+        }
+        // Pre-pass: collect every object literal's per-key print kinds into
+        // the unit-wide registry, so member reads through `object`-typed
+        // fields (`bus.currentEvent.data.user`) can format from the
+        // literal's shape (no per-variable entry exists there). Mirrors
+        // silverc-rs collect_object_shapes_item.
+        for (int i = 0; i < program.length; i++) {
+            this.collectObjectShapeTree(program[i]);
         }
         // Phase-B progress: total function bodies this program will emit
         // (free functions + class methods) so the driver can print
@@ -17849,17 +17869,101 @@ public void genNewCall(Node call) {
     }
 
     // Value kind for a dict member/index read: per-key kind first, then
-    // the whole-dict kind, else "". Only plain identifiers carry recorded
-    // kinds; anything else renders decimal.
+    // the whole-dict kind, else "". When the receiver is an OBJECT RECORD
+    // with no per-variable verdict of its own (an `object`-typed class
+    // field chain like `bus.currentEvent.data`), the unit-wide literal
+    // registry answers instead — a recorded entry (even the explicit ""
+    // of a non-string value) always wins, otherwise a conflicted key
+    // would format an int as %s and crash. Mirrors silverc-rs
+    // object_record_key_kind.
     public string dictReadKind(Node recv, string key) {
         if (recv.kind == 6) {
             if (key != "") {
                 string fk = this.dictFieldKindOf(recv.name, key);
                 if (fk != "") { return fk; }
             }
-            return this.dictWholeKindOf(recv.name);
+            // A tracked variable's recorded whole-dict verdict — even the
+            // explicit "" of a heterogeneous literal — always outranks the
+            // unit-wide registry: silverc-rs keeps "" per-key entries in
+            // dict_field_types for exactly this guard, but trackDictKey
+            // drops them, so the tracked whole entry stands in. Without
+            // this, `object mix2 = {k: 9}` next to `{k: "str"}` would
+            // format the int as %s and crash.
+            if (this.dictVarIsTracked(recv.name)) {
+                return this.dictWholeKindOf(recv.name);
+            }
+            string wk = this.dictWholeKindOf(recv.name);
+            if (wk != "") { return wk; }
+        }
+        if (key != "" && this.isObjectValue(recv)) {
+            return this.objectKeyKindOf(key);
         }
         return "";
+    }
+
+    // True when the variable has a recorded whole-dict kind entry (the
+    // kind itself may be "" — the entry's existence is what matters).
+    public bool dictVarIsTracked(string name) {
+        for (int i = 0; i < this.dictValueNames.length; i++) {
+            if (this.dictValueNames[i] == name) { return true; }
+        }
+        return false;
+    }
+
+    // Unit-wide literal-shape registry lookup: the recorded kind of a key,
+    // or "" when no object literal in the unit typed it.
+    public string objectKeyKindOf(string key) {
+        for (int i = 0; i < this.objectKeyKindKeys.length; i++) {
+            if (this.objectKeyKindKeys[i] == key) { return this.objectKeyKindKinds[i]; }
+        }
+        return "";
+    }
+
+    // Record one object literal's per-key kinds into the unit-wide
+    // registry. A key the unit types inconsistently (string here, int
+    // there) degrades to "" (decimal) — the value read is unaffected,
+    // only the format; an unknown-kind value never downgrades a known
+    // entry (it may be the very literal a later read formats). Mirrors
+    // silverc-rs note_object_literal_shape.
+    public void noteObjectLiteralShape(Node lit) {
+        for (int i = 0; i < lit.childCount(); i++) {
+            Node pair = lit.child(i);
+            if (pair.kind != 18 || pair.childCount() < 2) { continue; }
+            Node keyNode = pair.child(0);
+            string keyText = "";
+            if (keyNode.kind == 2) { keyText = keyNode.strVal; }
+            else if (keyNode.kind == 6) { keyText = keyNode.name; }
+            else { continue; }
+            string kind = this.classifyDictValue(pair.child(1));
+            if (kind == "") { continue; }
+            bool seen = false;
+            for (int k = 0; k < this.objectKeyKindKeys.length; k++) {
+                if (this.objectKeyKindKeys[k] == keyText) {
+                    seen = true;
+                    if (this.objectKeyKindKinds[k] != kind) {
+                        this.objectKeyKindKinds[k] = "";
+                    }
+                    break;
+                }
+            }
+            if (!seen) {
+                this.objectKeyKindKeys.add(keyText);
+                this.objectKeyKindKinds.add(kind);
+            }
+        }
+    }
+
+    // Collect object-literal shapes from every expression position of a
+    // node tree (nested literals included), mirroring the silverc-rs
+    // unit-wide collect_object_shapes pre-pass so read sites consult the
+    // registry regardless of the order functions generate in.
+    public void collectObjectShapeTree(Node node) {
+        if (node.kind == 74) {
+            this.noteObjectLiteralShape(node);
+        }
+        for (int i = 0; i < node.childCount(); i++) {
+            this.collectObjectShapeTree(node.child(i));
+        }
     }
 
     // Record a variable's whole-dict kind (upsert, "" included so an
