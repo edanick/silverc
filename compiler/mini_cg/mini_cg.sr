@@ -855,6 +855,40 @@ class MiniCg {
         return false;
     }
 
+    public string foundationInType(string t) {
+        for (int i = 0; i < this.foundNames.length; i++) {
+            string n = this.foundNames[i];
+            int nl = n.length;
+            if (nl == 0 || nl > t.length) { continue; }
+            for (int at = 0; at + nl <= t.length; at++) {
+                bool match = true;
+                for (int k = 0; k < nl; k++) {
+                    if (t[at + k] != n[k]) { match = false; }
+                }
+                if (!match) { continue; }
+                bool leftOk = at == 0;
+                if (!leftOk) {
+                    char lc = t[at - 1];
+                    leftOk = !((lc >= 'a' && lc <= 'z') || (lc >= 'A' && lc <= 'Z') || (lc >= '0' && lc <= '9') || lc == '_');
+                }
+                bool rightOk = at + nl == t.length;
+                if (!rightOk) {
+                    char rc = t[at + nl];
+                    rightOk = !((rc >= 'a' && rc <= 'z') || (rc >= 'A' && rc <= 'Z') || (rc >= '0' && rc <= '9') || rc == '_');
+                }
+                if (leftOk && rightOk) { return n; }
+            }
+        }
+        return "";
+    }
+
+    public void rejectFoundationType(string typeHint, int line, int col) {
+        string found = this.foundationInType(typeHint);
+        if (found == "") { return; }
+        printline((string)line + ":" + (string)col + ": foundation '" + found + "' has no implementation: Silver has no virtual dispatch, so a foundation type names no class (use it for a variable that holds one implementing class)");
+        exit(1);
+    }
+
     // True when `class_name` implements the foundation `foundation`: the
     // foundation is among the class's parents, or among the parents of one
     // of its class ancestors (foundation parents carry no ancestry).
@@ -893,34 +927,35 @@ class MiniCg {
             Node item = program[i];
             if (item.kind == 254) { continue; }
             if (item.kind == 100) {
-                // A foundation-typed return value names no implementation.
-                if (this.isFoundationName(item.typeHint)) {
-                    printline((string)item.line + ":" + (string)item.col + ": foundation '" + item.typeHint + "' has no implementation: Silver has no virtual dispatch, so a foundation type names no class (use it for a variable that holds one implementing class)");
-                    exit(1);
-                    return;
-                }
+                this.rejectFoundationType(item.typeHint, item.line, item.col);
                 if (item.childCount() > 0) {
                     Node params = item.child(0);
                     for (int pi = 0; pi < params.childCount(); pi++) {
                         Node p = params.child(pi);
-                        if (this.isFoundationName(p.typeHint)) {
-                            printline((string)item.line + ":" + (string)item.col + ": foundation '" + p.typeHint + "' has no implementation: Silver has no virtual dispatch, so a foundation type names no class (use it for a variable that holds one implementing class)");
-                            exit(1);
-                            return;
-                        }
+                        this.rejectFoundationType(p.typeHint, item.line, item.col);
                     }
                 }
             }
             if (item.kind == 102) {
                 for (int mi = 0; mi < item.childCount(); mi++) {
                     Node member = item.child(mi);
-                    if (member.kind == 50 && this.isFoundationName(member.typeHint)) {
+                    if (member.kind == 50) {
                         int fl = member.line;
                         int fc = member.col;
                         if (fl == 0) { fl = item.line; fc = item.col; }
-                        printline((string)fl + ":" + (string)fc + ": foundation '" + member.typeHint + "' has no implementation: Silver has no virtual dispatch, so a foundation type names no class (use it for a variable that holds one implementing class)");
-                        exit(1);
-                        return;
+                        this.rejectFoundationType(member.typeHint, fl, fc);
+                    }
+                    if (member.kind == 100) {
+                        int ml = member.line;
+                        int mc = member.col;
+                        if (ml == 0) { ml = item.line; mc = item.col; }
+                        this.rejectFoundationType(member.typeHint, ml, mc);
+                        if (member.childCount() > 0) {
+                            Node mparams = member.child(0);
+                            for (int pi = 0; pi < mparams.childCount(); pi++) {
+                                this.rejectFoundationType(mparams.child(pi).typeHint, ml, mc);
+                            }
+                        }
                     }
                 }
                 for (int a = 0; a < item.parentClasses.length; a++) {
@@ -4382,6 +4417,9 @@ int strIdx = this.stringPatchIndices[i];
             // recorded dynamic class is what field reads and method calls
             // through it dispatch on. A class that does not implement the
             // foundation is refused.
+            if (this.foundationInType(stmt.typeHint) != "" && !this.isFoundationName(stmt.typeHint)) {
+                this.rejectFoundationType(stmt.typeHint, stmt.line, stmt.col);
+            }
             if (this.isFoundationName(stmt.typeHint)) {
                 if (!initIsClass) {
                     printline((string)stmt.line + ":" + (string)stmt.col + ": a variable of foundation type '" + stmt.typeHint + "' must be initialized with a class that implements it");
@@ -4407,6 +4445,9 @@ int strIdx = this.stringPatchIndices[i];
         // A foundation-typed declaration without an initializer names no
         // implementing class: every call through it would have no
         // implementation to dispatch on.
+        if (stmt.childCount() == 0 && this.foundationInType(stmt.typeHint) != "" && !this.isFoundationName(stmt.typeHint)) {
+            this.rejectFoundationType(stmt.typeHint, stmt.line, stmt.col);
+        }
         if (this.isFoundationName(stmt.typeHint) && stmt.childCount() == 0) {
             printline((string)stmt.line + ":" + (string)stmt.col + ": a variable of foundation type '" + stmt.typeHint + "' must be initialized with a class that implements it");
             exit(1);
