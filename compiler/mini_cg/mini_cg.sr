@@ -8070,6 +8070,253 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.bindLabel(done);
     }
 
+    // A member-call argument names a global user function and no local or
+    // global variable shadows it: the array HOF treats it as a CALLBACK
+    // reference — the function is called per element, the interpreter's
+    // callCallbackValue path — instead of testing against its address.
+    public int userFnCallbackIdx(Node arg) {
+        if (arg.kind != 6 || arg.name == "this") { return -1; }
+        if (this.findVisibleLocalIndex(arg.name) >= 0) { return -1; }
+        for (int i = 0; i < this.globalNames.length; i++) {
+            if (this.globalNames[i] == arg.name) { return -1; }
+        }
+        for (int i = 0; i < this.funcNames.length; i++) {
+            if (this.funcNames[i] == arg.name && this.funcClasses[i] == "") { return i; }
+        }
+        return -1;
+    }
+
+    // Call a global user function with one or two value arguments already
+    // stored in RBP slots (arg1Off == 0 for one argument; local offsets are
+    // always negative, so 0 is an unambiguous sentinel); the result lands
+    // in RAX. Mirrors the named-call path: ABI call setup, the platform
+    // argument registers, direct or forward call recording, and the
+    // exception check.
+    public void emitUserFnCallbackCall(int funcIdx, string name, int arg0Off, int arg1Off) {
+        this.emitAbiCallSetup(0);
+        this.asm.movRMBase(0, 5, arg0Off);
+        if (this.isLinuxTarget()) {
+            this.asm.movRR64(7, 0);
+        } else {
+            this.asm.movRR64(1, 0);
+        }
+        if (arg1Off != 0) {
+            this.asm.movRMBase(0, 5, arg1Off);
+            if (this.isLinuxTarget()) {
+                this.asm.movRR64(6, 0);
+            } else {
+                this.asm.movRR64(2, 0);
+            }
+        }
+        if (funcIdx >= 0 && funcIdx < this.funcOffsets.length && this.funcOffsets[funcIdx] >= 0) {
+            int callPos = this.asm.buf.length;
+            int rel32 = this.funcOffsets[funcIdx] - (callPos + 5);
+            this.emitDirectCall(rel32, funcIdx, name, "");
+        } else {
+            this.asm.callRel32(0);
+            this.forwardCalls.add(this.asm.buf.length - 4);
+            this.forwardCallFuncIdxs.add(funcIdx);
+            this.forwardCallNames.add(name);
+            this.forwardCallClasses.add("");
+        }
+        this.emitAbiCallTeardown();
+        this.emitExcCheck();
+    }
+
+    // `recv.<hof>(userFn[, init])`: the HOF whose callback argument is a
+    // bare user-function reference. map builds the per-element call results
+    // into a new array, forEach only runs the calls, filter keeps the
+    // elements whose predicate answers true, find answers the first match,
+    // every/some short-circuit per the predicate, reduce folds
+    // fn(acc, elem) — the given initial value, else element 0 with the
+    // fold starting at 1 (the interpreter's rule).
+    public void genUserFnHof(Node call, string name) {
+        Node arrNode = call.child(0);
+        string arrType = this.inferExprType(arrNode);
+        bool strideOneElements = this.isStrideOneType(arrType);
+        int funcIdx = this.userFnCallbackIdx(call.child(1));
+        string fnName = call.child(1).name;
+        int srcOff = this.allocLocal("__ufn_src");
+        int lenOff = this.allocLocal("__ufn_len");
+        int elemOff = this.allocLocal("__ufn_elem");
+        int accOff = this.allocLocal("__ufn_acc");
+        int dstOff = this.allocLocal("__ufn_dst");
+        int cntOff = this.allocLocal("__ufn_cnt");
+        int iOff = this.allocLocal("__ufn_i");
+
+        this.genExpr(arrNode);
+        this.asm.movMBaseR(5, 0, srcOff);
+        this.asm.movRMBase(0, 5, srcOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+
+        if (name == "map" || name == "filter") {
+            // Destination buffer of (len + 2) * 8 bytes: header then data.
+            this.asm.movRMBase(1, 5, lenOff);
+            this.asm.addRI32(1, 2);
+            this.asm.shlR64Imm(1, 3);
+            this.addImportPatch("msvcrt.dll", "malloc");
+            int sUfn = 0xDEADBEEFCAFEBAD1;
+            this.asm.emitImm64(0, sUfn);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movMBaseR(5, 0, dstOff);
+            this.asm.movRMBase(0, 5, lenOff);
+            this.asm.movRMBase(1, 5, dstOff);
+            if (name == "filter") {
+                // Capacity is the source length; the final length is the
+                // kept count, written when the pass completes.
+                this.asm.movMBaseR(1, 0, 0);
+                this.asm.movRMBase(1, 5, dstOff);
+                this.asm.xorRR64(0, 0);
+                this.asm.movMBaseR(1, 0, 8);
+                this.asm.movMBaseR(5, 0, cntOff);
+            } else {
+                this.asm.movMBaseR(1, 0, 0);
+                this.asm.movRMBase(0, 5, lenOff);
+                this.asm.movRMBase(1, 5, dstOff);
+                this.asm.movMBaseR(1, 0, 8);
+            }
+        }
+
+        if (name == "reduce") {
+            int nonempty = this.newLabel();
+            int rloop = this.newLabel();
+            int rdone = this.newLabel();
+            this.asm.movRMBase(0, 5, lenOff);
+            this.asm.cmpRI32(0, 0);
+            this.asm.jneLabel(nonempty);
+            if (call.childCount() >= 3) {
+                this.genExpr(call.child(2));
+            } else {
+                this.asm.xorRR64(0, 0);
+            }
+            this.asm.movMBaseR(5, 0, accOff);
+            this.asm.jmpLabel(rdone);
+            this.asm.bindLabel(nonempty);
+            if (call.childCount() >= 3) {
+                this.genExpr(call.child(2));
+                this.asm.movMBaseR(5, 0, accOff);
+                this.asm.xorRR64(0, 0);
+                this.asm.movMBaseR(5, 0, iOff);
+            } else {
+                // No initial value: fold from element 1 with acc = elem 0.
+                this.asm.xorRR64(0, 0);
+                this.asm.movMBaseR(5, 0, iOff);
+                this.genArrayElemLoad(srcOff, iOff, strideOneElements);
+                this.asm.movMBaseR(5, 0, accOff);
+                this.asm.movRI64(0, 1);
+                this.asm.movMBaseR(5, 0, iOff);
+            }
+            this.asm.bindLabel(rloop);
+            this.asm.movRMBase(0, 5, iOff);
+            this.asm.movRMBase(1, 5, lenOff);
+            this.asm.cmpRR64(0, 1);
+            this.asm.jgeLabel(rdone);
+            this.genArrayElemLoad(srcOff, iOff, strideOneElements);
+            this.asm.movMBaseR(5, 0, elemOff);
+            this.emitUserFnCallbackCall(funcIdx, fnName, accOff, elemOff);
+            this.asm.movMBaseR(5, 0, accOff);
+            this.asm.movRMBase(0, 5, iOff);
+            this.asm.addRI32(0, 1);
+            this.asm.movMBaseR(5, 0, iOff);
+            this.asm.jmpLabel(rloop);
+            this.asm.bindLabel(rdone);
+            this.asm.movRMBase(0, 5, accOff);
+            return;
+        }
+
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, iOff);
+        if (name == "find" || name == "forEach") {
+            this.asm.movMBaseR(5, 0, accOff);
+        }
+
+        int loop = this.newLabel();
+        int act = this.newLabel();
+        int next = this.newLabel();
+        int done = this.newLabel();
+        int sc = this.newLabel();
+        int exhausted = this.newLabel();
+        this.asm.bindLabel(loop);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(exhausted);
+        this.genArrayElemLoad(srcOff, iOff, strideOneElements);
+        this.asm.movMBaseR(5, 0, elemOff);
+        this.emitUserFnCallbackCall(funcIdx, fnName, elemOff, -1);
+        this.asm.cmpRI32(0, 0);
+        if (name == "map" || name == "forEach") {
+            this.asm.jmpLabel(act);
+        } else if (name == "filter" || name == "find" || name == "some") {
+            this.asm.jneLabel(act);
+        } else if (name == "every") {
+            this.asm.jeLabel(sc);
+        }
+        this.asm.jmpLabel(next);
+        this.asm.bindLabel(act);
+        if (name == "map") {
+            // dst_data[i] = call result (still in RAX).
+            this.asm.movRMBase(1, 5, dstOff);
+            this.asm.addRI32(1, 16);
+            this.asm.movRMBase(2, 5, iOff);
+            this.asm.shlR64Imm(2, 3);
+            this.asm.addRR64(1, 2);
+            this.asm.movMBaseR(1, 0, 0);
+        } else if (name == "filter") {
+            // dst_data[count] = element; count++.
+            this.asm.movRMBase(1, 5, dstOff);
+            this.asm.addRI32(1, 16);
+            this.asm.movRMBase(2, 5, cntOff);
+            this.asm.shlR64Imm(2, 3);
+            this.asm.addRR64(1, 2);
+            this.asm.movRMBase(0, 5, elemOff);
+            this.asm.movMBaseR(1, 0, 0);
+            this.asm.movRMBase(0, 5, cntOff);
+            this.asm.addRI32(0, 1);
+            this.asm.movMBaseR(5, 0, cntOff);
+        } else if (name == "find") {
+            // First match: answer the element and stop.
+            this.asm.movRMBase(0, 5, elemOff);
+            this.asm.movMBaseR(5, 0, accOff);
+            this.asm.jmpLabel(done);
+        } else if (name == "some") {
+            this.asm.movRI64(0, 1);
+            this.asm.jmpLabel(done);
+        }
+        this.asm.bindLabel(next);
+        this.asm.movRMBase(0, 5, iOff);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, iOff);
+        this.asm.jmpLabel(loop);
+        this.asm.bindLabel(sc);
+        // `every` short-circuits false.
+        this.asm.xorRR64(0, 0);
+        this.asm.jmpLabel(done);
+        this.asm.bindLabel(exhausted);
+        if (name == "filter") {
+            // Final length = kept count.
+            this.asm.movRMBase(0, 5, dstOff);
+            this.asm.movRMBase(1, 5, cntOff);
+            this.asm.movMBaseR(0, 1, 8);
+            this.asm.movRMBase(0, 5, dstOff);
+            this.asm.addRI32(0, 16);
+        } else if (name == "map") {
+            this.asm.movRMBase(0, 5, dstOff);
+            this.asm.addRI32(0, 16);
+        } else if (name == "every") {
+            this.asm.movRI64(0, 1);
+        } else if (name == "some") {
+            this.asm.xorRR64(0, 0);
+        } else if (name == "find" || name == "forEach") {
+            this.asm.movRMBase(0, 5, accOff);
+        }
+        this.asm.bindLabel(done);
+    }
+
     public void genArrayLast(Node call) {
         Node arrNode = call.child(0);
         this.genExpr(arrNode);
@@ -10276,6 +10523,8 @@ int strIdx = this.stringPatchIndices[i];
             else if (name == "find") { this.genLambdaFind(call); }
             else if (name == "all" || name == "every") { this.genLambdaQuantifier(call, 1); }
             else { this.genLambdaQuantifier(call, 0); }
+        } else if (call.isMember && call.childCount() > 1 && this.isHofMethod(name) && this.isArrayLikeType(this.inferExprType(call.child(0))) && this.userFnCallbackIdx(call.child(1)) >= 0) {
+            this.genUserFnHof(call, name);
         } else if (call.isMember && call.childCount() > 0 && (name == "any" || name == "all" || name == "reverse" || name == "map") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             if (name == "any") { this.genArrayAny(call); }
             else if (name == "all") { this.genArrayAll(call); }
