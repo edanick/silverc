@@ -6853,6 +6853,22 @@ int strIdx = this.stringPatchIndices[i];
 
                     return "string";
                 }
+                if (cname == "isBlank" && recvType == "string") {
+                    return "bool";
+                }
+                // take/skip/distinct build a fresh array of the receiver's
+                // element type; chunk/zip build an array OF arrays
+                // (DOCS/133, DOCS/134, DOCS/135, DOCS/136).
+                if (cname == "take" || cname == "skip" || cname == "distinct") {
+                    if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
+                        return recvType;
+                    }
+                }
+                if (cname == "chunk" || cname == "zip") {
+                    if (recvType.length >= 2 && recvType[recvType.length - 2] == '[' && recvType[recvType.length - 1] == ']') {
+                        return recvType + "[]";
+                    }
+                }
             }
             string cls = recvType;
             if (expr.isMember && expr.childCount() > 0 && cls == "") {
@@ -8870,6 +8886,374 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.addRI32(0, 16);
     }
 
+    // A fresh array with `count` slots (capacity max(8, count)) whose
+    // length is `count`; the data pointer is left in RAX. Layout:
+    // [capacity, length] then the slots, like every other array builder.
+    public void genArrayAlloc(int countOff) {
+        int alCap = this.allocLocal("__al_cap");
+        int alBase = this.allocLocal("__al_base");
+        this.asm.movRMBase(0, 5, countOff);
+        this.asm.cmpRI32(0, 8);
+        int alGe = this.newLabel();
+        int alDone = this.newLabel();
+        this.asm.jgeLabel(alGe);
+        this.asm.movRI64(0, 8);
+        this.asm.jmpLabel(alDone);
+        this.asm.bindLabel(alGe);
+        this.asm.movRMBase(0, 5, countOff);
+        this.asm.bindLabel(alDone);
+        this.asm.movMBaseR(5, 0, alCap);
+        this.asm.movRMBase(8, 5, alCap);
+        this.asm.addRI32(8, 2);
+        this.asm.shlR64Imm(8, 3);
+        this.emitHeapAllocCall();
+        this.asm.movMBaseR(5, 0, alBase);
+        this.asm.movRMBase(1, 5, alCap);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(1, 5, countOff);
+        this.asm.movMBaseR(0, 1, 8);
+        this.asm.movRMBase(0, 5, alBase);
+        this.asm.addRI32(0, 16);
+    }
+
+    // Copy count elements from src[start..start+count) into a fresh array;
+    // the new array's data pointer is left in RAX.
+    public void genArrayRangeCopy(int srcOff, int startOff, int countOff) {
+        int rcData = this.allocLocal("__rc_data");
+        int rcI = this.allocLocal("__rc_i");
+        this.genArrayAlloc(countOff);
+        this.asm.movMBaseR(5, 0, rcData);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, rcI);
+        int rcLoop = this.newLabel();
+        int rcDone = this.newLabel();
+        this.asm.bindLabel(rcLoop);
+        this.asm.movRMBase(0, 5, rcI);
+        this.asm.movRMBase(1, 5, countOff);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(rcDone);
+        // value = src[start + i]
+        this.asm.movRMBase(0, 5, srcOff);
+        this.asm.movRMBase(1, 5, startOff);
+        this.asm.movRMBase(2, 5, rcI);
+        this.asm.addRR64(1, 2);
+        this.asm.shlR64Imm(1, 3);
+        this.asm.addRR64(0, 1);
+        this.asm.movRMBase(1, 0, 0);
+        // dst[i] = value
+        this.asm.movRMBase(0, 5, rcData);
+        this.asm.movRMBase(2, 5, rcI);
+        this.asm.shlR64Imm(2, 3);
+        this.asm.addRR64(0, 2);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(0, 5, rcI);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, rcI);
+        this.asm.jmpLabel(rcLoop);
+        this.asm.bindLabel(rcDone);
+        this.asm.movRMBase(0, 5, rcData);
+    }
+
+    // arr.take(n): the first n elements in a fresh array (DOCS/133).
+    public void genArrayTakeCall(Node call) {
+        int tkArr = this.allocLocal("__tk_arr");
+        int tkLen = this.allocLocal("__tk_len");
+        int tkN = this.allocLocal("__tk_n");
+        int tkCnt = this.allocLocal("__tk_cnt");
+        int tkStart = this.allocLocal("__tk_start");
+        this.genExpr(call.child(0));
+        this.asm.movMBaseR(5, 0, tkArr);
+        this.asm.movRMBase(0, 5, tkArr);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, tkLen);
+        if (call.childCount() > 1) { this.genExpr(call.child(1)); } else { this.asm.xorRR64(0, 0); }
+        this.asm.movMBaseR(5, 0, tkN);
+        // count = min(max(n, 0), len)
+        this.asm.movRMBase(0, 5, tkN);
+        this.asm.cmpRI32(0, 0);
+        int tkPos = this.newLabel();
+        this.asm.jgeLabel(tkPos);
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(tkPos);
+        this.asm.movRMBase(1, 5, tkLen);
+        this.asm.cmpRR64(0, 1);
+        int tkFit = this.newLabel();
+        this.asm.jleLabel(tkFit);
+        this.asm.movRR64(0, 1);
+        this.asm.bindLabel(tkFit);
+        this.asm.movMBaseR(5, 0, tkCnt);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, tkStart);
+        this.genArrayRangeCopy(tkArr, tkStart, tkCnt);
+    }
+
+    // arr.skip(n): the elements from index n onward in a fresh array
+    // (DOCS/133).
+    public void genArraySkipCall(Node call) {
+        int skArr = this.allocLocal("__sk_arr");
+        int skLen = this.allocLocal("__sk_len");
+        int skN = this.allocLocal("__sk_n");
+        int skStart = this.allocLocal("__sk_start");
+        int skCnt = this.allocLocal("__sk_cnt");
+        this.genExpr(call.child(0));
+        this.asm.movMBaseR(5, 0, skArr);
+        this.asm.movRMBase(0, 5, skArr);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, skLen);
+        if (call.childCount() > 1) { this.genExpr(call.child(1)); } else { this.asm.xorRR64(0, 0); }
+        this.asm.movMBaseR(5, 0, skN);
+        // start = min(max(n, 0), len)
+        this.asm.movRMBase(0, 5, skN);
+        this.asm.cmpRI32(0, 0);
+        int skPos = this.newLabel();
+        this.asm.jgeLabel(skPos);
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(skPos);
+        this.asm.movRMBase(1, 5, skLen);
+        this.asm.cmpRR64(0, 1);
+        int skFit = this.newLabel();
+        this.asm.jleLabel(skFit);
+        this.asm.movRR64(0, 1);
+        this.asm.bindLabel(skFit);
+        this.asm.movMBaseR(5, 0, skStart);
+        // count = len - start
+        this.asm.movRMBase(0, 5, skLen);
+        this.asm.movRMBase(1, 5, skStart);
+        this.asm.subRR64(0, 1);
+        this.asm.movMBaseR(5, 0, skCnt);
+        this.genArrayRangeCopy(skArr, skStart, skCnt);
+    }
+
+    // arr.slice(start, end): the end index is EXCLUSIVE (DOCS/89).
+    public void genArraySliceCall(Node call) {
+        int slArr = this.allocLocal("__sl_a_arr");
+        int slLen = this.allocLocal("__sl_a_len");
+        int slStart = this.allocLocal("__sl_a_start");
+        int slEnd = this.allocLocal("__sl_a_end");
+        int slCnt = this.allocLocal("__sl_a_cnt");
+        this.genExpr(call.child(0));
+        this.asm.movMBaseR(5, 0, slArr);
+        this.asm.movRMBase(0, 5, slArr);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, slLen);
+        if (call.childCount() > 1) { this.genExpr(call.child(1)); } else { this.asm.xorRR64(0, 0); }
+        this.asm.movMBaseR(5, 0, slStart);
+        if (call.childCount() > 2) { this.genExpr(call.child(2)); } else { this.asm.xorRR64(0, 0); }
+        this.asm.movMBaseR(5, 0, slEnd);
+        // start = clamp(start, 0, len)
+        this.asm.movRMBase(0, 5, slStart);
+        this.asm.cmpRI32(0, 0);
+        int slStartLow = this.newLabel();
+        this.asm.jgeLabel(slStartLow);
+        this.asm.xorRR64(0, 0);
+        this.asm.bindLabel(slStartLow);
+        this.asm.movRMBase(1, 5, slLen);
+        this.asm.cmpRR64(0, 1);
+        int slStartHigh = this.newLabel();
+        this.asm.jleLabel(slStartHigh);
+        this.asm.movRR64(0, 1);
+        this.asm.bindLabel(slStartHigh);
+        this.asm.movMBaseR(5, 0, slStart);
+        // end = clamp(end, start, len)
+        this.asm.movRMBase(0, 5, slEnd);
+        this.asm.movRMBase(1, 5, slStart);
+        this.asm.cmpRR64(0, 1);
+        int slEndLow = this.newLabel();
+        this.asm.jgeLabel(slEndLow);
+        this.asm.movRMBase(0, 5, slStart);
+        this.asm.bindLabel(slEndLow);
+        this.asm.movRMBase(1, 5, slLen);
+        this.asm.cmpRR64(0, 1);
+        int slEndHigh = this.newLabel();
+        this.asm.jleLabel(slEndHigh);
+        this.asm.movRR64(0, 1);
+        this.asm.bindLabel(slEndHigh);
+        this.asm.movMBaseR(5, 0, slEnd);
+        // count = end - start
+        this.asm.movRMBase(0, 5, slEnd);
+        this.asm.movRMBase(1, 5, slStart);
+        this.asm.subRR64(0, 1);
+        this.asm.movMBaseR(5, 0, slCnt);
+        this.genArrayRangeCopy(slArr, slStart, slCnt);
+    }
+
+    // arr.chunk(n): the elements grouped n at a time; the last group holds
+    // the remainder (DOCS/135). The result is an array of arrays.
+    public void genArrayChunkCall(Node call) {
+        int ckArr = this.allocLocal("__ck_arr");
+        int ckLen = this.allocLocal("__ck_len");
+        int ckSize = this.allocLocal("__ck_size");
+        int ckGroups = this.allocLocal("__ck_groups");
+        int ckG = this.allocLocal("__ck_g");
+        int ckStart = this.allocLocal("__ck_start");
+        int ckCnt = this.allocLocal("__ck_cnt");
+        int ckData = this.allocLocal("__ck_data");
+        int ckInner = this.allocLocal("__ck_inner");
+        this.genExpr(call.child(0));
+        this.asm.movMBaseR(5, 0, ckArr);
+        this.asm.movRMBase(0, 5, ckArr);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, ckLen);
+        // size = max(1, n)
+        if (call.childCount() > 1) { this.genExpr(call.child(1)); } else { this.asm.xorRR64(0, 0); }
+        this.asm.movMBaseR(5, 0, ckSize);
+        this.asm.movRMBase(0, 5, ckSize);
+        this.asm.cmpRI32(0, 1);
+        int ckSizeOk = this.newLabel();
+        this.asm.jgeLabel(ckSizeOk);
+        this.asm.movRI64(0, 1);
+        this.asm.bindLabel(ckSizeOk);
+        this.asm.movMBaseR(5, 0, ckSize);
+        // groups = (len + size - 1) / size
+        this.asm.movRMBase(0, 5, ckLen);
+        this.asm.movRMBase(1, 5, ckSize);
+        this.asm.addRR64(0, 1);
+        this.asm.subRI32(0, 1);
+        this.asm.cqo();
+        this.asm.idivR64(1);
+        this.asm.movMBaseR(5, 0, ckGroups);
+        // the outer array
+        this.genArrayAlloc(ckGroups);
+        this.asm.movMBaseR(5, 0, ckData);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, ckG);
+        int ckLoop = this.newLabel();
+        int ckDone = this.newLabel();
+        this.asm.bindLabel(ckLoop);
+        this.asm.movRMBase(0, 5, ckG);
+        this.asm.movRMBase(1, 5, ckGroups);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(ckDone);
+        // start = g * size
+        this.asm.movRMBase(0, 5, ckG);
+        this.asm.movRMBase(1, 5, ckSize);
+        this.asm.imulRR64(0, 1);
+        this.asm.movMBaseR(5, 0, ckStart);
+        // count = min(size, len - start)
+        this.asm.movRMBase(0, 5, ckLen);
+        this.asm.movRMBase(1, 5, ckStart);
+        this.asm.subRR64(0, 1);
+        this.asm.movRMBase(1, 5, ckSize);
+        this.asm.cmpRR64(0, 1);
+        int ckFit = this.newLabel();
+        this.asm.jleLabel(ckFit);
+        this.asm.movRR64(0, 1);
+        this.asm.bindLabel(ckFit);
+        this.asm.movMBaseR(5, 0, ckCnt);
+        // the inner array
+        this.genArrayRangeCopy(ckArr, ckStart, ckCnt);
+        this.asm.movMBaseR(5, 0, ckInner);
+        // outer[g] = inner
+        this.asm.movRMBase(0, 5, ckData);
+        this.asm.movRMBase(2, 5, ckG);
+        this.asm.shlR64Imm(2, 3);
+        this.asm.addRR64(0, 2);
+        this.asm.movRMBase(1, 5, ckInner);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(0, 5, ckG);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, ckG);
+        this.asm.jmpLabel(ckLoop);
+        this.asm.bindLabel(ckDone);
+        this.asm.movRMBase(0, 5, ckData);
+    }
+
+    // arr.zip(other): the element-wise pairs as two-element arrays; the
+    // result holds as many pairs as the shorter array (DOCS/136).
+    public void genArrayZipCall(Node call) {
+        int zpArr = this.allocLocal("__zp_arr");
+        int zpOther = this.allocLocal("__zp_other");
+        int zpLen = this.allocLocal("__zp_len");
+        int zpOLen = this.allocLocal("__zp_olen");
+        int zpCnt = this.allocLocal("__zp_cnt");
+        int zpI = this.allocLocal("__zp_i");
+        int zpData = this.allocLocal("__zp_data");
+        int zpA = this.allocLocal("__zp_a");
+        int zpB = this.allocLocal("__zp_b");
+        int zpPair = this.allocLocal("__zp_pair");
+        int zpBase = this.allocLocal("__zp_base");
+        this.genExpr(call.child(0));
+        this.asm.movMBaseR(5, 0, zpArr);
+        if (call.childCount() > 1) { this.genExpr(call.child(1)); } else { this.asm.xorRR64(0, 0); }
+        this.asm.movMBaseR(5, 0, zpOther);
+        this.asm.movRMBase(0, 5, zpArr);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, zpLen);
+        this.asm.movRMBase(0, 5, zpOther);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, zpOLen);
+        // count = min(len, olen)
+        this.asm.movRMBase(0, 5, zpLen);
+        this.asm.movRMBase(1, 5, zpOLen);
+        this.asm.cmpRR64(0, 1);
+        int zpFit = this.newLabel();
+        this.asm.jleLabel(zpFit);
+        this.asm.movRR64(0, 1);
+        this.asm.bindLabel(zpFit);
+        this.asm.movMBaseR(5, 0, zpCnt);
+        // the outer array
+        this.genArrayAlloc(zpCnt);
+        this.asm.movMBaseR(5, 0, zpData);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, zpI);
+        int zpLoop = this.newLabel();
+        int zpDone = this.newLabel();
+        this.asm.bindLabel(zpLoop);
+        this.asm.movRMBase(0, 5, zpI);
+        this.asm.movRMBase(1, 5, zpCnt);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(zpDone);
+        // a = arr[i]
+        this.asm.movRMBase(0, 5, zpArr);
+        this.asm.movRMBase(1, 5, zpI);
+        this.asm.shlR64Imm(1, 3);
+        this.asm.addRR64(0, 1);
+        this.asm.movRMBase(1, 0, 0);
+        this.asm.movRR64(0, 1);
+        this.asm.movMBaseR(5, 0, zpA);
+        // b = other[i]
+        this.asm.movRMBase(0, 5, zpOther);
+        this.asm.movRMBase(1, 5, zpI);
+        this.asm.shlR64Imm(1, 3);
+        this.asm.addRR64(0, 1);
+        this.asm.movRMBase(1, 0, 0);
+        this.asm.movRR64(0, 1);
+        this.asm.movMBaseR(5, 0, zpB);
+        // the pair: a fresh two-element array
+        this.asm.movRI64(8, 80);
+        this.emitHeapAllocCall();
+        this.asm.movMBaseR(5, 0, zpBase);
+        this.asm.movRI64(1, 8);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRI64(1, 2);
+        this.asm.movMBaseR(0, 1, 8);
+        this.asm.movRMBase(0, 5, zpBase);
+        this.asm.addRI32(0, 16);
+        this.asm.movMBaseR(5, 0, zpPair);
+        // pair[0] = a; pair[1] = b. The store takes the slot address in
+        // RAX and the value in RCX (movMBaseR writes [base+disp] = reg).
+        this.asm.movRMBase(0, 5, zpPair);
+        this.asm.movRMBase(1, 5, zpA);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(0, 5, zpPair);
+        this.asm.addRI32(0, 8);
+        this.asm.movRMBase(1, 5, zpB);
+        this.asm.movMBaseR(0, 1, 0);
+        // outer[i] = pair
+        this.asm.movRMBase(0, 5, zpData);
+        this.asm.movRMBase(2, 5, zpI);
+        this.asm.shlR64Imm(2, 3);
+        this.asm.addRR64(0, 2);
+        this.asm.movRMBase(1, 5, zpPair);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.movRMBase(0, 5, zpI);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, zpI);
+        this.asm.jmpLabel(zpLoop);
+        this.asm.bindLabel(zpDone);
+        this.asm.movRMBase(0, 5, zpData);
+    }
+
     public void genArrayJoin(Node call) {
         // arr.join(sep): concatenate the string elements with sep between
         // them and return the new heap string (DOCS/88, silverc-rs "Array
@@ -9913,8 +10297,18 @@ int strIdx = this.stringPatchIndices[i];
             this.genArrayFlatCall(call);
         } else if (call.isMember && call.childCount() > 0 && name == "swap" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArraySwap(call);
-        } else if (call.isMember && call.childCount() > 0 && name == "unique" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+        } else if (call.isMember && call.childCount() > 0 && (name == "unique" || name == "distinct") && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArrayUnique(call);
+        } else if (call.isMember && call.childCount() > 1 && name == "take" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+            this.genArrayTakeCall(call);
+        } else if (call.isMember && call.childCount() > 1 && name == "skip" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+            this.genArraySkipCall(call);
+        } else if (call.isMember && call.childCount() > 1 && name == "slice" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+            this.genArraySliceCall(call);
+        } else if (call.isMember && call.childCount() > 1 && name == "chunk" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+            this.genArrayChunkCall(call);
+        } else if (call.isMember && call.childCount() > 1 && name == "zip" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
+            this.genArrayZipCall(call);
         } else if (call.isMember && call.childCount() > 1 && name == "join" && this.inferExprType(call.child(0)).length >= 2 && this.inferExprType(call.child(0))[this.inferExprType(call.child(0)).length - 2] == '[') {
             this.genArrayJoin(call);
         } else if (call.isMember && call.childCount() > 2 && name == "join" && call.child(0).kind == 6 && call.child(0).name == "string") {
@@ -12738,7 +13132,7 @@ public void genNewCall(Node call) {
             }
         }
         if (recvType == "string") {
-            if (name == "contains" || name == "isDigits" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "lastIndexOf" || name == "substr" || name == "substring" || name == "slice" || name == "stripPrefix" || name == "stripSuffix" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toFloatBits" || name == "toBytes" || name == "repeat") {
+            if (name == "contains" || name == "isDigits" || name == "isBlank" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "lastIndexOf" || name == "substr" || name == "substring" || name == "slice" || name == "stripPrefix" || name == "stripSuffix" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toFloatBits" || name == "toBytes" || name == "repeat") {
                 return true;
             }
         }
@@ -12894,6 +13288,21 @@ public void genNewCall(Node call) {
             this.asm.bindLabel(notFound);
             this.asm.xorRR64(0, 0);
             this.asm.bindLabel(containsDone);
+            return;
+        }
+        if (name == "isBlank") {
+            // s.isBlank(): true when the text holds no character but
+            // whitespace (DOCS/142). The scan steps over every whitespace
+            // byte; without the step the loop never ends on a
+            // whitespace-only string.
+            this.genStringIsBlank(recv);
+            return;
+        }
+        if (name == "slugify") {
+            // s.slugify(): ASCII letters lowercased, digits kept, spaces,
+            // hyphens and underscores folded into one hyphen, every other
+            // character ignored, a trailing hyphen dropped (DOCS/229).
+            this.genStringSlugify(recv);
             return;
         }
         if (name == "isDigits") {
@@ -13943,18 +14352,17 @@ public void genNewCall(Node call) {
             this.asm.emitCallTeardown();
             this.asm.movMBaseR(5, 0, rpNL);
             int rpEmptyDone = -1;
-            if (name == "replaceAll") {
-                // Empty needle replaces nothing: return the receiver
-                // unchanged instead of entering the scan loop.
-                rpEmptyDone = this.newLabel();
-                int rpEmptyGo = this.newLabel();
-                this.asm.movRMBase(0, 5, rpOL);
-                this.asm.cmpRI32(0, 0);
-                this.asm.jneLabel(rpEmptyGo);
-                this.asm.movRMBase(0, 5, rpR);
-                this.asm.jmpLabel(rpEmptyDone);
-                this.asm.bindLabel(rpEmptyGo);
-            }
+            // Empty needle replaces nothing: return the receiver unchanged
+            // instead of entering the scan loop. An empty needle matches at
+            // EVERY position, so the scan would never advance (DOCS/74).
+            rpEmptyDone = this.newLabel();
+            int rpEmptyGo = this.newLabel();
+            this.asm.movRMBase(0, 5, rpOL);
+            this.asm.cmpRI32(0, 0);
+            this.asm.jneLabel(rpEmptyGo);
+            this.asm.movRMBase(0, 5, rpR);
+            this.asm.jmpLabel(rpEmptyDone);
+            this.asm.bindLabel(rpEmptyGo);
             // Count matches using strstr
             this.asm.xorRR64(0, 0);
             this.asm.movMBaseR(5, 0, rpCnt);
@@ -14082,9 +14490,7 @@ public void genNewCall(Node call) {
             this.asm.callR64(0);
             this.asm.emitCallTeardown();
             this.asm.movRMBase(0, 5, rpDst);
-            if (name == "replaceAll") {
-                this.asm.bindLabel(rpEmptyDone);
-            }
+            this.asm.bindLabel(rpEmptyDone);
             return;
         }
         if (name == "split" || name == "lines") {
@@ -14346,6 +14752,195 @@ public void genNewCall(Node call) {
         }
     }
 
+    // s.isBlank(): true when the text holds no character but whitespace
+    // (DOCS/142). The scan index advances on every byte: without the step
+    // the loop re-reads byte 0 forever and never ends.
+    public void genStringIsBlank(Node recv) {
+        int ibSrc = this.allocLocal("__ib_src");
+        int ibLen = this.allocLocal("__ib_len");
+        int ibI = this.allocLocal("__ib_i");
+        this.genExpr(recv);
+        this.asm.movMBaseR(5, 0, ibSrc);
+        this.asm.movRMBase(1, 5, ibSrc);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, ibLen);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, ibI);
+        int ibLoop = this.newLabel();
+        int ibStep = this.newLabel();
+        int ibDone = this.newLabel();
+        int ibNo = this.newLabel();
+        int ibEnd = this.newLabel();
+        this.asm.bindLabel(ibLoop);
+        this.asm.movRMBase(0, 5, ibI);
+        this.asm.movRMBase(1, 5, ibLen);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(ibDone);
+        this.asm.movRMBase(1, 5, ibSrc);
+        this.asm.movRMBase(0, 5, ibI);
+        this.asm.addRR64(1, 0);
+        this.asm.movzxByteMBase(2, 1, 0);
+        this.asm.cmpRI32(2, 32);
+        this.asm.jeLabel(ibStep);
+        this.asm.cmpRI32(2, 9);
+        this.asm.jeLabel(ibStep);
+        this.asm.cmpRI32(2, 10);
+        this.asm.jeLabel(ibStep);
+        this.asm.cmpRI32(2, 13);
+        this.asm.jneLabel(ibNo);
+        this.asm.bindLabel(ibStep);
+        this.asm.movRMBase(0, 5, ibI);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, ibI);
+        this.asm.jmpLabel(ibLoop);
+        this.asm.bindLabel(ibDone);
+        this.asm.movRI64(0, 1);
+        this.asm.jmpLabel(ibEnd);
+        this.asm.bindLabel(ibNo);
+        this.asm.movRI64(0, 0);
+        this.asm.bindLabel(ibEnd);
+    }
+
+    // s.slugify(): ASCII letters lowercased, digits kept, spaces, hyphens
+    // and underscores folded into ONE hyphen, every other character
+    // ignored, a trailing hyphen dropped (DOCS/229). Mirrors
+    // std/string.sr's slugify, so the builtin and the source-level
+    // function answer the same text.
+    public void genStringSlugify(Node recv) {
+        int sgSrc = this.allocLocal("__sg_src");
+        int sgLen = this.allocLocal("__sg_len");
+        int sgI = this.allocLocal("__sg_i");
+        int sgO = this.allocLocal("__sg_o");
+        int sgOut = this.allocLocal("__sg_out");
+        int sgSize = this.allocLocal("__sg_size");
+        this.genExpr(recv);
+        this.asm.movMBaseR(5, 0, sgSrc);
+        this.asm.movRMBase(1, 5, sgSrc);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD2);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, sgLen);
+        // out = malloc(len + 1)
+        this.asm.movRMBase(0, 5, sgLen);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, sgSize);
+        this.asm.movRMBase(8, 5, sgSize);
+        this.emitHeapAllocCall();
+        this.asm.movMBaseR(5, 0, sgOut);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, sgI);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(5, 0, sgO);
+        int sgLoop = this.newLabel();
+        int sgUpper = this.newLabel();
+        int sgDigit = this.newLabel();
+        int sgSepCheck = this.newLabel();
+        int sgSep = this.newLabel();
+        int sgAppend = this.newLabel();
+        int sgNext = this.newLabel();
+        int sgDone = this.newLabel();
+        int sgNoTrail = this.newLabel();
+        this.asm.bindLabel(sgLoop);
+        this.asm.movRMBase(0, 5, sgI);
+        this.asm.movRMBase(1, 5, sgLen);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jgeLabel(sgDone);
+        this.asm.movRMBase(1, 5, sgSrc);
+        this.asm.movRMBase(0, 5, sgI);
+        this.asm.addRR64(1, 0);
+        this.asm.movzxByteMBase(2, 1, 0);
+        this.asm.cmpRI32(2, 97);
+        this.asm.jlLabel(sgUpper);
+        this.asm.cmpRI32(2, 122);
+        this.asm.jleLabel(sgAppend);
+        this.asm.bindLabel(sgUpper);
+        this.asm.cmpRI32(2, 65);
+        this.asm.jlLabel(sgDigit);
+        this.asm.cmpRI32(2, 90);
+        this.asm.jgLabel(sgDigit);
+        this.asm.addRI32(2, 32);
+        this.asm.jmpLabel(sgAppend);
+        this.asm.bindLabel(sgDigit);
+        this.asm.cmpRI32(2, 48);
+        this.asm.jlLabel(sgSepCheck);
+        this.asm.cmpRI32(2, 57);
+        this.asm.jleLabel(sgAppend);
+        this.asm.jmpLabel(sgSepCheck);
+        this.asm.bindLabel(sgSepCheck);
+        this.asm.cmpRI32(2, 32);
+        this.asm.jeLabel(sgSep);
+        this.asm.cmpRI32(2, 45);
+        this.asm.jeLabel(sgSep);
+        this.asm.cmpRI32(2, 95);
+        this.asm.jneLabel(sgNext);
+        this.asm.bindLabel(sgSep);
+        // A separator becomes one hyphen: never a leading one, never two
+        // in a row.
+        this.asm.movRMBase(0, 5, sgO);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(sgNext);
+        this.asm.movRMBase(1, 5, sgOut);
+        this.asm.movRMBase(0, 5, sgO);
+        this.asm.addRR64(1, 0);
+        this.asm.subRI32(1, 1);
+        this.asm.movzxByteMBase(2, 1, 0);
+        this.asm.cmpRI32(2, 45);
+        this.asm.jeLabel(sgNext);
+        this.asm.movRMBase(1, 5, sgOut);
+        this.asm.movRMBase(0, 5, sgO);
+        this.asm.addRR64(1, 0);
+        this.asm.movRI64(2, 45);
+        this.asm.movMBaseByteR(1, 2, 0);
+        this.asm.movRMBase(0, 5, sgO);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, sgO);
+        this.asm.jmpLabel(sgNext);
+        this.asm.bindLabel(sgAppend);
+        this.asm.movRMBase(1, 5, sgOut);
+        this.asm.movRMBase(0, 5, sgO);
+        this.asm.addRR64(1, 0);
+        this.asm.movMBaseByteR(1, 2, 0);
+        this.asm.movRMBase(0, 5, sgO);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, sgO);
+        this.asm.bindLabel(sgNext);
+        this.asm.movRMBase(0, 5, sgI);
+        this.asm.addRI32(0, 1);
+        this.asm.movMBaseR(5, 0, sgI);
+        this.asm.jmpLabel(sgLoop);
+        this.asm.bindLabel(sgDone);
+        // A trailing hyphen is dropped.
+        this.asm.movRMBase(0, 5, sgO);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(sgNoTrail);
+        this.asm.movRMBase(1, 5, sgOut);
+        this.asm.movRMBase(0, 5, sgO);
+        this.asm.addRR64(1, 0);
+        this.asm.subRI32(1, 1);
+        this.asm.movzxByteMBase(2, 1, 0);
+        this.asm.cmpRI32(2, 45);
+        this.asm.jneLabel(sgNoTrail);
+        this.asm.movRMBase(0, 5, sgO);
+        this.asm.subRI32(0, 1);
+        this.asm.movMBaseR(5, 0, sgO);
+        this.asm.bindLabel(sgNoTrail);
+        // NUL terminate
+        this.asm.movRMBase(1, 5, sgOut);
+        this.asm.movRMBase(0, 5, sgO);
+        this.asm.addRR64(1, 0);
+        this.asm.xorRR64(2, 2);
+        this.asm.movMBaseByteR(1, 2, 0);
+        this.asm.movRMBase(0, 5, sgOut);
+    }
+
     public void genTrimEnd(Node recv) {
         int srcOff = this.allocLocal("__trim_src");
         int lenOff = this.allocLocal("__trim_len");
@@ -14440,7 +15035,15 @@ public void genNewCall(Node call) {
         this.genExpr(recv);
         this.asm.movMBaseR(5, 0, srcOff);
         if (hasSet == 1) {
-            this.genExpr(setNode);
+            // The set is a string of characters (DOCS/214). A CHAR
+            // argument is the one-character set: its code point is not a
+            // pointer, so it must be materialised as a one-character
+            // string before the set scan reads it.
+            if (this.isCharExpr(setNode)) {
+                this.genCharToString(setNode);
+            } else {
+                this.genExpr(setNode);
+            }
             this.asm.movMBaseR(5, 0, setOff);
         }
 
