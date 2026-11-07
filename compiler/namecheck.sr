@@ -110,22 +110,19 @@ bool ncValidName(string name) {
 // WHOLE function body, not per block: an over-approximation can only
 // silence a diagnostic, never invent one.
 class NcScope {
-    public prop string[] names;
+    public prop dict<string, int> names;
 
     construct {
-        this.names = [];
+        this.names = {};
     }
 
     public void add(string name) {
         if (name.length == 0) { return; }
-        this.names.add(name);
+        this.names[name] = 1;
     }
 
     public bool has(string name) {
-        for (int i = 0; i < this.names.length; i++) {
-            if (this.names[i] == name) { return true; }
-        }
-        return false;
+        return this.names.contains(name);
     }
 }
 
@@ -135,11 +132,12 @@ class NameChecker {
 
     // Program-level names: functions, classes, structs, enums, globals,
     // constants, type aliases, imported names and module names.
-    private prop string[] declNames;
+    private prop dict<string, int> declNames;
     // Class fields, kept per declaring class so a method of that class
     // resolves the bare `field` idiom.
     private prop string[] fieldClasses;
     private prop string[] fieldNames;
+    private prop dict<string, int> fieldNameSet;
     // Declaring class -> its parent classes, so a subclass method also
     // resolves an inherited field by its bare name. One entry per
     // (child, parent) pair.
@@ -148,9 +146,10 @@ class NameChecker {
 
     construct {
         this.errors = [];
-        this.declNames = [];
+        this.declNames = {};
         this.fieldClasses = [];
         this.fieldNames = [];
+        this.fieldNameSet = {};
         this.parentChildren = [];
         this.parentNames = [];
     }
@@ -159,7 +158,7 @@ class NameChecker {
     // names (the parser records them beside the program, not inside it).
     public void checkProgram(Node[] program, string[] modNames) {
         for (int m = 0; m < modNames.length; m++) {
-            this.declNames.add(modNames[m]);
+            this.declNames[modNames[m]] = 1;
         }
         for (int i = 0; i < program.length; i++) {
             this.collectItem(program[i]);
@@ -175,19 +174,19 @@ class NameChecker {
 
     private void collectItem(Node item) {
         if (item.kind == ncKindFunction) {
-            this.declNames.add(item.name);
+            this.declNames[item.name] = 1;
             // A top-level `int x = 1;` lives in the program's global block.
             if (item.name == "main" && item.childCount() > 1) {
                 Node body = item.child(1);
                 for (int b = 0; b < body.childCount(); b++) {
                     Node stmt = body.child(b);
                     if (stmt.kind == ncKindVarDecl) {
-                        this.declNames.add(stmt.name);
+                        this.declNames[stmt.name] = 1;
                     }
                 }
             }
         } else if (item.kind == ncKindClass || item.kind == ncKindStruct) {
-            this.declNames.add(item.name);
+            this.declNames[item.name] = 1;
             for (int p = 0; p < item.parentClasses.length; p++) {
                 this.parentChildren.add(item.name);
                 this.parentNames.add(item.parentClasses[p]);
@@ -197,20 +196,21 @@ class NameChecker {
                 if (member.kind == ncKindVarDecl) {
                     this.fieldClasses.add(item.name);
                     this.fieldNames.add(member.name);
+                    this.fieldNameSet[member.name] = 1;
                 }
             }
         } else if (item.kind == ncKindConst || item.kind == ncKindVarDecl
                    || item.kind == ncKindDef) {
-            this.declNames.add(item.name);
+            this.declNames[item.name] = 1;
         } else if (item.kind == ncKindModule) {
             // An import node and an enum node share this kind. Both bind
             // names: an import binds its source module and the names it
             // pulls in, an enum binds its type name and its variants.
-            if (item.name.length > 0) { this.declNames.add(item.name); }
-            if (item.typeHint.length > 0) { this.declNames.add(item.typeHint); }
+            if (item.name.length > 0) { this.declNames[item.name] = 1; }
+            if (item.typeHint.length > 0) { this.declNames[item.typeHint] = 1; }
             for (int c = 0; c < item.childCount(); c++) {
                 Node child = item.child(c);
-                if (child.name.length > 0) { this.declNames.add(child.name); }
+                if (child.name.length > 0) { this.declNames[child.name] = 1; }
             }
         }
     }
@@ -228,7 +228,8 @@ class NameChecker {
                     scope.add(params.child(p).name);
                 }
             }
-            this.addClassFields(scope, className);
+            dict<string, int> seen = {};
+            this.addClassFields(scope, className, seen);
             if (item.childCount() > 1) {
                 this.collectLocals(item.child(1), scope);
                 this.walk(item.child(1), scope);
@@ -241,7 +242,8 @@ class NameChecker {
                 } else if (member.kind == ncKindVarDecl && member.childCount() > 0) {
                     // A field initializer is an expression in the class scope.
                     NcScope scope = new NcScope();
-                    this.addClassFields(scope, item.name);
+                    dict<string, int> seen = {};
+                    this.addClassFields(scope, item.name, seen);
                     this.walk(member.child(0), scope);
                 }
             }
@@ -256,8 +258,10 @@ class NameChecker {
     // `this.total`. The DECLARING class's fields bind here, and so do the
     // fields it inherits (a subclass method reads an inherited field by
     // its bare name too).
-    private void addClassFields(NcScope scope, string className) {
+    private void addClassFields(NcScope scope, string className, dict<string, int> seen) {
         if (className.length == 0) { return; }
+        if (seen.contains(className)) { return; }
+        seen[className] = 1;
         for (int i = 0; i < this.fieldClasses.length; i++) {
             if (this.fieldClasses[i] == className) {
                 scope.add(this.fieldNames[i]);
@@ -265,7 +269,7 @@ class NameChecker {
         }
         for (int p = 0; p < this.parentChildren.length; p++) {
             if (this.parentChildren[p] != className) { continue; }
-            this.addClassFields(scope, this.parentNames[p]);
+            this.addClassFields(scope, this.parentNames[p], seen);
         }
     }
 
@@ -400,11 +404,7 @@ class NameChecker {
         if (scope.has(name)) { return; }
         if (this.declNames.contains(name)) { return; }
         if (ncBuiltinName(name)) { return; }
-        bool isField = false;
-        for (int i = 0; i < this.fieldNames.length; i++) {
-            if (this.fieldNames[i] == name) { isField = true; break; }
-        }
-        if (isField) { return; }
+        if (this.fieldNameSet.contains(name)) { return; }
         scope.add(name);
     }
 }
