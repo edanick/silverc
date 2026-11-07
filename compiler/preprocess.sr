@@ -126,19 +126,48 @@ private int ppFindStarQuote(string s, int start, int end) {
     return -1;
 }
 
+// One output buffer for the preprocess splice: kept runs are appended here
+// and joined once by the caller. Growing a bare `string[]` through a helper
+// parameter leaves the caller length stale (see ProjectPieces), so the
+// accumulator rides a class, like ProjectPieces / DrvSourcePieces.
+class PpPieces {
+    public prop string[] parts;
+
+    construct {
+        this.parts = [];
+    }
+
+    public void add(string s) {
+        this.parts.add(s);
+    }
+
+    public int count() {
+        return this.parts.length;
+    }
+
+    public void truncateTo(int count) {
+        while (this.parts.length > count) { this.parts.pop(); }
+    }
+
+    public string joinAll() {
+        return this.parts.join("");
+    }
+}
+
 // Normalize one path literal body (source[start..end], without quotes) for
 // the target OS and wrap it as an ordinary quoted literal: `/` becomes `\`
 // on WINDOWS, `\` becomes `/` elsewhere, and backslashes are doubled so the
 // normal string lexer reads them back singly (mirrors silverc-rs).
 private string ppNormalizeOne(string source, int start, int end, string targetOs) {
     string body = path.normalize(projectSlice(source, start, end));
-    string lit = "\"";
+    string[] litParts = [];
+    litParts.add("\"");
     for (int q = 0; q < body.length; q++) {
-        if (body[q] == '/' && targetOs == "WINDOWS") { lit += "\\\\"; }
-        else { lit += body[q]; }
+        if (body[q] == '/' && targetOs == "WINDOWS") { litParts.add("\\\\"); }
+        else { litParts.add((string)body[q]); }
     }
-    lit += "\"";
-    return lit;
+    litParts.add("\"");
+    return litParts.join("");
 }
 
 // DOCS/257 — rewrite `*"..."` path literals for the target OS. A `*`
@@ -149,27 +178,33 @@ private string ppNormalizeOne(string source, int start, int end, string targetOs
 // braces never nest quotes at lex level), char literals (with `\X` pairs
 // skipped) and `//` / `/* ... */` comments pass through untouched; `*` not
 // immediately followed by `"` is untouched. Single-line only: an unclosed
-// literal errors at its opening line. Pieces splice through pieces.join so a
-// directive-heavy aggregate costs a handful of concatenations, mirroring the
-// pass-2 splice below.
+// literal errors at its opening line. Pieces append into the one output
+// accumulator and join once, so a directive-heavy aggregate costs a handful
+// of concatenations, mirroring the pass-2 splice below.
 public string ppNormalizePaths(string source, string targetOs, string[] errs) {
     int srcLen = source.length;
     // No literal anywhere: the input itself, not a copy.
     if (ppFindStarQuote(source, 0, srcLen) < 0) { return source; }
-    return ppNormalizeRange(source, 0, srcLen, 1, targetOs, errs);
+    PpPieces out = new PpPieces();
+    ppNormalizeInto(out, source, 0, srcLen, 1, targetOs, errs);
+    return out.joinAll();
 }
 
-// ppNormalizePaths over the range [start, end) of `source`, whose first line
-// is the absolute 1-based `baseLine` (literal errors report absolute lines).
-// Every bound is `end`, so the scan sees exactly the text a slice would, and
-// on error the range is returned verbatim. The length is never re-read per
-// character (strlen is O(n)). Comments, strings and chars are only skipped
-// over: the output splits into pieces at path literals alone (one kept run +
-// one rewritten literal each), never once per comment or string — the join is
-// identical and a literal-free stretch costs no allocation at all.
-private string ppNormalizeRange(string source, int start, int end, int baseLine, string targetOs, string[] errs) {
-    if (ppFindStarQuote(source, start, end) < 0) { return projectSlice(source, start, end); }
-    string[] pieces = [];
+// ppNormalizePaths over the range [start, end) of `source`, appending the
+// rewritten range to `out`, whose first line is the absolute 1-based
+// `baseLine` (literal errors report absolute lines). Every bound is `end`,
+// so the scan sees exactly the text a slice would, and on error the range is
+// appended verbatim (any pieces already appended for this range are dropped
+// first, so the output is the untouched range, one piece). The length is
+// never re-read per character (strlen is O(n)). Comments, strings and chars
+// are only skipped over: the output splits into pieces at path literals
+// alone (one kept run + one rewritten literal each), never once per comment
+// or string — appending straight into the caller's single accumulator (no
+// per-run join) keeps the whole splice to one final join, and a
+// literal-free stretch costs no allocation at all.
+private void ppNormalizeInto(PpPieces out, string source, int start, int end, int baseLine, string targetOs, string[] errs) {
+    int baseCount = out.count();
+    if (ppFindStarQuote(source, start, end) < 0) { out.add(projectSlice(source, start, end)); return; }
     int runStart = start;
     int i = start;
     int lineNo = baseLine;
@@ -234,11 +269,13 @@ private string ppNormalizeRange(string source, int start, int end, int baseLine,
             while (k < end && source[k] != '"' && source[k] != '\n') { k++; }
             if (k >= end || source[k] != '"') {
                 errs.add("preprocessor: '\"*\"' path literal opened at line " + (string)lineNo + " is never closed on the same line");
-                if (start == 0 && end == source.length) { return source; }
-                return projectSlice(source, start, end);
+                out.truncateTo(baseCount);
+                if (start == 0 && end == source.length) { out.add(source); }
+                else { out.add(projectSlice(source, start, end)); }
+                return;
             }
-            pieces.add(projectSlice(source, runStart, i));
-            pieces.add(ppNormalizeOne(source, i + 2, k, targetOs));
+            out.add(projectSlice(source, runStart, i));
+            out.add(ppNormalizeOne(source, i + 2, k, targetOs));
             runStart = k + 1;
             i = k + 1;
             continue;
@@ -246,8 +283,7 @@ private string ppNormalizeRange(string source, int start, int end, int baseLine,
         if (c == '\n') { lineNo++; }
         i++;
     }
-    pieces.add(projectSlice(source, runStart, end));
-    return pieces.join("");
+    out.add(projectSlice(source, runStart, end));
 }
 
 // First non-whitespace (space/tab) offset at or after `start`, bounded by
@@ -433,17 +469,18 @@ public string ppPreprocess(string source, string targetOs, bool debugBuild, stri
         return ppNormalizePaths(source, targetOs, errs);
     }
 
-    // Pass 2: splice — one piece per kept run (path literals rewritten inline
-    // per run, so only one output buffer exists instead of a filtered copy
-    // plus a renormalized copy), one terminator per blanked line, joined once
-    // at the end. runLine tracks each run's absolute first line for
-    // ppNormalizeRange: every kept line and every blanked line advances it.
-    string[] outParts = [];
+    // Pass 2: splice — path literals are rewritten inline per kept run,
+    // appending straight into the single output accumulator, so the filtered
+    // text is joined exactly once (no per-run materialized copy alongside
+    // the final joined output), one terminator per blanked line. runLine
+    // tracks each run's absolute first line for ppNormalizeInto: every kept
+    // line and every blanked line advances it.
+    PpPieces outParts = new PpPieces();
     int runLine = 1;
     int copyStart = 0;
     for (int d = 0; d < dropAt.length; d++) {
         if (dropAt[d] > copyStart) {
-            outParts.add(ppNormalizeRange(source, copyStart, dropAt[d], runLine, targetOs, errs));
+            ppNormalizeInto(outParts, source, copyStart, dropAt[d], runLine, targetOs, errs);
             // The kept run [copyStart, dropAt[d]) ends on a newline (a drop
             // always starts a line), so it spans exactly its newline count.
             for (int r = copyStart; r < dropAt[d]; r++) {
@@ -458,9 +495,9 @@ public string ppPreprocess(string source, string targetOs, bool debugBuild, stri
         copyStart = (dropNl[d] >= 0) ? dropNl[d] + 1 : srcLen;
     }
     if (copyStart < srcLen) {
-        outParts.add(ppNormalizeRange(source, copyStart, srcLen, runLine, targetOs, errs));
+        ppNormalizeInto(outParts, source, copyStart, srcLen, runLine, targetOs, errs);
     }
     // DOCS/257 — path literals rewrite on the kept text, during region
     // filtering, so stripped regions never see the scan.
-    return outParts.join("");
+    return outParts.joinAll();
 }
