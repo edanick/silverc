@@ -250,6 +250,57 @@ class FileOps {
         close(fd);
         #off
     }
+
+    // Append-only seekable sink: writes `data` at `offset` in `path`,
+    // creating the file when absent and NEVER truncating or reading it.
+    // A negative offset is a no-op. Every byte outside
+    // [offset, offset + data.length) is left untouched, so a caller can
+    // stream a large image to disk in small chunks instead of holding a
+    // whole-file buffer. The cursor is moved (SetFilePointer/lseek)
+    // before the single write; the handle closes on every branch.
+    // OPEN_ALWAYS (4) / O_WRONLY|O_CREAT without O_TRUNC (0x41 Linux,
+    // 0x201 Darwin) keep the existing radius of the file.
+    public void writeBytesAt(string path, int offset, byte[] data) {
+        if (offset < 0) { return; }
+        #on WINDOWS
+        int h = CreateFileA(path, 0x40000000, 0, null, 4, 0x80, 0);
+        if (h == -1) { return; }
+        SetFilePointer(h, offset, null, 0);
+        int wrote = 0;
+        WriteFile(h, data, data.length, &wrote, null);
+        CloseHandle(h);
+        #on LINUX
+        string npath = normalizePath(path);
+        int fd = open(npath, 0x41, 0x1A4);
+        if (fd < 0) { return; }
+        lseek(fd, offset, 0);
+        if (data.length > 0) {
+            int slots = (data.length + 7) / 8;
+            int[] packed = new int[slots];
+            for (int i = 0; i < data.length; i++) {
+                int b = data[i] & 0xFF;
+                packed[i / 8] = packed[i / 8] | (b << ((i % 8) * 8));
+            }
+            write(fd, packed, data.length);
+        }
+        close(fd);
+        #on MAC
+        string npath = normalizePath(path);
+        int fd = open(npath, 0x201, 0x1A4);
+        if (fd < 0) { return; }
+        lseek(fd, offset, 0);
+        if (data.length > 0) {
+            int slots = (data.length + 7) / 8;
+            int[] packed = new int[slots];
+            for (int i = 0; i < data.length; i++) {
+                int b = data[i] & 0xFF;
+                packed[i / 8] = packed[i / 8] | (b << ((i % 8) * 8));
+            }
+            write(fd, packed, data.length);
+        }
+        close(fd);
+        #off
+    }
 }
 
 class FolderOps {
@@ -520,6 +571,58 @@ public void write(string path, byte[] data) {
     string npath = normalizePath(path);
     int fd = open(npath, 0x601, 0x1A4);
     if (fd < 0) { return; }
+    if (data.length > 0) {
+        int slots = (data.length + 7) / 8;
+        int[] packed = new int[slots];
+        for (int i = 0; i < data.length; i++) {
+            int b = data[i] & 0xFF;
+            packed[i / 8] = packed[i / 8] | (b << ((i % 8) * 8));
+        }
+        write(fd, packed, data.length);
+    }
+        close(fd);
+        #off
+    }
+}
+
+// Append-only seekable sink: writes `data` at `offset` in `path`,
+// creating the file when absent and NEVER truncating or reading it.
+// A negative offset is a no-op. Every byte outside
+// [offset, offset + data.length) is left untouched, so a caller can
+// stream a large image to disk in small chunks instead of holding a
+// whole-file buffer. The cursor is moved (SetFilePointer/lseek)
+// before the single write; the handle closes on every branch.
+// OPEN_ALWAYS (4) / O_WRONLY|O_CREAT without O_TRUNC (0x41 Linux,
+// 0x201 Darwin) keep the existing radius of the file.
+public void writeBytesAt(string path, int offset, byte[] data) {
+    if (offset < 0) { return; }
+    #on WINDOWS
+    int h = CreateFileA(path, 0x40000000, 0, null, 4, 0x80, 0);
+    if (h == -1) { return; }
+    SetFilePointer(h, offset, null, 0);
+    int wrote = 0;
+    WriteFile(h, data, data.length, &wrote, null);
+    CloseHandle(h);
+    #on LINUX
+    string npath = normalizePath(path);
+    int fd = open(npath, 0x41, 0x1A4);
+    if (fd < 0) { return; }
+    lseek(fd, offset, 0);
+    if (data.length > 0) {
+        int slots = (data.length + 7) / 8;
+        int[] packed = new int[slots];
+        for (int i = 0; i < data.length; i++) {
+            int b = data[i] & 0xFF;
+            packed[i / 8] = packed[i / 8] | (b << ((i % 8) * 8));
+        }
+        write(fd, packed, data.length);
+    }
+    close(fd);
+    #on MAC
+    string npath = normalizePath(path);
+    int fd = open(npath, 0x201, 0x1A4);
+    if (fd < 0) { return; }
+    lseek(fd, offset, 0);
     if (data.length > 0) {
         int slots = (data.length + 7) / 8;
         int[] packed = new int[slots];
