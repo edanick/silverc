@@ -1,19 +1,29 @@
 mod export path;
 import * from fs;
 
-string pathJoinTwo(string left, string right) {
-    if (left.length == 0) { return right; }
-    if (right.length == 0) { return left; }
-    char last = left[left.length - 1];
-    char first = right[0];
-    bool leftSep = last == '/' || last == '\\';
-    bool rightSep = first == '/' || first == '\\';
-    if (leftSep && rightSep) { return left + right[1..right.length]; }
-    if (leftSep || rightSep) { return left + right; }
+bool pathIsSep(char c) {
+    return c == '/' || c == '\\';
+}
+
+string pathSeparator() {
     #on LINUX or MAC
-    return left + "/" + right;
+    return "/";
     #off
-    return left + "\\" + right;
+    return "\\";
+}
+
+string pathJoinTwo(string left, string right) {
+    int leftLen = left.length;
+    if (leftLen == 0) { return right; }
+    int rightLen = right.length;
+    if (rightLen == 0) { return left; }
+    char last = left[leftLen - 1];
+    char first = right[0];
+    bool leftSep = pathIsSep(last);
+    bool rightSep = pathIsSep(first);
+    if (leftSep && rightSep) { return left + right.substring(1, rightLen - 1); }
+    if (leftSep || rightSep) { return left + right; }
+    return left + pathSeparator() + right;
 }
 
 public string join(string left, string right) {
@@ -21,25 +31,60 @@ public string join(string left, string right) {
 }
 
 public string join(string[] parts) {
-    string result = "";
+    string[] pieces = [];
+    bool hasPrev = false;
+    bool prevSep = false;
     for (int i = 0; i < parts.length; i++) {
-        result = pathJoinTwo(result, parts[i]);
+        string part = parts[i];
+        int partLen = part.length;
+        if (partLen == 0) { continue; }
+        if (!hasPrev) {
+            pieces.add(part);
+            hasPrev = true;
+            prevSep = pathIsSep(part[partLen - 1]);
+            continue;
+        }
+        bool partSep = pathIsSep(part[0]);
+        if (prevSep && partSep) {
+            if (partLen > 1) {
+                string stripped = part.substring(1, partLen - 1);
+                pieces.add(stripped);
+                prevSep = pathIsSep(stripped[stripped.length - 1]);
+            }
+        } else if (prevSep || partSep) {
+            pieces.add(part);
+            prevSep = pathIsSep(part[partLen - 1]);
+        } else {
+            pieces.add(pathSeparator());
+            pieces.add(part);
+            prevSep = pathIsSep(part[partLen - 1]);
+        }
     }
-    return result;
+    return pieces.join("");
 }
 
 public string normalize(string p) {
-    string r = "";
-    for (int i = 0; i < p.length; i++) {
-        if (p[i] == '\\') { r += '/'; }
-        else { r += p[i]; }
+    int n = p.length;
+    string[] parts = [];
+    int start = 0;
+    bool changed = false;
+    for (int i = 0; i < n; i++) {
+        if (p[i] == '\\') {
+            changed = true;
+            if (i > start) { parts.add(p.substring(start, i - start)); }
+            parts.add("/");
+            start = i + 1;
+        }
     }
-    return r;
+    if (!changed) { return p; }
+    if (start < n) { parts.add(p.substring(start, n - start)); }
+    return parts.join("");
 }
 
 public string dirname(string p) {
+    int n = p.length;
     int last = -1;
-    for (int i = 0; i < p.length; i++) {
+    for (int i = 0; i < n; i++) {
         if (p[i] == '\\' || p[i] == '/') { last = i; }
     }
     if (last < 0) { return "."; }
@@ -52,13 +97,15 @@ public string dirname(string p) {
 public string relative(string root, string absolute) {
     string norm = normalize(absolute);
     string rootNorm = normalize(root);
-    if (rootNorm.length > 0 && norm.length > rootNorm.length + 1) {
+    int normLen = norm.length;
+    int rootLen = rootNorm.length;
+    if (rootLen > 0 && normLen > rootLen + 1) {
         bool prefix = true;
-        for (int i = 0; i < rootNorm.length; i++) {
+        for (int i = 0; i < rootLen; i++) {
             if (norm[i] != rootNorm[i]) { prefix = false; break; }
         }
-        if (prefix && norm[rootNorm.length] == '/') {
-            return norm[rootNorm.length + 1..norm.length];
+        if (prefix && norm[rootLen] == '/') {
+            return norm.substring(rootLen + 1, normLen - rootLen - 1);
         }
     }
     return norm;
@@ -70,29 +117,34 @@ bool pathIsWindowsForbidden(char c) {
 }
 
 public string guardForWindows(string name) {
-    string result = "";
-    for (int i = 0; i < name.length; i++) {
-        char c = name[i];
-        if (pathIsWindowsForbidden(c)) {
-            result += '_';
-        } else {
-            result += c;
+    int n = name.length;
+    string[] parts = [];
+    int start = 0;
+    for (int i = 0; i < n; i++) {
+        if (pathIsWindowsForbidden(name[i])) {
+            if (i > start) { parts.add(name.substring(start, i - start)); }
+            parts.add("_");
+            start = i + 1;
         }
     }
-    return result;
+    if (start == 0) { return name; }
+    if (start < n) { parts.add(name.substring(start, n - start)); }
+    return parts.join("");
 }
 
 // File stem of a path: the characters after the last separator, with the
 // final extension removed (a leading dot is not an extension, so ".sr"
 // keeps its name). Case is preserved — callers lowercase explicitly.
 public string stem(string p) {
+    int n = p.length;
     int last = -1;
-    for (int i = 0; i < p.length; i++) {
+    for (int i = 0; i < n; i++) {
         if (p[i] == '\\' || p[i] == '/') { last = i; }
     }
-    string name = p.substring(last + 1, p.length);
+    string name = p.substring(last + 1, n - last - 1);
+    int nameLen = name.length;
     int dot = -1;
-    for (int j = name.length - 1; j >= 0; j--) {
+    for (int j = nameLen - 1; j >= 0; j--) {
         if (name[j] == '.') { dot = j; break; }
     }
     if (dot > 0) { name = name.substring(0, dot); }
@@ -103,13 +155,14 @@ public string stem(string p) {
 // <>\"|?* or a control byte, or sitting on a drive whose root is missing.
 // Sibling of guardForWindows (which repairs); this one only reports.
 public bool invalidForWindows(string s) {
-    if (s.length == 0) { return true; }
-    for (int i = 0; i < s.length; i++) {
+    int n = s.length;
+    if (n == 0) { return true; }
+    for (int i = 0; i < n; i++) {
         char c = s[i];
         if (c == '<' || c == '>' || c == '"' || c == '|' || c == '?' || c == '*') { return true; }
         if (c < 32) { return true; }
     }
-    if (s.length >= 2 && s[1] == ':') {
+    if (n >= 2 && s[1] == ':') {
         char d = s[0];
         if ((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z')) {
             string root = (string)d + ":" + (string)char(92);

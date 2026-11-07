@@ -73,9 +73,9 @@ mod export sysinfo;
 
 // Writable string buffer of n bytes (spaces) for NUL-terminated Win32 data.
 string blankBuf(int n) {
-    string r = "";
-    for (int i = 0; i < n; i++) { r += " "; }
-    return r;
+    string[] parts = [];
+    for (int i = 0; i < n; i++) { parts.add(" "); }
+    return parts.join("");
 }
 
 #on WINDOWS
@@ -140,16 +140,18 @@ public string hostname() {
     string buf = blankBuf(256);
     int size = 256;
     GetComputerNameA(buf, &size);
-    string result = "";
-    for (int i = 0; i < size && buf[i] != (char)0; i++) { result += (char)buf[i]; }
-    return result;
+    if (size > 256) { size = 256; }
+    if (size < 0) { size = 0; }
+    string[] parts = [];
+    for (int i = 0; i < size && buf[i] != (char)0; i++) { parts.add((string)buf[i]); }
+    return parts.join("");
     #else
     string buf = blankBuf(256);
     int rc = gethostname(buf, 256);
     if (rc != 0) { return ""; }
-    string result = "";
-    for (int i = 0; i < 256 && buf[i] != (char)0; i++) { result += (char)buf[i]; }
-    return result;
+    string[] parts = [];
+    for (int i = 0; i < 256 && buf[i] != (char)0; i++) { parts.add((string)buf[i]); }
+    return parts.join("");
     #off
     return "";
 }
@@ -178,9 +180,11 @@ public string cpuModel() {
     int ok = RegQueryValueExA(hkey, "ProcessorNameString", null, null, buf, &size);
     RegCloseKey(hkey);
     if (ok != 0) { return ""; }
-    string model = "";
-    for (int i = 0; i < size && buf[i] != (char)0; i++) { model += (char)buf[i]; }
-    return model;
+    if (size > 256) { size = 256; }
+    if (size < 0) { size = 0; }
+    string[] parts = [];
+    for (int i = 0; i < size && buf[i] != (char)0; i++) { parts.add((string)buf[i]); }
+    return parts.join("");
     #on LINUX
     return procCpuModel();
     #on MAC
@@ -238,9 +242,10 @@ public double memoryUsagePercent() {
     if (ok == 0) { return 0; }
     return double((ms[0] >> 32) & 0xFFFFFFFF);
     #on LINUX
-    int64 total = procMemValue("MemTotal");
+    string mem = readProcFile("/proc/meminfo");
+    int64 total = procMemValueIn(mem, "MemTotal");
     if (total <= 0) { return 0; }
-    int64 avail = procMemValue("MemAvailable");
+    int64 avail = procMemValueIn(mem, "MemAvailable");
     return double(total - avail) / double(total) * 100.0;
     #on MAC
     int64 total = memoryTotal();
@@ -290,7 +295,7 @@ public int64 diskFree() {
 public double diskUsagePercent() {
     int64 total = diskTotal();
     if (total == 0) { return 0; }
-    return double(diskTotal() - diskFree()) / double(total) * 100.0;
+    return double(total - diskFree()) / double(total) * 100.0;
 }
 
 public string[] networkIPs() {
@@ -332,15 +337,18 @@ public string username() {
     string buf = blankBuf(256);
     int size = 256;
     GetUserNameA(buf, &size);
-    string result = "";
-    for (int i = 0; i < size && buf[i] != (char)0; i++) { result += (char)buf[i]; }
-    return result;
+    if (size > 256) { size = 256; }
+    if (size < 0) { size = 0; }
+    string[] parts = [];
+    for (int i = 0; i < size && buf[i] != (char)0; i++) { parts.add((string)buf[i]); }
+    return parts.join("");
     #on LINUX
     string buf = blankBuf(256);
     int rc = getlogin_r(buf, 256);
     if (rc == 0) {
-        string result = "";
-        for (int i = 0; i < 256 && buf[i] != (char)0; i++) { result += (char)buf[i]; }
+        string[] parts = [];
+        for (int i = 0; i < 256 && buf[i] != (char)0; i++) { parts.add((string)buf[i]); }
+        string result = parts.join("");
         if (result.length > 0) { return result; }
     }
     return sysProcEnvValue("USER");
@@ -348,8 +356,9 @@ public string username() {
     string buf = blankBuf(256);
     int rc = getlogin_r(buf, 256);
     if (rc == 0) {
-        string result = "";
-        for (int i = 0; i < 256 && buf[i] != (char)0; i++) { result += (char)buf[i]; }
+        string[] parts = [];
+        for (int i = 0; i < 256 && buf[i] != (char)0; i++) { parts.add((string)buf[i]); }
+        string result = parts.join("");
         if (result.length > 0) { return result; }
     }
     return env.get("USER");
@@ -386,13 +395,13 @@ public string tempDir() {
 public string lang() {
     #on WINDOWS
     int langId = GetUserDefaultUILanguage();
-    string result = "";
-    result += (char)((langId >> 8) & 0xFF);
-    result += (char)(langId & 0xFF);
-    result += "-";
-    result += (char)((langId >> 8) & 0xFF);
-    result += (char)(langId & 0xFF);
-    return result;
+    string[] parts = [];
+    parts.add((string)char((langId >> 8) & 0xFF));
+    parts.add((string)char(langId & 0xFF));
+    parts.add("-");
+    parts.add((string)char((langId >> 8) & 0xFF));
+    parts.add((string)char(langId & 0xFF));
+    return parts.join("");
     #on LINUX
     return sysProcEnvValue("LANG");
     #on MAC
@@ -426,13 +435,13 @@ public string env(string name) {
 // One 256-byte NUL-terminated Darwin utsname field at byte offset off.
 string macUtsField(int[] u, int off) {
     #on MAC
-    string r = "";
+    string[] parts = [];
     for (int i = 0; i < 256; i++) {
         int b = (u[(off + i) / 8] >> (((off + i) % 8) * 8)) & 0xFF;
         if (b == 0) { break; }
-        r += (char)b;
+        parts.add((string)char(b));
     }
-    return r;
+    return parts.join("");
     #off
     return "";
 }
@@ -444,9 +453,11 @@ string macSysctlString(string name) {
     int len = 256;
     int rc = sysctlbyname(name, buf, &len, null, 0);
     if (rc != 0) { return ""; }
-    string r = "";
-    for (int i = 0; i < len && buf[i] != (char)0; i++) { r += (char)buf[i]; }
-    return r;
+    if (len > 256) { len = 256; }
+    if (len < 0) { len = 0; }
+    string[] parts = [];
+    for (int i = 0; i < len && buf[i] != (char)0; i++) { parts.add((string)buf[i]); }
+    return parts.join("");
     #off
     return "";
 }
@@ -469,13 +480,13 @@ int64 macSysctlU64(string name) {
 // straight out of the int[] slots (no address arithmetic).
 string utsField(int[] u, int off) {
     #on LINUX
-    string r = "";
+    string[] parts = [];
     for (int i = 0; i < 65; i++) {
         int b = (u[(off + i) / 8] >> (((off + i) % 8) * 8)) & 0xFF;
         if (b == 0) { break; }
-        r += (char)b;
+        parts.add((string)char(b));
     }
-    return r;
+    return parts.join("");
     #off
     return "";
 }
@@ -487,19 +498,19 @@ string readProcFile(string path) {
     #on LINUX
     int fd = open(path, 0, 0);
     if (fd < 0) { return ""; }
-    string out = "";
+    string[] parts = [];
+    int[] chunk = new int[512];
     while (true) {
-        int[] chunk = new int[512];
         int n = read(fd, chunk, 4096);
         if (n <= 0) { break; }
         for (int i = 0; i < n; i++) {
             int b = (chunk[i / 8] >> ((i % 8) * 8)) & 0xFF;
-            out += (char)b;
+            parts.add((string)char(b));
         }
         if (n < 4096) { break; }
     }
     close(fd);
-    return out;
+    return parts.join("");
     #off
     return "";
 }
@@ -510,26 +521,33 @@ string sysProcEnvValue(string key) {
     #on LINUX
     if (key.length == 0) { return ""; }
     string want = key + "=";
+    int wantLen = want.length;
     int fd = open("/proc/self/environ", 0, 0);
     if (fd < 0) { return ""; }
-    string entry = "";
+    string[] entryParts = [];
+    int entryLen = 0;
     string value = "";
     int hit = 0;
+    int[] chunk = new int[512];
     while (true) {
-        int[] chunk = new int[512];
         int n = read(fd, chunk, 4096);
         if (n <= 0) { break; }
         for (int i = 0; i < n; i++) {
             int b = (chunk[i / 8] >> ((i % 8) * 8)) & 0xFF;
             if (b == 0) {
-                if (entry.length >= want.length && entry.substr(0, want.length) == want) {
-                    value = entry.substr(want.length);
-                    hit = 1;
-                    break;
+                if (entryLen >= wantLen) {
+                    string entry = entryParts.join("");
+                    if (entry.substr(0, wantLen) == want) {
+                        value = entry.substr(wantLen);
+                        hit = 1;
+                        break;
+                    }
                 }
-                entry = "";
+                entryParts = [];
+                entryLen = 0;
             } else {
-                entry += (char)b;
+                entryParts.add((string)char(b));
+                entryLen++;
             }
         }
         if (hit != 0 || n < 4096) { break; }
@@ -540,21 +558,32 @@ string sysProcEnvValue(string key) {
     return "";
 }
 
-// Number after "Key:" in /proc/meminfo (kilobytes), or 0 when absent.
-int64 procMemValue(string key) {
+// Number after "Key:" in already-read /proc/meminfo text (kilobytes), or 0
+// when absent. Splitting the parse from the read lets callers that need two
+// values read the file once (INV-36).
+int64 procMemValueIn(string mem, string key) {
     #on LINUX
-    string mem = readProcFile("/proc/meminfo");
     string want = key + ":";
     int at = mem.indexOf(want);
     if (at < 0) { return 0; }
+    int memLen = mem.length;
     int p = at + want.length;
-    while (p < mem.length && (mem[p] == ' ' || mem[p] == '\t')) { p++; }
+    while (p < memLen && (mem[p] == ' ' || mem[p] == '\t')) { p++; }
     int64 v = 0;
-    while (p < mem.length && mem[p] >= '0' && mem[p] <= '9') {
+    while (p < memLen && mem[p] >= '0' && mem[p] <= '9') {
         v = v * 10 + int64(mem[p]) - 48;
         p++;
     }
     return v;
+    #off
+    return 0;
+}
+
+// Number after "Key:" in /proc/meminfo (kilobytes), or 0 when absent.
+int64 procMemValue(string key) {
+    #on LINUX
+    string mem = readProcFile("/proc/meminfo");
+    return procMemValueIn(mem, key);
     #off
     return 0;
 }
@@ -572,10 +601,11 @@ string procCpuModel() {
     string tail = cpu.substr(at + want.length);
     int rel = tail.indexOf(":");
     if (rel < 0) { return ""; }
+    int tailLen = tail.length;
     int start = rel + 1;
-    while (start < tail.length && (tail[start] == ' ' || tail[start] == '\t')) { start++; }
+    while (start < tailLen && (tail[start] == ' ' || tail[start] == '\t')) { start++; }
     int end = start;
-    while (end < tail.length && tail[end] != '\n') { end++; }
+    while (end < tailLen && tail[end] != '\n') { end++; }
     return tail.substr(start, end - start);
     #off
     return "";
