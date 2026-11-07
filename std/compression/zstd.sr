@@ -29,6 +29,17 @@ import * from exception;
 // flagged. Decoders accept any frame size field and skip dictionary/checksum
 // handling only for the shapes they read.
 
+// Runtime-sized byte[] allocation routed through a return statement.
+// The self-hosted compiler mis-lowers `byte[] x = new byte[expr];`
+// declaration initializers as one-element byte-array literals, so every
+// runtime-sized byte[] is built here and returned; the caller's
+// `byte[] out = zsAllocBytes(n);` init is a plain call and takes the
+// normal path (netAllocBytes/wsAllocBytes precedent). silverc-rs lowers
+// both shapes correctly; this detour is byte-for-byte equivalent there.
+private byte[] zsAllocBytes(int count) {
+    return new byte[count];
+}
+
 class ZstdEngine {
     // Zstandard levels are 1..22 (reference CLI range: 1 fast, 19 default-ish,
     // 22 ultra). This build emits valid STORE frames at every level in range
@@ -53,30 +64,35 @@ class ZstdEngine {
     public byte[] compress(byte[] data, int level = 3) {
         int n = data.length;
         this.checkedLevel(level); // validate the 1..22 range (throws if out of bounds)
-        byte[] out = [];
-        out.add(40); out.add(181); out.add(47); out.add(253); // magic (LE FD2FB528)
+        int blocks = 1;
+        if (n > 0) { blocks = (n + 131071) / 131072; }
+        byte[] out = zsAllocBytes(9 + n + 3 * blocks);
+        out[0] = 40; out[1] = 181; out[2] = 47; out[3] = 253; // magic (LE FD2FB528)
         // FHD: Single_Segment=1 (bit5), FCS_flag=2 (bits3-4 -> 4 bytes), no
         // checksum, no dict.
-        out.add(32 | (2 << 3));
-        out.add(n & 255);
-        out.add((n >> 8) & 255);
-        out.add((n >> 16) & 255);
-        out.add((n >> 24) & 255);
+        out[4] = 32 | (2 << 3);
+        out[5] = n & 255;
+        out[6] = (n >> 8) & 255;
+        out[7] = (n >> 16) & 255;
+        out[8] = (n >> 24) & 255;
         int pos = 0;
         if (n == 0) {
             // One empty raw block, last=1: 3-byte header = 1 (last, type0, size0).
-            out.add(1); out.add(0); out.add(0);
+            out[9] = 1; out[10] = 0; out[11] = 0;
             return out;
         }
+        int k = 9;
         while (pos < n) {
             int chunk = n - pos;
             if (chunk > 131072) { chunk = 131072; }
             bool last = pos + chunk >= n;
             int hdr = (last ? 1 : 0) | (0 << 1) | (chunk << 3); // Raw_Block type=0
-            out.add(hdr & 255);
-            out.add((hdr >> 8) & 255);
-            out.add((hdr >> 16) & 255);
-            for (int i = 0; i < chunk; i++) { out.add(data[pos + i]); }
+            out[k] = hdr & 255;
+            out[k + 1] = (hdr >> 8) & 255;
+            out[k + 2] = (hdr >> 16) & 255;
+            k = k + 3;
+            for (int i = 0; i < chunk; i++) { out[k + i] = data[pos + i]; }
+            k = k + chunk;
             pos = pos + chunk;
         }
         return out;
@@ -121,7 +137,7 @@ class ZstdEngine {
             if (btype == 3) { return []; } // reserved
             if (btype == 0) {
                 // Raw_Block: bsize literal bytes copied verbatim.
-                if (p + bsize > contentEnd) { return []; }
+                if (bsize > contentEnd - p) { return []; }
                 for (int i = 0; i < bsize; i++) { out.add(data[p + i] & 255); }
                 p = p + bsize;
             } else if (btype == 1) {

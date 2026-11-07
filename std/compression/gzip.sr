@@ -4,6 +4,17 @@ import DeflateEngine from compression.deflate;
 import * from exception;
 import * from hash;
 
+// Runtime-sized byte[] allocation routed through a return statement.
+// The self-hosted compiler mis-lowers `byte[] x = new byte[expr];`
+// declaration initializers as one-element byte-array literals, so every
+// runtime-sized byte[] is built here and returned; the caller's
+// `byte[] out = gzAllocBytes(n);` init is a plain call and takes the
+// normal path (netAllocBytes/wsAllocBytes precedent). silverc-rs lowers
+// both shapes correctly; this detour is byte-for-byte equivalent there.
+private byte[] gzAllocBytes(int count) {
+    return new byte[count];
+}
+
 // DOCS -- GZIP codec (RFC 1952, DOCS/260): the DEFLATE payload plus a fixed
 // 10-byte header (ID1/ID2/CM/FLG=0/MTIME/EXTRA/OS=3) and an 8-byte trailer
 // (CRC32 + ISIZE). The raw DEFLATE work is std/compression/deflate.sr; this
@@ -36,23 +47,24 @@ class GzipEngine {
         byte[] payload = d.compress(data, lvl);
         int crc = hash.crc32(data);
         int isize = data.length & 268435455;
-        byte[] out = [];
-        out.add(31); // ID1
-        out.add(139); // ID2
-        out.add(8); // CM = deflate
-        out.add(0); // FLG
-        out.add(0); out.add(0); out.add(0); out.add(0); // MTIME
-        out.add(0); // XFL
-        out.add(3); // OS = Unix
-        for (int i = 0; i < payload.length; i++) { out.add(payload[i]); }
-        out.add(crc & 255);
-        out.add((crc >> 8) & 255);
-        out.add((crc >> 16) & 255);
-        out.add((crc >> 24) & 255);
-        out.add(isize & 255);
-        out.add((isize >> 8) & 255);
-        out.add((isize >> 16) & 255);
-        out.add((isize >> 24) & 255);
+        byte[] out = gzAllocBytes(18 + payload.length);
+        out[0] = 31; // ID1
+        out[1] = 139; // ID2
+        out[2] = 8; // CM = deflate
+        out[3] = 0; // FLG
+        out[4] = 0; out[5] = 0; out[6] = 0; out[7] = 0; // MTIME
+        out[8] = 0; // XFL
+        out[9] = 3; // OS = Unix
+        for (int i = 0; i < payload.length; i++) { out[10 + i] = payload[i]; }
+        int t = 10 + payload.length;
+        out[t] = crc & 255;
+        out[t + 1] = (crc >> 8) & 255;
+        out[t + 2] = (crc >> 16) & 255;
+        out[t + 3] = (crc >> 24) & 255;
+        out[t + 4] = isize & 255;
+        out[t + 5] = (isize >> 8) & 255;
+        out[t + 6] = (isize >> 16) & 255;
+        out[t + 7] = (isize >> 24) & 255;
         return out;
     }
 
@@ -66,6 +78,7 @@ class GzipEngine {
             // FEXTRA: two-byte length then that many bytes.
             if (p + 2 > n) { return []; }
             int xlen = (data[p] & 255) | ((data[p + 1] & 255) << 8);
+            if (xlen > n - p - 2) { return []; }
             p = p + 2 + xlen;
         }
         if ((flg & 8) != 0) {
@@ -79,8 +92,8 @@ class GzipEngine {
         if ((flg & 2) != 0) { p = p + 2; }
         if (p + 8 > n) { return []; }
         int bodyLen = n - p - 8;
-        byte[] payload = [];
-        for (int i = 0; i < bodyLen; i++) { payload.add(data[p + i]); }
+        byte[] payload = gzAllocBytes(bodyLen);
+        for (int i = 0; i < bodyLen; i++) { payload[i] = data[p + i]; }
         var d = new DeflateEngine();
         byte[] out = d.decompress(payload);
         int crc = (data[n - 8] & 255) | ((data[n - 7] & 255) << 8) | ((data[n - 6] & 255) << 16) | ((data[n - 5] & 255) << 24);

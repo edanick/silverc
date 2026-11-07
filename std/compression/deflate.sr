@@ -44,6 +44,17 @@ int[] dflClOrder() {
     return t;
 }
 
+// Runtime-sized byte[] allocation routed through a return statement.
+// The self-hosted compiler mis-lowers `byte[] x = new byte[expr];`
+// declaration initializers as one-element byte-array literals, so every
+// runtime-sized byte[] is built here and returned; the caller's
+// `byte[] out = dflAllocBytes(n);` init is a plain call and takes the
+// normal path (netAllocBytes/wsAllocBytes precedent). silverc-rs lowers
+// both shapes correctly; this detour is byte-for-byte equivalent there.
+private byte[] dflAllocBytes(int count) {
+    return new byte[count];
+}
+
 // Growable int cell buffer (class-held: growth through a property stays
 // correct on every backend; see ProjectVisited).
 class OutBuf {
@@ -68,8 +79,8 @@ class OutBuf {
     }
 
     public byte[] toBytes() {
-        byte[] r = [];
-        for (int i = 0; i < this.len; i++) { r.add(this.data[i] & 255); }
+        byte[] r = dflAllocBytes(this.len);
+        for (int i = 0; i < this.len; i++) { r[i] = this.data[i] & 255; }
         return r;
     }
 }
@@ -249,9 +260,10 @@ class BitWriter {
 }
 
 // Length symbol + extra value/bits for a match length 3..258.
-int dflLenSym(int len, int[] info) {
-    int[] base = dflLenBase();
-    int[] extra = dflLenExtra();
+// `dflLenSymWith` is the single home of the scan: it uses sticky tables so
+// a caller that probes many lengths pays no per-call allocation. The
+// public `dflLenSym` wrapper keeps its arity and fresh-table behaviour.
+int dflLenSymWith(int len, int[] info, int[] base, int[] extra) {
     for (int s = 28; s >= 0; s--) {
         if (len >= base[s]) {
             info[0] = 257 + s;
@@ -266,10 +278,14 @@ int dflLenSym(int len, int[] info) {
     return 257;
 }
 
+int dflLenSym(int len, int[] info) {
+    return dflLenSymWith(len, info, dflLenBase(), dflLenExtra());
+}
+
 // Distance symbol + extra value/bits for a distance 1..32768.
-int dflDistSym(int dist, int[] info) {
-    int[] base = dflDistBase();
-    int[] extra = dflDistExtra();
+// `dflDistSymWith` is the single home of the scan (sticky tables); the
+// public `dflDistSym` wrapper keeps its arity and fresh-table behaviour.
+int dflDistSymWith(int dist, int[] info, int[] base, int[] extra) {
     for (int s = 29; s >= 0; s--) {
         if (dist >= base[s]) {
             info[0] = s;
@@ -284,6 +300,10 @@ int dflDistSym(int dist, int[] info) {
     return 0;
 }
 
+int dflDistSym(int dist, int[] info) {
+    return dflDistSymWith(dist, info, dflDistBase(), dflDistExtra());
+}
+
 class DeflateEngine {
     // GZip/zlib-style hash chains over the 3-byte prefix (power-of-two
     // table, 32K window, capped probe chain). Tables ride class fields (not
@@ -292,11 +312,29 @@ class DeflateEngine {
     private int[] matchPrev;
     // Probe-chain cap for the current compress() call (set from the level).
     private int chainLimit;
+    // Length/distance tables cached once per engine so the per-match
+    // symbol probes allocate nothing (the With helpers above take them).
+    private int[] lenBaseC;
+    private int[] lenExtraC;
+    private int[] distBaseC;
+    private int[] distExtraC;
     public HuffTable dynLitTable;
     public HuffTable dynDistTable;
 
     construct {
         this.chainLimit = 64;
+        this.lenBaseC = dflLenBase();
+        this.lenExtraC = dflLenExtra();
+        this.distBaseC = dflDistBase();
+        this.distExtraC = dflDistExtra();
+    }
+
+    public int lenSymC(int len, int[] info) {
+        return dflLenSymWith(len, info, this.lenBaseC, this.lenExtraC);
+    }
+
+    public int distSymC(int dist, int[] info) {
+        return dflDistSymWith(dist, info, this.distBaseC, this.distExtraC);
     }
 
     // DEFLATE levels are zlib-style: 0 = stored, 1..9 = increasing match-search
@@ -398,20 +436,20 @@ class DeflateEngine {
             int bestDist = info[1];
             bool useMatch = false;
             if (bestLen >= 3) {
-                dflLenSym(bestLen, code);
+                this.lenSymC(bestLen, code);
                 int mcost = 7 + code[2] + 5 + this.dflDistExtraFor(bestDist);
                 int lcost = 0;
                 for (int k = 0; k < bestLen; k++) { lcost = lcost + this.litCost(data[pos + k]); }
                 if (mcost < lcost) { useMatch = true; }
             }
             if (useMatch) {
-                dflLenSym(bestLen, code);
+                this.lenSymC(bestLen, code);
                 int sym = code[0];
                 int extraVal = code[1];
                 int extraN = code[2];
                 bw.putCode(this.fixedCodeOf(sym), this.fixedLenOf(sym));
                 if (extraN > 0) { bw.putBits(extraVal, extraN); }
-                dflDistSym(bestDist, code);
+                this.distSymC(bestDist, code);
                 bw.putCode(code[0], 5);
                 if (code[2] > 0) { bw.putBits(code[1], code[2]); }
                 for (int k = 0; k < bestLen; k++) {
@@ -447,10 +485,8 @@ class DeflateEngine {
     }
 
     public int dflDistExtraFor(int dist) {
-        int[] extra = dflDistExtra();
-        int[] base = dflDistBase();
         for (int s = 29; s >= 0; s--) {
-            if (dist >= base[s]) { return extra[s]; }
+            if (dist >= this.distBaseC[s]) { return this.distExtraC[s]; }
         }
         return 0;
     }
