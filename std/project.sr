@@ -1514,14 +1514,31 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild,
     #on DEBUG
     eprintln("TRC strip done " + (string)stripped.length);
     #off
-    // One pieces buffer for the remaining stages (stripped aggregate, shipped
-    // std inlines, library sources): a single terminal join replaces the old
-    // chain of whole-aggregate `+=` copies. aggLen tracks the joined length
-    // for the TRC traces below.
+    string metadata = "";
+    string name = projectManifestValue(manifest, "name");
+    string version = projectManifestValue(manifest, "version");
+    string license = projectManifestValue(manifest, "license");
+    if (name != "") { metadata += "const string APP_NAME = \"" + name + "\";\n"; }
+    if (version != "") { metadata += "const string APP_VERSION = \"" + version + "\";\n"; }
+    if (license != "") { metadata += "const string APP_LICENSE = \"" + license + "\";\n"; }
+    metadata += "const string LANG_VERSION = \"0.7.10\";\n";
+    metadata += "const string APP_COPYRIGHT = \"Edan M. © 2025\";\n";
+    // DOCS/253 -- expose the project type so Silver code can branch on it.
+    // A missing `type` (or the legacy `exe` spelling) means `console`.
+    string ptype = projectManifestValue(manifest, "type");
+    if (ptype == "" || ptype == "exe") { ptype = "console"; }
+    metadata += "const string APP_TYPE = \"" + ptype + "\";\n";
+    // One pieces buffer for the remaining stages (metadata consts,
+    // stripped aggregate, shipped std inlines, library sources): a single
+    // terminal join replaces the old chain of whole-aggregate `+=` copies
+    // and the trailing `metadata + body` concatenation, which duplicated
+    // the whole body one last time. aggLen tracks the joined length for
+    // the TRC traces below.
     ProjectPieces agg = new ProjectPieces();
+    agg.add(metadata);
     agg.add(stripped);
     #on DEBUG
-    int aggLen = stripped.length;
+    int aggLen = metadata.length + stripped.length;
     #off
 
     // `.qs` libraries listed under `imports` are not auto-imported; declaring
@@ -1615,11 +1632,16 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild,
                                         string stdRoot = projectDirname(stdPath);
                                         string[] stdDirs = [];
                                         stdDirs.add("");
-                                        string stdText = projectCollect(stdPath, stdRoot, stdDirs, visited, emitMarkers, progress, debugBuild);
-                                        agg.add(stdText);
+                                        #on DEBUG
+                                        int stdPartsBefore = agg.parts.length;
+                                        #off
+                                        projectCollectInto(stdPath, stdRoot, stdDirs, visited, emitMarkers, progress, debugBuild, agg);
                                         agg.add("\n");
                                         #on DEBUG
-                                        aggLen += stdText.length + 1;
+                                        for (int stdPi = stdPartsBefore; stdPi < agg.parts.length; stdPi++) {
+                                            string stdPiece = agg.parts[stdPi];
+                                            aggLen += stdPiece.length;
+                                        }
                                         #off
                                     }
                                 }
@@ -1644,22 +1666,8 @@ string projectBuildSource(string projectPath, bool emitMarkers, bool debugBuild,
     string body = agg.joinAll();
     body = projectExpandCollections(body, root, collections);
 
-    string metadata = "";
-    string name = projectManifestValue(manifest, "name");
-    string version = projectManifestValue(manifest, "version");
-    string license = projectManifestValue(manifest, "license");
-    if (name != "") { metadata += "const string APP_NAME = \"" + name + "\";\n"; }
-    if (version != "") { metadata += "const string APP_VERSION = \"" + version + "\";\n"; }
-    if (license != "") { metadata += "const string APP_LICENSE = \"" + license + "\";\n"; }
-    metadata += "const string LANG_VERSION = \"0.7.10\";\n";
-    metadata += "const string APP_COPYRIGHT = \"Edan M. © 2025\";\n";
-    // DOCS/253 -- expose the project type so Silver code can branch on it.
-    // A missing `type` (or the legacy `exe` spelling) means `console`.
-    string ptype = projectManifestValue(manifest, "type");
-    if (ptype == "" || ptype == "exe") { ptype = "console"; }
-    metadata += "const string APP_TYPE = \"" + ptype + "\";\n";
     if (countOut.length > 0) { countOut[0] = progress.processedCount(); }
-    return metadata + body;
+    return body;
 }
 
 // Build a QuickSilver (.qs) library bundle (DOCS/226) for a `quicksilver`
