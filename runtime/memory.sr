@@ -115,10 +115,11 @@ public int smHeaderValidate(SmHeader h, int64 fileSize, int checkFileSize, int64
     if (h.codec != SM_CODEC_NONE || (h.flags & SM_FLAG_COMPRESSED) != 0) { return SM_ERR_CODEC; }
     if (h.page_id == 0 || h.owner_id == 0 || h.generation == 0) { return SM_ERR_ID; }
     if (h.chunk_size == 0 || h.chunk_size > SM_MAX_CHUNK_SIZE) { return SM_ERR_SIZE; }
+    if (h.logical_size < 0 || h.payload_size < 0) { return SM_ERR_SIZE; }
     int64 expectedCount = h.logical_size / (int64)h.chunk_size;
     if (h.logical_size % (int64)h.chunk_size != 0) { expectedCount++; }
     if (expectedCount > 4294967295) { return SM_ERR_INDEX; }
-    if ((int)expectedCount != h.chunk_count) { return SM_ERR_INDEX; }
+    if ((int64)h.chunk_count != expectedCount) { return SM_ERR_INDEX; }
     if (h.index_offset != SM_INDEX_OFFSET_REQUIRED) { return SM_ERR_INDEX; }
     int64 expectedIndexSize = expectedCount * (int64)SM_INDEX_RECORD_SIZE;
     if (h.index_size != expectedIndexSize) { return SM_ERR_INDEX; }
@@ -285,7 +286,8 @@ bool smIsHex16(string s) {
 
 int64 smParseHex16(string s) {
     int64 v = 0;
-    for (int i = 0; i < s.length; i++) {
+    int n = s.length;
+    for (int i = 0; i < n; i++) {
         char c = s[i];
         int d = 0;
         if (c >= '0' && c <= '9') { d = int(c) - 48; }
@@ -322,8 +324,11 @@ public bool smSystemPressureHigh() {
 
 // Gate 2: Silver bump at/above 90% of the configured process budget.
 public bool smBumpNearOom(int64 bumpOffset, int64 rounded) {
-    int64 budget = smSt[SM_ST_PROC_BUDGET] * 9 / 10;
-    return bumpOffset + rounded >= budget;
+    if (bumpOffset < 0 || rounded < 0) { return false; }
+    int64 budget = smSt[SM_ST_PROC_BUDGET];
+    int64 threshold = (budget / 10) * 9 + ((budget % 10) * 9) / 10;
+    if (bumpOffset > 9223372036854775807 - rounded) { return true; }
+    return bumpOffset + rounded >= threshold;
 }
 
 // Both gates: the only state that may page.
@@ -338,11 +343,15 @@ public void smSetBudgets(int64 processBudget, int64 pageBudget) {
 }
 
 public void smAccountAlloc(int64 bytes) {
-    smSt[SM_ST_MANAGED] += bytes;
-    smSt[SM_ST_RESIDENT] += bytes;
+    if (bytes <= 0) { return; }
+    int64 newManaged = smSt[SM_ST_MANAGED] + bytes;
+    if (newManaged >= smSt[SM_ST_MANAGED]) { smSt[SM_ST_MANAGED] = newManaged; }
+    int64 newResident = smSt[SM_ST_RESIDENT] + bytes;
+    if (newResident >= smSt[SM_ST_RESIDENT]) { smSt[SM_ST_RESIDENT] = newResident; }
 }
 
 public void smAccountFree(int64 bytes) {
+    if (bytes <= 0) { return; }
     smSt[SM_ST_MANAGED] -= bytes;
     if (smSt[SM_ST_MANAGED] < 0) { smSt[SM_ST_MANAGED] = 0; }
     smSt[SM_ST_RESIDENT] -= bytes;
@@ -409,12 +418,16 @@ public string smSpillPath(int64 pageId, int64 ownerId, int64 generation, int kin
 // (codec none); payloads sit contiguous after header + index.
 byte[] smBuildIndex(SmHeader h, byte[] payload) {
     int n = h.chunk_count;
+    if (n <= 0 || n > 67108863) { return []; }
+    if (h.chunk_size <= 0) { return []; }
+    if ((int64)payload.length < h.logical_size) { return []; }
     byte[] idx = new byte[n * SM_INDEX_RECORD_SIZE];
     for (int i = 0; i < n; i++) {
         int64 lo = (int64)i * (int64)h.chunk_size;
         int64 rem = h.logical_size - lo;
         int wantLen = h.chunk_size;
         if (rem < (int64)wantLen) { wantLen = int(rem); }
+        if (wantLen <= 0) { return []; }
         int64 fo = (int64)h.index_offset + h.index_size + lo;
         byte[] chunk = new byte[wantLen];
         for (int j = 0; j < wantLen; j++) { chunk[j] = payload[int(lo) + j]; }
@@ -434,15 +447,19 @@ byte[] smBuildIndex(SmHeader h, byte[] payload) {
 
 // Header + index + payload image. [] when the header is invalid.
 byte[] smBuildPageFile(SmHeader h, byte[] payload) {
+    if ((int64)payload.length != h.logical_size) { return []; }
     byte[] header = smHeaderEncode(h);
     if (header.length == 0) { return []; }
     byte[] idx = smBuildIndex(h, payload);
     if (idx.length != int(h.index_size)) { return []; }
-    int total = SM_HEADER_SIZE + idx.length + payload.length;
+    int idxLen = idx.length;
+    int payLen = payload.length;
+    if (payLen > 2147483647 - SM_HEADER_SIZE - idxLen) { return []; }
+    int total = SM_HEADER_SIZE + idxLen + payLen;
     byte[] file = new byte[total];
     for (int i = 0; i < SM_HEADER_SIZE; i++) { file[i] = header[i]; }
-    for (int i = 0; i < idx.length; i++) { file[SM_HEADER_SIZE + i] = idx[i]; }
-    for (int i = 0; i < payload.length; i++) { file[SM_HEADER_SIZE + idx.length + i] = payload[i]; }
+    for (int i = 0; i < idxLen; i++) { file[SM_HEADER_SIZE + i] = idx[i]; }
+    for (int i = 0; i < payLen; i++) { file[SM_HEADER_SIZE + idxLen + i] = payload[i]; }
     return file;
 }
 
@@ -482,15 +499,17 @@ public string smWritePage(byte[] payload, int kind) {
     h.logical_size = (int64)payload.length;
     h.payload_size = (int64)payload.length;
     h.chunk_size = SM_DEFAULT_CHUNK_SIZE;
-    int count = (payload.length + SM_DEFAULT_CHUNK_SIZE - 1) / SM_DEFAULT_CHUNK_SIZE;
+    int count = int(((int64)payload.length + SM_DEFAULT_CHUNK_SIZE - 1) / SM_DEFAULT_CHUNK_SIZE);
     h.chunk_count = count;
     h.index_offset = SM_INDEX_OFFSET_REQUIRED;
-    h.index_size = (int64)(count * SM_INDEX_RECORD_SIZE);
+    h.index_size = (int64)count * SM_INDEX_RECORD_SIZE;
     h.payload_checksum = hash.crc32c(payload);
     h.name_hash = smSt[SM_ST_NAME_HASH];
     byte[] fileBytes = smBuildPageFile(h, payload);
     if (fileBytes.length == 0) { smFl[SM_FL_LAST_ERR] = SM_ERR_INDEX; return ""; }
-    if (smSt[SM_ST_PAGEFILE] + (int64)fileBytes.length > smSt[SM_ST_PAGE_BUDGET]) { smFl[SM_FL_LAST_ERR] = SM_ERR_SIZE; return ""; }
+    int64 pageBudget = smSt[SM_ST_PAGE_BUDGET];
+    int64 pageUsed = smSt[SM_ST_PAGEFILE];
+    if (pageBudget - pageUsed < (int64)fileBytes.length) { smFl[SM_FL_LAST_ERR] = SM_ERR_SIZE; return ""; }
     string tmp = path + ".tmp";
     smOwnedTmps.add(tmp);
     // MAC.md §5d (mac-gated only): ensure /tmp/silver/ exists (create if
@@ -526,7 +545,7 @@ public string smPageOutBytes(byte[] payload, int kind) {
     smFl[SM_FL_LAST_ERR] = SM_OK;
     if (kind != SM_KIND_STRING && kind != SM_KIND_BYTES) { smFl[SM_FL_LAST_ERR] = SM_ERR_KIND; return ""; }
     if (payload.length < SM_PAGE_MIN) { return ""; }
-    if (smSt[SM_ST_MANAGED] < smSt[SM_ST_PROC_BUDGET] * 9 / 10) { return ""; }
+    if (!smBumpNearOom(smSt[SM_ST_MANAGED], 0)) { return ""; }
     if (!smSystemPressureHigh()) { return ""; }
     return smWritePage(payload, kind);
 }
@@ -540,23 +559,26 @@ public string smPageOutString(string data) {
 // [] on any mismatch (partial bytes are never exposed).
 bool smVerifyIndex(SmHeader h, byte[] file, byte[] payload) {
     int n = h.chunk_count;
+    if (n < 0) { return false; }
+    if (h.index_size < 0 || h.index_size > (int64)file.length) { return false; }
     int idxSize = int(h.index_size);
-    byte[] idx = new byte[idxSize];
-    for (int i = 0; i < idxSize; i++) { idx[i] = file[SM_HEADER_SIZE + i]; }
+    if (idxSize > file.length - SM_HEADER_SIZE) { return false; }
+    if ((int64)idxSize != (int64)n * SM_INDEX_RECORD_SIZE) { return false; }
     for (int i = 0; i < n; i++) {
         int base = i * SM_INDEX_RECORD_SIZE;
-        int64 lo = smGetU64(idx, base);
-        int64 fo = smGetU64(idx, base + 8);
-        int llen = smGetU32(idx, base + 16);
-        int slen = smGetU32(idx, base + 20);
-        int crc = smGetU32(idx, base + 24);
-        int flags = smGetU32(idx, base + 28);
+        int64 lo = smGetU64(file, SM_HEADER_SIZE + base);
+        int64 fo = smGetU64(file, SM_HEADER_SIZE + base + 8);
+        int llen = smGetU32(file, SM_HEADER_SIZE + base + 16);
+        int slen = smGetU32(file, SM_HEADER_SIZE + base + 20);
+        int crc = smGetU32(file, SM_HEADER_SIZE + base + 24);
+        int flags = smGetU32(file, SM_HEADER_SIZE + base + 28);
         int64 wantLo = (int64)i * (int64)h.chunk_size;
         if (lo != wantLo) { return false; }
         if (fo != (int64)h.index_offset + h.index_size + wantLo) { return false; }
         int64 rem = h.logical_size - wantLo;
         int wantLen = h.chunk_size;
         if (rem < (int64)wantLen) { wantLen = int(rem); }
+        if (wantLen < 0) { return false; }
         if (llen != wantLen || slen != wantLen) { return false; }
         int wantFlags = 0;
         if (i == n - 1) { wantFlags = 1; }
@@ -588,9 +610,10 @@ public byte[] smPageInBytes(string spillPath) {
     if (dec != SM_OK) { smFl[SM_FL_LAST_ERR] = dec; return []; }
     int chk = smHeaderValidate(d, (int64)fileBytes.length, 1, want, 1);
     if (chk != SM_OK) { smFl[SM_FL_LAST_ERR] = chk; return []; }
+    if (d.payload_size < 0 || d.index_size < 0 || d.payload_size > (int64)fileBytes.length || d.index_size > (int64)fileBytes.length) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return []; }
     int idxSize = int(d.index_size);
     int payLen = int(d.payload_size);
-    if (fileBytes.length != SM_HEADER_SIZE + idxSize + payLen) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return []; }
+    if ((int64)fileBytes.length != (int64)SM_HEADER_SIZE + d.index_size + d.payload_size) { smFl[SM_FL_LAST_ERR] = SM_ERR_BOUNDS; return []; }
     byte[] payload = new byte[payLen];
     for (int i = 0; i < payLen; i++) { payload[i] = fileBytes[SM_HEADER_SIZE + idxSize + i]; }
     if (hash.crc32c(payload) != d.payload_checksum) { smFl[SM_FL_LAST_ERR] = SM_ERR_CHECKSUM; return []; }
@@ -606,10 +629,12 @@ public byte[] smPageInBytes(string spillPath) {
 // unowned *.sm files.
 public int smPageCleanup() {
     int n = 0;
-    for (int i = 0; i < smOwnedTmps.length; i++) {
+    int tmpsN = smOwnedTmps.length;
+    for (int i = 0; i < tmpsN; i++) {
         if (smOwnedTmps[i] != "") { file.delete(smOwnedTmps[i]); smOwnedTmps[i] = ""; n++; }
     }
-    for (int i = 0; i < smOwnedFinals.length; i++) {
+    int finalsN = smOwnedFinals.length;
+    for (int i = 0; i < finalsN; i++) {
         if (smOwnedFinals[i] != "") { file.delete(smOwnedFinals[i]); smOwnedFinals[i] = ""; n++; }
     }
     smSt[SM_ST_PAGEFILE] = 0;
