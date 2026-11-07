@@ -1,0 +1,79 @@
+// THREAD_SAFETY.md T2 -- the `threads` module really spawns.
+// Self-hosted-suite mirror of silverc-rs/tests/suite/thread_spawn.sr: the
+// same fixture, so the spawn is proven under BOTH compilers.
+//
+// Before this fixture, `Thread.start()` was an empty body: the spawn was
+// unreachable dead text, so `join()` was a bounded no-op and a program that
+// "started a thread" ran no callback at all. This fixture fails unless the
+// callback ACTUALLY runs on another thread and `join()` waits for it.
+//
+// The proof is a FILE the callback writes and the main thread reads back
+// AFTER the join: if the callback never ran the file is absent, and if
+// `join()` did not wait the read races the write. A file is the signal
+// because Silver has no mutable module-level binding and no mutable class
+// property -- the only cross-thread channel the language offers today.
+//
+// The callback calls a MODULE-LEVEL helper rather than `fs.*` directly:
+// the self-hosted compiler resolves an imported module inside an anonymous
+// function body only through a helper, not through the import itself (the
+// `fs` name is not in scope inside the lambda there). The helper keeps the
+// fixture portable across all three implementations.
+//
+// `multi` is proven the same way: two callbacks, two files, one join point
+// over the whole group.
+
+import * from thread;
+import * from fs;
+
+void mark(string path) {
+    fs.writeString(path, "ran");
+}
+
+void main() {
+    // 1. A single spawned thread runs its callback and join() waits for it.
+    threads.Thread t = threads.start((void () {
+        mark("thread_spawn_single.txt");
+    }));
+    t.join();
+    if (!fs.exists("thread_spawn_single.txt")) {
+        printline("FAIL single spawn: the callback never ran");
+        exit(1);
+    }
+    if (fs.readString("thread_spawn_single.txt") != "ran") {
+        printline("FAIL single spawn: the callback wrote the wrong content");
+        exit(2);
+    }
+
+    // 2. A group of callbacks all run, and joinAll() waits for all of them.
+    threads.ThreadGroup g = threads.multi([
+        (void () {
+            mark("thread_spawn_group_zero.txt");
+        }),
+        (void () {
+            mark("thread_spawn_group_one.txt");
+        })
+    ]);
+    g.startAll();
+    g.joinAll();
+    if (!fs.exists("thread_spawn_group_zero.txt")) {
+        printline("FAIL group spawn: the first callback never ran");
+        exit(3);
+    }
+    if (!fs.exists("thread_spawn_group_one.txt")) {
+        printline("FAIL group spawn: the second callback never ran");
+        exit(4);
+    }
+
+    // 3. A second spawn on the same module still works -- the trampoline is
+    //    reusable, not one-shot.
+    threads.Thread u = threads.start((void () {
+        mark("thread_spawn_second.txt");
+    }));
+    u.join();
+    if (!fs.exists("thread_spawn_second.txt")) {
+        printline("FAIL second spawn: the callback never ran");
+        exit(5);
+    }
+
+    printline("thread spawn ok");
+}

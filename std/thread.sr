@@ -5,26 +5,24 @@ mod export threads;
 // (threads -> win32.kernel32).
 //
 // SHAPE (UNIFIED_CORE_LIBRARY.md §4 rule 6): the raw OS calls live INSIDE
-// the public function bodies (Thread.join / sleep) behind `#on WINDOWS`
-// regions with a shared POSIX `#else` (LINUX/MAC spellings identical) --
-// one unified function name, no win-prefixed helpers, no wrapper
-// indirection. Thread.start holds no spawn call and needs no region (see
-// DORMANT SPAWN below). OS selection is compile-time via the
-// preprocessor; the module does not use the runtime `os` check. The
-// failure style stays OS-independent: sleep() is a silent no-op, start()
-// leaves the handle at 0 so join() is a no-op too, and the spawn path
-// reports failure through the 0 handle (the Win32 failure convention).
+// the public function bodies (Thread.start / Thread.join / sleep) behind
+// `#on WINDOWS` regions with a shared POSIX `#else` (LINUX/MAC spellings
+// identical) -- one unified function name, no win-prefixed helpers, no
+// wrapper indirection. OS selection is compile-time via the preprocessor;
+// the module does not use the runtime `os` check. The failure style stays
+// OS-independent: sleep() is a silent no-op, and a FAILED spawn leaves the
+// handle at 0 so join() is a no-op too (the Win32 failure convention).
 //
 // PLAIN IMPORT: the kernel32 grant is a plain full-table
 // `import * from win32.kernel32;` inside its own region -- no alias
-// imports. TABLE STATUS: Sleep, WaitForSingleObject and CloseHandle are
-// tabled on BOTH compilers (silverc-rs/src/win32.rs and the self-host
-// win32ExportTable), so the plain grant resolves them directly. CreateThread
-// is tabled on NEITHER, and the plain full-table grant resolves calls
-// strictly against the tables (silverc-rs win32::resolve scans
-// dll_exports first; the self-host win32Allowed checks win32TableHas) -- so
-// a CreateThread call through this import would fail to compile, which is
-// the documented dead-spawn posture below.
+// imports. TABLE STATUS: Sleep, WaitForSingleObject, CloseHandle AND
+// CreateThread are tabled on BOTH compilers (silverc-rs/src/win32.rs and
+// the self-host win32ExportTable -- the self-host's three sites are
+// compiler/parser.sr, compiler/mini_cg/windows.sr and the native-call
+// classifier in compiler/mini_cg/mini_cg.sr), so the plain grant resolves
+// them directly. The plain full-table grant resolves calls strictly
+// against the tables (silverc-rs win32::resolve scans dll_exports first;
+// the self-host win32Allowed checks win32TableHas).
 //
 // DISPATCH (per compiler, probed): `threads` is
 // builtin-reserved on NEITHER compiler -- silverc-rs main.rs
@@ -38,37 +36,33 @@ mod export threads;
 // (MiniCg.emitFieldAccess) -- a pre-existing builtin, unrelated to this
 // module's API, which defines no `length` member.
 //
-// DORMANT SPAWN MECHANISM (probed, stays dead -- documented): this module's
-// spawn entry passes its private trampoline to CreateThread as a BARE
-// FUNCTION NAME -- `CreateThread(null, 0, threadStart, this, 0, null)`.
-// Neither compiler supports function-name-as-value: an identifier that names
-// a function lowers to a null/garbage slot (silverc-rs gen_expr falls
-// through to `xor eax, eax` = 0; the self-hosted MiniCg loads [rbp+0], the
-// saved frame pointer). The language also lacks the fn-typed constructor
-// parameters, fn-typed props and fn-type arrays this API shape calls for
-// (probed on both compilers), so the spawn entry is unreachable dead text:
-// a spawned thread would jump to an invalid address and fault the process.
-// CreateThread is additionally not callable through the plain grant (see
-// PLAIN IMPORT). Every public signature keeps its name/arity/return type;
-// the three inexpressible shapes are documented at their sites below.
+// SPAWN MECHANISM (probed): this module's spawn entry passes its private
+// trampoline to CreateThread as a BARE FUNCTION NAME --
+// `CreateThread(null, 0, threadStart, this, 0, null)`. Both compilers
+// support function-name-as-value: an identifier that names a function
+// lowers to the function's address (silverc-rs gen_expr pushes the address
+// reloc and patches the placeholder; the self-hosted MiniCg does the same
+// through findUserFunctionRef / genFunctionAddressRef / patchFnAddrRefs).
+// The language also has the fn-typed constructor parameters, fn-typed props
+// and fn-type arrays this API shape calls for (DOCS/259 G1/G2/G3), so the
+// spawn is live.
+//
+// The trampoline's parameter is the Thread itself: the OS hands the pointer
+// back in the first argument register (RCX on Win64, RDI on SysV), which is
+// exactly where the callee's first parameter lives, so no cast is needed.
 //
 // BOUNDED JOIN: join waits with a -1 (INFINITE) millisecond count on the
 // stored handle only; the public join() guards on `this.handle != 0`
 // first, so joining an un-started Thread is a no-op and probes over this
 // module can never hang through it.
 //
-// LINUX BACKEND (Phase B): pthread_join for join(), nanosleep for sleep(),
-// from linux.libc. The dormant-spawn posture is OS-INDEPENDENT and stays:
-// pthread_create needs a start-routine function pointer, and bare function
-// names lower to null/garbage on both compilers (see DORMANT SPAWN above),
-// so start() keeps no region and no spawn call on Linux either; handle
-// stays 0 and join() is a no-op there exactly like on Windows.
+// LINUX BACKEND (Phase B): pthread_create for the spawn, pthread_join for
+// join(), nanosleep for sleep(), from linux.libc.
 //
 // MAC BACKEND (Phase B, code-only -- MAC.md section 10, UNVALIDATED until
-// probed on Mac hardware): pthread_join for join(), nanosleep for sleep()
-// via mac.libsystem -- identical spellings, shared through `#else`. The
-// dormant-spawn posture stays OS-independent (libSystem pthreads need the
-// same unexpressible start-routine pointer).
+// probed on Mac hardware): pthread_create for the spawn, pthread_join for
+// join(), nanosleep for sleep() via mac.libsystem -- identical spellings,
+// shared through `#else`.
 
 #on WINDOWS
 import * from win32.kernel32;
@@ -79,25 +73,29 @@ import * from mac.libsystem;
 #off
 
 class Thread {
-    private prop object fn;
+    // The callback to run on the new thread. A fn-typed prop holds the
+    // callback's address; `this.fn()` calls through it (DOCS/259 G2).
+    private prop void () fn;
     private prop int handle;
 
-    construct (object fn) {
+    construct (void () fn) {
         this.fn = fn;
         this.handle = 0;
     }
 
     public void start() {
-        // DORMANT SPAWN (see header): a spawn would pass the private
-        // trampoline `threadStart` below as a bare function name --
-        // `this.handle = CreateThread(null, 0, threadStart, this, 0,
-        // null);` -- which both compilers lower to a null/garbage entry
-        // slot. The path stays dead and UNCOMPILED: CreateThread is in
-        // neither compiler's kernel32 export table, so the plain full-table
-        // grant rejects the call, and the bare-function-name lowering would
-        // fault any spawned thread at the invalid address. This body
-        // intentionally holds no spawn call and needs no region (§4 rule 6:
-        // nothing here is OS-enabled).
+        #on WINDOWS
+        // CreateThread(NULL, 0, threadStart, this, 0, NULL): the start
+        // routine is the module trampoline below and lpParameter is this
+        // Thread, so the trampoline can recover the callback.
+        this.handle = CreateThread(null, 0, threadStart, this, 0, null);
+        #else
+        // pthread_create(&tid, NULL, threadStart, this): same shape, with
+        // the thread id written back through the first argument.
+        int tid = 0;
+        pthread_create(&tid, null, threadStart, this);
+        this.handle = tid;
+        #off
     }
 
     public void join() {
@@ -150,10 +148,20 @@ public Thread start(void () fn) {
     return t;
 }
 
-public ThreadGroup multi(object[] fns) {
+// `multi` takes an ARRAY OF CALLBACKS -- `void ()[] fns` -- so each entry
+// is callable in its own right (DOCS/259 G3: fn-typed arrays store an
+// 8-byte address per element). The array parameter is by-reference (arrays
+// are reference types), so the callee reads the caller's array in place.
+//
+// The loop is an INDEX loop, not a `foreach`: a `foreach` binding declares
+// its variable's type, and the fn type is not a declarable variable type
+// (only a parameter type and a prop type), so `foreach (void () fn in fns)`
+// does not parse. The index loop reads the same elements -- `fns[i]` is the
+// element's address, and `fns[i]()` calls through it.
+public ThreadGroup multi(void ()[] fns) {
     ThreadGroup g = new ThreadGroup();
-    foreach (object fn in fns) {
-        g.add(new Thread(fn));
+    for (int i = 0; i < fns.length; i++) {
+        g.add(new Thread(fns[i]));
     }
     return g;
 }
@@ -171,14 +179,12 @@ public void sleep(int ms) {
     #off
 }
 
-private int threadStart(object param) {
-    // DORMANT SPAWN trampoline (see header): a spawn would run the body
-    // `Thread t = param as Thread; t.fn(); return 0;` and pass this
-    // trampoline to CreateThread as a bare function name. Neither statement
-    // can compile (`as` casts do not parse on either compiler -- silverc-rs
-    // reports "Expected expression" at the `as` -- and `t.fn()` needs the
-    // fn-typed prop invocation), and the entry slot lowers to null/garbage,
-    // so the trampoline's work is unreachable. The trampoline keeps its
-    // exact signature; nothing calls it.
+// The thread entry point the OS calls. The OS hands the Thread pointer back
+// as its single argument -- in the first argument register, which is where
+// this callee's first parameter lives -- so the trampoline receives the
+// Thread directly and runs the callback. It returns 0 -- the value is the
+// thread's exit code, which nothing here reads.
+private int threadStart(Thread t) {
+    t.fn();
     return 0;
 }
