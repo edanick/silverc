@@ -233,12 +233,12 @@ string[] projectAddEntry(string root, string entry, string[] excludes) {
 // (`mini_cg.windows` -> `mini_cg/windows.sr`); `sep` is the target's
 // separator ("/" on LINUX, "\\" on WINDOWS).
 string projectDottedPath(string name, string sep) {
-    string out = "";
+    string[] parts = [];
     for (int i = 0; i < name.length; i++) {
-        if (name[i] == '.') { out += sep; }
-        else { out += (string)name[i]; }
+        if (name[i] == '.') { parts.add(sep); }
+        else { parts.add((string)name[i]); }
     }
-    return out;
+    return parts.join("");
 }
 
 string projectSourcePath(string root, string[] sourceDirs, string moduleName) {
@@ -506,12 +506,7 @@ string[] nativeSplitExports(string inner) {
 }
 
 string nativeJoinExports(string[] parts) {
-    string out = "";
-    for (int i = 0; i < parts.length; i++) {
-        if (i > 0) { out += " "; }
-        out += parts[i];
-    }
-    return out;
+    return parts.join(" ");
 }
 
 class NativeModules {
@@ -823,17 +818,24 @@ QsParts projectQsSplit(string content) {
     if (!projectQsBundle(content)) { return out; }
     int pos = 6;
     pos += 4;              // flags (reserved)
+    if (pos + 4 > content.length) { return out; }
     int metaLen = projectQsU32(content, pos);
     pos += 4 + metaLen;    // metadata payload
+    if (metaLen < 0 || pos > content.length || pos + 4 > content.length) { return out; }
     int count = projectQsU32(content, pos);
     pos += 4;
+    if (count < 0) { return out; }
     for (int i = 0; i < count; i++) {
+        if (pos + 4 > content.length) { break; }
         int nameLen = projectQsU32(content, pos);
         pos += 4;
+        if (nameLen < 0 || pos + nameLen > content.length) { break; }
         string filename = projectSlice(content, pos, pos + nameLen);
         pos += nameLen;
+        if (pos + 4 > content.length) { break; }
         int srcLen = projectQsU32(content, pos);
         pos += 4;
+        if (srcLen < 0 || pos + srcLen > content.length) { break; }
         out.sources.add(projectSlice(content, pos, pos + srcLen));
         pos += srcLen;
         string stem = path.stem(filename);
@@ -859,6 +861,7 @@ bool projectQsBundle(string content) {
 
 // Read a fixed 4-byte base-255 big-endian u32 at pos (digit = byte - 1).
 int projectQsU32(string content, int pos) {
+    if (pos < 0 || pos + 4 > content.length) { return 0; }
     int v = 0;
     for (int i = 0; i < 4; i++) {
         v = v * 255 + (content[pos + i] - 1);
@@ -1055,12 +1058,12 @@ string projectRelativePath(string root, string path) {
             if (path[i] != prefix[i]) { matched = false; }
         }
         if (matched) {
-            string result = "";
+            string[] parts = [];
             for (int i = prefix.length; i < path.length; i++) {
-                if (path[i] == '\\') { result += "/"; }
-                else { result += (string)path[i]; }
+                if (path[i] == '\\') { parts.add("/"); }
+                else { parts.add((string)path[i]); }
             }
-            return result;
+            return parts.join("");
         }
     }
     return path;
@@ -1189,11 +1192,12 @@ string projectStripDirectives(string source) {
 // Cache-marker comment line (--cache-bytecode): the driver splits the
 // aggregate back into per-file chunks along these lines.
 string projectCacheMarker(string path) {
-    string norm = "";
+    string[] parts = [];
     for (int i = 0; i < path.length; i++) {
-        if (path[i] == '\\') { norm += "/"; }
-        else { norm += (string)path[i]; }
+        if (path[i] == '\\') { parts.add("/"); }
+        else { parts.add((string)path[i]); }
     }
+    string norm = parts.join("");
     return "//@@SILVER_FILE@@ " + norm + "\n";
 }
 
@@ -1306,20 +1310,21 @@ void projectCollectInto(string path, string root, string[] sourceDirs, ProjectVi
 }
 
 string projectCollectionEscape(string value) {
-    string result = "";
+    string[] parts = [];
     for (int i = 0; i < value.length; i++) {
         char c = value[i];
-        if (c == '\\') { result += "\\\\"; }
-        else if (c == '"') { result += "\\\""; }
-        else if (c == '\t') { result += "\\t"; }
-        else { result += (string)c; }
+        if (c == '\\') { parts.add("\\\\"); }
+        else if (c == '"') { parts.add("\\\""); }
+        else if (c == '\t') { parts.add("\\t"); }
+        else { parts.add((string)c); }
     }
-    return result;
+    return parts.join("");
 }
 
 string projectCollectionLiteral(string path) {
     string content = file.readString(path);
-    string result = "[";
+    string[] parts = [];
+    parts.add("[");
     bool first = true;
     int start = 0;
     for (int i = 0; i <= content.length; i++) {
@@ -1331,14 +1336,17 @@ string projectCollectionLiteral(string path) {
                 int end = i;
                 if (end > start && content[end - 1] == '\r') { end--; }
                 string value = projectSlice(content, start, end);
-                if (!first) { result += ", "; }
+                if (!first) { parts.add(", "); }
                 first = false;
-                result += "\"" + projectCollectionEscape(value) + "\"";
+                parts.add("\"");
+                parts.add(projectCollectionEscape(value));
+                parts.add("\"");
             }
             start = i + 1;
         }
     }
-    return result + "]";
+    parts.add("]");
+    return parts.join("");
 }
 
 void projectCollectionFail(string path, int line) {
