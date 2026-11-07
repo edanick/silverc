@@ -121,6 +121,14 @@ class Parser {
     // modules export the same top-level name. The entry file declares no
     // module, so its items keep "" and resolve exactly as before.
     public string curModule;
+    // Module-name interning table (MEMORY.md M3): moduleNames[id] is the
+    // spelling for id, and moduleIds is its reverse index. Index 0 is
+    // always "" (the entry file / untagged items), so a Node holding 0
+    // means "no module" exactly as the old "" srcModule did. internModule
+    // dedups on insert: one spelling, one copy, however many top-level
+    // items name it.
+    public string[] moduleNames;
+    private dict<string, int> moduleIds;
     // `internal:` section marker active inside the class body being parsed
     // (reset by `public:`/`private:` and at the start of every class).
     private bool classSectionInternal;
@@ -215,6 +223,8 @@ class Parser {
         this.modExportNames = [];
         this.modExportInternal = [];
         this.curModule = "";
+        this.moduleNames = [""];
+        this.moduleIds = {};
         this.classSectionInternal = false;
         this.fnPtrCallScope = [];
         this.anonKnownGlobals = [];
@@ -229,6 +239,17 @@ class Parser {
     // just past the end of a line (SYNTAX_EXCEPTIONS.md #3).
     public void setLineLengths(int[] lens) {
         this.lineLens = lens;
+    }
+
+    // Deduped module-name interning: the id of `name`, adding it to
+    // moduleNames on first sight. "" is always id 0 (entry file).
+    private int internModule(string name) {
+        if (name.length == 0) { return 0; }
+        if (this.moduleIds.contains(name)) { return this.moduleIds[name]; }
+        int id = this.moduleNames.length;
+        this.moduleNames.add(name);
+        this.moduleIds[name] = id;
+        return id;
     }
 
     private void recordError(string msg) {
@@ -1409,7 +1430,7 @@ class Parser {
                     for (int mi = 0; mi < item.childCount(); mi++) {
                         Node inner = item.child(mi);
                         if (item.isInternal) { inner.isInternal = true; }
-                        inner.srcModule = item.name;
+                        inner.srcModule = this.internModule(item.name);
                         if (inner.kind == 100 && inner.name == "main") {
                             mainSeen = true;
                         }
@@ -1422,7 +1443,7 @@ class Parser {
                 } else if (item.kind == 61 || item.kind == 50 || item.kind == 73 || item.kind == 16 || item.kind == 53 || item.kind == 54 || item.kind == 55 || item.kind == 59 || item.kind == 68) {
                     mainBody.children.add(item);
                 } else {
-                    item.srcModule = this.curModule;
+                    item.srcModule = this.internModule(this.curModule);
                     items.add(item);
                 }
             }
@@ -2147,7 +2168,7 @@ class Parser {
         hidden.kind = 102;
         hidden.line = newTok.line;
         hidden.col = newTok.col;
-        hidden.srcModule = this.curModule;
+        hidden.srcModule = this.internModule(this.curModule);
         this.parseClassParentsInto(hidden);
         this.expect(102);
         this.parseClassBodyInto(hidden);
@@ -5188,7 +5209,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
         this.anonCounter = pp.anonCounter;
         for (int hi = 0; hi < pp.anonClasses.length; hi++) {
             Node hidden = pp.anonClasses[hi];
-            hidden.srcModule = this.curModule;
+            hidden.srcModule = this.internModule(this.curModule);
             this.registerDeclaredType(hidden.name);
             this.anonClasses.add(hidden);
         }

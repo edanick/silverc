@@ -1223,7 +1223,7 @@ int[] objLinkFresh(CliFlags flags, ObjSession? osess, ObjPlan p, int subsystem, 
 // boundary falls back loudly to the monolithic path (the message is
 // printed here; the object cache is left untouched). Link failures print
 // the exact reference error and exit — never a silent mislink.
-int[] objCompileFlow(CliFlags flags, ObjSession? osess, CacheSession? sess, Node[] ast, string source, string inputFile, bool inputIsProject, string manifest, ProgressReporter progress, int subsystem, string[] verKeys, string[] verVals) {
+int[] objCompileFlow(CliFlags flags, ObjSession? osess, CacheSession? sess, Node[] ast, string source, string inputFile, bool inputIsProject, string manifest, ProgressReporter progress, int subsystem, string[] verKeys, string[] verVals, string[] moduleTable) {
     int[] empty = [];
     if (osess == null) { return empty; }
     string target = ppTargetOsFor(flags.targetOs);
@@ -1340,6 +1340,7 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, CacheSession? sess, Node
         }
         // Progress ticks stay on the monolithic path: the recorded
         // emission runs without progress (mirrors the reference).
+        ocg.moduleNames = moduleTable;
         ocg.genProgramOwned(ast, owners, entryKey);
         if (ocg.objHasRawRel32) {
             flags.errLine("cache-object: inline assembly is outside the v1 object tier; full monolithic compile, objects not updated");
@@ -1904,6 +1905,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
 
     Token[] tokens = [];
     Node[] ast = [];
+    string[] moduleTable = [""];
     int[] peData = [];
     bool objFast = false;
     ObjPlan fastPlan = new ObjPlan();
@@ -2062,6 +2064,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
     if (parseTargetOs == "MACX64") { parseTargetOs = "LINUX"; }
     pipeParseUnit(tokens, lineLens, true, drvNm, parseTargetOs, true, pout);
     ast = pout.program;
+    moduleTable = pout.moduleNames;
 
     // Post-parse call diagnostics (EXCEPTIONS/*.md): unknown-method /
     // did-you-mean over the fully collected symbol table, and filesystem
@@ -2140,7 +2143,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
     // v1 boundary falls back loudly; link failures exit inside. Fast-link
     // warm hits already hold the linked image above, so the tier is skipped.
     if (!objFast && osess != null) {
-        peData = objCompileFlow(flags, osess, sess, ast, source, inputFile, inputIsProject, manifest, progress, linkSubsystem, viKeys, viValues);
+        peData = objCompileFlow(flags, osess, sess, ast, source, inputFile, inputIsProject, manifest, progress, linkSubsystem, viKeys, viValues, moduleTable);
     }
     if (peData.length == 0) {
     MiniAsm asm = new MiniAsm();
@@ -2169,6 +2172,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
     if (progress != null) { progress.parseDone(); }
     if (progress != null) { progress.phaseCodegen(); }
     cg.progress = progress;
+    cg.moduleNames = moduleTable;
 
     cg.genProgram(ast);
 

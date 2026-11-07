@@ -74,11 +74,17 @@ class MiniCg {
     public prop int[] foundMemberArgCounts;
     public prop string[] foundMemberReturns;
     // Owning module per collected function (parallel to funcNames): the
-    // `mod export` name of the file that declared it, "" for the entry file
-    // and synthetic helpers. A module-qualified call (`datetime.now()`)
-    // resolves to the named module's own entry when two collected modules
-    // export the same top-level name; bare calls never consult it.
-    public prop string[] funcModules;
+    // interned module id of the `mod export` file that declared it (index
+    // into moduleNames below), 0 for the entry file and synthetic helpers.
+    // A module-qualified call (`datetime.now()`) resolves to the named
+    // module's own entry when two collected modules export the same
+    // top-level name; bare calls never consult it.
+    public prop int[] funcModules;
+    // Module interning table handed over from the parse (PipeParseOut):
+    // moduleNames[id] is the spelling for funcModules id. moduleIds is
+    // its reverse index, rebuilt in genProgram from moduleNames.
+    public prop string[] moduleNames;
+    private prop dict<string, int> moduleIds;
     public prop string[] constNames;
     public prop int[] constValues;
     public prop string[] constStringValues;
@@ -406,6 +412,8 @@ class MiniCg {
         this.foundMemberReturns = [];
         this.funcClasses = [];
         this.funcModules = [];
+        this.moduleNames = [""];
+        this.moduleIds = {};
         this.constNames = [];
         this.constValues = [];
         this.constStringValues = [];
@@ -2733,6 +2741,12 @@ int strIdx = this.stringPatchIndices[i];
     }
 
     public void genProgram(Node[] program) {
+        // Reverse index over the handed-over interning table (index 0 is
+        // "" and never a lookup key: funcModuleMatches guards id 0 first).
+        this.moduleIds = {};
+        for (int modi = 1; modi < this.moduleNames.length; modi++) {
+            this.moduleIds[this.moduleNames[modi]] = modi;
+        }
         this.collectClassLayouts(program);
         for (int i = 0; i < program.length; i++) {
             Node pi = program[i];
@@ -3223,7 +3237,7 @@ int strIdx = this.stringPatchIndices[i];
         if (!existed) {
             this.funcNames.add(fname);
             this.funcClasses.add("");
-            this.funcModules.add("");
+            this.funcModules.add(0);
             this.funcRetTypes.add("void");
             this.funcOffsets.add(off);
             this.funcOwners.add(this.objEntryOwner);
@@ -12129,20 +12143,24 @@ public void genNewCall(Node call) {
     // same-arity ties keep the last declaration. -1 when nothing matches.
     private bool funcModuleMatches(int idx, string want) {
         // True when the collected function at idx was declared in module
-        // `want`: exact match first, then a case-insensitive fallback for a
-        // receiver whose spelling differs in case only (llmai/LLMAI shape).
-        // Untracked entries (runtime helpers, older table tails) and the
-        // moduless entry file never match, so those calls keep the legacy
-        // bare-name scan exactly.
+        // `want`: interned-id match first, then a case-insensitive fallback
+        // for a receiver whose spelling differs in case only (llmai/LLMAI
+        // shape). Untracked entries (runtime helpers, older table tails)
+        // and the moduless entry file never match, so those calls keep the
+        // legacy bare-name scan exactly.
+        int haveId = 0;
+        if (idx >= 0 && idx < this.funcModules.length) { haveId = this.funcModules[idx]; }
+        if (haveId <= 0 || want.length == 0) { return false; }
+        int wantId = -1;
+        if (this.moduleIds.contains(want)) { wantId = this.moduleIds[want]; }
+        if (wantId >= 0 && haveId == wantId) { return true; }
         string have = "";
-        if (idx >= 0 && idx < this.funcModules.length) { have = this.funcModules[idx]; }
-        if (have.length == 0 || want.length == 0) { return false; }
-        if (have == want) { return true; }
+        if (haveId >= 0 && haveId < this.moduleNames.length) { have = this.moduleNames[haveId]; }
         // Case-insensitive fallback: compare without building either lowered
-        // string. This runs once per candidate scanned for every
-        // module-qualified call site, and a lowered copy of each name on each
-        // side grew the compiler's peak memory by gigabytes on multi-module
-        // projects (the runtime never frees intermediates).
+        // string. This runs only on an id miss (a case-variant receiver),
+        // and a lowered copy of each name on each side grew the compiler's
+        // peak memory by gigabytes on multi-module projects (the runtime
+        // never frees intermediates).
         if (have.length != want.length) { return false; }
         for (int i = 0; i < have.length; i++) {
             int a = int(have[i]);
