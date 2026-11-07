@@ -46,6 +46,11 @@ mod export mini_cg.mac;
 
 class MiniCgMac {
 
+    private prop string[] macLibSystemSet;
+    private prop bool macLibSystemReady;
+    private prop string[] macObjcSet;
+    private prop bool macObjcReady;
+
     public int aapcsRegCount() {
         return 8;
     }
@@ -134,15 +139,36 @@ class MiniCgMac {
     }
 
     public bool macTableHas(string lib, string fn) {
-        string table = this.macExportTable(lib);
+        return this.macExportSet(lib).contains(fn);
+    }
+
+    // Split one export table into its words exactly as the old tableHas
+    // scan did (space-separated, empty words skipped). Runs ONCE per
+    // library per MiniCgMac; the cached words back slice-free
+    // membership. Mirror of parser.sr parseExportTable (INV-19).
+    private string[] parseExportTable(string table) {
+        string[] words = [];
         int i = 0;
         while (i < table.length) {
             while (i < table.length && table[i] == ' ') { i++; }
             int start = i;
             while (i < table.length && table[i] != ' ') { i++; }
-            if (i > start && fn == projectSlice(table, start, i)) { return true; }
+            if (i > start) { words.add(projectSlice(table, start, i)); }
         }
-        return false;
+        return words;
+    }
+
+    private string[] macExportSet(string lib) {
+        if (lib == "/usr/lib/libSystem.B.dylib") {
+            if (!this.macLibSystemReady) { this.macLibSystemSet = this.parseExportTable(this.macExportTable(lib)); this.macLibSystemReady = true; }
+            return this.macLibSystemSet;
+        }
+        if (lib == "/usr/lib/libobjc.A.dylib") {
+            if (!this.macObjcReady) { this.macObjcSet = this.parseExportTable(this.macExportTable(lib)); this.macObjcReady = true; }
+            return this.macObjcSet;
+        }
+        string[] none = [];
+        return none;
     }
 
     public void macAddLib(MiniCg cg, string lib) {

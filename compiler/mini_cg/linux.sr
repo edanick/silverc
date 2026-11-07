@@ -27,6 +27,13 @@ mod export mini_cg.linux;
 
 class MiniCgLinux {
 
+    private prop string[] linuxLibcSet;
+    private prop bool linuxLibcReady;
+    private prop string[] linuxX11Set;
+    private prop bool linuxX11Ready;
+    private prop string[] linuxXtstSet;
+    private prop bool linuxXtstReady;
+
     public int sysvRegAt(int i) {
         if (i == 0) { return 7; }
         if (i == 1) { return 6; }
@@ -100,15 +107,40 @@ class MiniCgLinux {
     }
 
     public bool linuxTableHas(string lib, string fn) {
-        string table = this.linuxExportTable(lib);
+        return this.linuxExportSet(lib).contains(fn);
+    }
+
+    // Split one export table into its words exactly as the old tableHas
+    // scan did (space-separated, empty words skipped). Runs ONCE per
+    // library per MiniCgLinux; the cached words back slice-free
+    // membership. Mirror of parser.sr parseExportTable (INV-19).
+    private string[] parseExportTable(string table) {
+        string[] words = [];
         int i = 0;
         while (i < table.length) {
             while (i < table.length && table[i] == ' ') { i++; }
             int start = i;
             while (i < table.length && table[i] != ' ') { i++; }
-            if (i > start && fn == projectSlice(table, start, i)) { return true; }
+            if (i > start) { words.add(projectSlice(table, start, i)); }
         }
-        return false;
+        return words;
+    }
+
+    private string[] linuxExportSet(string lib) {
+        if (lib == "libc.so.6") {
+            if (!this.linuxLibcReady) { this.linuxLibcSet = this.parseExportTable(this.linuxExportTable(lib)); this.linuxLibcReady = true; }
+            return this.linuxLibcSet;
+        }
+        if (lib == "libX11.so.6") {
+            if (!this.linuxX11Ready) { this.linuxX11Set = this.parseExportTable(this.linuxExportTable(lib)); this.linuxX11Ready = true; }
+            return this.linuxX11Set;
+        }
+        if (lib == "libXtst.so.6") {
+            if (!this.linuxXtstReady) { this.linuxXtstSet = this.parseExportTable(this.linuxExportTable(lib)); this.linuxXtstReady = true; }
+            return this.linuxXtstSet;
+        }
+        string[] none = [];
+        return none;
     }
 
     public void linuxAddLib(MiniCg cg, string lib) {
