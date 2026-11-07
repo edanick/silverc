@@ -142,6 +142,14 @@ class VisibilityChecker {
     // (an unknown module is skipped everywhere); only hits are stored.
     private prop string[] resNames;
     private prop VisModuleFile[] resFiles;
+    // Preloaded driver resolutions (DrvModuleCache converted to VisModuleFile
+    // pairs by the driver): name -> (path, text) the driver's single read
+    // already holds. Consulted before probing (INV-15 shared aggregate);
+    // a preloaded text is used only when its path is exactly the unified
+    // ladder's answer for the name (see visPreloadedModule) — otherwise the
+    // checker probes as before.
+    private prop string[] preNames;
+    private prop VisModuleFile[] preFiles;
     // Preprocessor build mode (--debug): forwarded so file filtering matches
     // the main pipeline exactly.
     private prop bool debugBuild;
@@ -151,11 +159,13 @@ class VisibilityChecker {
     // and segfaults (silverc-rs emit_cargs_linux main-as-entry gap).
     private prop string exeDir;
 
-    construct (string entry, bool debugBuild, string exeDir) {
+    construct (string entry, bool debugBuild, string exeDir, string[] preNames, VisModuleFile[] preFiles) {
         this.errors = [];
         this.entryPath = entry;
         this.debugBuild = debugBuild;
         this.exeDir = exeDir;
+        this.preNames = preNames;
+        this.preFiles = preFiles;
         this.declNames = [];
         this.declKinds = [];
         this.declInternal = [];
@@ -180,6 +190,12 @@ class VisibilityChecker {
     private VisModuleFile resolveModule(string name) {
         for (int i = 0; i < this.resNames.length; i++) {
             if (this.resNames[i] == name) { return this.resFiles[i]; }
+        }
+        VisModuleFile pre = visPreloadedModule(name, this.entryPath, this.exeDir, this.preNames, this.preFiles);
+        if (pre != null && pre.path.length > 0) {
+            this.resNames.add(name);
+            this.resFiles.add(pre);
+            return pre;
         }
         VisModuleFile resolved = visFindModuleFile(name, this.entryPath, this.exeDir);
         if (resolved.path.length > 0) {
@@ -708,9 +724,11 @@ bool visBuiltinModule(string name) {
 
 // Locate a source-level module by name, returning its path AND the text the
 // probe read (a `VisModuleFile` with empty path when the module is
-// native/builtin or cannot be found). Mirrors the driver's findModuleFile
-// resolution exactly so enforcement sees the same files the aggregate
-// compile collects (flat-first nested resolution: `<name>.sr`,
+// native/builtin or cannot be found). Candidate order is now identical to
+// the driver's findModuleFile (sibling trio, sibling-std trio, bare trio,
+// exe tree, cwd trees, compiler trees, silveri tree, in that order) and
+// the same self-import skip applies, so enforcement sees the same files
+// the aggregate compile collects (flat-first nested resolution: `<name>.sr`,
 // then dotted `a.b` -> `a/b.sr`, then `<name>/<name>.sr`).
 
 // Map dots in `name` to `sep` (`mini_cg.windows` -> `mini_cg/windows.sr`
@@ -731,21 +749,50 @@ bool visIsDottedChild(string name, string root) {
     return projectFind(name, root + ".", 0) == 0;
 }
 
+// Native/builtin or baked-in modules never resolve to project-external
+// files on disk: `visBuiltinModule` plus the compiler baked-ins and their
+// dotted children (the driver excludes the baked-ins too, so enforcement
+// must match). `visFindModuleFile` and `visPreloadedModule` share this
+// single gate so a preloaded driver hit for a gated name is always
+// refused (the probe answer for such a name is empty).
+bool visModuleExcluded(string name) {
+    if (visBuiltinModule(name)) { return true; }
+    if ( name == "mini_asm"
+        || name == "mini_cg" || name == "mini_ef"
+        || name == "parser" || name == "node"
+        || visIsDottedChild(name, "mini_asm") || visIsDottedChild(name, "mini_cg")
+        || visIsDottedChild(name, "mini_ef") || visIsDottedChild(name, "parser")
+        || visIsDottedChild(name, "node")) { return true; }
+    return false;
+}
+
+// One driver resolution handed to the seed channel, usable only when its
+// path is exactly the unified ladder's answer for `name`: the gate must
+// allow the name (otherwise the probe answer is empty), a hit must exist
+// in the seed, its path must not be the entry file itself (the probe
+// skips a self-match), and — because the ladder below is now identical to
+// the driver's candidate order — a driver hit for a gate-passing name is
+// the probe winner (same candidates, same order, same inputs). Any other
+// case returns null so the caller falls back to probing as before.
+VisModuleFile? visPreloadedModule(string name, string inputFile, string exeDir, string[] preNames, VisModuleFile[] preFiles) {
+    if (visModuleExcluded(name)) { return null; }
+    VisModuleFile hit = null;
+    for (int i = 0; i < preNames.length; i++) {
+        if (preNames[i] == name) { hit = preFiles[i]; break; }
+    }
+    if (hit == null) { return null; }
+    if (hit.path.length == 0 || hit.text.length == 0) { return null; }
+    if (path.normalize(hit.path) == path.normalize(inputFile)) { return null; }
+    return hit;
+}
+
 // Module search for the visibility pass. `exeDir` is the compiler-binary
 // directory captured once in main() (see the VisibilityChecker.exeDir
 // field): the pass runs far off main, where the bootstrap's RBP-based Linux
 // cargs lowering rebuilds argv from a dead frame and segfaults, so the exe
 // tree must arrive as a parameter, never via a fresh cargs read.
 VisModuleFile visFindModuleFile(string name, string inputFile, string exeDir) {
-    if (visBuiltinModule(name)) { return new VisModuleFile("", ""); }
-    // Dotted children of the compiler baked-ins resolve to internals on
-    // disk; the driver excludes them too, so enforcement must match.
-    if ( name == "mini_asm"
-        || name == "mini_cg" || name == "mini_ef"
-        || name == "parser" || name == "node"
-        || visIsDottedChild(name, "mini_asm") || visIsDottedChild(name, "mini_cg")
-        || visIsDottedChild(name, "mini_ef") || visIsDottedChild(name, "parser")
-        || visIsDottedChild(name, "node")) { return new VisModuleFile("", ""); }
+    if (visModuleExcluded(name)) { return new VisModuleFile("", ""); }
     bool visHasDot = projectFind(name, ".", 0) >= 0;
     string visDottedSlash = visDottedPath(name, "/");
     string[] candidates = [];
@@ -764,6 +811,11 @@ VisModuleFile visFindModuleFile(string name, string inputFile, string exeDir) {
             candidates.add(visSibBase + visDottedSlash + ".sr");
         }
         candidates.add(visSibBase + name + *"/" + name + ".sr");
+        candidates.add(visSibBase + *"std/" + name + ".sr");
+        if (visHasDot) {
+            candidates.add(visSibBase + *"std/" + visDottedSlash + ".sr");
+        }
+        candidates.add(visSibBase + *"std/" + name + *"/" + name + ".sr");
     }
     candidates.add(name + ".sr");
     if (visHasDot) {
@@ -826,7 +878,9 @@ VisModuleFile visFindModuleFile(string name, string inputFile, string exeDir) {
     candidates.add(*"../../silveri/src/" + name + ".sr");
     if (visHasDot) { candidates.add(*"../../silveri/src/" + visDottedSlash + ".sr"); }
     candidates.add(*"../../silveri/src/" + name + *"/" + name + ".sr");
+    string selfNorm = path.normalize(inputFile);
     for (int i = 0; i < candidates.length; i++) {
+        if (path.normalize(candidates[i]) == selfNorm) { continue; }
         string src = visTryReadFile(candidates[i]);
         // The probe's text rides along: the caller hands it to loadText, so
         // the file is read exactly once (INV-15).

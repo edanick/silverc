@@ -685,10 +685,16 @@ bool importIsMac(string name) {
 class DrvCollected {
     public prop string source;
     public prop string[] errors;
+    // The single resolution cache the collection probed through (one
+    // (path, rawText) per hit name): the visibility seed channel. The
+    // checker reuses these texts (INV-15 shared aggregate) only for names
+    // whose preloaded path is exactly its unified probe answer.
+    public prop DrvModuleCache cache;
 
     construct {
         this.source = "";
         this.errors = [];
+        this.cache = new DrvModuleCache();
     }
 }
 
@@ -783,6 +789,7 @@ DrvCollected collectImports(string source, string inputFile, string ignored, boo
     }
     pieces.add(source);
     result.source = pieces.joinAll();
+    result.cache = cache;
     return result;
 }
 
@@ -1621,6 +1628,10 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
     // import collection; project builds create it once the module count is
     // known so the codegen/emission phases can report too.
     ProgressReporter progress = null;
+    // Visibility seed channel (standalone only): the driver resolutions
+    // converted below, consumed by the checker's preloaded lookup.
+    string[] visPreNames = [];
+    VisModuleFile[] visPreFiles = [];
 
     string manifest = "";
     if (inputIsProject) {
@@ -1824,6 +1835,11 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
         progress = new ProgressReporter(0);
         progress.moduleDone(inputFile);
         DrvCollected collected = collectImports(source, inputFile, "", flags.cacheBytecode || flags.cacheObject, progress, flags.debugBuild, exeDir);
+        for (int visSeedI = 0; visSeedI < collected.cache.names.length; visSeedI++) {
+            DrvModuleFile seedFile = collected.cache.files[visSeedI];
+            visPreNames.add(collected.cache.names[visSeedI]);
+            visPreFiles.add(new VisModuleFile(seedFile.path, seedFile.text));
+        }
         source = collected.source;
         if (collected.errors.length > 0) {
             // Unknown-module diagnostics are reported against the entry
@@ -2084,7 +2100,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
     // project, so nothing external exists there and the pass is skipped
     // (mirrors silverc-rs, which enforces on the single-file path).
     if (!inputIsProject) {
-        VisibilityChecker vis = new VisibilityChecker(inputFile, flags.debugBuild, exeDir);
+        VisibilityChecker vis = new VisibilityChecker(inputFile, flags.debugBuild, exeDir, visPreNames, visPreFiles);
         vis.run();
         if (vis.errors.length > 0) {
             // Visibility diagnostics are reported against the entry file
