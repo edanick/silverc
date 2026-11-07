@@ -1138,9 +1138,12 @@ void drvWriteOutput(string outputFile, int[] peData) {
 
 // Session naming mirrors silverc-rs: projects key the cache by their
 // manifest name (or manifest stem), standalone files by the source stem.
-string cacheSessionName(string inputFile, bool inputIsProject) {
+// The manifest text rides in (`manifest`): reading the manifest file again
+// for the name left another abandoned copy of it resident per session
+// (read each file once, MEMORY.md §2 rule 8).
+string cacheSessionName(string inputFile, bool inputIsProject, string manifest) {
     if (inputIsProject) {
-        string mn = projectManifestValue(file.readString(inputFile), "name");
+        string mn = projectManifestValue(manifest, "name");
         if (mn.length > 0) { return mn; }
         return drvFileStem(inputFile);
     }
@@ -1896,7 +1899,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
     // uncached pipeline.
     ObjSession? osess = null;
     if (flags.cacheObject) {
-        osess = new ObjSession(path.dirname(inputFile), cacheSessionName(inputFile, inputIsProject), ppTargetOsFor(flags.targetOs), flags.modeName(), flags.optimize);
+        osess = new ObjSession(path.dirname(inputFile), cacheSessionName(inputFile, inputIsProject, manifest), ppTargetOsFor(flags.targetOs), flags.modeName(), flags.optimize);
         if (!osess.ok) { osess = null; }
     }
     // OVERHAUL.md threading model: the unified pipeline maps per-file
@@ -1982,7 +1985,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
         // decode on a hit, misses lex fresh, nothing is written back (flush
         // below is a no-op for these sessions). Reached exactly when
         // --cache-bytecode is absent (the outer branch guarantees osess).
-        sess = new CacheSession(path.dirname(inputFile), cacheSessionName(inputFile, inputIsProject), !flags.cacheBytecode);
+        sess = new CacheSession(path.dirname(inputFile), cacheSessionName(inputFile, inputIsProject, manifest), !flags.cacheBytecode);
         if (sess.ok && chunks.paths.length > 0) {
             // Misses slice their chunk straight out of the aggregate (one
             // O(len) substring); hits never materialize a chunk at all.
