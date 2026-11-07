@@ -45,15 +45,48 @@ public WatchConfig watchConfigFor(bool multiFile, string manifest) {
     return cfg;
 }
 
+// One scan's file list. The walk grows this holder's property array instead
+// of a bare string[] parameter: growing a bare array inside a helper leaves
+// the caller's length stale (the stage-2 truncate-at-8 edge documented in
+// std/project.sr:181; see also ProjectVisited / ProjectPieces / PpPieces).
+// Growth through the class property stays visible to the holder's owner, and
+// a held WatchFiles can be drained in place and refilled per tick instead of
+// abandoning a fresh list per 500 ms poll.
+class WatchFiles {
+    public prop string[] files;
+
+    construct {
+        this.files = [];
+    }
+
+    public void add(string s) {
+        this.files.add(s);
+    }
+
+    public void clear() {
+        while (this.files.length > 0) { this.files.pop(); }
+    }
+}
+
+// Refill a held file list from rootDir, reusing its backing capacity: the
+// per-tick watch poll calls this instead of allocating a fresh list per tick
+// (in the never-free runtime every fresh list is abandoned, so watcher state
+// would grow with the number of ticks). The walk itself is unchanged (same
+// order, same joins), so results are byte-identical to watchScanSources.
+public void watchScanInto(string rootDir, WatchFiles out) {
+    out.clear();
+    wtWalk(rootDir, "", out);
+}
+
 // Recursively list the .sr files under root (sorted by discovery order is
 // not required; stability comes from the directory walk).
 public string[] watchScanSources(string rootDir) {
-    string[] result = [];
-    wtWalk(rootDir, "", result);
-    return result;
+    WatchFiles out = new WatchFiles();
+    watchScanInto(rootDir, out);
+    return out.files;
 }
 
-private void wtWalk(string rootDir, string relDir, string[] result) {
+private void wtWalk(string rootDir, string relDir, WatchFiles out) {
     string dir = rootDir;
     if (relDir.length > 0) {
         // A "." root stays bare (".\x" would leak into cache keys); every
@@ -65,10 +98,10 @@ private void wtWalk(string rootDir, string relDir, string[] result) {
         string name = names[i];
         if (!name.endsWith(".sr")) { continue; }
         if (rootDir == ".") {
-            if (relDir.length > 0) { result.add(relDir + "\\" + name); }
-            else { result.add(name); }
+            if (relDir.length > 0) { out.add(relDir + "\\" + name); }
+            else { out.add(name); }
         } else {
-            result.add(path.join(dir, name));
+            out.add(path.join(dir, name));
         }
     }
     string[] subdirs = folder.getFolders(dir);
@@ -77,7 +110,7 @@ private void wtWalk(string rootDir, string relDir, string[] result) {
         if (subname == ".git" || subname == "build" || subname == "target") { continue; }
         string subrel = subname;
         if (relDir.length > 0) { subrel = relDir + "\\" + subname; }
-        wtWalk(rootDir, subrel, result);
+        wtWalk(rootDir, subrel, out);
     }
 }
 
