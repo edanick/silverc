@@ -189,12 +189,18 @@ public string objEntrySym() { return "__slv_entry"; }
 // (a/b.sr vs a_b.sr).
 public string databName(string filekey) {
     string[] parts = [];
+    int runStart = -1;
     for (int i = 0; i < filekey.length; i++) {
         char c = filekey[i];
         bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
-        if (ok) { parts.add((string)c); }
-        else { parts.add("_"); }
+        if (ok) {
+            if (runStart < 0) { runStart = i; }
+        } else {
+            if (runStart >= 0) { parts.add(filekey[runStart..i]); runStart = -1; }
+            parts.add("_");
+        }
     }
+    if (runStart >= 0) { parts.add(filekey[runStart..filekey.length]); }
     int64 h = hash.fnv1(filekey);
     int64 low = h & 0xFFFFFFFF;
     return objDatabPrefix() + parts.join("") + "_" + objHex8(low);
@@ -212,13 +218,14 @@ public string normObjKey(string p) {
 private string objCleanDots(string key) {
     bool rooted = key.length > 0 && key[0] == '/';
     string[] parts = [];
-    string cur = "";
+    int segStart = 0;
     for (int i = 0; i <= key.length; i++) {
         if (i == key.length || key[i] == '/') {
-            if (cur != "" && cur != ".") { parts.add(cur); }
-            cur = "";
-        } else {
-            cur += (string)key[i];
+            int segLen = i - segStart;
+            if (segLen > 0 && !(segLen == 1 && key[segStart] == '.')) {
+                parts.add(key[segStart..i]);
+            }
+            segStart = i + 1;
         }
     }
     string out = parts.join("/");
@@ -255,32 +262,48 @@ public string objHex8(int64 v) {
 // line breaks (mirrors the reference escape_text).
 public string objEscapeText(string s) {
     string[] parts = [];
+    int runStart = 0;
     for (int i = 0; i < s.length; i++) {
         char c = s[i];
-        if (c == '\\') { parts.add("\\\\"); }
-        else if (c == char(0)) { parts.add("\\0"); }
-        else if (c == '\n') { parts.add("\\n"); }
-        else if (c == '\r') { parts.add("\\r"); }
-        else { parts.add((string)c); }
+        string esc = "";
+        if (c == '\\') { esc = "\\\\"; }
+        else if (c == char(0)) { esc = "\\0"; }
+        else if (c == '\n') { esc = "\\n"; }
+        else if (c == '\r') { esc = "\\r"; }
+        if (esc != "") {
+            if (runStart < i) { parts.add(s[runStart..i]); }
+            parts.add(esc);
+            runStart = i + 1;
+        }
     }
+    if (runStart < s.length) { parts.add(s[runStart..s.length]); }
     return parts.join("");
 }
 
 public string objUnescapeText(string s) {
     string[] parts = [];
-    for (int i = 0; i < s.length; i++) {
+    int runStart = 0;
+    int i = 0;
+    while (i < s.length) {
         char c = s[i];
+        string rep = "";
         if (c == '\\' && i + 1 < s.length) {
             char d = s[i + 1];
-            if (d == '\\') { parts.add("\\"); i++; }
-            else if (d == 'n') { parts.add("\n"); i++; }
-            else if (d == 'r') { parts.add("\r"); i++; }
-            else if (d == '0') { parts.add((string)char(0)); i++; }
-            else { parts.add((string)c); }
+            if (d == '\\') { rep = "\\"; }
+            else if (d == 'n') { rep = "\n"; }
+            else if (d == 'r') { rep = "\r"; }
+            else if (d == '0') { rep = (string)char(0); }
+        }
+        if (rep != "") {
+            if (runStart < i) { parts.add(s[runStart..i]); }
+            parts.add(rep);
+            runStart = i + 2;
+            i += 2;
         } else {
-            parts.add((string)c);
+            i++;
         }
     }
+    if (runStart < s.length) { parts.add(s[runStart..s.length]); }
     return parts.join("");
 }
 
@@ -309,6 +332,7 @@ private int64 objParseHex(string s) {
 }
 
 private int objParseDec(string s) {
+    if (s.length > 18) { return -1; }
     int v = 0;
     for (int i = 0; i < s.length; i++) {
         char c = s[i];
@@ -1212,19 +1236,15 @@ public int[] emitCoff(ObjUnit unit, int[] note, int stamp) {
     int relocOff = noteOff + notePad;
     int symtabOff = relocOff + unit.relSites.length * 10;
     // String table for names longer than 8 bytes.
-    int[] strLens = [];
     string[] strNames = [];
+    dict<string, int> strIdx = {};
     int strSize = 4;
     for (int i = 0; i < symNames.length; i++) {
         string nm = symNames[i];
         if (nm.length > 8) {
-            bool seen = false;
-            for (int j = 0; j < strNames.length; j++) {
-                if (strNames[j] == nm) { seen = true; break; }
-            }
-            if (!seen) {
+            if (!strIdx.contains(nm)) {
+                strIdx[nm] = strSize;
                 strNames.add(nm);
-                strLens.add(strSize);
                 strSize += nm.length + 1;
             }
         }
@@ -1289,10 +1309,7 @@ public int[] emitCoff(ObjUnit unit, int[] note, int stamp) {
     for (int i = 0; i < symNames.length; i++) {
         string nm = symNames[i];
         if (nm.length > 8) {
-            int off = 0;
-            for (int j = 0; j < strNames.length; j++) {
-                if (strNames[j] == nm) { off = strLens[j]; break; }
-            }
+            int off = strIdx[nm];
             w.u32(0);
             w.u32(off);
         } else {
@@ -2103,18 +2120,17 @@ public void linkUnits(ParsedObj[] unitsIn, int subsystem, string[] verKeys, stri
     string[] defNames = [];
     int[] defUnits = [];
     int[] defOffs = [];
+    dict<string, int> defIdx = {};
     for (int ui = 0; ui < units.length; ui++) {
         ParsedObj u = units[ui];
         for (int s = 0; s < u.symNames.length; s++) {
             if (u.symSects[s] == 1 && u.symIsFunc[s] == 1) {
-                bool dup = false;
-                for (int d = 0; d < defNames.length; d++) {
-                    if (defNames[d] == u.symNames[s]) { dup = true; break; }
-                }
+                bool dup = defIdx.contains(u.symNames[s]);
                 if (dup) {
                     link.err = "object cache: duplicate symbol '" + u.symNames[s] + "' (in '" + u.filekey + "' and elsewhere)";
                     return;
                 }
+                defIdx[u.symNames[s]] = defNames.length;
                 defNames.add(u.symNames[s]);
                 defUnits.add(ui);
                 defOffs.add(u.symVals[s]);
@@ -2218,7 +2234,8 @@ public void linkUnits(ParsedObj[] unitsIn, int subsystem, string[] verKeys, stri
             int64 target = 0;
             bool resolved = false;
             if (ssect == 1 && sisfunc == 1) {
-                int di = objFindDef(defNames, sname);
+                int di = -1;
+                if (defIdx.contains(sname)) { di = defIdx[sname]; }
                 if (di < 0) {
                     link.err = "object cache: undefined symbol '" + sname + "' (referenced by '" + u.filekey + "')";
                     return;
@@ -2266,7 +2283,8 @@ public void linkUnits(ParsedObj[] unitsIn, int subsystem, string[] verKeys, stri
                     target = globalsVa + addend;
                     resolved = true;
                 } else {
-                    int di = objFindDef(defNames, sname);
+                    int di = -1;
+                    if (defIdx.contains(sname)) { di = defIdx[sname]; }
                     if (di < 0) {
                         link.err = "object cache: undefined symbol '" + sname + "' (referenced by '" + u.filekey + "')";
                         return;
@@ -2305,11 +2323,14 @@ public void linkUnits(ParsedObj[] unitsIn, int subsystem, string[] verKeys, stri
     // monolithic backend's entryOffset preference), else main when defined,
     // else the section base.
     int entryRva = 0x1000;
-    int ei = objFindDef(defNames, objEntrySym());
+    string entrySym = objEntrySym();
+    int ei = -1;
+    if (defIdx.contains(entrySym)) { ei = defIdx[entrySym]; }
     if (ei >= 0) {
         entryRva = 0x1000 + codeOffs[defUnits[ei]] + defOffs[ei];
     } else {
-        int mi = objFindDef(defNames, "main");
+        int mi = -1;
+        if (defIdx.contains("main")) { mi = defIdx["main"]; }
         if (mi >= 0) {
             entryRva = 0x1000 + codeOffs[defUnits[mi]] + defOffs[mi];
         }
@@ -2548,9 +2569,9 @@ private void elfPlanLayout(int codeLen, int dataLen, string[] dlls, string[] nam
     plan.entryVaddr = int64(BASE + entryOff);
 }
 
-// Serialize the complete ELF ET_EXEC file: blob holds codeLen code bytes
-// then dataLen data bytes. Mirrors silverc-rs elf.rs emit().
-private int[] elfEmit(ElfPlan plan, int[] blob) {
+// Serialize the complete ELF ET_EXEC file: code holds codeLen code bytes,
+// data holds dataLen data bytes. Mirrors silverc-rs elf.rs emit().
+private int[] elfEmit(ElfPlan plan, int[] code, int[] data) {
     int BASE = 0x400000;
     int PAGE = 0x1000;
     ObjWriter w = new ObjWriter();
@@ -2593,9 +2614,9 @@ private int[] elfEmit(ElfPlan plan, int[] blob) {
     w.rawBytes(plan.rela);
     w.rawBytes(plan.dynamic);
     while (w.out.length < plan.rxOff) { w.u8(0); }
-    for (int i = 0; i < plan.codeLen; i++) { w.u8(blob[i]); }
+    for (int i = 0; i < plan.codeLen; i++) { w.u8(code[i]); }
     while (w.out.length < plan.rxOff + plan.rxFilesz) { w.u8(0); }
-    for (int i = 0; i < plan.dataLen; i++) { w.u8(blob[plan.codeLen + i]); }
+    for (int i = 0; i < plan.dataLen; i++) { w.u8(data[i]); }
     while (w.out.length < plan.dataOff + plan.dataFilesz) { w.u8(0); }
     for (int i = 0; i < 24 + plan.nImports * 8; i++) { w.u8(0); }
     return w.out;
@@ -2628,18 +2649,17 @@ public void linkUnitsElf(ParsedObj[] unitsIn, ObjLinkResult link) {
     string[] defNames = [];
     int[] defUnits = [];
     int[] defOffs = [];
+    dict<string, int> defIdx = {};
     for (int ui = 0; ui < units.length; ui++) {
         ParsedObj u = units[ui];
         for (int s = 0; s < u.symNames.length; s++) {
             if (u.symSects[s] == 1 && u.symIsFunc[s] == 1) {
-                bool dup = false;
-                for (int d = 0; d < defNames.length; d++) {
-                    if (defNames[d] == u.symNames[s]) { dup = true; break; }
-                }
+                bool dup = defIdx.contains(u.symNames[s]);
                 if (dup) {
                     link.err = "object cache: duplicate symbol '" + u.symNames[s] + "' (in '" + u.filekey + "' and elsewhere)";
                     return;
                 }
+                defIdx[u.symNames[s]] = defNames.length;
                 defNames.add(u.symNames[s]);
                 defUnits.add(ui);
                 defOffs.add(u.symVals[s]);
@@ -2701,11 +2721,14 @@ public void linkUnitsElf(ParsedObj[] unitsIn, ObjLinkResult link) {
     ElfPlan probe = new ElfPlan();
     elfPlanLayout(totalCode, dataTotal, unionDlls, unionNames, 0, probe);
     int entryRel = 0;
-    int ei = objFindDef(defNames, objEntrySym());
+    string entrySym = objEntrySym();
+    int ei = -1;
+    if (defIdx.contains(entrySym)) { ei = defIdx[entrySym]; }
     if (ei >= 0) {
         entryRel = codeOffs[defUnits[ei]] + defOffs[ei];
     } else {
-        int mi = objFindDef(defNames, "main");
+        int mi = -1;
+        if (defIdx.contains("main")) { mi = defIdx["main"]; }
         if (mi >= 0) {
             entryRel = codeOffs[defUnits[mi]] + defOffs[mi];
         }
@@ -2731,7 +2754,8 @@ public void linkUnitsElf(ParsedObj[] unitsIn, ObjLinkResult link) {
             int64 target = 0;
             bool resolved = false;
             if (ssect == 1 && sisfunc == 1) {
-                int di = objFindDef(defNames, sname);
+                int di = -1;
+                if (defIdx.contains(sname)) { di = defIdx[sname]; }
                 if (di < 0) {
                     link.err = "object cache: undefined symbol '" + sname + "' (referenced by '" + u.filekey + "')";
                     return;
@@ -2773,7 +2797,8 @@ public void linkUnitsElf(ParsedObj[] unitsIn, ObjLinkResult link) {
                     target = dataVa + totalData + 16 + (16 + 512) + addend;
                     resolved = true;
                 } else {
-                    int di = objFindDef(defNames, sname);
+                    int di = -1;
+                    if (defIdx.contains(sname)) { di = defIdx[sname]; }
                     if (di < 0) {
                         link.err = "object cache: undefined symbol '" + sname + "' (referenced by '" + u.filekey + "')";
                         return;
@@ -2806,10 +2831,7 @@ public void linkUnitsElf(ParsedObj[] unitsIn, ObjLinkResult link) {
             }
         }
     }
-    int[] blob = [];
-    for (int i = 0; i < code.length; i++) { blob.add(code[i]); }
-    for (int i = 0; i < data.length; i++) { blob.add(data[i]); }
-    link.bytes = elfEmit(plan, blob);
+    link.bytes = elfEmit(plan, code, data);
 }
 
 private int objFindDef(string[] defNames, string name) {
@@ -3328,15 +3350,17 @@ class ObjSession {
         sep = "/";
         #off
         string cur = "";
+        int runStart = 0;
         for (int i = 0; i < dir.length; i++) {
             char c = dir[i];
             if (c == '\\' || c == '/') {
+                if (runStart < i) { cur += dir[runStart..i]; }
                 if (cur.length >= 2) { this.objMakeDir(cur); }
                 cur += sep;
-            } else {
-                cur += c;
+                runStart = i + 1;
             }
         }
+        if (runStart < dir.length) { cur += dir[runStart..dir.length]; }
         if (cur.length >= 2) { this.objMakeDir(cur); }
     }
 
@@ -6581,7 +6605,7 @@ private int macRotr(int x, int n) {
 // Build the ad-hoc SuperBlob + CodeDirectory over the __TEXT image
 // (headers + code + stubs, page-padded with zeros). ident names the binary
 // ("silver"). Mirrors the reference signature_for byte-exactly.
-private int[] macSignatureFor(int[] textImage, int npages) {
+private int[] macSignatureFor(int[] textImage, int imgLen, int npages) {
     ObjWriter cd = new ObjWriter();
     // CodeDirectory magic 0xFADE0C02.
     macAddU32BE(cd, int(4208856066));
@@ -6594,7 +6618,7 @@ private int[] macSignatureFor(int[] textImage, int npages) {
     macAddU32BE(cd, 64);
     macAddU32BE(cd, 0);
     macAddU32BE(cd, npages);
-    macAddU32BE(cd, textImage.length);
+    macAddU32BE(cd, imgLen);
     cd.u8(32);
     cd.u8(2);
     cd.u8(0);
@@ -6611,7 +6635,7 @@ private int[] macSignatureFor(int[] textImage, int npages) {
         int[] one = [];
         for (int i = 0; i < page; i++) {
             int idx = p * page + i;
-            if (idx < textImage.length) { one.add(textImage[idx]); }
+            if (idx < imgLen) { one.add(textImage[idx]); }
             else { one.add(0); }
         }
         int[] digest = macSha256(one);
@@ -6639,11 +6663,11 @@ private void macAddU64BE(ObjWriter w, int64 v) {
     for (int i = 7; i >= 0; i--) { w.u8(int((v >> (i * 8)) & 0xFF)); }
 }
 
-// Serialize the complete Mach-O MH_EXECUTE file: blob holds codeLen code
-// bytes then dataLen data bytes. Mirrors silverc-rs macho.rs emit(): the
+// Serialize the complete Mach-O MH_EXECUTE file: code holds codeLen code
+// bytes, data holds dataLen data bytes. Mirrors silverc-rs macho.rs emit(): the
 // __TEXT prefix (headers + code + stubs) is hashed into the real ad-hoc
 // signature, whose length the planner already reserved.
-private int[] macEmitExec(MacPlan plan, int[] blob) {
+private int[] macEmitExec(MacPlan plan, int[] code, int[] data) {
     ObjWriter w = new ObjWriter();
     // MH_MAGIC_64 0xFEEDFACF.
     w.u32(int(4277009103));
@@ -6655,7 +6679,7 @@ private int[] macEmitExec(MacPlan plan, int[] blob) {
     w.u32(int(0x200085));
     w.u32(0);
     w.rawBytes(plan.loadCmds);
-    for (int i = 0; i < plan.codeLen; i++) { w.u8(blob[i]); }
+    for (int i = 0; i < plan.codeLen; i++) { w.u8(code[i]); }
     while (w.out.length < plan.stubsOff) { w.u8(0); }
     // __stubs (adrp/ldr/blr per import, 12 bytes each).
     for (int i = 0; i < plan.nImports; i++) {
@@ -6675,8 +6699,8 @@ private int[] macEmitExec(MacPlan plan, int[] blob) {
     while (w.out.length < plan.dataOff) { w.u8(0); }
     // __DATA.__got (zeros; dyld resolves binds eagerly at load).
     for (int i = 0; i < plan.nImports * 8; i++) { w.u8(0); }
-    // __DATA.__data (remaining blob bytes).
-    for (int i = plan.codeLen; i < blob.length; i++) { w.u8(blob[i]); }
+    // __DATA.__data (data bytes).
+    for (int i = 0; i < data.length; i++) { w.u8(data[i]); }
     while (w.out.length < plan.dataOff + plan.dataFilesz) { w.u8(0); }
     // __LINKEDIT (bind + symtab + strtab, then signature).
     while (w.out.length < plan.linkeditOff) { w.u8(0); }
@@ -6685,10 +6709,8 @@ private int[] macEmitExec(MacPlan plan, int[] blob) {
     w.rawBytes(plan.strtab);
     // Real signature over the final __TEXT image (headers included).
     int textLen = plan.textOff + plan.textFilesz;
-    int[] textImage = [];
-    for (int i = 0; i < textLen; i++) { textImage.add(w.out[i]); }
     int npages = (plan.textFilesz + 0x4000 - 1) / 0x4000;
-    int[] sig = macSignatureFor(textImage, npages);
+    int[] sig = macSignatureFor(w.out, textLen, npages);
     while (w.out.length < plan.offSig) { w.u8(0); }
     w.rawBytes(sig);
     return w.out;
@@ -6717,18 +6739,17 @@ public void linkUnitsMac(ParsedObj[] unitsIn, ObjLinkResult link) {
     string[] defNames = [];
     int[] defUnits = [];
     int[] defOffs = [];
+    dict<string, int> defIdx = {};
     for (int ui = 0; ui < units.length; ui++) {
         ParsedObj u = units[ui];
         for (int s = 0; s < u.symNames.length; s++) {
             if (u.symSects[s] == 1 && u.symIsFunc[s] == 1) {
-                bool dup = false;
-                for (int d = 0; d < defNames.length; d++) {
-                    if (defNames[d] == u.symNames[s]) { dup = true; break; }
-                }
+                bool dup = defIdx.contains(u.symNames[s]);
                 if (dup) {
                     link.err = "object cache: duplicate symbol '" + u.symNames[s] + "' (in '" + u.filekey + "' and elsewhere)";
                     return;
                 }
+                defIdx[u.symNames[s]] = defNames.length;
                 defNames.add(u.symNames[s]);
                 defUnits.add(ui);
                 defOffs.add(u.symVals[s]);
@@ -6877,10 +6898,7 @@ public void linkUnitsMac(ParsedObj[] unitsIn, ObjLinkResult link) {
             macWriteWord(codeBlob, codeOffs[ui] + bsite, word);
         }
     }
-    int[] blob = [];
-    for (int i = 0; i < codeBlob.length; i++) { blob.add(codeBlob[i]); }
-    for (int i = 0; i < dataBlob.length; i++) { blob.add(dataBlob[i]); }
-    link.bytes = macEmitExec(plan, blob);
+    link.bytes = macEmitExec(plan, codeBlob, dataBlob);
 }
 
 // Resolve one parsed symbol to its final virtual address. dataBase is the
