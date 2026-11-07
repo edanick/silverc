@@ -248,6 +248,18 @@ string drvPreprocessOrDie(string src, bool debugBuild) {
     return out;
 }
 
+// True when any of `texts` holds `needle`. The driver's import probes read
+// the entry source together with the standard-library pieces prepended to
+// it; scanning the pieces one by one is the same test as scanning the
+// joined source, because a newline separates every piece and a match can
+// never straddle two of them.
+bool drvAnyHolds(string[] texts, string needle) {
+    for (int i = 0; i < texts.length; i++) {
+        if (projectFind(texts[i], needle, 0) >= 0) { return true; }
+    }
+    return false;
+}
+
 // File stem of a path: characters after the last separator, extension
 // removed.
 string drvFileStem(string path) {
@@ -323,8 +335,31 @@ string drvTryExeTree(string exeDir, string rel) {
     return tryReadFile(exeDir + rel);
 }
 
-string findModulePath(string name, string inputFile, string exeDir) {
-    if (projectBuiltin(name)) { return ""; }
+// One resolved module: the path the resolution probe hit (the exact
+// spelling the old findModulePath returned, so progress lines and cache
+// markers read byte-identically) together with the file text the probe
+// already had in hand.
+//
+// The text rides along so a module file is read from disk EXACTLY ONCE per
+// compile: the resolution probe reads the candidate to test it, and the
+// collection used to read the same file again. The runtime never frees
+// intermediates, so that second read left one abandoned copy of every
+// imported module resident for the whole run (MEMORY.md §3.2 rank 4 /
+// §2 rule 8: read each file once, pass the text through).
+class DrvModuleFile {
+    public prop string path;
+    public prop string text;
+
+    construct (string p, string t) {
+        this.path = p;
+        this.text = t;
+    }
+}
+
+// Resolve one module name to its path AND its text ("" path when the module
+// is native/builtin or cannot be found).
+DrvModuleFile findModuleFile(string name, string inputFile, string exeDir) {
+    if (projectBuiltin(name)) { return new DrvModuleFile("", ""); }
     // Modules the driver already prepends above (llmai/exception/bom/process/
     // notifications) and the compiler's own baked-in modules must not be
     // re-collected from disk: that would duplicate their definitions.  Source
@@ -346,7 +381,7 @@ string findModulePath(string name, string inputFile, string exeDir) {
         || drvIsDottedChild(name, "notifications") || drvIsDottedChild(name, "http")
         || drvIsDottedChild(name, "mini_asm") || drvIsDottedChild(name, "mini_cg")
         || drvIsDottedChild(name, "mini_ef") || drvIsDottedChild(name, "parser")
-        || drvIsDottedChild(name, "node")) { return ""; }
+        || drvIsDottedChild(name, "node")) { return new DrvModuleFile("", ""); }
     bool drvHasDot = projectFind(name, ".", 0) >= 0;
     string drvDottedSlash = drvDottedPath(name, "/");
     string[] candidates = [];
@@ -447,9 +482,9 @@ string findModulePath(string name, string inputFile, string exeDir) {
     for (int i = 0; i < candidates.length; i++) {
         if (path.normalize(candidates[i]) == selfNorm) { continue; }
         string src = tryReadFile(candidates[i]);
-        if (src.length > 0) { return candidates[i]; }
+        if (src.length > 0) { return new DrvModuleFile(candidates[i], src); }
     }
-    return "";
+    return new DrvModuleFile("", "");
 }
 
 string cacheMarkerLine(string path) {
@@ -476,18 +511,19 @@ class DrvSourcePieces {
     }
 }
 
-// Module-resolution cache: each module name resolves to its path once per
-// compile instead of being re-probed (dozens of file reads) per importer,
-// per pass, and per probe. The stored path is the findModulePath hit itself,
-// so progress lines and cache markers read byte-identically; the file text
-// is read once and passed through to collectModuleInto, never re-read.
+// Module-resolution cache: each module name resolves to its path AND its
+// text once per compile instead of being re-probed (dozens of file reads)
+// per importer, per pass, and per probe. The stored path is the resolution
+// hit itself, so progress lines and cache markers read byte-identically; the
+// text is the bytes that probe already read, so the file is read once and
+// the text is passed through to collectModuleInto, never re-read.
 class DrvModuleCache {
     public prop string[] names;
-    public prop string[] paths;
+    public prop DrvModuleFile[] files;
 
     construct {
         this.names = [];
-        this.paths = [];
+        this.files = [];
     }
 
     public int find(string name) {
@@ -497,32 +533,35 @@ class DrvModuleCache {
         return -1;
     }
 
-    public string pathFor(string name) {
+    // The resolved file for `name`, or an empty one ("" path, "" text) when
+    // the name was never resolved.
+    public DrvModuleFile fileFor(string name) {
         int idx = this.find(name);
-        if (idx < 0) { return ""; }
-        return this.paths[idx];
+        if (idx < 0) { return new DrvModuleFile("", ""); }
+        return this.files[idx];
     }
 
-    public void store(string name, string path) {
+    public void store(string name, DrvModuleFile file) {
         int idx = this.find(name);
         if (idx < 0) {
             this.names.add(name);
-            this.paths.add(path);
+            this.files.add(file);
             return;
         }
-        this.paths[idx] = path;
+        this.files[idx] = file;
     }
 }
 
-// Resolve one module name to its path, once per name per compile ("" when
-// native/builtin/missing). Misses stay uncached: an unknown module aborts
-// the compile, so no second probe ever happens. `exeDir` arrives from main()
-// (captured inline there): this helper must never read cargs itself.
-string drvCachedModulePath(string name, string inputFile, DrvModuleCache cache, string exeDir) {
-    string hit = cache.pathFor(name);
-    if (hit.length > 0) { return hit; }
-    string resolved = findModulePath(name, inputFile, exeDir);
-    if (resolved.length > 0) { cache.store(name, resolved); }
+// Resolve one module name to its path and text, once per name per compile
+// (an empty file when the module is native/builtin/missing). Misses stay
+// uncached: an unknown module aborts the compile, so no second probe ever
+// happens. `exeDir` arrives from main() (captured inline there): this helper
+// must never read cargs itself.
+DrvModuleFile drvCachedModule(string name, string inputFile, DrvModuleCache cache, string exeDir) {
+    int idx = cache.find(name);
+    if (idx >= 0) { return cache.files[idx]; }
+    DrvModuleFile resolved = findModuleFile(name, inputFile, exeDir);
+    if (resolved.path.length > 0) { cache.store(name, resolved); }
     return resolved;
 }
 
@@ -577,12 +616,12 @@ void collectModuleInto(string name, string inputFile, string modPath, string mod
         string statement = projectSlice(modSrc, importPos + 6, semi);
         string depName = projectImportModule(statement);
         if (depName.length > 0 && !visited.contains(depName)) {
-            string depPath = drvCachedModulePath(depName, inputFile, cache, exeDir);
-            if (depPath.length > 0) {
-                string depText = tryReadFile(depPath);
-                if (depText.length > 0) {
-                    collectModuleInto(depName, inputFile, depPath, depText, visited, cache, emitMarkers, progress, debugBuild, out, exeDir);
-                }
+            // The text rides with the resolved path: the module file was
+            // already read by the resolution probe, so it is never read
+            // again here.
+            DrvModuleFile depFile = drvCachedModule(depName, inputFile, cache, exeDir);
+            if (depFile.path.length > 0 && depFile.text.length > 0) {
+                collectModuleInto(depName, inputFile, depFile.path, depFile.text, visited, cache, emitMarkers, progress, debugBuild, out, exeDir);
             }
         }
         cursor = semi + 1;
@@ -640,10 +679,30 @@ bool importIsMac(string name) {
     return name[0] == 'm' && name[1] == 'a' && name[2] == 'c';
 }
 
-string collectImports(string source, string inputFile, string ignored, string[] errs, bool emitMarkers, ProgressReporter progress, bool debugBuild, string exeDir) {
+// The result of one standalone import collection: the collected aggregate
+// (every imported module's source, dependencies first, then the entry
+// source) and the unknown-module diagnostics.
+//
+// The diagnostics ride in a class property array, never a bare `string[]`
+// parameter grown inside a helper: the self-hosted stage-2 backend leaves
+// the caller's length slot stale when a helper grows a caller's array
+// (silently truncating growth at 8 elements — the ProjectVisited pattern's
+// reason to exist). A property array grows correctly (MEMORY.md §2 rule 5).
+class DrvCollected {
+    public prop string source;
+    public prop string[] errors;
+
+    construct {
+        this.source = "";
+        this.errors = [];
+    }
+}
+
+DrvCollected collectImports(string source, string inputFile, string ignored, bool emitMarkers, ProgressReporter progress, bool debugBuild, string exeDir) {
     ProjectVisited visited = new ProjectVisited();
     DrvModuleCache cache = new DrvModuleCache();
     DrvSourcePieces pieces = new DrvSourcePieces();
+    DrvCollected result = new DrvCollected();
     int cursor = 0;
     // Length read once (strlen is O(n)), not once per import occurrence.
     int srcLen = source.length;
@@ -690,10 +749,11 @@ string collectImports(string source, string inputFile, string ignored, string[] 
                 || moduleName == "console" || moduleName == "math"
                 || moduleName == "http" || moduleName == "os";
             if (!prepended && !visited.contains(moduleName)) {
-                string depPath = drvCachedModulePath(moduleName, inputFile, cache, exeDir);
-                string depText = "";
-                if (depPath.length > 0) { depText = tryReadFile(depPath); }
-                if (depText.length == 0) {
+                // The text rides with the resolved path: the module file was
+                // already read by the resolution probe, so it is never read
+                // again here.
+                DrvModuleFile depFile = drvCachedModule(moduleName, inputFile, cache, exeDir);
+                if (depFile.text.length == 0) {
                     // SYNTAX_EXCEPTIONS.md — unknown module, with a did-you-mean
                     // suggestion when it resembles a known one.
                     int rel = projectFind(statement, moduleName, 0);
@@ -703,12 +763,12 @@ string collectImports(string source, string inputFile, string ignored, string[] 
                     diagLocateOffset(source, absOff, loc);
                     string sugg = array.findBestMatch(diagKnownModules(), moduleName);
                     if (sugg.length > 0) {
-                        errs.add("did you mean to import the module \"" + sugg + "\"?, unknown module \"" + moduleName + "\" was found at line " + (string)loc[0] + " column " + (string)loc[1]);
+                        result.errors.add("did you mean to import the module \"" + sugg + "\"?, unknown module \"" + moduleName + "\" was found at line " + (string)loc[0] + " column " + (string)loc[1]);
                     } else {
-                        errs.add("unknown module \"" + moduleName + "\" was found at line " + (string)loc[0] + ", column " + (string)loc[1] + ". module either doesn't exist or not installed.");
+                        result.errors.add("unknown module \"" + moduleName + "\" was found at line " + (string)loc[0] + ", column " + (string)loc[1] + ". module either doesn't exist or not installed.");
                     }
                 } else {
-                    collectModuleInto(moduleName, inputFile, depPath, depText, visited, cache, emitMarkers, progress, debugBuild, pieces, exeDir);
+                    collectModuleInto(moduleName, inputFile, depFile.path, depFile.text, visited, cache, emitMarkers, progress, debugBuild, pieces, exeDir);
                 }
             } else if (prepended && !visited.contains(moduleName)) {
                 // Hand-prepended or native-backed modules (llmai, exception,
@@ -716,12 +776,9 @@ string collectImports(string source, string inputFile, string ignored, string[] 
                 // source-level bodies (e.g. std/env.sr's set/keys, which the
                 // self-host dispatches to as globals) still collect from disk
                 // exactly like the old unconditional collectModule call did.
-                string prePath = drvCachedModulePath(moduleName, inputFile, cache, exeDir);
-                if (prePath.length > 0) {
-                    string preText = tryReadFile(prePath);
-                    if (preText.length > 0) {
-                        collectModuleInto(moduleName, inputFile, prePath, preText, visited, cache, emitMarkers, progress, debugBuild, pieces, exeDir);
-                    }
+                DrvModuleFile preFile = drvCachedModule(moduleName, inputFile, cache, exeDir);
+                if (preFile.path.length > 0 && preFile.text.length > 0) {
+                    collectModuleInto(moduleName, inputFile, preFile.path, preFile.text, visited, cache, emitMarkers, progress, debugBuild, pieces, exeDir);
                 }
             }
         }
@@ -731,7 +788,8 @@ string collectImports(string source, string inputFile, string ignored, string[] 
         pieces.add(cacheMarkerLine(inputFile));
     }
     pieces.add(source);
-    return pieces.joinAll();
+    result.source = pieces.joinAll();
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -972,17 +1030,39 @@ int drvDiagLine(string msg) {
     return -1;
 }
 
-// Marker path owning aggregate 1-based line `aggLine`: the last chunk whose
-// first content line starts at or before it (startLines is a 0-based
-// aggregate line index). "" when no chunk covers the line (empty split, or
-// the line is a marker comment itself): the caller falls back to the entry.
-string drvChunkOwner(MarkedChunks chunks, int aggLine) {
-    string owner = "";
-    for (int i = 0; i < chunks.paths.length; i++) {
-        if (chunks.startLines[i] <= aggLine - 1) { owner = chunks.paths[i]; }
-        else { break; }
+// Index of the marker chunk owning aggregate 1-based line `aggLine`: the
+// last chunk whose first content line starts at or before it (startLines is
+// a 0-based aggregate line index). -1 when no chunk covers the line (empty
+// split, or the line is a marker comment itself): the caller falls back to
+// the entry.
+//
+// The chunk list is sorted by start line, so the owner is found by binary
+// search: the linear scan cost O(chunks) per lookup, and the object tier
+// asks once per AST item (items x chunks string compares on a big project).
+int drvChunkOwnerIndex(MarkedChunks chunks, int aggLine) {
+    int target = aggLine - 1;
+    int lo = 0;
+    int hi = chunks.startLines.length - 1;
+    int hit = -1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (chunks.startLines[mid] <= target) {
+            hit = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
     }
-    return owner;
+    return hit;
+}
+
+// Marker path owning aggregate 1-based line `aggLine` (see
+// drvChunkOwnerIndex). "" when no chunk covers the line: the caller falls
+// back to the entry.
+string drvChunkOwner(MarkedChunks chunks, int aggLine) {
+    int idx = drvChunkOwnerIndex(chunks, aggLine);
+    if (idx < 0) { return ""; }
+    return chunks.paths[idx];
 }
 
 // Print `msgs` grouped under one `[file]` header per file, on stdout via
@@ -1172,12 +1252,21 @@ int[] objCompileFlow(CliFlags flags, ObjSession? osess, CacheSession? sess, Node
         if (osess.notedKeys[i] == entryKey) { entryNoted = true; break; }
     }
     if (!entryNoted) { entryKey = osess.notedKeys[osess.notedKeys.length - 1]; }
+    // One record key per chunk, computed once: the per-item lookup used to
+    // rebuild the key (a path rewrite plus a key derivation) for EVERY AST
+    // item, so a big project allocated two strings per item where one per
+    // file does (MEMORY.md §3.2 rank 7 / §2 rule 4: one path per file, not
+    // per item).
+    string[] chunkKeys = [];
+    for (int ck = 0; ck < chunks.paths.length; ck++) {
+        chunkKeys.add(osess.relKeyFor(chunks.paths[ck].replaceAll("/", "\\")));
+    }
     string[] owners = [];
     for (int i = 0; i < ast.length; i++) {
         string owner = entryKey;
         if (ast[i].line > 0) {
-            string hit = drvChunkOwner(chunks, ast[i].line);
-            if (hit.length > 0) { owner = osess.relKeyFor(hit.replaceAll("/", "\\")); }
+            int chunkIdx = drvChunkOwnerIndex(chunks, ast[i].line);
+            if (chunkIdx >= 0) { owner = chunkKeys[chunkIdx]; }
         }
         owners.add(owner);
     }
@@ -1547,7 +1636,10 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
         }
     }
 
-    string source = file.readString(inputFile);
+    // The entry source is read ONCE: a project build replaces it with the
+    // collected aggregate below, so reading the .srp manifest as if it were
+    // source left an abandoned copy of it resident for the whole run.
+    string source = "";
     if (inputIsProject) {
         // Progress (STDERR): the per-module lines are printed by the project
         // module's own reporter (projectBuildSource), which knows the module
@@ -1567,6 +1659,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
         progress.setTotal(moduleCount);
         source = drvPreprocessOrDie(builtSource, flags.debugBuild);
     } else {
+        source = file.readString(inputFile);
         // `.col` declarations require a project manifest with a configured
         // collection directory. Standalone source compilation reports the
         // same UnknownCollectionException as the native compiler.
@@ -1576,14 +1669,30 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
         // entry source (import probes, module collection, the lexer).
         source = drvPreprocessOrDie(source, flags.debugBuild);
 
+        // The source-level standard libraries the driver prepends (llmai,
+        // exception, bom, process, notifications) are collected as PIECES and
+        // joined once with the entry source below. The old chain
+        // (`source = lib + "\n" + source`) rebuilt the whole growing source
+        // once per library: with five libraries in play that is five
+        // abandoned copies of the entry source (the runtime never frees
+        // intermediates — MEMORY.md §2 rule 2, M2/M5).
+        //
+        // `prependScan` holds the texts the import probes below read: the
+        // entry source plus every piece collected so far. The probes ran
+        // against the source as it grew, and a newline separates every
+        // piece, so a match can never straddle two of them — scanning the
+        // pieces one by one is the same test.
+        string[] prependPieces = [];
+        string[] prependScan = [];
+        prependScan.add(source);
+
         // The universal llmai client is a source-level standard library. Keep
         // the low-level WinInet builtin available, but include the shared
         // wrapper when a standalone source imports llmai. The test runner
         // invokes the compiler from tests/, so ../std is the stable library
         // location for both self-hosting and top-level suites.
-        int llmaiImport = projectFind(source, "from " + "llmai", 0);
-        if (llmaiImport < 0) { llmaiImport = projectFind(source, "from " + "LLMAI", 0); }
-        if (llmaiImport >= 0) {
+        bool llmaiImport = drvAnyHolds(prependScan, "from llmai") || drvAnyHolds(prependScan, "from LLMAI");
+        if (llmaiImport) {
             // Load the wrapper by content instead of probing with
             // file.exists(): the self-hosted exists lowering is not reliable
             // for paths containing `..` on every bootstrap stage. The
@@ -1608,15 +1717,17 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
             if (llmaiSource.length == 0) {
                 llmaiSource = tryReadFile(*"../../std/llmai.sr");
             }
-            source = drvPreprocessOrDie(llmaiSource, flags.debugBuild) + "\n" + source;
+            string llmaiPiece = drvPreprocessOrDie(llmaiSource, flags.debugBuild);
+            prependPieces.add(llmaiPiece);
+            prependScan.add(llmaiPiece);
         }
 
         // The exception hierarchy is a source-level standard library. When a
         // standalone source imports it, prepend the
         // std class definitions so `catch (Exception e) { e.message }` resolves
         // the shared fields to strings. Mirrors the llmai handling above.
-        int excImport = projectFind(source, "from " + "exception", 0);
-        if (excImport >= 0) {
+        bool excImport = drvAnyHolds(prependScan, "from exception");
+        if (excImport) {
             string excSource = drvTryExeTree(exeDir, *"/std/exception.sr");
             if (excSource.length == 0) {
                 excSource = tryReadFile(*"std/exception.sr");
@@ -1633,44 +1744,65 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
             if (excSource.length == 0) {
                 excSource = tryReadFile(*"../../std/exception.sr");
             }
-            source = drvPreprocessOrDie(excSource, flags.debugBuild) + "\n" + source;
+            string excPiece = drvPreprocessOrDie(excSource, flags.debugBuild);
+            prependPieces.add(excPiece);
+            prependScan.add(excPiece);
         }
 
         // BOM and focused-process APIs are source-level standard libraries.
         // Prepend their definitions for standalone compilation, matching the
         // self-hosted import behavior used by llmai and exception.
-        int bomImport = projectFind(source, "from " + "bom", 0);
-        if (bomImport >= 0) {
+        bool bomImport = drvAnyHolds(prependScan, "from bom");
+        if (bomImport) {
             string bomSource = drvTryExeTree(exeDir, *"/std/bom.sr");
             if (bomSource.length == 0) { bomSource = tryReadFile(*"std/bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile(*"silverc/std/bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile(*"../std/bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile(*"../silverc/std/bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile(*"../../std/bom.sr"); }
-            source = drvPreprocessOrDie(bomSource, flags.debugBuild) + "\n" + source;
+            string bomPiece = drvPreprocessOrDie(bomSource, flags.debugBuild);
+            prependPieces.add(bomPiece);
+            prependScan.add(bomPiece);
         }
-        int processImport = projectFind(source, "from " + "process", 0);
-        if (processImport >= 0) {
+        bool processImport = drvAnyHolds(prependScan, "from process");
+        if (processImport) {
             string processSource = drvTryExeTree(exeDir, *"/std/process.sr");
             if (processSource.length == 0) { processSource = tryReadFile(*"std/process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile(*"silverc/std/process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile(*"../std/process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile(*"../silverc/std/process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile(*"../../std/process.sr"); }
-            source = drvPreprocessOrDie(processSource, flags.debugBuild) + "\n" + source;
+            string processPiece = drvPreprocessOrDie(processSource, flags.debugBuild);
+            prependPieces.add(processPiece);
+            prependScan.add(processPiece);
         }
         // Notifications (Windows toast / tray-balloon) is a source-level
         // standard library.  Prepend its definitions when a standalone source
         // imports it, matching the self-hosted import behavior above.
-        int notifImport = projectFind(source, "from " + "notifications", 0);
-        if (notifImport >= 0) {
+        bool notifImport = drvAnyHolds(prependScan, "from notifications");
+        if (notifImport) {
             string notifSource = drvTryExeTree(exeDir, *"/std/notifications.sr");
             if (notifSource.length == 0) { notifSource = tryReadFile(*"std/notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile(*"silverc/std/notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile(*"../std/notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile(*"../silverc/std/notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile(*"../../std/notifications.sr"); }
-            source = drvPreprocessOrDie(notifSource, flags.debugBuild) + "\n" + source;
+            string notifPiece = drvPreprocessOrDie(notifSource, flags.debugBuild);
+            prependPieces.add(notifPiece);
+            prependScan.add(notifPiece);
+        }
+
+        // One join for the whole prepend set: the last library collected
+        // leads, then the earlier ones, then the entry source — the exact
+        // order the old prepend chain produced (each prepend pushed the
+        // previous aggregate down), with one newline between the pieces.
+        if (prependPieces.length > 0) {
+            string[] aggregate = [];
+            for (int pa = prependPieces.length - 1; pa >= 0; pa--) {
+                aggregate.add(prependPieces[pa]);
+            }
+            aggregate.add(source);
+            source = aggregate.join("\n");
         }
 
         // Generic source-level imports (`import * from helper;`, `import
@@ -1684,17 +1816,17 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
         // alone (no count, no percentage): no counting pre-pass re-reads and
         // re-filters every file just for the total (MEMORY.md M1). The exact
         // total is pinned once the single pass below finishes.
-        string[] moduleErrors = [];
         progress = new ProgressReporter(0);
         progress.moduleDone(inputFile);
-        source = collectImports(source, inputFile, "", moduleErrors, flags.cacheBytecode || flags.cacheObject, progress, flags.debugBuild, exeDir);
-        if (moduleErrors.length > 0) {
+        DrvCollected collected = collectImports(source, inputFile, "", flags.cacheBytecode || flags.cacheObject, progress, flags.debugBuild, exeDir);
+        source = collected.source;
+        if (collected.errors.length > 0) {
             // Unknown-module diagnostics are reported against the entry
             // source (pre-collection lines), so they always belong to the
             // entry file: single `[input-as-given]` header, bodies untouched.
             printline("[" + inputFile + "]");
-            for (int meI = 0; meI < moduleErrors.length; meI++) {
-                printline(moduleErrors[meI]);
+            for (int meI = 0; meI < collected.errors.length; meI++) {
+                printline(collected.errors[meI]);
             }
             exit(1);
         }
@@ -1705,10 +1837,13 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
     // Version-metadata and subsystem inputs shared by the monolithic, object,
     // and fast-link paths (the object tier links them into its image
     // directly). Pure manifest reads hoisted here so the fast link below
-    // reuses the same values with no second computation.
+    // reuses the same values with no second computation. The manifest text
+    // is the ONE read taken above (the quicksilver branch): re-reading the
+    // file for the type and again for the version block left two abandoned
+    // copies of it resident (read each file once, MEMORY.md §2 rule 8).
     string projectType = "";
     if (inputIsProject) {
-        projectType = projectManifestValue(file.readString(inputFile), "type");
+        projectType = projectManifestValue(manifest, "type");
     }
     int linkSubsystem = 3;
     if (projectType == "app" || projectType == "service") {
@@ -1717,12 +1852,11 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
     string[] viKeys = [];
     string[] viValues = [];
     if (inputIsProject) {
-        string manifest2 = file.readString(inputFile);
-        string viName = projectManifestValue(manifest2, "name");
-        string viVers = projectManifestValue(manifest2, "version");
-        string viProd = projectManifestValue(manifest2, "product");
-        string viCopy = projectManifestValue(manifest2, "copyright");
-        string viComp = projectManifestValue(manifest2, "company");
+        string viName = projectManifestValue(manifest, "name");
+        string viVers = projectManifestValue(manifest, "version");
+        string viProd = projectManifestValue(manifest, "product");
+        string viCopy = projectManifestValue(manifest, "copyright");
+        string viComp = projectManifestValue(manifest, "company");
         if (viName != "")   { viKeys.add("FileDescription");  viValues.add(viName); }
         if (viProd != "")  { viKeys.add("ProductName");      viValues.add(viProd); }
         if (viCopy != "")  { viKeys.add("LegalCopyright");   viValues.add(viCopy); }
