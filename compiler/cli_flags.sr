@@ -220,16 +220,17 @@ public int totalCpuThreads() {
 // Collect the forbidden_flags entries of a manifest: quoted strings and bare
 // identifiers inside the [...] list, both accepted (mirrors silverc-rs).
 public string[] manifestForbiddenFlags(string manifest) {
-    string[] result = [];
+    CliFlagNames result = new CliFlagNames();
+    int mlen = manifest.length;
     int keyPos = projectFind(manifest, "forbidden_flags", 0);
-    if (keyPos < 0) { return result; }
+    if (keyPos < 0) { return result.items; }
     int open = keyPos;
-    while (open < manifest.length && manifest[open] != '[') { open++; }
-    if (open >= manifest.length) { return result; }
+    while (open < mlen && manifest[open] != '[') { open++; }
+    if (open >= mlen) { return result.items; }
     int close = open + 1;
-    while (close < manifest.length && manifest[close] != ']') { close++; }
+    while (close < mlen && manifest[close] != ']') { close++; }
     int end = close;
-    if (end >= manifest.length) { end = manifest.length; }
+    if (end >= mlen) { end = mlen; }
     int i = open + 1;
     while (i < end) {
         char c = manifest[i];
@@ -238,16 +239,16 @@ public string[] manifestForbiddenFlags(string manifest) {
             int s = i + 1;
             int e = s;
             while (e < end && manifest[e] != '"') { e++; }
-            cliAddUnique(result, projectSlice(manifest, s, e));
+            result.addUnique(projectSlice(manifest, s, e));
             i = e + 1;
         } else {
             int s = i;
             while (i < end && manifest[i] != ',' && manifest[i] != ']'
                 && manifest[i] != ' ' && manifest[i] != '\t' && manifest[i] != '\r' && manifest[i] != '\n') { i++; }
-            cliAddUnique(result, projectSlice(manifest, s, i));
+            result.addUnique(projectSlice(manifest, s, i));
         }
     }
-    return result;
+    return result.items;
 }
 
 // Numeric value of `key: 123` inside the precompile block (seconds for
@@ -256,13 +257,14 @@ public string[] manifestForbiddenFlags(string manifest) {
 public int precompileNumericValue(string manifest, string key) {
     int pos = projectFind(manifest, "precompile", 0);
     if (pos < 0) { return -1; }
-    int searchEnd = manifest.length;
+    int mlen = manifest.length;
+    int searchEnd = mlen;
     int brace = pos;
-    while (brace < manifest.length && manifest[brace] != '{' && manifest[brace] != '\n') { brace++; }
-    if (brace < manifest.length && manifest[brace] == '{') {
+    while (brace < mlen && manifest[brace] != '{' && manifest[brace] != '\n') { brace++; }
+    if (brace < mlen && manifest[brace] == '{') {
         int depth = 1;
         int p = brace + 1;
-        while (p < manifest.length && depth > 0) {
+        while (p < mlen && depth > 0) {
             if (manifest[p] == '{') { depth++; }
             else if (manifest[p] == '}') { depth--; }
             p++;
@@ -287,12 +289,24 @@ public int precompileNumericValue(string manifest, string key) {
     return v;
 }
 
-private void cliAddUnique(string[] arr, string v) {
-    if (v.length == 0) { return; }
-    for (int i = 0; i < arr.length; i++) {
-        if (arr[i] == v) { return; }
+// One scan's forbidden-flag names. The walk grows this holder's property
+// array instead of a bare string[] parameter: growing a bare array inside
+// a helper leaves the caller's length stale (the truncate-at-8 edge
+// documented in std/project.sr:181; see also ProjectVisited / WatchFiles).
+class CliFlagNames {
+    public prop string[] items;
+
+    construct {
+        this.items = [];
     }
-    arr.add(v);
+
+    public void addUnique(string flagName) {
+        if (flagName.length == 0) { return; }
+        for (int i = 0; i < this.items.length; i++) {
+            if (this.items[i] == flagName) { return; }
+        }
+        this.items.add(flagName);
+    }
 }
 
 // Parse raw args (excluding argv[0]) into validated CliFlags. Never null:
