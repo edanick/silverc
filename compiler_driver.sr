@@ -1594,7 +1594,10 @@ void main() {
     // installed silverc then still finds the std tree it shipped with.
     if (exeDir.length == 0) { exeDir = drvSelfDir(); }
     if (flags.watch) {
-        runWatchLoop(flags, inputIsProject, manifestText, outputFile, exeDir);
+        // The command line rides along (captured inline in main(), the only
+        // place cargs may be read): the rebuild child runs the same
+        // compiler with the same arguments minus `--watch`.
+        runWatchLoop(flags, inputIsProject, manifestText, outputFile, exeDir, args);
         exit(0);
     }
 
@@ -2299,13 +2302,109 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
 // Polling goes through the fs builtins (mtime + size signatures every 500 ms).
 // ---------------------------------------------------------------------------
 
-void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, string outputFile, string exeDir) {
-    // Memory note: every rebuild runs in-process, so each tick's full working
-    // set (aggregate + tokens + AST) stays resident in the never-free runtime.
-    // Reclaiming it fully would need each rebuild to run in a fresh child
-    // process — deliberately not restructured here. What IS bounded cheaply:
-    // the poll snapshot buffers below are drained and refilled in place
-    // instead of reallocated per tick.
+// The command line the rebuild child runs: the program path, then every
+// argument the watcher was started with except `--watch` (a child that
+// watched too would never return), then the null terminator the exec
+// family expects.
+string[] drvWatchChildArgv(string[] cliArgs) {
+    string[] argv = [];
+    if (cliArgs.length > 0) { argv.add(cliArgs[0]); }
+    for (int i = 1; i < cliArgs.length; i++) {
+        if (cliArgs[i] == "--watch") { continue; }
+        argv.add(cliArgs[i]);
+    }
+    argv.add(null);
+    return argv;
+}
+
+// The Windows command line for the rebuild child: every argument in quotes
+// (the quoting the compiler's own Windows argument reader understands), so
+// a path with spaces survives the round trip.
+string drvWatchChildCommandLine(string[] cliArgs) {
+    string line = "";
+    for (int i = 0; i < cliArgs.length; i++) {
+        if (i > 0 && cliArgs[i] == "--watch") { continue; }
+        if (line.length > 0) { line = line + " "; }
+        line = line + "\"" + cliArgs[i] + "\"";
+    }
+    return line;
+}
+
+// Rebuild the watched program in a CHILD PROCESS and wait for it.
+//
+// The watcher rebuilds the program on every idle tick. An in-process
+// rebuild leaves the whole working set (aggregate + tokens + AST) resident
+// in the never-free runtime, so every tick's memory stays for the life of
+// the watcher: on a big project the second tick already doubles the
+// footprint and the third runs the machine out of memory (MEMORY.md §3.2
+// rank 9 / M1 — the working set is never released). The child does the
+// rebuild and takes its working set with it when it exits; the watcher
+// keeps only its own poll state.
+//
+// The child runs the SAME compiler with the SAME arguments minus `--watch`
+// (a child that watched too would never return), and its exit code comes
+// back to the watcher exactly like the in-process rebuild's. The child's
+// output streams are the watcher's own, so the rebuild's progress lines
+// and diagnostics land where they always did.
+int drvWatchRebuild(CliFlags flags, string[] cliArgs) {
+    if (cliArgs.length == 0) { return 1; }
+    int code = 1;
+    #on LINUX
+    // fork + execvpe + waitpid: the child image is a fresh compiler
+    // process, so nothing of the rebuild survives it.
+    string[] argv = drvWatchChildArgv(cliArgs);
+    int pid = fork();
+    if (pid == 0) {
+        execvpe(cliArgs[0], argv, null);
+        exit(127);
+    }
+    if (pid < 0) {
+        flags.errLine("watch: could not start the rebuild process");
+    } else {
+        int st = 0;
+        waitpid(pid, &st, 0);
+        code = (st >> 8) & 0xFF;
+    }
+    #on MAC
+    // Darwin has no fork (deprecated, and absent from the grant table): the
+    // rebuild runs as a spawned process instead.
+    string[] argv = drvWatchChildArgv(cliArgs);
+    int pid = 0;
+    int rc = posix_spawnp(&pid, cliArgs[0], null, null, argv, null);
+    if (rc != 0 || pid <= 0) {
+        flags.errLine("watch: could not start the rebuild process");
+    } else {
+        int st = 0;
+        waitpid(pid, &st, 0);
+        code = (st >> 8) & 0xFF;
+    }
+    #on WINDOWS
+    int[] si = [];
+    for (int zi = 0; zi < 104; zi++) { si.add(0); }
+    int[] pi = [];
+    for (int pz = 0; pz < 6; pz++) { pi.add(0); }
+    int created = CreateProcessA(null, drvWatchChildCommandLine(cliArgs), null, null, 0, 0, null, null, si, pi);
+    if (created == 0) {
+        flags.errLine("watch: could not start the rebuild process");
+    } else {
+        int hProcess = pi[0];
+        WaitForSingleObject(hProcess, -1);
+        int gotCode = 0;
+        GetExitCodeProcess(hProcess, &gotCode);
+        CloseHandle(hProcess);
+        code = gotCode;
+    }
+    #off
+    return code;
+}
+
+void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, string outputFile, string exeDir, string[] cliArgs) {
+    // Memory note: every rebuild runs in a CHILD PROCESS (drvWatchRebuild),
+    // so each tick's full working set (aggregate + tokens + AST) dies with
+    // the child instead of staying resident in the watcher's never-free
+    // runtime. The watcher itself keeps only the poll snapshot below, and
+    // those buffers are drained and refilled in place instead of being
+    // reallocated per tick.
     string root = ".";
     string[] files = [];
     bool multiFile = false;
@@ -2409,7 +2508,7 @@ void runWatchLoop(CliFlags flags, bool inputIsProject, string manifestText, stri
         }
 
         flags.errLine("watch: idle timer expired, precompiling");
-        int code = compileOnce(flags, outputFile, exeDir);
+        int code = drvWatchRebuild(flags, cliArgs);
         if (code != 0) {
             flags.errLine("watch: precompilation failed");
         }
