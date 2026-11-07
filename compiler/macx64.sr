@@ -16,9 +16,12 @@ mod export macx64;
 // array and callers re-adopt it (`buf = macX64AddU32(buf, v)`).
 
 int macX64AlignUp(int64 v, int64 a) {
+    if (a <= 0) { return v; }
+    if (v < 0) { return v; }
     int64 m = v % a;
-    if (m != 0) { return v + (a - m); }
-    return v;
+    if (m == 0) { return v; }
+    if (v > 9223372036854775807 - (a - m)) { return 9223372036854775807; }
+    return v + (a - m);
 }
 
 // True when a native import returns 32-bit C int (rather than a 64-bit
@@ -117,25 +120,36 @@ int[] macX64AddU16(int[] buf, int v) {
 // 0 rxVaddr, 1 dataOff, 2 dataVaddr, 3 dataLen, 4 slotsOff, 5 slotsVaddr,
 // 6 fixOff, 7 entryFileoff, 8 codeLen
 int64[] macX64Plan(int codeLen, int dataLen, int nImports, int mainOffset) {
+    int cLen = codeLen;
+    if (cLen < 0) { cLen = 0; }
+    int dLen = dataLen;
+    if (dLen < 0) { dLen = 0; }
+    int nImp = nImports;
+    if (nImp < 0) { nImp = 0; }
+    if (nImp > 9223372036854775807 / 8) { nImp = 9223372036854775807 / 8; }
+    int mOff = mainOffset;
+    if (mOff < 0) { mOff = 0; }
     int64 TEXT_BASE = 4294967296;
     int64 PAGE = 4096;
     int64 CODE_OFF = 4096;
     int64 rxVaddr = TEXT_BASE + CODE_OFF;
-    int64 dataOff = macX64AlignUp(CODE_OFF + codeLen, PAGE);
+    int64 dataOff = macX64AlignUp(CODE_OFF + cLen, PAGE);
     int64 dataVaddr = TEXT_BASE + dataOff;
-    int64 slotsOff = macX64AlignUp(dataOff + dataLen, PAGE);
+    int64 slotsOff = macX64AlignUp(dataOff + dLen, PAGE);
     int64 slotsVaddr = TEXT_BASE + slotsOff;
-    int64 fixOff = macX64AlignUp(slotsOff + nImports * 8, PAGE);
+    int64 slotsBytes = nImp * 8;
+    if (slotsOff > 9223372036854775807 - slotsBytes) { slotsBytes = 9223372036854775807 - slotsOff; }
+    int64 fixOff = macX64AlignUp(slotsOff + slotsBytes, PAGE);
     int64[] layout = [];
     layout.add(rxVaddr);
     layout.add(dataOff);
     layout.add(dataVaddr);
-    layout.add(dataLen);
+    layout.add(dLen);
     layout.add(slotsOff);
     layout.add(slotsVaddr);
     layout.add(fixOff);
-    layout.add(CODE_OFF + mainOffset);
-    layout.add(codeLen);
+    layout.add(CODE_OFF + mOff);
+    layout.add(cLen);
     return layout;
 }
 
@@ -213,12 +227,14 @@ int[] macX64AddSection(int[] cmds, string sectname, string segname, int64 addr, 
 }
 
 int[] macX64AddSegmentHead(int[] cmds, int nsects) {
+    if (nsects < 0) { nsects = 0; }
     cmds = macX64AddU32(cmds, 25);
     cmds = macX64AddU32(cmds, 72 + 80 * nsects);
     return cmds;
 }
 
 int[] macX64AddSegmentTail(int[] cmds, int64 vmaddr, int64 vmsize, int64 fileoff, int64 filesize, int maxprot, int initprot, int nsects, int flags) {
+    if (nsects < 0) { nsects = 0; }
     cmds = macX64AddU64(cmds, vmaddr);
     cmds = macX64AddU64(cmds, vmsize);
     cmds = macX64AddU64(cmds, fileoff);
@@ -231,6 +247,7 @@ int[] macX64AddSegmentTail(int[] cmds, int64 vmaddr, int64 vmsize, int64 fileoff
 }
 
 int[] macX64Emit(int64[] layout, int[] code, int[] data, string[] funcs) {
+    if (layout.length < 9) { return []; }
     int64 TEXT_BASE = 4294967296;
     int64 CODE_OFF = 4096;
     int64 rxVaddr = layout[0];
