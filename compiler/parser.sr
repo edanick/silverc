@@ -62,6 +62,45 @@ class Parser {
     private bool macAllModules;
     private string[] macOpenModules;
     private string[] macGrantNames;
+    // Parsed export-table sets (C5 / MEMORY.md row 12): each fixed DLL/lib
+    // table is split into words ONCE per Parser and cached here; lookups
+    // are slice-free `.contains` tests instead of re-slicing the whole
+    // table per call node. One word array + ready flag per library.
+    private string[] win32Kernel32Set;
+    private bool win32Kernel32Ready;
+    private string[] win32Ws2Set;
+    private bool win32Ws2Ready;
+    private string[] win32WinhttpSet;
+    private bool win32WinhttpReady;
+    private string[] win32WininetSet;
+    private bool win32WininetReady;
+    private string[] win32Shell32Set;
+    private bool win32Shell32Ready;
+    private string[] win32MsvcrtSet;
+    private bool win32MsvcrtReady;
+    private string[] win32User32Set;
+    private bool win32User32Ready;
+    private string[] win32Advapi32Set;
+    private bool win32Advapi32Ready;
+    private string[] win32VersionSet;
+    private bool win32VersionReady;
+    private string[] linuxLibcSet;
+    private bool linuxLibcReady;
+    private string[] linuxX11Set;
+    private bool linuxX11Ready;
+    private string[] linuxXtstSet;
+    private bool linuxXtstReady;
+    private string[] macLibSystemSet;
+    private bool macLibSystemReady;
+    private string[] macObjcSet;
+    private bool macObjcReady;
+    // Membership set over sigNames (row 7): maintained alongside every
+    // sigNames.add so isKnownCallableName is O(1) instead of O(n) per
+    // call node. Duplicate signature names collapse, as membership did.
+    private dict<string, int> sigNameSet;
+    // callableCandidates cache: rebuilt only after sigNames grows.
+    private string[] callableCandsCache;
+    private bool callableCandsReady;
     // DOCS/261 -- per-project custom native modules (`.srp` `nativeModules`).
     // Declared custom names resolve per target OS (bare `import { f } from m;`
     // uses the `windows` file on WINDOWS/MAC, the `linux` file on LINUX; star
@@ -140,6 +179,37 @@ class Parser {
         this.macAllModules = false;
         this.macOpenModules = [];
         this.macGrantNames = [];
+        this.win32Kernel32Set = [];
+        this.win32Kernel32Ready = false;
+        this.win32Ws2Set = [];
+        this.win32Ws2Ready = false;
+        this.win32WinhttpSet = [];
+        this.win32WinhttpReady = false;
+        this.win32WininetSet = [];
+        this.win32WininetReady = false;
+        this.win32Shell32Set = [];
+        this.win32Shell32Ready = false;
+        this.win32MsvcrtSet = [];
+        this.win32MsvcrtReady = false;
+        this.win32User32Set = [];
+        this.win32User32Ready = false;
+        this.win32Advapi32Set = [];
+        this.win32Advapi32Ready = false;
+        this.win32VersionSet = [];
+        this.win32VersionReady = false;
+        this.linuxLibcSet = [];
+        this.linuxLibcReady = false;
+        this.linuxX11Set = [];
+        this.linuxX11Ready = false;
+        this.linuxXtstSet = [];
+        this.linuxXtstReady = false;
+        this.macLibSystemSet = [];
+        this.macLibSystemReady = false;
+        this.macObjcSet = [];
+        this.macObjcReady = false;
+        this.sigNameSet = {};
+        this.callableCandsCache = [];
+        this.callableCandsReady = false;
         this.customNative = new NativeModules();
         this.customTargetOs = "";
         this.modExportNames = [];
@@ -398,25 +468,22 @@ class Parser {
     // Split a comma-joined signature component back into entries.
     private string[] splitSigList(string joined) {
         string[] parts = [];
-        string cur = "";
+        int start = 0;
         for (int i = 0; i < joined.length; i++) {
-            char c = joined[i];
-            if (c == ',') { parts.add(cur); cur = ""; }
-            else { cur += (string)c; }
+            if (joined[i] == ',') { parts.add(projectSlice(joined, start, i)); start = i + 1; }
         }
-        parts.add(cur);
+        parts.add(projectSlice(joined, start, joined.length));
         return parts;
     }
 
     // VALUE_EXCEPTION.md — a numeric parse conversion receiving a non-numeric
     // string literal raises a ValueException pointing at the literal.
     private bool stringIsNumber(string s, bool wantInt) {
-        string t = "";
         int start = 0;
         int end = s.length;
         while (start < end && s[start] == ' ') { start++; }
         while (end > start && s[end - 1] == ' ') { end--; }
-        for (int i = start; i < end; i++) { t += (string)s[i]; }
+        string t = projectSlice(s, start, end);
         int len = t.length;
         if (len == 0) { return false; }
         int i2 = 0;
@@ -729,9 +796,7 @@ class Parser {
             if (this.anonKnownGlobals[g] == name) { return true; }
         }
         if (this.knownIdentName(name)) { return true; }
-        for (int s = 0; s < this.sigNames.length; s++) {
-            if (this.sigNames[s] == name) { return true; }
-        }
+        if (this.sigNameSet.contains(name)) { return true; }
         if (this.isDeclaredTypeName(name)) { return true; }
         // Module receivers (`time.now()` inside the body): the aggregate's
         // declared modules resolve like silverc-rs's module_names set.
@@ -760,9 +825,7 @@ class Parser {
     }
 
     private bool isKnownCallableName(string name) {
-        for (int i = 0; i < this.sigNames.length; i++) {
-            if (this.sigNames[i] == name) { return true; }
-        }
+        if (this.sigNameSet.contains(name)) { return true; }
         if (this.isDeclaredTypeName(name)) { return true; }
         if (this.isBuiltinCallableName(name)) { return true; }
         if (this.win32Resolvable(name)) { return true; }
@@ -788,7 +851,7 @@ class Parser {
         }
         for (int m = 0; m < this.win32OpenModules.length; m++) {
             string dll = this.win32ModuleNameDll(this.win32OpenModules[m]);
-            if (dll.length > 0 && this.tableHas(this.win32DllExportTable(dll), name)) { return true; }
+            if (dll.length > 0 && this.win32ExportSet(dll).contains(name)) { return true; }
         }
         return false;
     }
@@ -804,7 +867,7 @@ class Parser {
         }
         for (int m = 0; m < this.linuxOpenModules.length; m++) {
             string lib = this.linuxModuleNameLib(this.linuxOpenModules[m]);
-            if (lib.length > 0 && this.tableHas(this.linuxLibExportTable(lib), name)) { return true; }
+            if (lib.length > 0 && this.linuxExportSet(lib).contains(name)) { return true; }
         }
         return false;
     }
@@ -823,15 +886,90 @@ class Parser {
         return "";
     }
 
-    private bool tableHas(string table, string fn) {
+    // Split one export table into its words exactly as the old tableHas
+    // scan did (space-separated, empty words skipped). Runs ONCE per
+    // library per Parser; the cached words back slice-free membership.
+    private string[] parseExportTable(string table) {
+        string[] words = [];
         int i = 0;
         while (i < table.length) {
             while (i < table.length && table[i] == ' ') { i++; }
             int start = i;
             while (i < table.length && table[i] != ' ') { i++; }
-            if (i > start && fn == projectSlice(table, start, i)) { return true; }
+            if (i > start) { words.add(projectSlice(table, start, i)); }
         }
-        return false;
+        return words;
+    }
+
+    private string[] win32ExportSet(string dll) {
+        if (dll == "kernel32.dll") {
+            if (!this.win32Kernel32Ready) { this.win32Kernel32Set = this.parseExportTable(this.win32DllExportTable(dll)); this.win32Kernel32Ready = true; }
+            return this.win32Kernel32Set;
+        }
+        if (dll == "ws2_32.dll") {
+            if (!this.win32Ws2Ready) { this.win32Ws2Set = this.parseExportTable(this.win32DllExportTable(dll)); this.win32Ws2Ready = true; }
+            return this.win32Ws2Set;
+        }
+        if (dll == "winhttp.dll") {
+            if (!this.win32WinhttpReady) { this.win32WinhttpSet = this.parseExportTable(this.win32DllExportTable(dll)); this.win32WinhttpReady = true; }
+            return this.win32WinhttpSet;
+        }
+        if (dll == "wininet.dll") {
+            if (!this.win32WininetReady) { this.win32WininetSet = this.parseExportTable(this.win32DllExportTable(dll)); this.win32WininetReady = true; }
+            return this.win32WininetSet;
+        }
+        if (dll == "shell32.dll") {
+            if (!this.win32Shell32Ready) { this.win32Shell32Set = this.parseExportTable(this.win32DllExportTable(dll)); this.win32Shell32Ready = true; }
+            return this.win32Shell32Set;
+        }
+        if (dll == "msvcrt.dll") {
+            if (!this.win32MsvcrtReady) { this.win32MsvcrtSet = this.parseExportTable(this.win32DllExportTable(dll)); this.win32MsvcrtReady = true; }
+            return this.win32MsvcrtSet;
+        }
+        if (dll == "user32.dll") {
+            if (!this.win32User32Ready) { this.win32User32Set = this.parseExportTable(this.win32DllExportTable(dll)); this.win32User32Ready = true; }
+            return this.win32User32Set;
+        }
+        if (dll == "advapi32.dll") {
+            if (!this.win32Advapi32Ready) { this.win32Advapi32Set = this.parseExportTable(this.win32DllExportTable(dll)); this.win32Advapi32Ready = true; }
+            return this.win32Advapi32Set;
+        }
+        if (dll == "version.dll") {
+            if (!this.win32VersionReady) { this.win32VersionSet = this.parseExportTable(this.win32DllExportTable(dll)); this.win32VersionReady = true; }
+            return this.win32VersionSet;
+        }
+        string[] none = [];
+        return none;
+    }
+
+    private string[] linuxExportSet(string lib) {
+        if (lib == "libc.so.6") {
+            if (!this.linuxLibcReady) { this.linuxLibcSet = this.parseExportTable(this.linuxLibExportTable(lib)); this.linuxLibcReady = true; }
+            return this.linuxLibcSet;
+        }
+        if (lib == "libX11.so.6") {
+            if (!this.linuxX11Ready) { this.linuxX11Set = this.parseExportTable(this.linuxLibExportTable(lib)); this.linuxX11Ready = true; }
+            return this.linuxX11Set;
+        }
+        if (lib == "libXtst.so.6") {
+            if (!this.linuxXtstReady) { this.linuxXtstSet = this.parseExportTable(this.linuxLibExportTable(lib)); this.linuxXtstReady = true; }
+            return this.linuxXtstSet;
+        }
+        string[] none = [];
+        return none;
+    }
+
+    private string[] macExportSet(string lib) {
+        if (lib == "/usr/lib/libSystem.B.dylib") {
+            if (!this.macLibSystemReady) { this.macLibSystemSet = this.parseExportTable(this.macLibExportTable(lib)); this.macLibSystemReady = true; }
+            return this.macLibSystemSet;
+        }
+        if (lib == "/usr/lib/libobjc.A.dylib") {
+            if (!this.macObjcReady) { this.macObjcSet = this.parseExportTable(this.macLibExportTable(lib)); this.macObjcReady = true; }
+            return this.macObjcSet;
+        }
+        string[] none = [];
+        return none;
     }
 
     // Mirror of linuxResolvable for the mac grant trio above: a full `mac`
@@ -844,7 +982,7 @@ class Parser {
         }
         for (int m = 0; m < this.macOpenModules.length; m++) {
             string lib = this.macModuleNameLib(this.macOpenModules[m]);
-            if (lib.length > 0 && this.tableHas(this.macLibExportTable(lib), name)) { return true; }
+            if (lib.length > 0 && this.macExportSet(lib).contains(name)) { return true; }
         }
         return false;
     }
@@ -956,6 +1094,7 @@ class Parser {
     // Did-you-mean candidate pool: every user-defined function plus the
     // builtin free calls.
     private string[] callableCandidates() {
+        if (this.callableCandsReady) { return this.callableCandsCache; }
         string[] cands = [];
         for (int i = 0; i < this.sigNames.length; i++) { cands.add(this.sigNames[i]); }
         cands.add("print"); cands.add("printline");
@@ -976,6 +1115,8 @@ class Parser {
         cands.add("deleteFile");
         cands.add("toString"); cands.add("toInt");
         cands.add("toUpper"); cands.add("toLower");
+        this.callableCandsCache = cands;
+        this.callableCandsReady = true;
         return cands;
     }
 
@@ -1008,9 +1149,7 @@ class Parser {
         if (m != "startsWith" && m != "endsWith") { return; }
         int argc = call.childCount() - 1;
         if (argc <= 1) { return; }
-        for (int i = 0; i < this.sigNames.length; i++) {
-            if (this.sigNames[i] == m) { return; }
-        }
+        if (this.sigNameSet.contains(m)) { return; }
         this.recordError((string)call.line + ":" + (string)call.col + ": no overload of '" + m + "' takes " + (string)argc + " argument(s)");
     }
 
@@ -1791,8 +1930,7 @@ class Parser {
                 int e = s;
                 while (e < exps.length && exps[e] != ' ' && exps[e] != '\t') { e++; }
                 if (e > s) {
-                    string nm = "";
-                    for (int k = s; k < e; k++) { nm += exps[k]; }
+                    string nm = projectSlice(exps, s, e);
                     if (isLinux) { this.linuxGrantNames.add(nm); }
                     else { this.win32GrantNames.add(nm); }
                 }
@@ -2743,6 +2881,8 @@ class Parser {
             joinNames += sp.name;
         }
         this.sigNames.add(opName);
+        this.sigNameSet[opName] = 1;
+        this.callableCandsReady = false;
         this.sigTypes.add(joinTypes);
         this.sigParams.add(joinNames);
         this.sigVariadic.add(0);
@@ -2903,6 +3043,8 @@ class Parser {
             if (sp.isVariadic) { variadicTail = true; }
         }
         this.sigNames.add(node.name);
+        this.sigNameSet[node.name] = 1;
+        this.callableCandsReady = false;
         this.sigTypes.add(joinTypes);
         this.sigParams.add(joinNames);
         if (variadicTail) { this.sigVariadic.add(1); } else { this.sigVariadic.add(0); }
@@ -5183,6 +5325,8 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
     // follow-on unknown-method noise.
     private void registerDamagedSignature(string name) {
         this.sigNames.add(name);
+        this.sigNameSet[name] = 1;
+        this.callableCandsReady = false;
         this.sigTypes.add("");
         this.sigParams.add("");
         this.sigVariadic.add(0);
