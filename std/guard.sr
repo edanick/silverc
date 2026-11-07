@@ -138,6 +138,32 @@ class GuardField {
     }
 }
 
+// One branch checkpoint (undo state): the mutable flag state of the
+// live-variable set at a branch entry — the parallel isInit/isAlive/
+// holdsAddress flags plus the aliasOf/addrTarget strings — and the live
+// length. Only these five fields ever change after a binding's
+// declaration; the rest (name, typeHint, isOnce, isFixed, isNullable,
+// isAlias, line, col) are immutable, so a checkpoint never needs to copy
+// a GuardVar object. Restoring rewrites the flags in place and truncates
+// branch-local declarations.
+class VarCheckpoint {
+    public prop int len;
+    public prop bool[] init;
+    public prop bool[] alive;
+    public prop bool[] holds;
+    public prop string[] alias;
+    public prop string[] addr;
+
+    construct {
+        this.len = 0;
+        this.init = [];
+        this.alive = [];
+        this.holds = [];
+        this.alias = [];
+        this.addr = [];
+    }
+}
+
 class MemoryGuard {
     private prop GuardVar[] vars;
     private prop int[] scopeEnds;
@@ -263,32 +289,37 @@ class MemoryGuard {
         }
         // Truncate in place: rebuilding `kept`/`newSE` arrays per scope exit
         // copied the whole live set on every block end (2-3 array copies per
-        // branch node via snapshot above this).
+        // branch node via the old whole-object snapshots — now branch
+        // checkpoints in saveVars/restoreVars, flags only).
         while (this.vars.length > start) { this.vars.pop(); }
     }
 
-    private GuardVar cloneVar(GuardVar v) {
-        GuardVar c = new GuardVar();
-        c.name = v.name;
-        c.typeHint = v.typeHint;
-        c.isInit = v.isInit;
-        c.isAlive = v.isAlive;
-        c.isOnce = v.isOnce;
-        c.isNullable = v.isNullable;
-        c.isFixed = v.isFixed;
-        c.isAlias = v.isAlias;
-        c.holdsAddress = v.holdsAddress;
-        c.aliasOf = v.aliasOf;
-        c.addrTarget = v.addrTarget;
-        c.line = v.line;
-        c.col = v.col;
-        return c;
+    private VarCheckpoint saveVars() {
+        VarCheckpoint cp = new VarCheckpoint();
+        cp.len = this.vars.length;
+        for (int i = 0; i < cp.len; i++) {
+            GuardVar v = this.vars[i];
+            cp.init.add(v.isInit);
+            cp.alive.add(v.isAlive);
+            cp.holds.add(v.holdsAddress);
+            cp.alias.add(v.aliasOf);
+            cp.addr.add(v.addrTarget);
+        }
+        return cp;
     }
 
-    private GuardVar[] snapshot() {
-        GuardVar[] out = [];
-        for (int i = 0; i < this.vars.length; i++) { out.add(this.cloneVar(this.vars[i])); }
-        return out;
+    private void restoreVars(VarCheckpoint cp) {
+        int n = this.vars.length;
+        if (n > cp.len) { n = cp.len; }
+        for (int i = 0; i < n; i++) {
+            GuardVar v = this.vars[i];
+            v.isInit = cp.init[i];
+            v.isAlive = cp.alive[i];
+            v.holdsAddress = cp.holds[i];
+            v.aliasOf = cp.alias[i];
+            v.addrTarget = cp.addr[i];
+        }
+        while (this.vars.length > cp.len) { this.vars.pop(); }
     }
 
     // Same-scope redeclaration: a name already bound in the innermost
@@ -369,9 +400,9 @@ class MemoryGuard {
         if (start < 0) { start = 0; }
         if (end > s.length) { end = s.length; }
         if (end <= start) { return ""; }
-        string r = "";
-        for (int i = start; i < end; i++) { r += s[i]; }
-        return r;
+        string[] parts = [];
+        for (int i = start; i < end; i++) { parts.add((string)s[i]); }
+        return parts.join("");
     }
 
     private bool isKnownTypeName(string t) {
@@ -1426,7 +1457,7 @@ class MemoryGuard {
         string[] elseNarrowed = [];
         this.collectNarrowings(cond, true, thenNarrowed);
         this.collectNarrowings(cond, false, elseNarrowed);
-        GuardVar[] before = this.snapshot();
+        VarCheckpoint before = this.saveVars();
         string[] savedNN = this.snapshotNonNull();
         this.pushScope();
         this.addNarrowings(thenNarrowed);
@@ -1435,9 +1466,9 @@ class MemoryGuard {
         bool thenTerminal = this.stmtListIsTerminal(n.child(1));
         this.popScope();
         this.nonNullNames = savedNN;
-        GuardVar[] afterThen = this.snapshot();
-        this.vars = before;
-        GuardVar[] afterElse = [];
+        VarCheckpoint afterThen = this.saveVars();
+        this.restoreVars(before);
+        VarCheckpoint afterElse = before;
         // Join-point merge (null-state-flow `Meet` at branch convergence):
         // a fact survives the if only when it holds on every path that
         // completes it. Terminal branches never reach the join
@@ -1456,9 +1487,8 @@ class MemoryGuard {
             }
             this.popScope();
             this.nonNullNames = savedNN;
-            afterElse = this.snapshot();
+            afterElse = this.saveVars();
         } else {
-            afterElse = this.snapshot();
             string[] implicitPath = this.copyWithFacts(savedNN, elseNarrowed);
             if (!haveJoin) { joined = implicitPath; haveJoin = true; } else { joined = this.meetNonNull(joined, implicitPath); }
         }
@@ -1466,9 +1496,9 @@ class MemoryGuard {
         this.nonNullNames = joined;
         for (int i = 0; i < this.vars.length; i++) {
             GuardVar v = this.vars[i];
-            v.isInit = afterThen[i].isInit && afterElse[i].isInit;
-            v.isAlive = afterThen[i].isAlive || afterElse[i].isAlive;
-            v.holdsAddress = afterThen[i].holdsAddress || afterElse[i].holdsAddress;
+            v.isInit = afterThen.init[i] && afterElse.init[i];
+            v.isAlive = afterThen.alive[i] || afterElse.alive[i];
+            v.holdsAddress = afterThen.holds[i] || afterElse.holds[i];
         }
     }
 
@@ -1480,7 +1510,7 @@ class MemoryGuard {
         if (n.child(0).kind == GND_BOOL_LIT && !n.child(0).boolVal) {
             this.warnings.add("condition is always false: this body never executes at line " + (string)n.line + ", column " + (string)n.col);
         }
-        GuardVar[] before = this.snapshot();
+        VarCheckpoint before = this.saveVars();
         string[] savedNN = this.snapshotNonNull();
         // While the loop runs, the condition holds: nullable conditions
         // like `while (x != null)` narrow `x` inside the body.
@@ -1506,13 +1536,13 @@ class MemoryGuard {
         // >=1-iteration path the body's exit state; both then gain the exit
         // facts (they hold at every condition re-test).
         this.nonNullNames = this.copyWithFacts(this.meetNonNull(savedNN, bodyNN), exitNarrowed);
-        this.vars = before;
+        this.restoreVars(before);
     }
 
     private void checkFor(Node n) {
         this.pushScope();
         this.checkStmt(n.child(0));
-        GuardVar[] before = this.snapshot();
+        VarCheckpoint before = this.saveVars();
         this.checkExpr(n.child(1));
         this.pushScope();
         this.loopDepth++;
@@ -1520,7 +1550,7 @@ class MemoryGuard {
         this.loopDepth--;
         string[] bodyNN = this.snapshotNonNull();
         this.popScope();
-        this.vars = before;
+        this.restoreVars(before);
         // Historical outflow kept deliberately: loop-body null-state flows
         // out of for loops (a guaranteed-run loop's body facts hold after
         // it; joining with the entry state would drop facts such programs
@@ -1560,8 +1590,7 @@ class MemoryGuard {
         string[] tryNN = this.snapshotNonNull();
         this.popScope();
         this.nonNullNames = savedNN;
-        GuardVar[] afterTry = this.snapshot();
-        this.vars = afterTry;
+        VarCheckpoint afterTry = this.saveVars();
         this.pushScope();
         string cv = n.name;
         if (cv.length > 0) {
@@ -1571,12 +1600,12 @@ class MemoryGuard {
         string[] catchNN = this.snapshotNonNull();
         bool catchTerminal = this.stmtListIsTerminal(n.child(1));
         this.popScope();
-        GuardVar[] afterCatch = this.snapshot();
+        VarCheckpoint afterCatch = this.saveVars();
         for (int i = 0; i < this.vars.length; i++) {
             GuardVar v = this.vars[i];
-            v.isInit = afterTry[i].isInit && afterCatch[i].isInit;
-            v.isAlive = afterTry[i].isAlive || afterCatch[i].isAlive;
-            v.holdsAddress = afterTry[i].holdsAddress || afterCatch[i].holdsAddress;
+            v.isInit = afterTry.init[i] && afterCatch.init[i];
+            v.isAlive = afterTry.alive[i] || afterCatch.alive[i];
+            v.holdsAddress = afterTry.holds[i] || afterCatch.holds[i];
         }
         // Join (null-state-flow try/catch convergence): the statement
         // completes via the body's end or the catch's end; a fact must hold
@@ -1617,7 +1646,7 @@ class MemoryGuard {
     private void checkSwitch(Node n) {
         this.checkExpr(n.child(0));
         this.checkEnumExhaustiveSwitch(n);
-        GuardVar[] before = this.snapshot();
+        VarCheckpoint before = this.saveVars();
         string[] savedNN = this.snapshotNonNull();
         int total = n.childCount();
         bool hasElse = total % 2 == 0;
@@ -1653,7 +1682,7 @@ class MemoryGuard {
         string[] joined = [];
         bool haveJoin = false;
         if (hasElse) {
-            this.vars = before;
+            this.restoreVars(before);
             this.pushScope();
             this.checkStmtList(n.child(total - 1));
             if (!this.stmtListIsTerminal(n.child(total - 1))) {
@@ -1669,7 +1698,7 @@ class MemoryGuard {
             }
         }
         for (int ci = 1; ci < pairEnd; ci += 2) {
-            this.vars = before;
+            this.restoreVars(before);
             this.nonNullNames = savedNN;
             this.checkExpr(n.child(ci));
             this.pushScope();
@@ -1691,11 +1720,11 @@ class MemoryGuard {
             // unassigned on that path by the merge above).
             if (!haveJoin) { joined = savedNN; haveJoin = true; } else { joined = this.meetNonNull(joined, savedNN); }
             for (int b = 0; b < this.vars.length; b++) {
-                if (before[b].isAlive) { aliveAny[b] = true; }
-                if (before[b].holdsAddress) { addrAny[b] = true; }
+                if (before.alive[b]) { aliveAny[b] = true; }
+                if (before.holds[b]) { addrAny[b] = true; }
             }
         }
-        this.vars = before;
+        this.restoreVars(before);
         for (int b = 0; b < this.vars.length; b++) {
             this.vars[b].isInit = initOk[b];
             this.vars[b].isAlive = aliveAny[b];
@@ -1762,11 +1791,9 @@ class MemoryGuard {
             if (!covered.contains(variant)) { missing.add(variant); }
         }
         if (missing.length == 0) { return; }
-        string list = "";
-        for (int m = 0; m < missing.length; m++) {
-            if (m > 0) { list += ", "; }
-            list += "'" + missing[m] + "'";
-        }
+        string[] parts = [];
+        for (int m = 0; m < missing.length; m++) { parts.add("'" + missing[m] + "'"); }
+        string list = parts.join(", ");
         this.warnings.add("switch on enum '" + en + "' does not cover " + list + " at line " + (string)line + ", column " + (string)col);
     }
 
