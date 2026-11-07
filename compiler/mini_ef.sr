@@ -57,6 +57,19 @@ class MiniEf {
     // PE optional-header subsystem (DOCS/253): 3 = console (default),
     // 2 = Windows GUI (no attached console, used by `type: app` / `service`).
     public int subsystem;
+    public int evCacheReady;
+    public string[] evDlls;
+    public int[] evGroupSizes;
+    public int[] evGroupMap;
+    public int[] evPosInGroup;
+    public int[] evIltSizes;
+    public int[] evHintOffs;
+    public int[] evDllOffs;
+    public int evNumGroups;
+    public int evDescBytes;
+    public int evIltTotal;
+    public int evNamesStart;
+    public int evStringsStart;
 
     construct {
         this.code = [];
@@ -68,6 +81,19 @@ class MiniEf {
         this.viKeys = [];
         this.viValues = [];
         this.subsystem = 3;
+        this.evCacheReady = 0;
+        this.evDlls = [];
+        this.evGroupSizes = [];
+        this.evGroupMap = [];
+        this.evPosInGroup = [];
+        this.evIltSizes = [];
+        this.evHintOffs = [];
+        this.evDllOffs = [];
+        this.evNumGroups = 0;
+        this.evDescBytes = 0;
+        this.evIltTotal = 0;
+        this.evNamesStart = 0;
+        this.evStringsStart = 0;
     }
 
     public void addSectionData(int[] data) {
@@ -86,6 +112,7 @@ class MiniEf {
 
     public void addImport(string dll, string name) {
         this.imports.add(new EfImport(dll, name));
+        this.evCacheReady = 0;
     }
 
     public int computeRdataRva() {
@@ -95,9 +122,16 @@ class MiniEf {
         return textRva + textVirt;
     }
 
-    public int[] computeLayout(int stringDataLen) {
+    private void cacheEvLayout() {
+        if (this.evCacheReady == 1) { return; }
+        this.evDlls = [];
+        this.evGroupSizes = [];
+        this.evGroupMap = [];
+        this.evPosInGroup = [];
+        this.evIltSizes = [];
+        this.evHintOffs = [];
+        this.evDllOffs = [];
         EfDllGroup[] groups = [];
-        int[] groupMap = [];
         for (int i = 0; i < this.imports.length; i++) {
             string impDll = this.imports[i].dll;
             int gIdx = -1;
@@ -114,31 +148,53 @@ class MiniEf {
             }
             EfDllGroup grp = groups[gIdx];
             grp.count++;
-            groupMap.add(gIdx);
+            this.evGroupMap.add(gIdx);
         }
         int numGroups = groups.length;
-        int descBytes = (numGroups + 1) * 20;
+        this.evNumGroups = numGroups;
+        for (int g = 0; g < numGroups; g++) {
+            this.evDlls.add(groups[g].dll);
+            this.evGroupSizes.add(groups[g].count);
+        }
+        this.evDescBytes = (numGroups + 1) * 20;
         int iltTotal = 0;
         for (int g = 0; g < numGroups; g++) {
-            int cnt = groups[g].count;
-            iltTotal += (cnt + 1) * 8;
+            int sz = (groups[g].count + 1) * 8;
+            this.evIltSizes.add(sz);
+            iltTotal += sz;
+        }
+        this.evIltTotal = iltTotal;
+        int[] runningCount = [];
+        for (int g = 0; g < numGroups; g++) {
+            runningCount.add(0);
+        }
+        for (int i = 0; i < this.imports.length; i++) {
+            int g = this.evGroupMap[i];
+            this.evPosInGroup.add(runningCount[g]);
+            runningCount[g]++;
         }
         int iatTotal = iltTotal;
-        int namesStart = descBytes + iltTotal + iatTotal;
-        int hintNamesLen = 0;
+        this.evNamesStart = this.evDescBytes + iltTotal + iatTotal;
+        int off = 0;
         for (int i = 0; i < this.imports.length; i++) {
             string nm = this.imports[i].name;
-            hintNamesLen += 2 + nm.length + 1;
+            this.evHintOffs.add(off);
+            off += 2 + nm.length + 1;
         }
         for (int g = 0; g < numGroups; g++) {
-            string gDll2 = groups[g].dll;
-            hintNamesLen += gDll2.length + 1;
+            this.evDllOffs.add(off);
+            off += this.evDlls[g].length + 1;
         }
-        int stringsStart = namesStart + hintNamesLen;
+        this.evStringsStart = this.evNamesStart + off;
+        this.evCacheReady = 1;
+    }
+
+    public int[] computeLayout(int stringDataLen) {
+        this.cacheEvLayout();
         int[] layout = [];
-        layout.add(stringsStart);
-        layout.add(numGroups);
-        layout.add(iltTotal);
+        layout.add(this.evStringsStart);
+        layout.add(this.evNumGroups);
+        layout.add(this.evIltTotal);
         return layout;
     }
 
@@ -183,10 +239,12 @@ class MiniEf {
         for (int i = 0; i < v.length; i++) {
             if (v[i] == '.') { dots++; }
         }
+        string[] parts = [];
+        parts.add(v);
         for (int i = 0; dots < 3; dots++) {
-            v += ".0";
+            parts.add(".0");
         }
-        return v;
+        return parts.join("");
     }
 
     private int[] buildVERSIONINFO(string[] keys, string[] values) {
@@ -289,85 +347,21 @@ public int[] build(int[] codeIn, int[] stringData, string[] versionData) {
         }
 
         int numImports = this.imports.length;
-        string[] uniqueDlls = [];
-        int[] groupSizes = [];
-        int[] importGroupIdx = [];
-        for (int i = 0; i < numImports; i++) {
-            string impDll = this.imports[i].dll;
-            int gIdx = -1;
-            for (int j = 0; j < uniqueDlls.length; j++) {
-                if (uniqueDlls[j] == impDll) {
-                    gIdx = j;
-                    break;
-                }
-            }
-            if (gIdx < 0) {
-                uniqueDlls.add(impDll);
-                groupSizes.add(0);
-                gIdx = uniqueDlls.length - 1;
-            }
-            groupSizes[gIdx]++;
-            importGroupIdx.add(gIdx);
-        }
-        int numGroups = uniqueDlls.length;
-        int[] posInGroup = [];
-        int[] runningCount = [];
-        for (int g = 0; g < numGroups; g++) {
-            runningCount.add(0);
-        }
-        for (int i = 0; i < numImports; i++) {
-            posInGroup.add(0);
-        }
-        for (int i = 0; i < numImports; i++) {
-            int g = importGroupIdx[i];
-            posInGroup[i] = runningCount[g];
-            runningCount[g]++;
-        }
-
-        int descBytes = (numGroups + 1) * 20;
-        int iltTotal = 0;
-        int[] iltSizes = [];
-        for (int g = 0; g < numGroups; g++) {
-            int sz = (groupSizes[g] + 1) * 8;
-            iltSizes.add(sz);
-            iltTotal += sz;
-        }
+        this.cacheEvLayout();
+        string[] uniqueDlls = this.evDlls;
+        int[] groupSizes = this.evGroupSizes;
+        int[] importGroupIdx = this.evGroupMap;
+        int numGroups = this.evNumGroups;
+        int[] posInGroup = this.evPosInGroup;
+        int descBytes = this.evDescBytes;
+        int iltTotal = this.evIltTotal;
+        int[] iltSizes = this.evIltSizes;
         int iatTotal = iltTotal;
+        int[] hintNameOffsets = this.evHintOffs;
+        int[] dllNameOffsets = this.evDllOffs;
 
-        int[] hintNameOffsets = [];
-        int off = 0;
-        for (int i = 0; i < numImports; i++) {
-            string nm = this.imports[i].name;
-            hintNameOffsets.add(off);
-            off += 2 + nm.length + 1;
-        }
-        int[] dllNameOffsets = [];
-        for (int g = 0; g < numGroups; g++) {
-            string dll = uniqueDlls[g];
-            dllNameOffsets.add(off);
-            off += dll.length + 1;
-        }
-
-        int[] hintNames = [];
-        for (int i = 0; i < numImports; i++) {
-            hintNames.add(0);
-            hintNames.add(0);
-            string nm = this.imports[i].name;
-            for (int c = 0; c < nm.length; c++) {
-                hintNames.add(nm[c]);
-            }
-            hintNames.add(0);
-        }
-        for (int g = 0; g < numGroups; g++) {
-            string dll = uniqueDlls[g];
-            for (int c = 0; c < dll.length; c++) {
-                hintNames.add(dll[c]);
-            }
-            hintNames.add(0);
-        }
-
-        int namesStart = descBytes + iltTotal + iatTotal;
-        int stringsStart = namesStart + hintNames.length;
+        int namesStart = this.evNamesStart;
+        int stringsStart = this.evStringsStart;
         int importDataSize = stringsStart + stringData.length + this.globalAreaSize;
 
         int[] rsrcData = [];
@@ -436,6 +430,7 @@ public int[] build(int[] codeIn, int[] stringData, string[] versionData) {
         int imageSize = this.padToAlign(rdataRva + importVirt + rsrcVirt, SECT_ALIGN);
         int totalSize = rdataFileOff + importRaw;
         if (rsrcData.length > 0) { totalSize = rsrcFileOff + rsrcRaw; }
+        if (totalSize < 0) { return []; }
         int[] pe = [];
         for (int i = 0; i < totalSize; i++) {
             pe.add(0);
@@ -578,8 +573,23 @@ public int[] build(int[] codeIn, int[] stringData, string[] versionData) {
             this.writeLe64(pe, gIatBase + nullOff, 0);
         }
 
-        for (int i = 0; i < hintNames.length; i++) {
-            pe[importBase + namesStart + i] = hintNames[i];
+        for (int i = 0; i < numImports; i++) {
+            int hnbase = importBase + namesStart + hintNameOffsets[i];
+            pe[hnbase] = 0;
+            pe[hnbase + 1] = 0;
+            string nm = this.imports[i].name;
+            for (int c = 0; c < nm.length; c++) {
+                pe[hnbase + 2 + c] = nm[c];
+            }
+            pe[hnbase + 2 + nm.length] = 0;
+        }
+        for (int g = 0; g < numGroups; g++) {
+            string dll = uniqueDlls[g];
+            int dnbase = importBase + namesStart + dllNameOffsets[g];
+            for (int c = 0; c < dll.length; c++) {
+                pe[dnbase + c] = dll[c];
+            }
+            pe[dnbase + dll.length] = 0;
         }
         for (int i = 0; i < stringData.length; i++) {
             pe[importBase + stringsStart + i] = stringData[i];
@@ -689,7 +699,6 @@ class MiniEf {
 
     public int[] computeLayout(int stringDataLen) {
         EfDllGroup[] groups = [];
-        int[] groupMap = [];
         for (int i = 0; i < this.imports.length; i++) {
             string impDll = this.imports[i].dll;
             int gIdx = -1;
@@ -706,7 +715,6 @@ class MiniEf {
             }
             EfDllGroup grp = groups[gIdx];
             grp.count++;
-            groupMap.add(gIdx);
         }
         int numGroups = groups.length;
         int relaTotal = this.imports.length * 24;
@@ -808,6 +816,7 @@ class MiniEf {
         int rwVaddr = dataVaddr + dataFilesz;
         int64 entryAddr = BASE + this.entryRva;
         int totalSize = rwOff + 24 + n * 8;
+        if (totalSize < 0) { return []; }
         int[] out = [];
         for (int i = 0; i < totalSize; i++) { out.add(0); }
         out[0] = 127;
@@ -1064,7 +1073,6 @@ class MiniEf {
 
     public int[] computeLayout(int stringDataLen) {
         EfDllGroup[] groups = [];
-        int[] groupMap = [];
         for (int i = 0; i < this.imports.length; i++) {
             string impDll = this.imports[i].dll;
             int gIdx = -1;
@@ -1081,7 +1089,6 @@ class MiniEf {
             }
             EfDllGroup grp = groups[gIdx];
             grp.count++;
-            groupMap.add(gIdx);
         }
         int numGroups = groups.length;
         int[] layout = [];
@@ -1350,6 +1357,7 @@ class MiniEf {
         this.lcAddU32(lc, sigStart);
         this.lcAddU32(lc, sigLen);
         int totalSize = sigStart + sigLen;
+        if (totalSize < 0) { return []; }
         int[] out = [];
         for (int f = 0; f < totalSize; f++) { out.add(0); }
         this.writeLe32(out, 0, 4277009103);
