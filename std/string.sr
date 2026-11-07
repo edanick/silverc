@@ -26,8 +26,10 @@ public bool equals(string a, string b, int sc) {
     // `sc == 1` covers raw-int callers (and the compilers, where the enum
     // IS the int); the enum disjunct covers interpreter enum values.
     if (sc == 1 || sc == StringCase.INSENSITIVE) {
-        if (a.length != b.length) { return false; }
-        for (int i = 0; i < a.length; i++) {
+        int alen = a.length;
+        int blen = b.length;
+        if (alen != blen) { return false; }
+        for (int i = 0; i < alen; i++) {
             int ca = a[i];
             int cb = b[i];
             if (ca >= 'A' && ca <= 'Z') { ca += 32; }
@@ -43,8 +45,10 @@ int projectFind(string text, string needle, int start) {
     // Lengths read once: `string.length` lowers to strlen (O(n)).
     int needleLen = needle.length;
     if (needleLen == 0) { return start; }
+    int first = start;
+    if (first < 0) { first = 0; }
     int limit = text.length - needleLen;
-    for (int i = start; i <= limit; i++) {
+    for (int i = first; i <= limit; i++) {
         bool same = true;
         for (int j = 0; j < needleLen; j++) {
             int needleIndex = i + j;
@@ -59,7 +63,8 @@ string projectSlice(string text, int start, int end) {
     int a = start;
     if (a < 0) { a = 0; }
     int b = end;
-    if (b > text.length) { b = text.length; }
+    int tlen = text.length;
+    if (b > tlen) { b = tlen; }
     if (b <= a) { return ""; }
     // One O(len) alloc via substring — NOT a per-char `+=` rebuild. The
     // runtime never frees intermediates, so `+=`-slicing an L-byte string
@@ -86,43 +91,51 @@ string projectTrim(string text) {
 public string pad(string text, int count, string fill) {
     if (count <= 0 || fill.length == 0) { return text; }
     string unit = (string)fill[0];
-    string left = "";
-    string right = "";
-    for (int i = 0; i < count; i++) { left += unit; right += unit; }
-    return left + text + right;
+    string[] parts = [];
+    for (int i = 0; i < count; i++) { parts.add(unit); }
+    parts.add(text);
+    for (int i = 0; i < count; i++) { parts.add(unit); }
+    return parts.join("");
 }
 
 public string padLeft(string text, int count, string fill) {
     if (count <= 0 || fill.length == 0) { return text; }
     string unit = (string)fill[0];
-    string result = "";
-    for (int i = 0; i < count; i++) { result += unit; }
-    return result + text;
+    string[] parts = [];
+    for (int i = 0; i < count; i++) { parts.add(unit); }
+    parts.add(text);
+    return parts.join("");
 }
 
 public string padRight(string text, int count, string fill) {
     if (count <= 0 || fill.length == 0) { return text; }
     string unit = (string)fill[0];
-    string result = text;
-    for (int i = 0; i < count; i++) { result += unit; }
-    return result;
+    string[] parts = [];
+    parts.add(text);
+    for (int i = 0; i < count; i++) { parts.add(unit); }
+    return parts.join("");
 }
 
 public string slugify(string text) {
-    string result = "";
-    for (int i = 0; i < text.length; i++) {
+    int n = text.length;
+    string[] parts = [];
+    int outLen = 0;
+    bool hasOut = false;
+    char lastChar = ' ';
+    for (int i = 0; i < n; i++) {
         char c = text[i];
-        if (c >= 'a' && c <= 'z') { result += c; }
-        else if (c >= 'A' && c <= 'Z') { result += char(c + 32); }
-        else if (c >= '0' && c <= '9') { result += c; }
+        if (c >= 'a' && c <= 'z') { parts.add((string)c); outLen++; lastChar = c; hasOut = true; }
+        else if (c >= 'A' && c <= 'Z') { parts.add((string)char(c + 32)); outLen++; lastChar = char(c + 32); hasOut = true; }
+        else if (c >= '0' && c <= '9') { parts.add((string)c); outLen++; lastChar = c; hasOut = true; }
         else if (c == ' ' || c == '-' || c == '_') {
-            if (result.length > 0 && result[result.length - 1] != '-') { result += "-"; }
+            if (hasOut && lastChar != '-') { parts.add("-"); outLen++; lastChar = '-'; }
         }
     }
-    if (result.length > 0 && result[result.length - 1] == '-') {
+    string result = parts.join("");
+    if (hasOut && lastChar == '-') {
         // substring(start, len): the `s.slice(a..b)` Range-method form passes
         // an int[] and always yields "", so use the (start, length) primitive.
-        result = result.substring(0, result.length - 1);
+        result = result.substring(0, outLen - 1);
     }
     return result;
 }
