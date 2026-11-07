@@ -23,6 +23,37 @@ import * from sysinfo;
 
 private int64 LOW_MEMORY_FLOOR = 1073741824; // 1 GiB
 
+private int64 NOMINAL_BYTES_PER_ITEM = 1024;
+
+// THREAD_SAFETY.md §8.2 — machine-wide capacity budget shared by every
+// concurrent compiler instance. capacity = total - safety_margin with
+// safety_margin = max(2, total / 4), never below 2, so the OS, shell and
+// user stay responsive (Rule 0). The OVERHAUL default (total - 2) is the
+// single-instance worker count; the capacity budget governs the SUM of
+// concurrent instances' demands, never a single compile's correctness.
+public int rsSafetyMargin() {
+    int total = rsCpuThreadCount();
+    int quarter = total / 4;
+    if (quarter < 2) { quarter = 2; }
+    return quarter;
+}
+
+public int rsCapacityBudget() {
+    int total = rsCpuThreadCount();
+    int capacity = total - rsSafetyMargin();
+    if (capacity < 1) { capacity = 1; }
+    return capacity;
+}
+
+// Demand an instance registers under the capacity budget: its resolved
+// worker count plus one fixed overhead for the sequential phases
+// (codegen, PE emission) on the main thread (§8.2).
+public int rsDemandForThreads(int threads) {
+    int demand = threads + 1;
+    if (demand < 1) { demand = 1; }
+    return demand;
+}
+
 // Logical processor count (SYSTEM_INFO.dwNumberOfProcessors).
 public int rsCpuThreadCount() {
     int n = sysinfo.cpuCores();
@@ -82,14 +113,20 @@ public bool rsIsLowMemory() {
 // clamped so the total concurrent working set of all active workers stays
 // within the adaptive memory budget: each worker holds at most
 // budget / threads / 1024 items' worth of memory, never below 1.
-public int rsAdaptiveChunkSize(int hint) {
-    int threads = rsDefaultThreadCount();
+// THREAD_SAFETY.md §7 rule 2: the budget divides by the ACTUAL worker
+// count in use, never by a default while running fewer (or more) workers.
+public int rsAdaptiveChunkSizeForThreads(int hint, int threads) {
     if (threads < 1) { threads = 1; }
     int64 budget = rsMemoryBudgetBytes();
-    int64 perWorker = budget / threads / 1024;
+    int64 perWorker = budget / threads / NOMINAL_BYTES_PER_ITEM;
     if (perWorker < 1) { perWorker = 1; }
     int cap = int(perWorker);
     if (hint < 1) { hint = 1; }
     if (hint < cap) { return hint; }
     return cap;
+}
+
+// Compatibility wrapper: the per-worker cap at the default worker count.
+public int rsAdaptiveChunkSize(int hint) {
+    return rsAdaptiveChunkSizeForThreads(hint, rsDefaultThreadCount());
 }

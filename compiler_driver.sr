@@ -29,6 +29,8 @@ import * from visibility;
 import * from namecheck;
 import * from preprocess;
 import * from macx64;
+import * from resource;
+import * from thread_safety;
 
 // LINUX (additive): the raw libc calls the driver needs to read the
 // running image's own path (/proc/self/maps) -- a proc file reports size
@@ -1111,21 +1113,21 @@ bool drvOutputLocked(string outputFile) {
     return file.size(outputFile) != 1;
 }
 
-// The single executable writer. An existing output is removed before the
-// write: truncating an executable the on-access scanner is still checking
-// (the previous build's output, seconds old) blocks until that scan ends —
-// ~250 ms per rebuild, larger than a whole warm cached build — while
-// removing it returns at once and the new file is written fresh. A running
-// process at this path refuses first: deleting the name would strand the
-// stale image as the live build.
 void drvWriteOutput(string outputFile, int[] peData) {
     if (drvOutputLocked(outputFile)) {
         eprintln("cannot write to a running process: \"" + outputFile + "\"");
         eprintln("you have to either use a different file name for the output or close the process");
         exit(1);
     }
+    // Atomic write: stage the image under a pid-suffixed temp name and
+    // rename, so a killed compile never leaves a half-written output (TS-12).
+    string tmpFile = outputFile + ".tmp-" + (string)sysinfo.pid();
+    file.writeBytes(tmpFile, peData);
     if (file.exists(outputFile)) { file.delete(outputFile); }
-    file.writeBytes(outputFile, peData);
+    file.rename(tmpFile, outputFile);
+    if (!file.exists(outputFile)) {
+        file.writeBytes(outputFile, peData);
+    }
 }
 
 // Session naming mirrors silverc-rs: projects key the cache by their
@@ -1596,7 +1598,12 @@ void main() {
         exit(0);
     }
 
+    TsRegistry tsHandle = tsAcquire(flags.input, flags.threadCount);
+    if (tsHandle.fallback) {
+        flags.errLine("warning: compiler registry unavailable or busy — running alone with local thread count");
+    }
     int code = compileOnce(flags, outputFile, exeDir);
+    tsRelease(tsHandle);
     exit(code);
 }
 

@@ -1,0 +1,291 @@
+mod export thread_safety;
+
+import * from fs;
+import * from env;
+import * from path;
+import * from hash;
+import * from string;
+import * from datetime;
+import * from time;
+import * from sysinfo;
+import * from resource;
+
+#on WINDOWS
+import * from win32.kernel32;
+#on LINUX
+import * from linux.libc;
+#on MAC
+import * from mac.libsystem;
+#off
+
+class TsRegistry {
+    public prop string dir;
+    public prop string recordsPath;
+    public prop string projectLockPath;
+    public prop string projectKey;
+    public prop int pid;
+    public prop int startMs;
+    public prop int demand;
+    public prop bool active;
+    public prop bool fallback;
+
+    construct {
+        this.dir = "";
+        this.recordsPath = "";
+        this.projectLockPath = "";
+        this.projectKey = "";
+        this.pid = 0;
+        this.startMs = 0;
+        this.demand = 1;
+        this.active = false;
+        this.fallback = false;
+    }
+}
+
+public bool tsPidAlive(int pid) {
+    if (pid <= 0) {
+        return false;
+    }
+    if (pid == sysinfo.pid()) {
+        return true;
+    }
+    #on WINDOWS
+    int h = OpenProcess(4096, 0, pid);
+    if (h == 0) {
+        return false;
+    }
+    CloseHandle(h);
+    return true;
+    #on LINUX or MAC
+    int rc = kill(pid, 0);
+    return rc == 0;
+    #off
+    return false;
+}
+
+public string tsTryRead(string path) {
+    string result = "";
+    try {
+        result = file.readString(path);
+    } catch (int e) {
+        result = "";
+    }
+    return result;
+}
+
+public string tsRegistryDir() {
+    string tempRoot = sysinfo.tempDir();
+    if (tempRoot.length == 0) {
+        tempRoot = env.get("TEMP");
+    }
+    if (tempRoot.length == 0) {
+        tempRoot = env.get("TMP");
+    }
+    if (tempRoot.length == 0) {
+        tempRoot = ".";
+    }
+    return path.join(tempRoot, "silver-registry");
+}
+
+public string tsRecordsPath() {
+    return path.join(tsRegistryDir(), "instances.txt");
+}
+
+public string tsProjectKey(string inputFile) {
+    return path.normalize(inputFile);
+}
+
+public string tsProjectLockPath(string projectKey) {
+    int64 h = hash.fnv1(projectKey);
+    return path.join(tsRegistryDir(), "project-" + (string)h + ".lock");
+}
+
+public bool tsEnsureDir(string dir) {
+    fs.createDir(dir);
+    return file.exists(dir);
+}
+
+public void tsAtomicWrite(string path, string content) {
+    string tmp = path + ".tmp-" + (string)sysinfo.pid();
+    file.writeString(tmp, content);
+    if (!file.exists(tmp)) {
+        return;
+    }
+    if (file.exists(path)) {
+        file.delete(path);
+    }
+    file.rename(tmp, path);
+}
+
+public int tsParseInt(string s) {
+    if (s.length == 0) {
+        return 0;
+    }
+    if (!s.isDigits()) {
+        return 0;
+    }
+    return (int)s;
+}
+
+public int tsAdmittedDemand(string recordsPath, int selfPid) {
+    string text = tsTryRead(recordsPath);
+    if (text.length == 0) {
+        return 0;
+    }
+    string[] lines = text.split("\n");
+    int admitted = 0;
+    for (int i = 0; i < lines.length; i++) {
+        string line = lines[i];
+        if (line.length == 0) {
+            continue;
+        }
+        string[] parts = line.split(" ");
+        if (parts.length < 4) {
+            continue;
+        }
+        int recordPid = tsParseInt(parts[0]);
+        if (recordPid == selfPid || recordPid == 0) {
+            continue;
+        }
+        if (!tsPidAlive(recordPid)) {
+            continue;
+        }
+        int recordDemand = tsParseInt(parts[1]);
+        if (recordDemand < 1) {
+            recordDemand = 1;
+        }
+        admitted = admitted + recordDemand;
+    }
+    return admitted;
+}
+
+public string tsAppendRecord(string recordsPath, int pid, int demand, int startMs, string projectKey) {
+    string existing = tsTryRead(recordsPath);
+    string next = existing;
+    if (next.length > 0 && next[next.length - 1] != '\n') {
+        next = next + "\n";
+    }
+    next = next + (string)pid + " " + (string)demand + " " + (string)startMs + " " + projectKey + "\n";
+    return next;
+}
+
+public string tsWithoutPid(string recordsPath, int selfPid) {
+    string text = tsTryRead(recordsPath);
+    if (text.length == 0) {
+        return "";
+    }
+    string[] lines = text.split("\n");
+    string[] kept = [];
+    for (int i = 0; i < lines.length; i++) {
+        string line = lines[i];
+        if (line.length == 0) {
+            continue;
+        }
+        string[] parts = line.split(" ");
+        if (parts.length < 1) {
+            continue;
+        }
+        int recordPid = tsParseInt(parts[0]);
+        if (recordPid == selfPid) {
+            continue;
+        }
+        kept.add(line);
+    }
+    string out = "";
+    for (int k = 0; k < kept.length; k++) {
+        out = out + kept[k] + "\n";
+    }
+    return out;
+}
+
+public TsRegistry tsAcquire(string inputFile, int threadCount) {
+    TsRegistry handle = new TsRegistry();
+    handle.pid = sysinfo.pid();
+    handle.projectKey = tsProjectKey(inputFile);
+    handle.demand = rsDemandForThreads(threadCount);
+    handle.startMs = datetime.now().milliseconds();
+    handle.fallback = false;
+    handle.active = false;
+    string dir = tsRegistryDir();
+    handle.dir = dir;
+    handle.recordsPath = tsRecordsPath();
+    handle.projectLockPath = tsProjectLockPath(handle.projectKey);
+    if (!tsEnsureDir(dir)) {
+        handle.fallback = true;
+        return handle;
+    }
+    int lockPid = 0;
+    if (file.exists(handle.projectLockPath)) {
+        string lockText = tsTryRead(handle.projectLockPath);
+        string trimmed = lockText.trim();
+        if (trimmed.length > 0) {
+            string[] lockParts = trimmed.split(" ");
+            lockPid = tsParseInt(lockParts[0]);
+        }
+    }
+    int lockWait = 0;
+    while (lockWait < 50 && lockPid > 0 && lockPid != handle.pid && tsPidAlive(lockPid)) {
+        time.sleep(100);
+        lockWait++;
+        if (file.exists(handle.projectLockPath)) {
+            string lockText = tsTryRead(handle.projectLockPath);
+            string trimmed = lockText.trim();
+            lockPid = 0;
+            if (trimmed.length > 0) {
+                string[] lockParts = trimmed.split(" ");
+                lockPid = tsParseInt(lockParts[0]);
+            }
+        } else {
+            lockPid = 0;
+        }
+    }
+    if (lockPid > 0 && lockPid != handle.pid && tsPidAlive(lockPid)) {
+        handle.fallback = true;
+    }
+    int capacity = rsCapacityBudget();
+    int admitted = tsAdmittedDemand(handle.recordsPath, handle.pid);
+    int capacityWait = 0;
+    while (capacityWait < 50 && admitted > 0 && admitted + handle.demand > capacity && handle.demand <= capacity) {
+        time.sleep(100);
+        capacityWait++;
+        admitted = tsAdmittedDemand(handle.recordsPath, handle.pid);
+    }
+    if (admitted > 0 && admitted + handle.demand > capacity && handle.demand <= capacity) {
+        handle.fallback = true;
+    }
+    if (!handle.fallback || lockPid == 0) {
+        string nextRecords = tsAppendRecord(handle.recordsPath, handle.pid, handle.demand, handle.startMs, handle.projectKey);
+        tsAtomicWrite(handle.recordsPath, nextRecords);
+        string lockContent = (string)handle.pid + " " + (string)handle.startMs + " " + handle.projectKey + "\n";
+        tsAtomicWrite(handle.projectLockPath, lockContent);
+        handle.active = !handle.fallback;
+        if (handle.fallback) {
+            handle.active = true;
+        }
+    } else {
+        handle.active = false;
+    }
+    return handle;
+}
+
+public void tsRelease(TsRegistry handle) {
+    if (handle == null) {
+        return;
+    }
+    if (handle.dir.length == 0) {
+        return;
+    }
+    string nextRecords = tsWithoutPid(handle.recordsPath, handle.pid);
+    tsAtomicWrite(handle.recordsPath, nextRecords);
+    if (file.exists(handle.projectLockPath)) {
+        string lockText = tsTryRead(handle.projectLockPath);
+        string[] lockParts = lockText.trim().split(" ");
+        if (lockParts.length > 0) {
+            int lockPid = tsParseInt(lockParts[0]);
+            if (lockPid == handle.pid) {
+                file.delete(handle.projectLockPath);
+            }
+        }
+    }
+    handle.active = false;
+}
