@@ -1305,7 +1305,7 @@ class MiniCg {
         int start = -1;
         int cnt = 0;
         for (int i = 0; i < this.classNames.length; i++) {
-            if ((this.classNames[i] == className || className == this.classNames[i] + "?")) {
+            if ((this.classNames[i] == className || this.optMatch(className, this.classNames[i]))) {
                 start = this.classFieldStarts[i];
                 cnt = this.classFieldCounts[i];
             }
@@ -1332,7 +1332,7 @@ class MiniCg {
         int start = -1;
         int cnt = 0;
         for (int i = 0; i < this.classNames.length; i++) {
-            if ((this.classNames[i] == className || className == this.classNames[i] + "?")) {
+            if ((this.classNames[i] == className || this.optMatch(className, this.classNames[i]))) {
                 start = this.classFieldStarts[i];
                 cnt = this.classFieldCounts[i];
             }
@@ -1363,7 +1363,7 @@ class MiniCg {
         int start = -1;
         int cnt = 0;
         for (int i = 0; i < this.classNames.length; i++) {
-            if ((this.classNames[i] == className || className == this.classNames[i] + "?")) {
+            if ((this.classNames[i] == className || this.optMatch(className, this.classNames[i]))) {
                 start = this.classFieldStarts[i];
                 cnt = this.classFieldCounts[i];
             }
@@ -1381,7 +1381,7 @@ class MiniCg {
         int start = -1;
         int cnt = 0;
         for (int i = 0; i < this.classNames.length; i++) {
-            if ((this.classNames[i] == className || className == this.classNames[i] + "?")) {
+            if ((this.classNames[i] == className || this.optMatch(className, this.classNames[i]))) {
                 start = this.classFieldStarts[i];
                 cnt = this.classFieldCounts[i];
             }
@@ -1401,7 +1401,7 @@ class MiniCg {
             int astart = -1;
             int acnt = 0;
             for (int i = 0; i < this.classNames.length; i++) {
-                if ((this.classNames[i] == ancestor || ancestor == this.classNames[i] + "?")) {
+                if ((this.classNames[i] == ancestor || this.optMatch(ancestor, this.classNames[i]))) {
                     astart = this.classFieldStarts[i];
                     acnt = this.classFieldCounts[i];
                 }
@@ -1433,7 +1433,7 @@ class MiniCg {
         int start = -1;
         int cnt = 0;
         for (int i = 0; i < this.classNames.length; i++) {
-            if ((this.classNames[i] == className || className == this.classNames[i] + "?")) {
+            if ((this.classNames[i] == className || this.optMatch(className, this.classNames[i]))) {
                 start = this.classFieldStarts[i];
                 cnt = this.classFieldCounts[i];
             }
@@ -2205,6 +2205,22 @@ class MiniCg {
         int index = this.findVisibleLocalIndex(name);
         if (index >= 0) { return this.localOffsets[index]; }
         return 0;
+    }
+
+    // A lookup name may carry a trailing '?' marker (a nullable receiver
+    // type), so `x == y + "?"` asks whether `x` is `y` followed by that
+    // marker. The concatenation built a fresh string for EVERY collected
+    // class and EVERY collected function on EVERY call site; the runtime
+    // never frees intermediates, so those throwaway strings grew the
+    // compiler's peak memory quadratically in (functions x call sites) —
+    // a 21-module project needed 5 GB. Compare without building.
+    public bool optMatch(string x, string y) {
+        if (x.length != y.length + 1) { return false; }
+        if (x[x.length - 1] != '?') { return false; }
+        for (int i = 0; i < y.length; i++) {
+            if (x[i] != y[i]) { return false; }
+        }
+        return true;
     }
 
     public int findGlobal(string name) {
@@ -3891,7 +3907,30 @@ int strIdx = this.stringPatchIndices[i];
                 code[patchPos + 3] = (rel32 >> 24) & 0xFF;
             }
         }
-    }    public void emitMethod(Node func, string className) {
+    }    // The scratch tables are per-function working state. They are truncated
+    // in place rather than replaced with fresh empty arrays: an empty array
+    // literal allocates a full backing store, and the previous store is never
+    // freed, so replacing them on every emitted function grows the compiler's
+    // peak memory with the number of functions (see MINI_CG.md).
+    public void clearScratch() {
+        while (this.localOffsets.length > 0) { this.localOffsets.pop(); }
+        while (this.localNames.length > 0) { this.localNames.pop(); }
+        while (this.localTypes.length > 0) { this.localTypes.pop(); }
+        while (this.dictValueNames.length > 0) { this.dictValueNames.pop(); }
+        while (this.dictValueKinds.length > 0) { this.dictValueKinds.pop(); }
+        while (this.dictFieldVars.length > 0) { this.dictFieldVars.pop(); }
+        while (this.dictFieldKeys.length > 0) { this.dictFieldKeys.pop(); }
+        while (this.dictFieldKinds.length > 0) { this.dictFieldKinds.pop(); }
+        while (this.dictFieldClassVars.length > 0) { this.dictFieldClassVars.pop(); }
+        while (this.dictFieldClassKeys.length > 0) { this.dictFieldClassKeys.pop(); }
+        while (this.dictFieldClassNames.length > 0) { this.dictFieldClassNames.pop(); }
+        while (this.objectVars.length > 0) { this.objectVars.pop(); }
+        while (this.funcCallArgTemps.length > 0) { this.funcCallArgTemps.pop(); }
+        while (this.liveSlots.length > 0) { this.liveSlots.pop(); }
+        while (this.liveSlotIsArray.length > 0) { this.liveSlotIsArray.pop(); }
+        while (this.fnPtrParamNames.length > 0) { this.fnPtrParamNames.pop(); }
+    }
+    public void emitMethod(Node func, string className) {
     this.currentFunctionName = func.name;
     this.currentReturnType = func.typeHint;
     int emitIdx = -1;
@@ -3911,18 +3950,7 @@ int strIdx = this.stringPatchIndices[i];
         this.funcOffsets.add(this.asm.buf.length);
         this.funcOwners.add(this.objCurOwner);
     }
-    this.localOffsets = [];
-    this.localNames = [];
-    this.localTypes = [];
-    this.dictValueNames = [];
-    this.dictValueKinds = [];
-    this.dictFieldVars = [];
-    this.dictFieldKeys = [];
-    this.dictFieldKinds = [];
-    this.dictFieldClassVars = [];
-    this.dictFieldClassKeys = [];
-    this.dictFieldClassNames = [];
-    this.objectVars = [];
+    this.clearScratch();
     this.stackSize = 0;
     this.currentClassName = className;
     this.asm.label(func.name);
@@ -3930,7 +3958,7 @@ int strIdx = this.stringPatchIndices[i];
     this.asm.movRR64(5, 4);
         this.allocLocal("this");
         this.collectRefParams(func);
-    this.fnPtrParamNames = [];
+    while (this.fnPtrParamNames.length > 0) { this.fnPtrParamNames.pop(); }
     if (func.childCount() > 0) {
         Node params = func.child(0);
         for (int i = 0; i < params.childCount(); i++) {
@@ -3967,22 +3995,11 @@ int strIdx = this.stringPatchIndices[i];
         this.funcOffsets.add(this.asm.buf.length);
         this.funcOwners.add(this.objCurOwner);
     }
-    this.localOffsets = [];
-    this.localNames = [];
-    this.localTypes = [];
-    this.dictValueNames = [];
-    this.dictValueKinds = [];
-    this.dictFieldVars = [];
-    this.dictFieldKeys = [];
-    this.dictFieldKinds = [];
-    this.dictFieldClassVars = [];
-    this.dictFieldClassKeys = [];
-    this.dictFieldClassNames = [];
-    this.objectVars = [];
+    this.clearScratch();
     this.stackSize = 0;
     this.currentClassName = "";
     this.collectRefParams(func);
-    this.fnPtrParamNames = [];
+    while (this.fnPtrParamNames.length > 0) { this.fnPtrParamNames.pop(); }
     this.asm.label(func.name);
     this.asm.pushR64(5);
     this.asm.movRR64(5, 4);
@@ -4040,10 +4057,10 @@ int strIdx = this.stringPatchIndices[i];
         // Reserve member-call argument slots before emitting the function
         // prologue.  Calls can nest while generating expressions; keeping a
         // fixed pool avoids changing stackSize after RSP has been reserved.
-        this.funcCallArgTemps = [];
+        while (this.funcCallArgTemps.length > 0) { this.funcCallArgTemps.pop(); }
         this.funcCallArgCount = 0;
-        this.liveSlots = [];
-        this.liveSlotIsArray = [];
+        while (this.liveSlots.length > 0) { this.liveSlots.pop(); }
+        while (this.liveSlotIsArray.length > 0) { this.liveSlotIsArray.pop(); }
         this.scratchBaseOffset = -8 * (this.localOffsets.length + 1);
         for (int si = 0; si < 64; si++) {
             int scratchOff = this.allocLocal("__call_scratch");
@@ -5056,7 +5073,7 @@ int strIdx = this.stringPatchIndices[i];
         // offset registered for that field.
         int fieldCnt = 0;
         for (int ci = 0; ci < this.classNames.length; ci++) {
-            if ((this.classNames[ci] == typeName || typeName == this.classNames[ci] + "?")) {
+            if ((this.classNames[ci] == typeName || this.optMatch(typeName, this.classNames[ci]))) {
                 fieldCnt = this.classFieldCounts[ci];
             }
         }
@@ -5084,7 +5101,7 @@ int strIdx = this.stringPatchIndices[i];
             // Array-typed fields route through the typed lowering so
             // `pts: [{...}]` boxes elements as structs too.
             string fieldType = this.findFieldType(typeName, key.name);
-            if (value.kind == 74 && (fieldType == typeName || typeName == fieldType + "?")) {
+            if (value.kind == 74 && (fieldType == typeName || this.optMatch(typeName, fieldType))) {
                 this.genStructLiteral(value, fieldType);
             } else if (value.kind == 74) {
                 this.genStructLiteral(value, fieldType);
@@ -6008,7 +6025,7 @@ int strIdx = this.stringPatchIndices[i];
         this.localTypes = [];
         this.stackSize = 0;
         this.currentClassName = "";
-        this.fnPtrParamNames = [];
+        while (this.fnPtrParamNames.length > 0) { this.fnPtrParamNames.pop(); }
         Node f = new Node();
         f.kind = 100;
         f.name = name;
@@ -6899,7 +6916,7 @@ int strIdx = this.stringPatchIndices[i];
                 if (wi >= 0 && wi < this.funcRetTypes.length) { return this.funcRetTypes[wi]; }
             }
             for (int i = 0; i < this.funcNames.length; i++) {
-                if (this.funcNames[i] == cname && (this.funcClasses[i] == cls || cls == this.funcClasses[i] + "?")) {
+                if (this.funcNames[i] == cname && (this.funcClasses[i] == cls || this.optMatch(cls, this.funcClasses[i]))) {
                     return this.funcRetTypes[i];
                 }
             }
@@ -9958,7 +9975,7 @@ int strIdx = this.stringPatchIndices[i];
         string recvType = this.inferExprType(call.child(0));
         if (recvType == "this") { return ""; }
         for (int ci = 0; ci < this.classNames.length; ci++) {
-            if (this.classNames[ci] == recvType || recvType == this.classNames[ci] + "?") { return ""; }
+            if (this.classNames[ci] == recvType || this.optMatch(recvType, this.classNames[ci])) { return ""; }
         }
         return recvName;
     }
@@ -12121,7 +12138,20 @@ public void genNewCall(Node call) {
         if (idx >= 0 && idx < this.funcModules.length) { have = this.funcModules[idx]; }
         if (have.length == 0 || want.length == 0) { return false; }
         if (have == want) { return true; }
-        return have.toLower() == want.toLower();
+        // Case-insensitive fallback: compare without building either lowered
+        // string. This runs once per candidate scanned for every
+        // module-qualified call site, and a lowered copy of each name on each
+        // side grew the compiler's peak memory by gigabytes on multi-module
+        // projects (the runtime never frees intermediates).
+        if (have.length != want.length) { return false; }
+        for (int i = 0; i < have.length; i++) {
+            int a = int(have[i]);
+            int b = int(want[i]);
+            if (a >= 65 && a <= 90) { a += 32; }
+            if (b >= 65 && b <= 90) { b += 32; }
+            if (a != b) { return false; }
+        }
+        return true;
     }
 
     public int selectOverloadIdx(string name, string cls, int nargs, Node probe, Node probeB, string wantMod = "") {
@@ -12399,7 +12429,7 @@ public void genNewCall(Node call) {
             string rt0 = this.inferExprType(call.child(0));
             bool rt0IsClass = false;
             for (int ci2 = 0; ci2 < this.classNames.length; ci2++) {
-                if ((this.classNames[ci2] == rt0 || rt0 == this.classNames[ci2] + "?")) { rt0IsClass = true; }
+                if ((this.classNames[ci2] == rt0 || this.optMatch(rt0, this.classNames[ci2]))) { rt0IsClass = true; }
             }
             if (!rt0IsClass && rt0 != "this") {
                 nargs = call.childCount() - 1;
@@ -13264,7 +13294,7 @@ public void genNewCall(Node call) {
         }
         string recvClass = this.inferExprType(recv);
         for (int i = 0; i < this.classNames.length; i++) {
-            if ((this.classNames[i] == recvClass || recvClass == this.classNames[i] + "?")) { return true; }
+            if ((this.classNames[i] == recvClass || this.optMatch(recvClass, this.classNames[i]))) { return true; }
         }
         // Dynamic dispatch (DOCS/270 object initializer / html.parse shape):
         // an object-typed (or untyped) receiver holding a class instance.
@@ -15493,7 +15523,7 @@ public void genNewCall(Node call) {
         if (explicitUserArgs < 0) { explicitUserArgs = 0; }
         bool haveExactClass = false;
         for (int i = 0; i < this.funcNames.length; i++) {
-            if (this.funcNames[i] == name && (this.funcClasses[i] == recvClass || recvClass == this.funcClasses[i] + "?")) {
+            if (this.funcNames[i] == name && (this.funcClasses[i] == recvClass || this.optMatch(recvClass, this.funcClasses[i]))) {
                 haveExactClass = true;
             }
         }
@@ -15508,7 +15538,7 @@ public void genNewCall(Node call) {
                 // another class (CEmitter.emitPrintf bound
                 // CppEmitter.emitPrintf, faulting on first field access).
                 for (int ri = this.funcNames.length - 1; ri >= 0; ri--) {
-                    if (this.funcNames[ri] == name && (this.funcClasses[ri] == recvClass || recvClass == this.funcClasses[ri] + "?")) {
+                    if (this.funcNames[ri] == name && (this.funcClasses[ri] == recvClass || this.optMatch(recvClass, this.funcClasses[ri]))) {
                         funcIdx = ri;
                         break;
                     }
