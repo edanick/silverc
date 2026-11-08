@@ -250,6 +250,16 @@ class MiniCg {
     public prop string[] dictFieldClassVars;
     public prop string[] dictFieldClassKeys;
     public prop string[] dictFieldClassNames;
+    // The DICT variable stored under a dict key ("var" + "key" + name
+    // triples): the dict-in-dict analogue of dictFieldClassVars. A read
+    // through a nested dict (`root["server"]["port"]`, `root.server.port`)
+    // resolves the receiver to the nested variable, so the read takes the
+    // dict path (a dict's layout is [cap, len, slots...], not an array's)
+    // and the nested dict's own per-key kinds apply. Mirrors silverc-rs
+    // dict_nested_vars.
+    public prop string[] dictNestedVars;
+    public prop string[] dictNestedKeys;
+    public prop string[] dictNestedNames;
     // Object-record variables (struct literals, declared `object` unless
     // built from a string-keyed dict literal): whole-value prints render
     // `{...}` like the interpreter, plain dicts render `dict{...}`.
@@ -513,6 +523,9 @@ class MiniCg {
         this.dictFieldClassVars = [];
         this.dictFieldClassKeys = [];
         this.dictFieldClassNames = [];
+        this.dictNestedVars = [];
+        this.dictNestedKeys = [];
+        this.dictNestedNames = [];
         this.objectVars = [];
         this.forwardCalls = [];
 
@@ -4046,6 +4059,9 @@ int strIdx = this.stringPatchIndices[i];
         while (this.dictFieldClassVars.length > 0) { this.dictFieldClassVars.pop(); }
         while (this.dictFieldClassKeys.length > 0) { this.dictFieldClassKeys.pop(); }
         while (this.dictFieldClassNames.length > 0) { this.dictFieldClassNames.pop(); }
+        while (this.dictNestedVars.length > 0) { this.dictNestedVars.pop(); }
+        while (this.dictNestedKeys.length > 0) { this.dictNestedKeys.pop(); }
+        while (this.dictNestedNames.length > 0) { this.dictNestedNames.pop(); }
         while (this.objectVars.length > 0) { this.objectVars.pop(); }
         while (this.funcCallArgTemps.length > 0) { this.funcCallArgTemps.pop(); }
         while (this.liveSlots.length > 0) { this.liveSlots.pop(); }
@@ -7243,7 +7259,7 @@ int strIdx = this.stringPatchIndices[i];
     public void genArrayIndex(Node idx) {
         Node arrNode = idx.child(0);
         Node idxNode = idx.child(1);
-        if (this.isDictOrObjectType(this.inferReceiverType(arrNode))) {
+        if (this.isDictIndexReceiver(arrNode)) {
             this.genDictIndexGet(idx);
             return;
         }
@@ -11023,6 +11039,15 @@ int strIdx = this.stringPatchIndices[i];
             // of the instance stored under this key, so a read through
             // the key (`m["k"].v`) binds that class's field slot.
             this.trackDictKeyClass(dictNode.name, keyText, this.classOfExpr(rhs));
+            // A DICT stored under this key: remember the variable, so a
+            // read through the key (`root["server"]["port"]`) resolves
+            // the receiver to the nested dict — it takes the dict path
+            // and uses the nested dict's own per-key kinds. A value that
+            // is NOT a dict clears the record: the key now holds a
+            // scalar.
+            string nestedName = "";
+            if (this.holdsDictValue(rhs)) { nestedName = rhs.name; }
+            this.trackDictKeyNested(dictNode.name, keyText, nestedName);
         }
         this.genExpr(dictNode);
         int dBase = this.allocLocal("__ds_base");
@@ -16746,7 +16771,7 @@ public void genNewCall(Node call) {
             Node idxNode = lhs.child(1);
             // dict[k] op= r lowers to dict[k] = dict[k] op r (mirrors the
             // silverc-rs Index compound-assign arm).
-            if (this.isDictOrObjectType(this.inferReceiverType(arrNode))) {
+            if (this.isDictIndexReceiver(arrNode)) {
                 Node keyExpr = new Node();
                 keyExpr.kind = 24;
                 keyExpr.children.add(arrNode);
@@ -17484,7 +17509,7 @@ public void genNewCall(Node call) {
         if (lhs.kind == 24 && lhs.childCount() >= 2) {
             Node arrNode = lhs.child(0);
             Node idxNode = lhs.child(1);
-            if (this.isDictOrObjectType(this.inferReceiverType(arrNode))) {
+            if (this.isDictIndexReceiver(arrNode)) {
                 this.genDictIndexSet(bin);
                 return;
             }
@@ -17737,7 +17762,7 @@ public void genNewCall(Node call) {
         if (lhs.kind == 24 && lhs.childCount() >= 2) {
             Node arrNode = lhs.child(0);
             Node idxNode = lhs.child(1);
-            if (this.isDictOrObjectType(this.inferReceiverType(arrNode))) {
+            if (this.isDictIndexReceiver(arrNode)) {
                 this.genExpr(lhs);
                 this.asm.cmpRI32(0, 0);
                 int doAssign = this.newLabel();
@@ -18140,7 +18165,7 @@ public void genNewCall(Node call) {
             // Dict/object member reads (`d.key`, `o.key`): per-key kind
             // first, then the whole-dict kind; string only when "string"
             // (never %s on unknown — it would dereference a non-pointer).
-            if (expr.childCount() > 0 && this.isDictOrObjectType(this.inferExprType(expr.child(0)))) {
+            if (expr.childCount() > 0 && this.isDictReadReceiver(expr.child(0))) {
                 return this.dictReadKind(expr.child(0), expr.name) == "string";
             }
             string t = this.inferMemberAccessType(expr);
@@ -18149,7 +18174,7 @@ public void genNewCall(Node call) {
         if (expr.kind == 24) {
             // Dict index reads (`d["k"]`): literal keys classify per-key,
             // else the whole-dict kind.
-            if (expr.childCount() > 1 && this.isDictOrObjectType(this.inferExprType(expr.child(0)))) {
+            if (expr.childCount() > 1 && this.isDictReadReceiver(expr.child(0))) {
                 string keyText = "";
                 if (expr.child(1).kind == 2) { keyText = expr.child(1).strVal; }
                 return this.dictReadKind(expr.child(0), keyText) == "string";
@@ -18304,7 +18329,7 @@ public void genNewCall(Node call) {
         if (expr.kind == 13) {
             // Dict/object member reads: per-key kind first, then the
             // whole-dict kind; a double bit pattern only when "float".
-            if (expr.childCount() > 0 && this.isDictOrObjectType(this.inferExprType(expr.child(0)))) {
+            if (expr.childCount() > 0 && this.isDictReadReceiver(expr.child(0))) {
                 return this.dictReadKind(expr.child(0), expr.name) == "float";
             }
             string t = this.inferMemberAccessType(expr);
@@ -18313,7 +18338,7 @@ public void genNewCall(Node call) {
         if (expr.kind == 24) {
             // Dict index reads: literal keys classify per-key, else the
             // whole-dict kind.
-            if (expr.childCount() > 1 && this.isDictOrObjectType(this.inferExprType(expr.child(0)))) {
+            if (expr.childCount() > 1 && this.isDictReadReceiver(expr.child(0))) {
                 string keyText = "";
                 if (expr.child(1).kind == 2) { keyText = expr.child(1).strVal; }
                 return this.dictReadKind(expr.child(0), keyText) == "float";
@@ -19018,9 +19043,16 @@ public void genNewCall(Node call) {
     // would format an int as %s and crash. Mirrors silverc-rs
     // object_record_key_kind.
     public string dictReadKind(Node recv, string key) {
-        if (recv.kind == 6) {
+        // The receiver resolves to a dict VARIABLE: a plain identifier is
+        // itself, a keyed read (`root["server"]` / `root.server`) is the
+        // nested dict stored under that key. Resolving it here is what
+        // lets a read THROUGH a nested dict find the nested dict's own
+        // per-key kinds (the value rendered as a decimal pointer
+        // otherwise).
+        string varName = this.dictVarOf(recv);
+        if (varName != "") {
             if (key != "") {
-                string fk = this.dictFieldKindOf(recv.name, key);
+                string fk = this.dictFieldKindOf(varName, key);
                 if (fk != "") { return fk; }
             }
             // A tracked variable's recorded whole-dict verdict — even the
@@ -19030,10 +19062,10 @@ public void genNewCall(Node call) {
             // drops them, so the tracked whole entry stands in. Without
             // this, `object mix2 = {k: 9}` next to `{k: "str"}` would
             // format the int as %s and crash.
-            if (this.dictVarIsTracked(recv.name)) {
-                return this.dictWholeKindOf(recv.name);
+            if (this.dictVarIsTracked(varName)) {
+                return this.dictWholeKindOf(varName);
             }
-            string wk = this.dictWholeKindOf(recv.name);
+            string wk = this.dictWholeKindOf(varName);
             if (wk != "") { return wk; }
         }
         if (key != "" && this.isObjectValue(recv)) {
@@ -19229,6 +19261,114 @@ public void genNewCall(Node call) {
         if (base.kind != 6) { return ""; }
         if (keyNode.kind != 2) { return ""; }
         return this.dictKeyClassOf(base.name, keyNode.strVal);
+    }
+
+    // Record the DICT variable stored under a dict key (upsert; "" drops
+    // the entry, so a key that now holds a scalar stops resolving to a
+    // nested dict).
+    public void trackDictKeyNested(string name, string key, string nested) {
+        this.dropDictKeyNested(name, key);
+        if (key != "" && nested != "") {
+            this.dictNestedVars.add(name);
+            this.dictNestedKeys.add(key);
+            this.dictNestedNames.add(nested);
+        }
+    }
+
+    public void dropDictKeyNested(string name, string key) {
+        string[] nv = [];
+        string[] nk = [];
+        string[] nn = [];
+        for (int i = 0; i < this.dictNestedVars.length; i++) {
+            if (this.dictNestedVars[i] != name || this.dictNestedKeys[i] != key) {
+                nv.add(this.dictNestedVars[i]);
+                nk.add(this.dictNestedKeys[i]);
+                nn.add(this.dictNestedNames[i]);
+            }
+        }
+        this.dictNestedVars = nv;
+        this.dictNestedKeys = nk;
+        this.dictNestedNames = nn;
+    }
+
+    // The dict variable stored under `name[key]`, else "".
+    public string dictNestedVarOf(string name, string key) {
+        for (int i = 0; i < this.dictNestedVars.length; i++) {
+            if (this.dictNestedVars[i] == name && this.dictNestedKeys[i] == key) { return this.dictNestedNames[i]; }
+        }
+        return "";
+    }
+
+    // The dict variable an expression names, when it names one: a plain
+    // identifier is the variable itself, and a keyed read (`root["server"]`
+    // / `root.server`) resolves to the dict variable stored under that
+    // key. "" when the expression names no dict. Mirrors silverc-rs
+    // dict_var_of.
+    public string dictVarOf(Node expr) {
+        if (expr.kind == 6) { return expr.name; }
+        if (expr.kind == 24) {
+            if (expr.childCount() < 2) { return ""; }
+            if (expr.child(1).kind != 2) { return ""; }
+            string base = this.dictVarOf(expr.child(0));
+            if (base == "") { return ""; }
+            return this.dictNestedVarOf(base, expr.child(1).strVal);
+        }
+        if (expr.kind == 13) {
+            if (expr.childCount() < 1) { return ""; }
+            string base = this.dictVarOf(expr.child(0));
+            if (base == "") { return ""; }
+            return this.dictNestedVarOf(base, expr.name);
+        }
+        if (expr.kind == 23) {
+            if (expr.childCount() < 1) { return ""; }
+            return this.dictVarOf(expr.child(0));
+        }
+        return "";
+    }
+
+    // True when the expression reads a NESTED dict out of a dict: the
+    // slot holds a dict recorded at the write.
+    public bool isNestedDictRead(Node expr) {
+        if (expr.kind == 24) {
+            if (expr.childCount() < 2) { return false; }
+            if (expr.child(1).kind != 2) { return false; }
+            string base = this.dictVarOf(expr.child(0));
+            if (base == "") { return false; }
+            return this.dictNestedVarOf(base, expr.child(1).strVal) != "";
+        }
+        if (expr.kind == 13) {
+            if (expr.childCount() < 1) { return false; }
+            string base = this.dictVarOf(expr.child(0));
+            if (base == "") { return false; }
+            return this.dictNestedVarOf(base, expr.name) != "";
+        }
+        return false;
+    }
+
+    // True when an index expression addresses a DICT slot: the receiver
+    // is a dict/object value, or a NESTED dict read (`root["server"]`)
+    // whose slot holds a dict. Mirrors silverc-rs is_dict_expr for an
+    // index receiver.
+    public bool isDictIndexReceiver(Node arrNode) {
+        if (this.isDictOrObjectType(this.inferReceiverType(arrNode))) { return true; }
+        return this.isNestedDictRead(arrNode);
+    }
+
+    // True when the expression is a receiver a dict read goes through:
+    // a dict/object-typed value, or a NESTED dict read.
+    public bool isDictReadReceiver(Node expr) {
+        if (this.isDictOrObjectType(this.inferExprType(expr))) { return true; }
+        return this.isNestedDictRead(expr);
+    }
+
+    // True when the expression holds a DICT value (a tracked dict
+    // variable, not a class instance and not a scalar).
+    public bool holdsDictValue(Node e) {
+        if (e.kind != 6) { return false; }
+        if (!this.dictVarIsTracked(e.name)) { return false; }
+        string t = this.inferExprType(e);
+        if (t == "") { return true; }
+        return this.isDictOrObjectType(t);
     }
 
     // Whole-kind of a dict/object literal: "string" only when every value
