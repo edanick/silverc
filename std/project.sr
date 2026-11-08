@@ -1108,7 +1108,18 @@ string projectStripDirectivesCustom(string source, NativeModules nm) {
         if (projectWordAt(source, first, end, "import") || projectWordAt(source, first, end, "mod export")) {
             string line = projectSlice(source, cursor, end);
             string trimmed = projectTrim(line);
-            if (trimmed.length >= 10 && projectSlice(trimmed, 0, 10) == "mod export") { skip = true; }
+            // `mod export X;` is KEPT, not dropped: the declaration is what
+            // tags the module's own items, and that tag is what binds a
+            // module-qualified call (`datetime.now()`) to the named module's
+            // own global when two collected modules export the same
+            // top-level name (`time.now` vs `datetime.now`). The bootstrap
+            // keeps the same declaration (silverc-rs keeps the ModuleExport
+            // item and its codegen registers the qualified `X.name`
+            // alias), so dropping it here left every module-qualified call
+            // on the bare-name fallback: it bound to whichever module was
+            // collected last, and the chained call on that result
+            // (`datetime.now().milliseconds()`) was lowered with a null
+            // receiver and faulted at runtime.
             // Whole-word `import`: a trimmed line starting with the identifier
             // characters (e.g. `importGroupIdx.add(...);`) is code, not an
             // import statement, and must survive stripping.
@@ -1167,7 +1178,9 @@ string projectStripDirectives(string source) {
         string line = projectSlice(source, cursor, end);
         string trimmed = projectTrim(line);
         bool skip = false;
-        if (trimmed.length >= 10 && projectSlice(trimmed, 0, 10) == "mod export") { skip = true; }
+        // `mod export X;` is KEPT (see projectStripDirectivesCustom): the
+        // declaration tags the module's own items so a module-qualified
+        // call binds to the named module's own global.
         // Whole-word `import` (same guard as projectStripDirectivesCustom):
         // identifier-led lines such as `importGroupIdx.add(...);` are code.
         bool isImportLine = trimmed.length >= 6 && projectSlice(trimmed, 0, 6) == "import";
