@@ -67,6 +67,9 @@ class MiniCg {
     // heap text for scalars and live dict/array pointers for nested
     // containers (mirrors silverc-rs dyn_value_vars / is_dyn_value_root).
     public prop string[] dynValueVars;
+    // Locals declared with `alias` (kind-73): assignments to these bind
+    // the alias to the target, they do not copy-on-assign (INV-47).
+    public prop string[] aliasVarNames;
     // `found` foundations (SPEC section 8): a foundation is a TYPE a class
     // may list among its parents; it carries no fields and no code, so it
     // contributes nothing to a class layout and is never a super() target.
@@ -567,6 +570,7 @@ class MiniCg {
         this.entryOffset = 0;
         this.liveSlots = [];
         this.liveSlotIsArray = [];
+        this.aliasVarNames = [];
         this.qcTempCounter = 0;
         this.arrayLitElemHint = "";
         this.currentExcHandler = -1;
@@ -4083,6 +4087,7 @@ int strIdx = this.stringPatchIndices[i];
         while (this.funcCallArgTemps.length > 0) { this.funcCallArgTemps.pop(); }
         while (this.liveSlots.length > 0) { this.liveSlots.pop(); }
         while (this.liveSlotIsArray.length > 0) { this.liveSlotIsArray.pop(); }
+        while (this.aliasVarNames.length > 0) { this.aliasVarNames.pop(); }
         while (this.fnPtrParamNames.length > 0) { this.fnPtrParamNames.pop(); }
     }
     public void emitMethod(Node func, string className) {
@@ -4216,6 +4221,7 @@ int strIdx = this.stringPatchIndices[i];
         this.funcCallArgCount = 0;
         while (this.liveSlots.length > 0) { this.liveSlots.pop(); }
         while (this.liveSlotIsArray.length > 0) { this.liveSlotIsArray.pop(); }
+        while (this.aliasVarNames.length > 0) { this.aliasVarNames.pop(); }
         this.scratchBaseOffset = -8 * (this.localOffsets.length + 1);
         for (int si = 0; si < 64; si++) {
             int scratchOff = this.allocLocal("__call_scratch");
@@ -4478,6 +4484,7 @@ int strIdx = this.stringPatchIndices[i];
             }
         } else if (node.kind == 73) {
             this.allocLocal(node.name);
+            this.aliasVarNames.add(node.name);
             while (this.localTypes.length < this.localNames.length) {
                 this.localTypes.add("");
             }
@@ -4670,6 +4677,9 @@ int strIdx = this.stringPatchIndices[i];
                     // gen_expr_as_type on decl init); untyped shapes
                     // fall through to genExpr unchanged.
                     this.genExprAsType(initNode, stmt.typeHint);
+                    if (!(stmt.isLive && (stmt.typeHint == "string" || stmt.typeHint == "string?"))) {
+                        this.maybeCopyForAssign(initNode, stmt.typeHint, true);
+                    }
                     // `double d = n;` widens the integer to a real double
                     // (silverc-rs does this in its decl-init arm); without it
                     // the raw integer bits landed in the double slot.
@@ -11156,6 +11166,8 @@ int strIdx = this.stringPatchIndices[i];
         int dKey = this.allocLocal("__ds_key");
         this.asm.movMBaseR(5, 0, dKey);
         this.genExpr(rhs);
+        string dictValType = this.dictValueType(this.inferExprType(dictNode));
+        this.maybeCopyForAssign(rhs, dictValType, false);
         int dVal = this.allocLocal("__ds_val");
         this.asm.movMBaseR(5, 0, dVal);
         int dI = this.allocLocal("__ds_i");
@@ -17433,7 +17445,15 @@ public void genNewCall(Node call) {
                 
             } else {
                 this.genExprAsType(rhs, this.inferExprType(lhs));
-                
+                if (!this.isRefParam(lhs.name) && !this.isAliasVar(lhs.name)) {
+                    string copyDest = this.getLocalType(lhs.name);
+                    bool copyClass = true;
+                    if (off == 0 && gi < 0 && this.currentClassName != "") {
+                        copyClass = false;
+                        copyDest = this.findFieldType(this.currentClassName, lhs.name);
+                    }
+                    this.maybeCopyForAssign(rhs, copyDest, copyClass);
+                }
             }
             // Declared-then-assigned objects (`FBox b; b = new FBox();`) and
             // untyped vars (`var v; v = new C();`) get their class registered
@@ -17549,7 +17569,7 @@ public void genNewCall(Node call) {
 
                 if (this.checkVisibleStore(this.currentClassName, fieldName)) { return; }
                 this.genExprAsType(rhs, this.inferExprType(lhs));
-                
+                this.maybeCopyForAssign(rhs, this.inferExprType(lhs), false);
                 this.asm.pushR64(0);
                 this.asm.movRMBase(0, 5, thisOff);
                 this.asm.addRI32(0, fieldOff);
@@ -17561,6 +17581,7 @@ public void genNewCall(Node call) {
                 // A STATIC class field: `ClassName.field = value` writes
                 // the class-level slot (one value shared by every instance).
                 this.genExprAsType(rhs, this.inferExprType(lhs));
+                this.maybeCopyForAssign(rhs, this.inferExprType(lhs), false);
                 this.genGlobalStore(this.staticFieldGlobal["__static_" + obj.name + "_" + fieldName]);
                 return;
             }
@@ -17579,7 +17600,7 @@ public void genNewCall(Node call) {
                 this.assertWritableField(lookupType, fieldName, lhs);
                 if (this.checkVisibleStore(lookupType, fieldName)) { return; }
                 this.genExprAsType(rhs, this.inferExprType(lhs));
-                
+                this.maybeCopyForAssign(rhs, this.inferExprType(lhs), false);
                 this.asm.pushR64(0);
                 if (off != 0) {
                     this.asm.movRMBase(0, 5, off);
@@ -17610,7 +17631,7 @@ public void genNewCall(Node call) {
                     this.genExpr(obj);
                     this.asm.pushR64(0);
                     this.genExprAsType(rhs, this.inferExprType(lhs));
-                    
+                    this.maybeCopyForAssign(rhs, this.inferExprType(lhs), false);
                     this.asm.movRR64(12, 0);
                     this.asm.popR64(0);
                     this.asm.addRI32(0, fieldOff);
@@ -17651,7 +17672,7 @@ public void genNewCall(Node call) {
                             this.genStructLiteral(rhs, wFieldType);
                         } else {
                             this.genExprAsType(rhs, this.inferExprType(lhs));
-                            
+                            this.maybeCopyForAssign(rhs, wFieldType, false);
                         }
                         this.asm.pushR64(0);
                         this.genArrayIndex(obj);
@@ -17698,7 +17719,7 @@ public void genNewCall(Node call) {
                     this.genStructLiteral(rhs, idxElemType);
                 } else {
                     this.genExprAsType(rhs, this.inferExprType(lhs));
-                    
+                    this.maybeCopyForAssign(rhs, idxElemType, false);
                 }
                 this.asm.pushR64(0);
                 this.asm.movRMBase(11, 5, arrOff);
@@ -17739,7 +17760,7 @@ public void genNewCall(Node call) {
                     this.genStructLiteral(rhs, idxElemType2);
                 } else {
                     this.genExprAsType(rhs, this.inferExprType(lhs));
-                    
+                    this.maybeCopyForAssign(rhs, idxElemType2, false);
                 }
                 this.asm.movRR64(12, 0);
                 this.asm.popR64(0);
@@ -23320,6 +23341,209 @@ public void genNewCall(Node call) {
             if (t[t.length - 2] == '[' && t[t.length - 1] == ']') { isArr = true; }
         }
         this.liveSlotIsArray.add(isArr);
+    }
+
+    // ------------------------------------------------------------------
+    // INV-47 copy-on-assign (SPEC 9.2). When a store binds an existing
+    // heap value (identifier / member / index RHS) into a heap-typed
+    // destination, the destination owns a fresh copy. The copy helpers
+    // below take RAX = source pointer (null passes through) and return
+    // RAX = fresh owned block, null-guarded. Layouts are this runtime's:
+    // arrays and dicts keep [capacity, length] in the 16 bytes before the
+    // data pointer (data = block + 16), strings are NUL-terminated
+    // char* with no header, class instances are fieldCount*8 malloc blocks
+    // (min 16, as genNewCall lays them out). The string case reuses
+    // emitLlmaiStringDup. Copies allocate through emitLlmaiHeapAlloc
+    // (malloc on Linux, HeapAlloc on Windows), so the `live` epilogue
+    // free stays consistent: the copy is freed by the destination's own
+    // live slot, never twice. `<<` (Move) and `alias` never route here;
+    // parameters (by-reference) and returns (fresh by construction for
+    // calls) are untouched.
+    // ------------------------------------------------------------------
+
+    public bool isAliasVar(string name) {
+        for (int i = 0; i < this.aliasVarNames.length; i++) {
+            if (this.aliasVarNames[i] == name) { return true; }
+        }
+        return false;
+    }
+
+    // Copy kind for a type spelling: 0 = not a copyable heap type,
+    // 1 = string, 2 = array, 3 = dict, 4 = class.
+    public int copyKindForType(string t) {
+        if (t == "string" || t == "string?") { return 1; }
+        if (this.isArrayLikeType(t)) { return 2; }
+        if (this.isDictType(t)) { return 3; }
+        if (this.isStructTypeName(t)) { return 4; }
+        return 0;
+    }
+
+    public int classCopyBytes(string className) {
+        string base = className;
+        if (base.length > 0 && base[base.length - 1] == '?') {
+            base = base.substring(0, base.length - 1);
+        }
+        int size = 16;
+        for (int ci = 0; ci < this.classNames.length; ci++) {
+            if (this.classNames[ci] == base) {
+                size = this.classFieldCounts[ci] * 8;
+                if (size < 16) { size = 16; }
+            }
+        }
+        return size;
+    }
+
+    public void emitCopyOnAssignArray() {
+        int done = this.newLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(done);
+        int srcOff = this.allocLocal("__copy_arr_src");
+        int capOff = this.allocLocal("__copy_arr_cap");
+        int lenOff = this.allocLocal("__copy_arr_len");
+        int sizeOff = this.allocLocal("__copy_arr_size");
+        int baseOff = this.allocLocal("__copy_arr_base");
+        this.asm.movMBaseR(5, 0, srcOff);
+        this.asm.movRMBase(0, 5, srcOff);
+        this.asm.movRMBase(0, 0, -16);
+        this.asm.movMBaseR(5, 0, capOff);
+        this.asm.movRMBase(0, 5, srcOff);
+        this.asm.movRMBase(0, 0, -8);
+        this.asm.movMBaseR(5, 0, lenOff);
+        // size = (max(cap, len) + 2) * 8 so the payload always fits even
+        // if the source header were ever short; the stored cap stays the
+        // source cap, exactly as concat grows a fresh block.
+        this.asm.movRMBase(0, 5, capOff);
+        this.asm.movRMBase(1, 5, lenOff);
+        this.asm.cmpRR64(0, 1);
+        int capGeLen = this.newLabel();
+        int sizeDone = this.newLabel();
+        this.asm.jgeLabel(capGeLen);
+        this.asm.movRMBase(0, 5, lenOff);
+        this.asm.jmpLabel(sizeDone);
+        this.asm.bindLabel(capGeLen);
+        this.asm.movRMBase(0, 5, capOff);
+        this.asm.bindLabel(sizeDone);
+        this.asm.addRI32(0, 2);
+        this.asm.shlR64Imm(0, 3);
+        this.asm.movMBaseR(5, 0, sizeOff);
+        this.emitLlmaiHeapAlloc(sizeOff);
+        this.asm.movMBaseR(5, 0, baseOff);
+        this.asm.movRMBase(1, 5, baseOff);
+        this.asm.movRMBase(0, 5, capOff);
+        this.asm.movMBaseR(1, 0, 0);
+        this.asm.movRMBase(1, 5, baseOff);
+        this.asm.movRMBase(0, 5, lenOff);
+        this.asm.movMBaseR(1, 0, 8);
+        this.asm.movRMBase(1, 5, baseOff);
+        this.asm.addRI32(1, 16);
+        this.asm.movRMBase(2, 5, srcOff);
+        this.asm.movRMBase(8, 5, lenOff);
+        this.asm.shlR64Imm(8, 3);
+        this.addImportPatch("msvcrt.dll", "memcpy");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD9);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(0, 5, baseOff);
+        this.asm.addRI32(0, 16);
+        this.asm.bindLabel(done);
+    }
+
+    public void emitCopyOnAssignDict() {
+        int done = this.newLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(done);
+        int srcOff = this.allocLocal("__copy_dict_src");
+        int capOff = this.allocLocal("__copy_dict_cap");
+        int sizeOff = this.allocLocal("__copy_dict_size");
+        int baseOff = this.allocLocal("__copy_dict_base");
+        this.asm.movMBaseR(5, 0, srcOff);
+        this.asm.movRMBase(0, 5, srcOff);
+        this.asm.movRMBase(0, 0, -16);
+        this.asm.movMBaseR(5, 0, capOff);
+        // size = cap * 16 + 16 (16-byte header + 16 bytes per entry word
+        // pair), mirroring the dict literal allocation.
+        this.asm.movRMBase(0, 5, capOff);
+        this.asm.shlR64Imm(0, 4);
+        this.asm.addRI32(0, 16);
+        this.asm.movMBaseR(5, 0, sizeOff);
+        this.emitLlmaiHeapAlloc(sizeOff);
+        this.asm.movMBaseR(5, 0, baseOff);
+        this.asm.movRMBase(1, 5, baseOff);
+        this.asm.movRMBase(2, 5, srcOff);
+        this.asm.subRI32(2, 16);
+        this.asm.movRMBase(8, 5, sizeOff);
+        this.addImportPatch("msvcrt.dll", "memcpy");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD9);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(0, 5, baseOff);
+        this.asm.addRI32(0, 16);
+        this.asm.bindLabel(done);
+    }
+
+    public void emitCopyOnAssignClass(int bytes) {
+        if (bytes <= 0) { return; }
+        int done = this.newLabel();
+        this.asm.cmpRI32(0, 0);
+        this.asm.jeLabel(done);
+        int srcOff = this.allocLocal("__copy_cls_src");
+        int sizeOff = this.allocLocal("__copy_cls_size");
+        int baseOff = this.allocLocal("__copy_cls_base");
+        this.asm.movMBaseR(5, 0, srcOff);
+        this.asm.emitImm64(1, bytes);
+        this.asm.movMBaseR(5, 1, sizeOff);
+        this.asm.movRMBase(8, 5, sizeOff);
+        this.emitHeapAllocCall();
+        this.asm.movMBaseR(5, 0, baseOff);
+        this.asm.movRMBase(1, 5, baseOff);
+        this.asm.movRMBase(2, 5, srcOff);
+        this.asm.emitImm64(8, bytes);
+        this.addImportPatch("msvcrt.dll", "memcpy");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAD9);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movRMBase(0, 5, baseOff);
+        this.asm.bindLabel(done);
+    }
+
+    // After a store evaluated its RHS into RAX, copy RAX when the RHS
+    // names an existing heap value and the destination is a matching
+    // heap type. `destType` is "" or "var" for untyped destinations
+    // (any kind copies). `allowClass` is false for field/element/dict
+    // stores, where class values keep their instance identity.
+    public void maybeCopyForAssign(Node rhs, string destType, bool allowClass) {
+        Node r = rhs;
+        while (r.kind == 23 || r.kind == 86) {
+            if (r.childCount() == 0) { return; }
+            r = r.child(0);
+        }
+        if (r.kind != 6 && r.kind != 13 && r.kind != 24) { return; }
+        string rhsType = "";
+        if (r.kind == 6) {
+            rhsType = this.getLocalType(r.name);
+            if (rhsType == "") { rhsType = this.inferExprType(r); }
+        } else {
+            rhsType = this.inferExprType(r);
+        }
+        if (rhsType == "object" || rhsType == "object?") { return; }
+        int kind = this.copyKindForType(rhsType);
+        if (kind == 0) { return; }
+        if (kind == 4 && !allowClass) { return; }
+        if (destType != "" && destType != "var") {
+            int destKind = this.copyKindForType(destType);
+            if (destKind == 0) { return; }
+            if (destKind != kind) { return; }
+        }
+        if (kind == 1) { this.emitLlmaiStringDup(); }
+        else if (kind == 2) { this.emitCopyOnAssignArray(); }
+        else if (kind == 3) { this.emitCopyOnAssignDict(); }
+        else if (kind == 4) { this.emitCopyOnAssignClass(this.classCopyBytes(rhsType)); }
     }
 
     public void emitLlmaiStringDup() {
