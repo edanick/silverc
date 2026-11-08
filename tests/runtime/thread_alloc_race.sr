@@ -1,0 +1,117 @@
+// THREAD_SAFETY.md T3 -- the embedded runtime heap's bump pointer must be
+// atomic, or two threads can be handed the same block.
+//
+// Self-hosted-suite mirror of silverc-rs/tests/runtime/thread_alloc_race.sr:
+// the same fixture, so the allocator is proven under BOTH compilers.
+//
+// `--runtime` mode allocates through a single process-global bump pointer
+// over one reserved region (`__silver_rt_alloc`). Before T3 the allocator
+// read the offset, added the rounded size, checked the bound, and stored
+// the new offset -- an unlocked read-modify-write. Two threads can read the
+// same old offset, both pass the bound check, and both be handed the same
+// block: their writes silently overwrite each other (silent memory
+// corruption, no crash, no diagnostic). This fixture is the proof that the
+// fix (a LOCK CMPXCHG claim loop on the offset) works.
+//
+// Silver has no mutable module-level binding and no mutable class property
+// (verified), so there is no shared counter to point at: the corruption is
+// detected from INSIDE each thread body. Every thread allocates 6000 arrays
+// of 16 ints (128 payload bytes, so every allocation stays inside the 16 MiB
+// bump reserve and never falls back to the OS heap), fills every element
+// with its own id, and keeps the block. After a short pause -- long enough
+// for every thread to finish its own claims -- each thread re-reads every
+// element of every block it kept and verifies it still equals its own id.
+// Two threads sharing one block write two different ids into the same
+// elements, so the thread that wrote first observes the other's id and
+// exits with code 9. The many small allocations keep the bump offset
+// densely contested (16 threads x 6000 claims inside a 16 MiB reserve), so
+// the pre-fix race is hit within a single run. The atom is reached only
+// with `--runtime` (the AOT path allocates through the OS heap, which the
+// OS serializes), so the suite runner compiles this fixture with the
+// `--runtime` flag.
+//
+// DEVIATIONS from the prime-ancestor fixture, both for the self-hosted
+// backend:
+//   * the block is verified AFTER a pause instead of right after it was
+//     filled -- there the detection window was as narrow as the collision
+//     itself and a pre-fix run could slip through; here every collision is
+//     caught, so the fixture is a stable regression gate;
+//   * 16 threads instead of 8 -- the self-hosted allocator's claim window is
+//     entered less often per allocation, so more contenders are needed for
+//     the pre-fix race to be hit in every run.
+//
+// TOOLCHAIN ADAPTATION: the array size is a RUNTIME value (`new int[n]`),
+// not a literal. In the self-hosted backend a literal-sized `new int[16]`
+// takes the array-literal path, which calls libc malloc directly and never
+// reaches the embedded allocator -- so the literal spelling would test the
+// OS heap instead of the allocator under test. The runtime-sized spelling
+// lowers to the HeapAlloc-shaped call the `--runtime` redirect repoints at
+// `__silver_rt_alloc`, which is the code under test.
+//
+// A non-zero exit from ANY thread terminates the process with that code,
+// which the suite runner records as a failure. On the fixed allocator the
+// fixture prints "thread alloc race ok" and exits 0.
+//
+// Manual run: silverc tests/runtime/thread_alloc_race.sr -o out --runtime
+
+import * from thread;
+
+void race_worker(int id) {
+    int n = 16;
+    int[][] blocks = [];
+    for (int i = 0; i < 6000; i++) {
+        int[] a = new int[n];
+        for (int j = 0; j < n; j++) {
+            a[j] = id;
+        }
+        blocks.add(a);
+    }
+    // Let every thread finish its claims before the check, so a collision is
+    // always visible in the block that was written first.
+    threads.sleep(200);
+    for (int i = 0; i < blocks.length; i++) {
+        int[] a = blocks[i];
+        for (int j = 0; j < n; j++) {
+            if (a[j] != id) {
+                printline("CORRUPT id=" + id);
+                exit(9);
+            }
+        }
+    }
+}
+
+void main() {
+    threads.Thread t1 = threads.start((void () { race_worker(1); }));
+    threads.Thread t2 = threads.start((void () { race_worker(2); }));
+    threads.Thread t3 = threads.start((void () { race_worker(3); }));
+    threads.Thread t4 = threads.start((void () { race_worker(4); }));
+    threads.Thread t5 = threads.start((void () { race_worker(5); }));
+    threads.Thread t6 = threads.start((void () { race_worker(6); }));
+    threads.Thread t7 = threads.start((void () { race_worker(7); }));
+    threads.Thread t8 = threads.start((void () { race_worker(8); }));
+    threads.Thread t9 = threads.start((void () { race_worker(9); }));
+    threads.Thread t10 = threads.start((void () { race_worker(10); }));
+    threads.Thread t11 = threads.start((void () { race_worker(11); }));
+    threads.Thread t12 = threads.start((void () { race_worker(12); }));
+    threads.Thread t13 = threads.start((void () { race_worker(13); }));
+    threads.Thread t14 = threads.start((void () { race_worker(14); }));
+    threads.Thread t15 = threads.start((void () { race_worker(15); }));
+    threads.Thread t16 = threads.start((void () { race_worker(16); }));
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+    t5.join();
+    t6.join();
+    t7.join();
+    t8.join();
+    t9.join();
+    t10.join();
+    t11.join();
+    t12.join();
+    t13.join();
+    t14.join();
+    t15.join();
+    t16.join();
+    printline("thread alloc race ok");
+}

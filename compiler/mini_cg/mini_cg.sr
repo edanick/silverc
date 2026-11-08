@@ -3293,6 +3293,7 @@ int strIdx = this.stringPatchIndices[i];
         this.rtAllocOffset = this.asm.buf.length;
         int fbLbl = this.newLabel();
         int doneLbl = this.newLabel();
+        int claimLbl = this.newLabel();
         this.emitRtStateAddr(10);
         this.asm.movRMBase(0, 10, 0);
         this.asm.orRR64(0, 0);
@@ -3300,12 +3301,22 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRR64(9, 8);
         this.asm.addRI32(9, 15);
         this.asm.andRImm(9, -16);
-        this.asm.movRMBase(11, 10, 8);
-        this.asm.movRR64(2, 11);
+        // Atomic bump claim (THREAD_SAFETY.md T3): the offset update is a
+        // CAS loop, so two threads are never handed the same block. RAX
+        // holds the expected offset and, after a failed CAS, the fresh
+        // current offset (the reserve bound is re-checked against it on
+        // every retry). R9 (rounded size) and R10 (&state) survive the
+        // retries -- the loop contains no call, so no register is clobbered.
+        this.asm.movRMBase(0, 10, 8);
+        this.asm.bindLabel(claimLbl);
+        this.asm.movRR64(2, 0);
         this.asm.addRR64(2, 9);
         this.asm.cmpRI32(2, 16777216);
         this.asm.jgLabel(fbLbl);
-        this.asm.movMBaseR(10, 2, 8);
+        this.asm.lockCmpxchgMBaseR(10, 8, 2);
+        this.asm.jneLabel(claimLbl);
+        // RAX holds the claimed offset; the block starts at base + offset.
+        this.asm.movRMBase(11, 10, 0);
         this.asm.addRR64(0, 11);
         this.asm.jmpLabel(doneLbl);
         this.asm.bindLabel(fbLbl);
@@ -3339,9 +3350,10 @@ int strIdx = this.stringPatchIndices[i];
         this.rtRegisterFunc("__silver_rt_gc_collect");
         this.rtGcOffset = this.asm.buf.length;
         this.emitRtStateAddr(10);
-        this.asm.movRMBase(0, 10, 16);
-        this.asm.addRI32(0, 1);
-        this.asm.movMBaseR(10, 0, 16);
+        // LOCK INC: the cycle counter is shared by every thread, so the
+        // read-modify-write must be atomic or two collections lose an
+        // increment.
+        this.asm.lockIncMBase(10, 16);
         this.asm.ret();
     }
 
@@ -3442,6 +3454,7 @@ int strIdx = this.stringPatchIndices[i];
         this.rtAllocOffset = this.asm.buf.length;
         int fbLbl = this.newLabel();
         int doneLbl = this.newLabel();
+        int claimLbl = this.newLabel();
         this.emitRtStateAddr(10);
         this.asm.movRMBase(0, 10, 0);
         this.asm.orRR64(0, 0);
@@ -3449,20 +3462,29 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRR64(9, 8);
         this.asm.addRI32(9, 15);
         this.asm.andRImm(9, -16);
-        this.asm.movRMBase(11, 10, 8);
-        this.asm.movRR64(2, 11);
+        // Atomic bump claim (THREAD_SAFETY.md T3): the offset update is a
+        // CAS loop, so two threads are never handed the same block. RAX
+        // holds the expected offset and, after a failed CAS, the fresh
+        // current offset (the reserve bound is re-checked against it on
+        // every retry). R9 (rounded size) and R10 (&state) survive the
+        // retries -- the loop contains no call, so no register is clobbered.
+        this.asm.movRMBase(0, 10, 8);
+        this.asm.bindLabel(claimLbl);
+        this.asm.movRR64(2, 0);
         this.asm.addRR64(2, 9);
         this.asm.cmpRI32(2, 16777216);
         this.asm.jgLabel(fbLbl);
-        this.asm.movMBaseR(10, 2, 8);
-        // -- spill accounting (additive): state+24 managed_bytes += rounded.
-        // RCX (reg 1) is dead on this path (the Win64 heap-handle slot the
-        // Linux backend ignores); RAX/RDX/R8/R9/R11 stay live for the
-        // pointer commit below.
-        this.asm.movRMBase(1, 10, 24);
-        this.asm.addRR64(1, 9);
-        this.asm.movMBaseR(10, 1, 24);
+        this.asm.lockCmpxchgMBaseR(10, 8, 2);
+        this.asm.jneLabel(claimLbl);
+        // RAX holds the claimed offset; the block starts at base + offset.
+        this.asm.movRMBase(11, 10, 0);
         this.asm.addRR64(0, 11);
+        // -- spill accounting (additive): state+24 managed_bytes += rounded.
+        // LOCK XADD so two threads cannot lose an update; RCX (reg 1) is
+        // dead on this path (the Win64 heap-handle slot the Linux backend
+        // ignores) and takes the old counter value back.
+        this.asm.movRR64(1, 9);
+        this.asm.lockXaddMBaseR(10, 24, 1);
         this.asm.jmpLabel(doneLbl);
         this.asm.bindLabel(fbLbl);
         // -- pre-commit pressure relief (additive, GC hybrid paging stage
@@ -3515,9 +3537,10 @@ int strIdx = this.stringPatchIndices[i];
         this.rtRegisterFunc("__silver_rt_gc_collect");
         this.rtGcOffset = this.asm.buf.length;
         this.emitRtStateAddr(10);
-        this.asm.movRMBase(0, 10, 16);
-        this.asm.addRI32(0, 1);
-        this.asm.movMBaseR(10, 0, 16);
+        // LOCK INC: the cycle counter is shared by every thread, so the
+        // read-modify-write must be atomic or two collections lose an
+        // increment.
+        this.asm.lockIncMBase(10, 16);
         this.asm.ret();
 
         // ---- __silver_rt_page_out(size in R8) --------------------------
@@ -3525,8 +3548,8 @@ int strIdx = this.stringPatchIndices[i];
         // 1): Gate 2 recheck (bump >= 15099494 = 90% of the 16 MiB reserve)
         // plus pressure-probe accounting in state+32. ABI: R8 = requested
         // bytes, preserved; returns RAX = 0 (no native spill performed, so
-        // the caller runs its malloc fallback). Preserves R10/R11/RDX/RCX
-        // via push/pop; no calls inside, so no ABI setup is needed. Gate 1
+        // the caller runs its malloc fallback). Preserves R10/R11/RDX via
+        // push/pop; no calls inside, so no ABI setup is needed. Gate 1
         // (system pressure via /proc/meminfo MemAvailable) lives in the
         // Silver page manager (runtime/memory.sr smShouldSpill through
         // sysinfo.memoryUsagePercent); no /tmp/*.sm file is created here
@@ -3537,19 +3560,16 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.pushR64(10);
         this.asm.pushR64(11);
         this.asm.pushR64(2);
-        this.asm.pushR64(1);
         this.emitRtStateAddr(10);
         int poOutLbl = this.newLabel();
         this.asm.movRMBase(11, 10, 8);
         this.asm.movRI64(2, 15099494);
         this.asm.cmpRR64(11, 2);
         this.asm.jlLabel(poOutLbl);
-        this.asm.movRMBase(1, 10, 32);
-        this.asm.addRI32(1, 1);
-        this.asm.movMBaseR(10, 1, 32);
+        // LOCK INC: the pressure-probe counter is shared by every thread.
+        this.asm.lockIncMBase(10, 32);
         this.asm.bindLabel(poOutLbl);
         this.asm.xorRR64(0, 0);
-        this.asm.popR64(1);
         this.asm.popR64(2);
         this.asm.popR64(11);
         this.asm.popR64(10);
@@ -3559,17 +3579,14 @@ int strIdx = this.stringPatchIndices[i];
         // Fault-in wiring point (additive, stage 1): records one fault
         // inquiry in state+48 and returns RAX = 0 (resident — no disk fault
         // performed; the Silver manager in runtime/memory.sr validates
-        // header/checksum/index on real faults). Preserves R8/R10/R11/RDX/
-        // RCX via push/pop; no calls inside.
+        // header/checksum/index on real faults). Preserves R10 via push/pop;
+        // no calls inside.
         this.rtRegisterFunc("__silver_rt_page_in");
         this.asm.pushR64(10);
-        this.asm.pushR64(1);
         this.emitRtStateAddr(10);
-        this.asm.movRMBase(1, 10, 48);
-        this.asm.addRI32(1, 1);
-        this.asm.movMBaseR(10, 1, 48);
+        // LOCK INC: the fault counter is shared by every thread.
+        this.asm.lockIncMBase(10, 48);
         this.asm.xorRR64(0, 0);
-        this.asm.popR64(1);
         this.asm.popR64(10);
         this.asm.ret();
     }

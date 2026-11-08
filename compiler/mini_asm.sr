@@ -449,6 +449,94 @@ class MiniAsm {
         this.emitU8(0xC0 | ((dst & 7) << 3) | (src & 7));
     }
 
+    // ---- LOCK-prefixed atomics ------------------------------------------
+    // The embedded runtime's state block is shared by every thread of the
+    // program: the bump offset, the GC cycle counter and the accounting
+    // counters. A plain load/add/store read-modify-write lets two cores
+    // read the same old value and store the same new one -- a lost update,
+    // and for the bump offset two threads handed the SAME block (silent
+    // corruption, no crash, no diagnostic). The LOCK prefix makes the whole
+    // read-modify-write one indivisible transaction, so every writer of that
+    // block goes through these encoders.
+
+    // ModRM (+SIB) for the memory operand [base+disp] of the atomic
+    // instructions below, whose ModRM.reg field carries the source
+    // register. The addressing forms mirror movRMBase/movMBaseR: RBP/R13 as
+    // a base always need a displacement, RSP/R12 as a base always need a
+    // SIB byte.
+    private void emitAtomicModRM(int reg, int base, int disp) {
+        if (base == 5 || base == 13) {
+            this.emitU8(0x85 | ((reg & 7) << 3) | (base & 7));
+            this.emitU32(disp);
+        } else if (base == 4 || base == 12) {
+            if (disp >= -128 && disp <= 127) {
+                this.emitU8(0x44 | ((reg & 7) << 3));
+                this.emitU8(0x24);
+                this.emitU8(disp & 0xFF);
+            } else {
+                this.emitU8(0x84 | ((reg & 7) << 3));
+                this.emitU8(0x24);
+                this.emitU32(disp);
+            }
+        } else {
+            if (disp == 0) {
+                this.emitU8(((reg & 7) << 3) | (base & 7));
+            } else if (disp >= -128 && disp <= 127) {
+                this.emitU8(0x40 | ((reg & 7) << 3) | (base & 7));
+                this.emitU8(disp & 0xFF);
+            } else {
+                this.emitU8(0x80 | ((reg & 7) << 3) | (base & 7));
+                this.emitU32(disp);
+            }
+        }
+    }
+
+    // LOCK CMPXCHG r/m64, reg (0F B1): compares the accumulator (RAX) with
+    // the memory operand; equal -> the source register is stored into
+    // memory and ZF=1, not equal -> memory is loaded into RAX and ZF=0
+    // (nothing is stored). This is the CAS the embedded runtime's bump
+    // allocator claims a region with: RAX carries the expected value, the
+    // source register the desired one, and after a failed CAS the caller
+    // retries with the fresh value RAX received.
+    public void lockCmpxchgMBaseR(int base, int disp, int src) {
+        int rex = 0x48;
+        if (src > 7) { rex = rex | 0x04; }
+        if (base > 7) { rex = rex | 0x01; }
+        this.emitU8(0xF0); // LOCK
+        this.emitU8(rex);
+        this.emitU8(0x0F);
+        this.emitU8(0xB1);
+        this.emitAtomicModRM(src, base, disp);
+    }
+
+    // LOCK XADD r/m64, reg (0F C1): atomically adds the source register into
+    // the memory operand and loads the OLD memory value into the source
+    // register. With the addend preloaded in a register this is a
+    // one-instruction atomic counter update (the register ends up holding
+    // the value from before the update).
+    public void lockXaddMBaseR(int base, int disp, int src) {
+        int rex = 0x48;
+        if (src > 7) { rex = rex | 0x04; }
+        if (base > 7) { rex = rex | 0x01; }
+        this.emitU8(0xF0); // LOCK
+        this.emitU8(rex);
+        this.emitU8(0x0F);
+        this.emitU8(0xC1);
+        this.emitAtomicModRM(src, base, disp);
+    }
+
+    // LOCK INC r/m64 (FF /0): the atomic increment of a shared counter.
+    // Same effect as LOCK XADD with 1, but one instruction and no register
+    // to clobber.
+    public void lockIncMBase(int base, int disp) {
+        int rex = 0x48;
+        if (base > 7) { rex = rex | 0x01; }
+        this.emitU8(0xF0); // LOCK
+        this.emitU8(rex);
+        this.emitU8(0xFF);
+        this.emitAtomicModRM(0, base, disp);
+    }
+
     public void syscall() {
         this.emitU8(0x0F);
         this.emitU8(0x05);
