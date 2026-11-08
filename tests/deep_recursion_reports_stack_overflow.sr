@@ -1,0 +1,66 @@
+// Unbounded recursion must raise the catchable StackOverflowException
+// instead of overflowing the native stack and crashing the process.
+// Before the fix the compiled program died of SIGSEGV (exit 139) before
+// the catch could run; after it the exception is caught and the program
+// continues with the call-depth counter fully restored.
+class Exception {
+    string message;
+    construct(string msg) { this.message = msg; }
+}
+
+int countdown(int n) {
+    if (n <= 0) { return 0; }
+    return countdown(n - 1);
+}
+
+int blow(int x) { return blow(x + 1); }
+
+class Self {
+    int mblow(int x) { return mblow(x + 1); }
+    int mcount(int n) {
+        if (n <= 0) { return 0; }
+        return mcount(n - 1);
+    }
+}
+
+void check(bool ok, string label) {
+    if (!ok) {
+        printline("FAIL " + label);
+        exit(1);
+    }
+}
+
+void main() {
+    check(countdown(900) == 0, "bounded-900");
+    check(countdown(998) == 0, "bounded-998-at-cap");
+    string caught = "no throw";
+    try {
+        blow(0);
+        caught = "no throw";
+    } catch (Exception e) {
+        caught = e.message;
+    }
+    check(caught == "StackOverflowException", "caught-stack-overflow");
+    printline("caught: " + caught);
+    check(countdown(998) == 0, "bounded-after-catch");
+    Self s = new Self();
+    check(s.mcount(100) == 0, "method-bounded");
+    string mcaught = "no throw";
+    try {
+        s.mblow(0);
+        mcaught = "no throw";
+    } catch (Exception e) {
+        mcaught = e.message;
+    }
+    check(mcaught == "StackOverflowException", "method-caught");
+    string again = "no throw";
+    try {
+        blow(0);
+        again = "no throw";
+    } catch (Exception e) {
+        again = e.message;
+    }
+    check(again == "StackOverflowException", "caught-again");
+    check(countdown(998) == 0, "bounded-final");
+    printline("deep recursion reports stack overflow ok");
+}
