@@ -1,0 +1,42 @@
+import hash;
+
+// Crypto digest dispatch (FIPS 180-4 / RFC 1321 / RFC 2104), verified
+// against python hashlib on every backend: the Rust compiler lowers these
+// natively (Windows CNG bcrypt.dll / Linux libcrypto / macOS
+// CommonCrypto), the self-host compiles the pure-Silver std/hash.sr, and
+// the interpreter implements the same vectors. md5/sha512 previously fell
+// into the legacy djb2 fallback and returned garbage integers; the *File
+// variants previously did too; compare previously hashed its first
+// argument. Exit code 0 = all digests byte-identical.
+void main() {
+    if (hash.md5("hello") != "5d41402abc4b2a76b9719d911017c592") { printline("FAIL md5 hello"); exit(1); }
+    if (hash.md5("abc") != "900150983cd24fb0d6963f7d28e17f72") { printline("FAIL md5 abc"); exit(1); }
+    if (hash.md5("") != "d41d8cd98f00b204e9800998ecf8427e") { printline("FAIL md5 empty"); exit(1); }
+    if (hash.sha512("hello") != "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca72323c3d99ba5c11d7c7acc6e14b8c5da0c4663475c2e5c3adef46f73bcdec043") { printline("FAIL sha512 hello"); exit(1); }
+    if (hash.sha512("abc") != "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f") { printline("FAIL sha512 abc"); exit(1); }
+    if (hash.sha512("") != "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e") { printline("FAIL sha512 empty"); exit(1); }
+    if (hash.sha256("hello") != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824") { printline("FAIL sha256 hello"); exit(1); }
+    if (hash.sha1("hello") != "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d") { printline("FAIL sha1 hello"); exit(1); }
+    if (hash.hmacSha256("key", "The quick brown fox jumps over the lazy dog") != "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8") { printline("FAIL hmacSha256 fox"); exit(1); }
+    if (hash.hmacSha1("key", "The quick brown fox jumps over the lazy dog") != "de7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9") { printline("FAIL hmacSha1 fox"); exit(1); }
+
+    // Timing-safe compare: equal digests compare equal, differing ones do
+    // not, and a length difference alone decides false.
+    if (!hash.compare(hash.sha256("abc"), hash.sha256("abc"))) { printline("FAIL compare equal"); exit(1); }
+    if (hash.compare(hash.sha256("abc"), hash.sha256("abd"))) { printline("FAIL compare differ"); exit(1); }
+    if (hash.compare(hash.sha256("abc"), hash.sha256("abcd"))) { printline("FAIL compare length"); exit(1); }
+
+    // File variants digest the file's text bytes — identical to hashing
+    // the same content as a string.
+    file.writeString("hash_crypto_digests_tmp.txt", "hash file probe");
+    if (hash.md5File("hash_crypto_digests_tmp.txt") != hash.md5("hash file probe")) { printline("FAIL md5File"); exit(1); }
+    if (hash.sha1File("hash_crypto_digests_tmp.txt") != hash.sha1("hash file probe")) { printline("FAIL sha1File"); exit(1); }
+    if (hash.sha256File("hash_crypto_digests_tmp.txt") != hash.sha256("hash file probe")) { printline("FAIL sha256File"); exit(1); }
+    if (hash.sha512File("hash_crypto_digests_tmp.txt") != hash.sha512("hash file probe")) { printline("FAIL sha512File"); exit(1); }
+    if (!hash.compare(hash.sha256File("hash_crypto_digests_tmp.txt"), hash.sha256("hash file probe"))) { printline("FAIL compare file"); exit(1); }
+    file.delete("hash_crypto_digests_tmp.txt");
+
+    printline("hash crypto OK");
+}
+// CONTAINS: hash crypto OK
+// EXIT: 0
