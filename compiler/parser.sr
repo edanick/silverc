@@ -10,6 +10,12 @@ import * from array;
 class Parser {
     private prop Token[] tokens;
     private prop int pos;
+    // How many BLOCKS are open around the current token. A `shared`
+    // binding is a program-wide word every thread may touch
+    // (THREAD_SAFETY.md §3.4), so it is a module-level declaration: inside
+    // any block (a function body, a nested block) there is no single
+    // program-wide slot to give it.
+    private prop int blockDepth;
     // Inside a `[...]` index, a top-level `..` (token 144) starts a slice
     // rather than a binary range expression.
     private bool rangeIsSliceBoundary;
@@ -1434,12 +1440,25 @@ class Parser {
                         if (inner.kind == 100 && inner.name == "main") {
                             mainSeen = true;
                         }
-                        if (inner.kind == 61 || inner.kind == 50 || inner.kind == 73 || inner.kind == 16 || inner.kind == 53 || inner.kind == 54 || inner.kind == 55 || inner.kind == 59 || inner.kind == 68) {
+                        if (inner.kind == 50 && inner.isShared) {
+                            // A `shared` binding is a program-wide word
+                            // every thread may touch (THREAD_SAFETY.md
+                            // §3.4): it is always a global, never a local
+                            // of the implicit main.
+                            inner.srcModule = this.internModule(item.name);
+                            items.add(inner);
+                        } else if (inner.kind == 61 || inner.kind == 50 || inner.kind == 73 || inner.kind == 16 || inner.kind == 53 || inner.kind == 54 || inner.kind == 55 || inner.kind == 59 || inner.kind == 68) {
                             mainBody.children.add(inner);
                         } else {
                             items.add(inner);
                         }
                     }
+                } else if (item.kind == 50 && item.isShared) {
+                    // A `shared` binding is a program-wide word every thread
+                    // may touch (THREAD_SAFETY.md §3.4): it is always a
+                    // global, never a local of the implicit main.
+                    item.srcModule = this.internModule(this.curModule);
+                    items.add(item);
                 } else if (item.kind == 61 || item.kind == 50 || item.kind == 73 || item.kind == 16 || item.kind == 53 || item.kind == 54 || item.kind == 55 || item.kind == 59 || item.kind == 68) {
                     mainBody.children.add(item);
                 } else {
@@ -3125,6 +3144,7 @@ class Parser {
     private Node parseBlock() {
         Node block = new Node();
         block.kind = 16;
+        this.blockDepth++;
         this.expect(102);
         while (!this.check(103) && !this.check(0)) {
             int stmtStart = this.pos;
@@ -3144,6 +3164,7 @@ class Parser {
             int closeLine = this.prevEndLine() + 1;
             this.recordError("Missing closing curly bracket at line " + (string)closeLine + ", column 1");
         }
+        this.blockDepth--;
         return block;
     }
 
@@ -3294,9 +3315,23 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             return n;
         }
         if (this.check(155)) {
+            Token sharedTok = this.peek();
             this.advance();
             Node n = this.parseTypeNameInit();
             n.isShared = true;
+            if (this.blockDepth > 0) {
+                // A `shared` binding is a program-wide word every thread
+                // may touch, so it lives at module level: inside a block
+                // there is no single program-wide slot to give it.
+                this.recordError((string)sharedTok.line + ":" + (string)sharedTok.col + ": `shared` variable '" + n.name + "' must be declared at module level, not inside a function");
+            }
+            if (n.typeHint != "int" && n.typeHint != "int64" && n.typeHint != "uint" && n.typeHint != "uint64") {
+                // A `shared` binding holds ONE machine word: the atomic
+                // update is a compare-and-swap on that word, so a wider or
+                // non-integral value would need a lock Silver has not got
+                // yet.
+                this.recordError((string)sharedTok.line + ":" + (string)sharedTok.col + ": `shared` variable '" + n.name + "' must be a 64-bit integer (int, int64, uint or uint64), not '" + n.typeHint + "'");
+            }
             return n;
         }
         if (this.check(151)) {

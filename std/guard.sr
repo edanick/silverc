@@ -168,6 +168,10 @@ class MemoryGuard {
     private prop GuardVar[] vars;
     private prop int[] scopeEnds;
     private prop string[] globalNames;
+    // The `shared` bindings among the globals (THREAD_SAFETY.md §3.4):
+    // program-wide words every thread may read and write. A write to one
+    // is a legal target (the store is one atomic word access).
+    private prop string[] sharedGlobalNames;
     private prop string[] nonNullNames;
     private prop int unwrapDepth;
     private prop string[] typeNames;
@@ -239,6 +243,7 @@ class MemoryGuard {
         this.vars = [];
         this.scopeEnds = [];
         this.globalNames = [];
+        this.sharedGlobalNames = [];
         this.nonNullNames = [];
         this.unwrapDepth = 0;
         this.typeNames = [];
@@ -272,6 +277,19 @@ class MemoryGuard {
     private void fail(string exc, int line, int col, string varName, string msg) {
         printline("GuardError: " + exc + " at line " + (string)line + ", column " + (string)col + ": " + varName + ": " + msg);
         exit(1);
+    }
+
+    // Does this expression read the named binding? Used to refuse an
+    // assignment to a `shared` binding whose value expression reads it
+    // (`x = x + 1`): that read-modify-write is two steps, and another
+    // thread may write between them (THREAD_SAFETY.md §3.4).
+    private bool exprReadsName(Node e, string name) {
+        if (e == null) { return false; }
+        if (e.kind == GND_IDENT) { return e.name == name; }
+        for (int i = 0; i < e.childCount(); i++) {
+            if (this.exprReadsName(e.child(i), name)) { return true; }
+        }
+        return false;
     }
 
     private int findVar(string name) {
@@ -433,6 +451,16 @@ class MemoryGuard {
     private bool isGlobalName(string name) {
         for (int i = 0; i < this.globalNames.length; i++) {
             if (this.globalNames[i] == name) { return true; }
+        }
+        return false;
+    }
+
+    // Is this global one of the `shared` bindings (THREAD_SAFETY.md
+    // §3.4)? A `shared` binding is a program-wide word every thread may
+    // write, so writing to it is not a const reassignment.
+    private bool isSharedGlobalName(string name) {
+        for (int i = 0; i < this.sharedGlobalNames.length; i++) {
+            if (this.sharedGlobalNames[i] == name) { return true; }
         }
         return false;
     }
@@ -1072,13 +1100,35 @@ class MemoryGuard {
                     this.fail("UnassignedVariableCallException", lhs.line, lhs.col, lhs.name, "compound assignment reads '" + lhs.name + "' before it is assigned on all paths");
                 }
             }
-            if (this.isGlobalName(lhs.name) && this.findVar(lhs.name) < 0) {
+            if (this.isGlobalName(lhs.name) && this.findVar(lhs.name) < 0 && !this.isSharedGlobalName(lhs.name)) {
                 // An in-scope binding — a local, a parameter, or an
                 // in-scope class field (this-less member idiom) — shadows a
                 // same-named global: the assignment targets the inner
                 // binding. Only a global with no inner shadow is an invalid
-                // target (const reassignment).
+                // target (const reassignment). A `shared` binding is a
+                // program-wide word every thread may write, so it is a
+                // legal target.
                 this.fail("InvalidAssignment", lhs.line, lhs.col, lhs.name, "cannot write to a global or const");
+            }
+            if (this.isSharedGlobalName(lhs.name) && this.findVar(lhs.name) < 0) {
+                // A `shared` binding (THREAD_SAFETY.md §3.4): the update
+                // rules are narrower than for an ordinary binding, because
+                // the update has to be atomic.
+                if (n.op == GOP_ASSIGN) {
+                    // `x = <expr that reads x>` is a read-modify-write the
+                    // compiler cannot make atomic: the read and the write
+                    // are two steps and another thread may write between
+                    // them.
+                    if (this.exprReadsName(rhs, lhs.name)) {
+                        this.fail("InvalidAssignment", lhs.line, lhs.col, lhs.name, "cannot assign to a `shared` variable an expression that reads it: the read and the write would not be atomic (use '" + lhs.name + " += 1' or '" + lhs.name + "++')");
+                    }
+                } else if (isCompound && n.op != GOP_ADD_ASSIGN && n.op != GOP_SUB_ASSIGN) {
+                    // Only the additions and subtractions have an atomic
+                    // lowering (a compare-and-swap on the word); the rest
+                    // would need a wider critical section Silver has not got
+                    // yet.
+                    this.fail("InvalidAssignment", lhs.line, lhs.col, lhs.name, "a `shared` variable supports only '+=', '-=', '++' and '--': the other compound updates have no atomic lowering");
+                }
             }
             int idx = this.findVar(lhs.name);
             if (idx >= 0) {
@@ -2234,7 +2284,7 @@ class MemoryGuard {
                     // Same shadowing rule as a plain store: an in-scope
                     // binding (local, parameter, class field) hides a
                     // same-named global.
-                    if (this.isGlobalName(lhs.name) && this.findVar(lhs.name) < 0) {
+                    if (this.isGlobalName(lhs.name) && this.findVar(lhs.name) < 0 && !this.isSharedGlobalName(lhs.name)) {
                         this.fail("InvalidAssignment", lhs.line, lhs.col, lhs.name, "cannot write to a global or const");
                     }
                     int idx = this.findVar(lhs.name);
@@ -2773,6 +2823,11 @@ class MemoryGuard {
                 }
             } else if (n.kind == GND_VAR_DECL) {
                 this.globalNames.add(n.name);
+                if (n.isShared) {
+                    // A `shared` binding is a program-wide word every
+                    // thread may read and write (THREAD_SAFETY.md §3.4).
+                    this.sharedGlobalNames.add(n.name);
+                }
             } else if (n.kind == GND_STRUCT_DEF || n.kind == GND_ENUM_DEF || n.kind == GND_DEF || n.kind == GND_TYPE_ALIAS) {
                 if (this.nodeIsImport(n)) { continue; }
                 // Known user type names: class/struct/enum/def/typealias

@@ -271,6 +271,11 @@ class MiniCg {
     public prop Node[] globalInits;
     public prop int[] globalPatchOffsets;
     public prop int[] globalPatchIndices;
+    // The `shared` bindings among the globals (THREAD_SAFETY.md §3.4):
+    // program-wide words every thread may read and write. Their slots are
+    // 8-byte aligned, a plain read or write is one atomic word access, and
+    // a read-modify-write is a compare-and-swap loop.
+    public prop string[] sharedGlobalNames;
     public prop int globalAreaSize;
     public prop int entryOffset;
     public prop int[] liveSlots;
@@ -538,6 +543,7 @@ class MiniCg {
         this.globalInits = [];
         this.globalPatchOffsets = [];
         this.globalPatchIndices = [];
+        this.sharedGlobalNames = [];
         this.globalAreaSize = 0;
         this.entryOffset = 0;
         this.liveSlots = [];
@@ -2269,17 +2275,27 @@ class MiniCg {
         if (lhs.name.length == 0) { return; }
         if (this.findLocal(lhs.name) != 0) { return; }
         if (this.findGlobal(lhs.name) < 0) { return; }
+        // A `shared` binding is a program-wide word every thread may
+        // write (THREAD_SAFETY.md §3.4): the store is one atomic word
+        // access, so it is a legal target.
+        if (this.isSharedGlobal(lhs.name)) { return; }
         printline("GuardError: InvalidAssignment at line " + (string)lhs.line + ", column " + (string)lhs.col + ": " + lhs.name + ": cannot write to a global or const");
         exit(1);
+    }
+
+    public void genGlobalBase(int gi) {
+        // Put the global slot's absolute address into RAX. The address is
+        // patched after codegen (see patchGlobalRefs).
+        int sp = this.asm.buf.length;
+        this.asm.emitImm64(0, 0);
+        this.globalPatchOffsets.add(sp + 2);
+        this.globalPatchIndices.add(gi);
     }
 
     public void genGlobalLoad(int gi) {
         // Load the 8-byte global slot value into RAX.  The slot's absolute
         // address is patched after codegen (see patchGlobalRefs).
-        int sp = this.asm.buf.length;
-        this.asm.emitImm64(0, 0);
-        this.globalPatchOffsets.add(sp + 2);
-        this.globalPatchIndices.add(gi);
+        this.genGlobalBase(gi);
         this.asm.movRMBase(0, 0, 0);
     }
 
@@ -2287,12 +2303,78 @@ class MiniCg {
         // Store the value currently in RAX into the global slot.  Mirrors
         // genGlobalLoad but dereferences the patched slot address as a store.
         this.asm.pushR64(0);
-        int sp = this.asm.buf.length;
-        this.asm.emitImm64(0, 0);
-        this.globalPatchOffsets.add(sp + 2);
-        this.globalPatchIndices.add(gi);
+        this.genGlobalBase(gi);
         this.asm.popR64(1);
         this.asm.movMBaseR(0, 1, 0);
+    }
+
+    // Is this global one of the `shared` bindings (THREAD_SAFETY.md §3.4)?
+    public bool isSharedGlobal(string name) {
+        for (int i = 0; i < this.sharedGlobalNames.length; i++) {
+            if (this.sharedGlobalNames[i] == name) { return true; }
+        }
+        return false;
+    }
+
+    // Pad the string data so that the top-level-globals block starts on an
+    // 8-byte boundary.
+    //
+    // A `shared` binding is updated with a locked read-modify-write, and a
+    // locked access needs a naturally aligned slot (THREAD_SAFETY.md
+    // §3.4). The globals block holds one 8-byte slot per global and starts
+    // right after the string data, so aligning the block's base aligns
+    // every slot in it.
+    //
+    // `stringsStart` is the block's offset inside the data region: on
+    // Windows the import tables precede the strings, on Linux and macOS
+    // the data region starts with the strings. The padding is added only
+    // when the program uses a `shared` binding, so every other program
+    // keeps its byte-identical output.
+    public void padStringDataForGlobals(int[] stringData, int stringsStart) {
+        if (this.sharedGlobalNames.length == 0) { return; }
+        int misaligned = (stringsStart + stringData.length) % 8;
+        if (misaligned == 0) { return; }
+        for (int i = 0; i < 8 - misaligned; i++) { stringData.add(0); }
+    }
+
+    // An atomic read-modify-write on a `shared` binding: the slot ends up
+    // holding `old + value` (or `old - value`), and RAX holds the new value.
+    //
+    // The update is a compare-and-swap loop: read the word, compute the new
+    // value, swap it in only if nobody else changed the word in the
+    // meantime, and try again if somebody did. Two threads therefore cannot
+    // lose an update (THREAD_SAFETY.md §3.4, §6.1).
+    //
+    // The slot is 8-byte aligned (the globals block's base is aligned when
+    // the program uses a `shared` binding), so the locked access is a
+    // single atomic word access.
+    public void genSharedRmw(int gi, bool add, Node rhs) {
+        // The addend is evaluated once, before the loop: it does not depend
+        // on the slot's value, and evaluating it again on every retry would
+        // repeat its side effects.
+        int valOff = this.allocLocal("__shared_rmw_addend");
+        this.genExpr(rhs);
+        this.asm.movMBaseR(5, 0, valOff);
+        // The memory operand's base goes to RCX: `lock cmpxchg` uses RAX as
+        // its accumulator, so the base cannot live there.
+        this.genGlobalBase(gi);
+        this.asm.movRR64(1, 0);
+        int retry = this.newLabel();
+        this.asm.bindLabel(retry);
+        // RAX = the word as it is now; RDX = the value we want it to hold;
+        // R8 = the addend.
+        this.asm.movRMBase(0, 1, 0);
+        this.asm.movRR64(2, 0);
+        this.asm.movRMBase(8, 5, valOff);
+        if (add) { this.asm.addRR64(2, 8); } else { this.asm.subRR64(2, 8); }
+        // The swap succeeds when RAX still holds the word's value; on a
+        // failure the fresh value is loaded into RAX and ZF is cleared.
+        this.asm.lockCmpxchgMBaseR(1, 0, 2);
+        this.asm.jneLabel(retry);
+        // The swap succeeded: RAX still holds the old value, so the new one
+        // is the old one adjusted by the addend.
+        this.asm.movRMBase(8, 5, valOff);
+        if (add) { this.asm.addRR64(0, 8); } else { this.asm.subRR64(0, 8); }
     }
 
     public void emitExceptionJump() {
@@ -2861,6 +2943,15 @@ int strIdx = this.stringPatchIndices[i];
                 this.globalNames.add(pg.name);
                 this.globalTypes.add(globalType);
                 this.globalOffsets.add(this.globalOffsets.length * 8);
+                if (pg.isShared) {
+                    // A `shared` binding is a program-wide word every
+                    // thread may read and write (THREAD_SAFETY.md §3.4).
+                    // It lives in the writable globals block, whose base
+                    // is 8-byte aligned when the program uses a `shared`
+                    // binding (see the layout code), so the slot is
+                    // aligned and a single word access to it is atomic.
+                    this.sharedGlobalNames.add(pg.name);
+                }
                 if (pg.childCount() > 0) {
                     this.globalInits.add(pg.child(0));
                 } else {
@@ -16585,6 +16676,16 @@ public void genNewCall(Node call) {
                     return;
                 }
             }
+            if (off == 0 && gi >= 0 && this.isSharedGlobal(lhs.name)) {
+                // A `shared` binding is updated atomically: a
+                // compare-and-swap loop, so two threads cannot lose an
+                // update (THREAD_SAFETY.md §3.4). Only `+=` and `-=` reach
+                // here; the Guard refuses the other compound operators,
+                // which have no atomic lowering.
+                if (op == 14) { this.genSharedRmw(gi, true, rhs); }
+                else if (op == 15) { this.genSharedRmw(gi, false, rhs); }
+                return;
+            }
             if (off != 0) { this.asm.movRMBase(0, 5, off); }
             else if (gi >= 0) { this.genGlobalLoad(gi); }
             else if (fieldOff >= 0) {
@@ -17802,6 +17903,22 @@ public void genNewCall(Node call) {
                 return;
             }
             if (gi >= 0) {
+                if (this.isSharedGlobal(lhs.name)) {
+                    // An atomic increment of a `shared` binding: a
+                    // compare-and-swap loop, so two threads cannot lose an
+                    // update (THREAD_SAFETY.md §3.4). The loop leaves the
+                    // NEW value in RAX; the old one is the new one adjusted
+                    // back by one.
+                    Node one = new Node();
+                    one.kind = 0;
+                    one.intVal = 1;
+                    this.genSharedRmw(gi, plus, one);
+                    // The expression yields the OLD value (the self-hosted
+                    // compiler has post-update `x++`/`x--` only): the old
+                    // value is the new one adjusted back by one.
+                    if (plus) { this.asm.subRI32(0, 1); } else { this.asm.addRI32(0, 1); }
+                    return;
+                }
                 this.genGlobalLoad(gi);
                 this.asm.pushR64(0);
                 if (floatTarget) {
