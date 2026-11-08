@@ -62,6 +62,11 @@ class MiniCg {
     // layout (which faulted on class memory).
     public prop string[] objectDynNames;
     public prop string[] objectDynTypes;
+    // Locals holding a dynamic parse result (`json.parse` / `yaml.parse` /
+    // `yaml.load`): member/index/paren/safe chains read through them hold
+    // heap text for scalars and live dict/array pointers for nested
+    // containers (mirrors silverc-rs dyn_value_vars / is_dyn_value_root).
+    public prop string[] dynValueVars;
     // `found` foundations (SPEC section 8): a foundation is a TYPE a class
     // may list among its parents; it carries no fields and no code, so it
     // contributes nothing to a class layout and is never a super() target.
@@ -419,6 +424,7 @@ class MiniCg {
         this.funcNames = [];
         this.objectDynNames = [];
         this.objectDynTypes = [];
+        this.dynValueVars = [];
         this.foundNames = [];
         this.foundMemberStarts = [];
         this.foundMemberCounts = [];
@@ -4073,6 +4079,7 @@ int strIdx = this.stringPatchIndices[i];
         while (this.dictNestedKeys.length > 0) { this.dictNestedKeys.pop(); }
         while (this.dictNestedNames.length > 0) { this.dictNestedNames.pop(); }
         while (this.objectVars.length > 0) { this.objectVars.pop(); }
+        while (this.dynValueVars.length > 0) { this.dynValueVars.pop(); }
         while (this.funcCallArgTemps.length > 0) { this.funcCallArgTemps.pop(); }
         while (this.liveSlots.length > 0) { this.liveSlots.pop(); }
         while (this.liveSlotIsArray.length > 0) { this.liveSlotIsArray.pop(); }
@@ -4565,6 +4572,11 @@ int strIdx = this.stringPatchIndices[i];
         Node trackInit = null;
         if (stmt.childCount() > 0) { trackInit = stmt.child(0); }
         this.trackDictDecl(stmt.name, stmt.typeHint, trackInit);
+        if (trackInit != null && this.isParseResultInit(trackInit) && (stmt.typeHint == "" || stmt.typeHint == "var" || stmt.typeHint == "object" || stmt.typeHint == "object?" || stmt.typeHint == "JsonValue" || this.isDictType(stmt.typeHint))) {
+            this.noteDynValue(stmt.name);
+        } else {
+            this.clearDynValue(stmt.name);
+        }
         // Dynamic-type tracking: `object x = new Foo()` / `object x =
         // classFn()` — record the initializer's class so field reads and
         // method calls on the object-typed variable bind the class (via
@@ -6508,7 +6520,7 @@ int strIdx = this.stringPatchIndices[i];
         // lookup, mirroring `dict["key"]` (genDictIndexGet). Without this,
         // unknown-typed receivers fell through to the struct field path,
         // which emitted nothing, and reads came back stale registers.
-        if (fieldName != "length" && this.isDictOrObjectType(this.inferExprType(obj))) {
+        if (fieldName != "length" && (this.isDictOrObjectType(this.inferExprType(obj)) || this.isDynValueRoot(obj))) {
             Node idxNode = new Node();
             idxNode.kind = 24;
             idxNode.children.add(obj);
@@ -7254,6 +7266,67 @@ int strIdx = this.stringPatchIndices[i];
         }
         this.objectDynNames.add(name);
         this.objectDynTypes.add(cls);
+    }
+
+    public bool isDynValue(string name) {
+        for (int i = 0; i < this.dynValueVars.length; i++) {
+            if (this.dynValueVars[i] == name) { return true; }
+        }
+        return false;
+    }
+
+    public void noteDynValue(string name) {
+        if (this.isDynValue(name)) { return; }
+        this.dynValueVars.add(name);
+    }
+
+    public void clearDynValue(string name) {
+        string[] kept = [];
+        for (int i = 0; i < this.dynValueVars.length; i++) {
+            if (this.dynValueVars[i] != name) { kept.add(this.dynValueVars[i]); }
+        }
+        this.dynValueVars = kept;
+    }
+
+    // True when `e` is a module-qualified `json.parse` / `yaml.parse` /
+    // `yaml.load` call producing a dynamic value (mirrors silverc-rs
+    // is_parse_result_init; the receiver guard mirrors isBuiltinModuleReceiver
+    // so a shadowing local never reads as the module).
+    public bool isParseResultInit(Node e) {
+        if (e == null) { return false; }
+        if (e.kind != 10 || !e.isMember || e.childCount() < 1) { return false; }
+        Node recv = e.child(0);
+        if (recv.kind != 6) { return false; }
+        if (recv.name != "json" && recv.name != "yaml") { return false; }
+        if (e.name != "parse" && e.name != "load") { return false; }
+        if (this.isUserSymbol(recv.name)) { return false; }
+        return true;
+    }
+
+    // True when the expression reads through a dynamic parse-result value:
+    // walks member/index/paren/safe chains to the base variable. Reads
+    // through such roots are heap text (scalars) or live dict/array pointers
+    // (nested containers), so leaf reads render with %s (mirrors
+    // silverc-rs is_dyn_value_root).
+    public bool isDynValueRoot(Node expr) {
+        if (expr == null) { return false; }
+        if (expr.kind == 6) { return this.isDynValue(expr.name); }
+        if (expr.kind == 75) {
+            if (expr.childCount() > 0) {
+                Node safeInner = expr.child(0);
+                if (safeInner.kind == 10 && safeInner.isMember && safeInner.childCount() > 0) {
+                    return this.isDynValueRoot(safeInner.child(0));
+                }
+                return this.isDynValueRoot(safeInner);
+            }
+            return false;
+        }
+        if (expr.kind == 13 || expr.kind == 24 || expr.kind == 23) {
+            if (expr.childCount() > 0) { return this.isDynValueRoot(expr.child(0)); }
+            return false;
+        }
+        if (expr.kind == 10 && expr.isMember) { return this.isParseResultInit(expr); }
+        return false;
     }
 
     public int findFieldOffsetInAllClasses(string fieldName) {
@@ -17330,6 +17403,11 @@ public void genNewCall(Node call) {
                     this.recordObjectDynamicType(lhs.name, rhsClass);
                 }
             }
+            if (this.isParseResultInit(rhs)) {
+                this.noteDynValue(lhs.name);
+            } else {
+                this.clearDynValue(lhs.name);
+            }
             int off = this.findLocal(lhs.name);
             int gi = this.findGlobal(lhs.name);
             if (rhs.kind == 74) {
@@ -18239,8 +18317,9 @@ public void genNewCall(Node call) {
             // first, then the whole-dict kind; string only when "string"
             // (never %s on unknown — it would dereference a non-pointer).
             if (expr.childCount() > 0 && this.isDictReadReceiver(expr.child(0))) {
-                return this.dictReadKind(expr.child(0), expr.name) == "string";
+                return this.dictReadKind(expr.child(0), expr.name) == "string" || this.isDynValueRoot(expr.child(0));
             }
+            if (expr.childCount() > 0 && this.isDynValueRoot(expr.child(0))) { return true; }
             string t = this.inferMemberAccessType(expr);
             return t == "string";
         }
@@ -18250,8 +18329,9 @@ public void genNewCall(Node call) {
             if (expr.childCount() > 1 && this.isDictReadReceiver(expr.child(0))) {
                 string keyText = "";
                 if (expr.child(1).kind == 2) { keyText = expr.child(1).strVal; }
-                return this.dictReadKind(expr.child(0), keyText) == "string";
+                return this.dictReadKind(expr.child(0), keyText) == "string" || this.isDynValueRoot(expr.child(0));
             }
+            if (expr.childCount() > 0 && this.isDynValueRoot(expr.child(0))) { return true; }
             // An index chained on a string[]-returning builtin method call
             // (`d.keys()[0]`, `d.values()[0]`, `s.split(",")[1]`,
             // `s.lines()[i]`) must format as text: keys are NUL-terminated
@@ -18262,7 +18342,7 @@ public void genNewCall(Node call) {
                 string recvT = this.inferExprType(expr.child(0).child(0));
                 if (this.isDictOrObjectType(recvT)) {
                     if (expr.child(0).name == "keys") { return true; }
-                    if (expr.child(0).name == "values") { return this.dictReadKind(expr.child(0).child(0), "") == "string"; }
+                    if (expr.child(0).name == "values") { return this.dictReadKind(expr.child(0).child(0), "") == "string" || this.isDynValueRoot(expr.child(0).child(0)); }
                 }
                 if ((expr.child(0).name == "split" || expr.child(0).name == "lines") && recvT == "string") { return true; }
             }
@@ -19424,6 +19504,7 @@ public void genNewCall(Node call) {
     // index receiver.
     public bool isDictIndexReceiver(Node arrNode) {
         if (this.isDictOrObjectType(this.inferReceiverType(arrNode))) { return true; }
+        if (this.isDynValueRoot(arrNode)) { return true; }
         return this.isNestedDictRead(arrNode);
     }
 
@@ -19431,6 +19512,7 @@ public void genNewCall(Node call) {
     // a dict/object-typed value, or a NESTED dict read.
     public bool isDictReadReceiver(Node expr) {
         if (this.isDictOrObjectType(this.inferExprType(expr))) { return true; }
+        if (this.isDynValueRoot(expr)) { return true; }
         return this.isNestedDictRead(expr);
     }
 
