@@ -2547,7 +2547,7 @@ class Parser {
                     superCall.kind = 10;
                     superCall.name = "super";
                     while (!this.check(101) && !this.check(0)) {
-                        superCall.children.add(this.parseExpr(0));
+                        superCall.children.add(this.parseCallArg());
                         if (this.check(107)) { this.advance(); }
                     }
                     this.expect(101);
@@ -3890,6 +3890,32 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
     // (`x => expr`, `x << expr`, `(a, b) => expr`) or a plain expression.
     // Lambdas are represented as a kind-80 node whose children are the
     // parameter name nodes followed by the body expression.
+    // Named arguments (DOCS/67): an argument shaped `IDENT = expr` in
+    // call position. The name is inert - the right-hand side is the
+    // argument, bound positionally in appearance order, exactly as the
+    // interpreter evaluates it. Only the exact `IDENT` (kind 7) followed
+    // by `=` (kind 110) triggers this: `==` (134), `<=` (136), `>=` (137),
+    // `!=` (135), `+=` (130), ... are comparison/compound operators and
+    // parse as ordinary expressions.
+    private void skipNamedArgPrefix() {
+        if (this.check(7) && this.pos + 1 < this.tokens.length && this.tokens[this.pos + 1].kind == 110) {
+            this.advance(); // argument name (inert)
+            this.advance(); // `=`
+        }
+    }
+
+    // Parse one call argument (named-argument tolerant).
+    private Node parseCallArg() {
+        this.skipNamedArgPrefix();
+        return this.parseExpr(0);
+    }
+
+    // Parse one higher-order call argument (named-argument tolerant).
+    private Node parseLambdaCallArg() {
+        this.skipNamedArgPrefix();
+        return this.parseLambdaArg();
+    }
+
     private Node parseLambdaArg() {
         // Multi-param form: `(a, b) => body` / `(a, b) << body`.  Backtracks
         // when the parenthesized text is really a plain expression.
@@ -4061,7 +4087,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                         Token prevT = this.tokens[this.pos - 1];
                         this.recordError("you forgot a comma \",\" at line " + (string)prevT.line + ", column " + (prevT.col + this.tokenSrcLen(prevT)).toString());
                     }
-                    call.children.add(this.parseExpr(0));
+                    call.children.add(this.parseCallArg());
                     argc++;
                 }
                 if (this.check(101)) {
@@ -4155,9 +4181,9 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                             this.recordError("you forgot a comma \",\" at line " + (string)prevT2.line + ", column " + (prevT2.col + this.tokenSrcLen(prevT2)).toString());
                         }
                         if (hof) {
-                            call.children.add(this.parseLambdaArg());
+                            call.children.add(this.parseLambdaCallArg());
                         } else {
-                            call.children.add(this.parseExpr(0));
+                            call.children.add(this.parseCallArg());
                         }
                         mArgc++;
                     }
@@ -4231,9 +4257,9 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
                     this.advance();
                     while (!this.check(101) && !this.check(0)) {
                         if (hof) {
-                            call.children.add(this.parseLambdaArg());
+                            call.children.add(this.parseLambdaCallArg());
                         } else {
-                            call.children.add(this.parseExpr(0));
+                            call.children.add(this.parseCallArg());
                         }
                         if (this.check(107)) { this.advance(); }
                     }
@@ -4874,7 +4900,7 @@ if (next.kind == 104 && this.pos + 2 < this.tokens.length && this.tokens[this.po
             }
             this.expect(100);
             while (!this.check(101) && !this.check(0)) {
-                ctor.children.add(this.parseExpr(0));
+                ctor.children.add(this.parseCallArg());
                 if (this.check(107)) { this.advance(); }
             }
             this.expect(101);
