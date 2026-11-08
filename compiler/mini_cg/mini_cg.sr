@@ -6961,6 +6961,9 @@ int strIdx = this.stringPatchIndices[i];
                 if ((cname == "length" || cname == "len") && recvType == "string") {
                     return "int";
                 }
+                if (cname == "charAt" && recvType == "string") {
+                    return "char";
+                }
                 // DOCS/45: the number-parse form of a string -- parse the
                 // receiver as an int, throwing on non-numeric input.
                 if (cname == "parse" && recvType == "string") {
@@ -7353,6 +7356,15 @@ int strIdx = this.stringPatchIndices[i];
             // treated as a 64-bit-element array (bounds check against the heap
             // bytes before the string, *8 scaling) and crashed in later stages.
             if (this.isStrideOneType(this.inferExprType(arrNode))) { isString = 1; }
+        } else if (this.isStrideOneType(this.inferExprType(arrNode))) {
+            // Every other base whose inferred type is a string -- a string
+            // LITERAL (`"hello"[1]`), a concatenation, a stringify result.
+            // A literal is not a local/param, so none of the shapes above
+            // named it and the read took the 64-bit array path: the bounds
+            // check read the heap bytes before the string as the "length"
+            // and indexed them, faulting. Classify by the inferred type
+            // instead.
+            isString = 1;
         }
         if (arrNode.kind == 6 && this.findLocal(arrNode.name) != 0) {
             int arrOff = this.findLocal(arrNode.name);
@@ -13577,7 +13589,7 @@ public void genNewCall(Node call) {
             }
         }
         if (recvType == "string") {
-            if (name == "contains" || name == "isDigits" || name == "isBlank" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "lastIndexOf" || name == "substr" || name == "substring" || name == "slice" || name == "stripPrefix" || name == "stripSuffix" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "len" || name == "parse" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toFloatBits" || name == "toBytes" || name == "repeat") {
+            if (name == "contains" || name == "isDigits" || name == "isBlank" || name == "trim" || name == "trimEnd" || name == "trimStart" || name == "trimLeft" || name == "trimRight" || name == "split" || name == "lines" || name == "startsWith" || name == "endsWith" || name == "indexOf" || name == "find" || name == "lastIndexOf" || name == "substr" || name == "substring" || name == "slice" || name == "stripPrefix" || name == "stripSuffix" || name == "toLower" || name == "lower" || name == "toUpper" || name == "upper" || name == "replace" || name == "replaceAll" || name == "pad" || name == "padLeft" || name == "padRight" || name == "slugify" || name == "length" || name == "len" || name == "charAt" || name == "parse" || name == "toInt64" || name == "toInt" || name == "toNumber" || name == "toFloatBits" || name == "toBytes" || name == "repeat") {
                 return true;
             }
         }
@@ -13614,6 +13626,49 @@ public void genNewCall(Node call) {
         }
         if ((name == "toFloat" || name == "toFloat64") && this.isScalarValueType(recvType)) {
             this.genFloatingConversion(recv); return;
+        }
+        if (name == "charAt") {
+            // The char at the index argument (DOCS/104): in range -> the
+            // byte at [base + idx]; negative, at or past the length, or a
+            // null base -> a space (the interpreter's semantics), never an
+            // out-of-bounds read.
+            this.genExpr(recv);
+            int charBaseOff = this.allocLocal("__charat_base");
+            this.asm.movMBaseR(5, 0, charBaseOff);
+            if (call.childCount() >= 2) { this.genExpr(call.child(1)); } else { this.asm.xorRR64(0, 0); }
+            int charIdxOff = this.allocLocal("__charat_i");
+            this.asm.movMBaseR(5, 0, charIdxOff);
+            int charSpace = this.newLabel();
+            int charOk = this.newLabel();
+            this.asm.movRMBase(0, 5, charBaseOff);
+            this.asm.cmpRI32(0, 0);
+            this.asm.jeLabel(charSpace);
+            this.asm.movRMBase(1, 5, charIdxOff);
+            this.asm.cmpRI32(1, 0);
+            this.asm.jlLabel(charSpace);
+            int charLenOff = this.allocLocal("__charat_n");
+            this.asm.movRMBase(1, 5, charBaseOff);
+            this.addImportPatch("ucrtbase.dll", "strlen");
+            int sCharAtLen = 0xDEADBEEFCAFEBAC0;
+            this.asm.emitImm64(0, sCharAtLen);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.emitCallSetup(0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movMBaseR(5, 0, charLenOff);
+            this.asm.movRMBase(1, 5, charIdxOff);
+            this.asm.movRMBase(2, 5, charLenOff);
+            this.asm.cmpRR64(1, 2);
+            this.asm.jgeLabel(charSpace);
+            this.asm.movRMBase(0, 5, charBaseOff);
+            this.asm.movRMBase(1, 5, charIdxOff);
+            this.asm.addRR64(0, 1);
+            this.asm.movzxByteMBase(0, 0, 0);
+            this.asm.jmpLabel(charOk);
+            this.asm.bindLabel(charSpace);
+            this.asm.movRI64(0, 32);
+            this.asm.bindLabel(charOk);
+            return;
         }
         if (name == "length" || name == "len") {
             // string.length()/len() - call form of the .length field access
