@@ -2871,10 +2871,13 @@ int strIdx = this.stringPatchIndices[i];
                     this.constIsString.add(0);
                 }
             }
-            if (pi.kind == 105 && (pi.typeHint.length > 0 || pi.isStatic)) {
-                // DOCS/213 -- import statement (win32 module grants or a
-                // no-op source-module marker). Registered, not treated as an
-                // enum.
+            if (pi.kind == 105 && (pi.typeHint.length > 0 || pi.isStatic || pi.childCount() == 0)) {
+                // DOCS/213 -- import statement (win32 module grants, source-
+                // module markers and bare user-module imports). Registered,
+                // not treated as an enum. The child-count term admits the
+                // bare `import mmm;` marker (which carries no typeHint): it
+                // is a user module, and without the registration
+                // `new mmm.Class()` failed with "Unknown type".
                 this.registerWin32Import(pi);
                 // LINUX SysV backend (additive): linux imports resolve beside
                 // win32 ones (registrars self-filter by source namespace).
@@ -2895,7 +2898,14 @@ int strIdx = this.stringPatchIndices[i];
                 // DOCS/261: declared bare customs are native too, never user
                 // modules (their dormant grant is harmless; calls resolve
                 // user-first, lazily).
+                // A BARE module import (`import mmm;`) records its module on
+                // the node's NAME and leaves typeHint empty; only a `from`
+                // import carries the source in typeHint. Reading just
+                // typeHint skipped every bare import, so no user module was
+                // registered and `new mod.Class()` failed with
+                // "Unknown type" -- and so did any dotted class name.
                 string src = pi.typeHint;
+                if (src.length == 0) { src = pi.name; }
                 bool srcIsWin32 = src == "win32";
                 if (!srcIsWin32 && src.length > 6) {
                     if (projectSlice(src, 0, 6) == "win32.") { srcIsWin32 = true; }
