@@ -3,26 +3,53 @@ import {readString, writeString} from fs;
 
 public object parse(string raw) {
     object result = {};
-    object currentSection = result;
+    object currentSection = {};
+    string currentSectionName = "";
+    bool inSection = false;
     string[] lines = raw.split("\n");
     foreach (string line in lines) {
         line = line.trim();
-        if (line.length == 0 || line[0] == ';' || line[0] == '#') { continue; }
-        if (line[0] == '[') {
-            int end = line.indexOf("]");
-            if (end < 0) { continue; }
-            string sectionName = line.substr(1, end - 1);
-            currentSection = {};
-            result[sectionName] = currentSection;
-        } else {
-            int eq = line.indexOf("=");
-            if (eq < 0) { continue; }
-            string key = line.substr(0, eq).trim();
-            string val = line.substr(eq + 1).trim();
-            currentSection[key] = val;
+        // NOTE: no `continue` here on purpose: the bootstrap
+        // compiler's continue inside foreach does not skip the
+        // rest of the body, so blank/comment lines are guarded
+        // positively instead.
+        if (line.length > 0 && line[0] != ';' && line[0] != '#') {
+            if (line[0] == '[') {
+                int end = line.indexOf("]");
+                if (end >= 0) {
+                    string sectionName = line.substr(1, end - 1);
+                    if (inSection) {
+                        result[currentSectionName] = currentSection;
+                    } else {
+                        mergeTopLevel(result, currentSection);
+                    }
+                    currentSection = {};
+                    currentSectionName = sectionName;
+                    inSection = true;
+                }
+            } else {
+                int eq = line.indexOf("=");
+                if (eq >= 0) {
+                    string key = line.substr(0, eq).trim();
+                    string val = line.substr(eq + 1).trim();
+                    currentSection[key] = val;
+                }
+            }
         }
     }
+    if (inSection) {
+        result[currentSectionName] = currentSection;
+    } else {
+        mergeTopLevel(result, currentSection);
+    }
     return result;
+}
+
+private void mergeTopLevel(object result, object top) {
+    string[] keys = top.keys();
+    for (int i = 0; i < keys.length; i++) {
+        result[keys[i]] = top[keys[i]];
+    }
 }
 
 public object load(string path) {

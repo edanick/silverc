@@ -1,0 +1,30 @@
+// A nested read through an ini parse result renders the VALUE, never the
+// raw pointer: the parse result holds heap text scalars under runtime
+// keys (dyn roots, like json/yaml parse results), so the member chain
+// (`config.server.port`) formats with %s on every implementation. The
+// nested section dict is fully built before it is stored under its
+// section name (storing an empty dict first and filling it later would
+// snapshot the empty dict under copy-on-assign semantics).
+
+import ini;
+
+void main() {
+    object config = ini.parse("[server]\nport=8080\nhost=localhost\n\n[database]\nname=mydb\npool=10");
+
+    printline(config.server.port);
+    printline(config.server.host);
+    printline(config.database.name);
+    printline(config.database.pool);
+
+    if (config.server.port != "8080") { exit(1); }
+    if (config.server.host != "localhost") { exit(2); }
+    if (config.database.name != "mydb") { exit(3); }
+    if (config.database.pool != "10") { exit(4); }
+
+    // Keys above the first section land in the result itself.
+    object top = ini.parse("owner = sam\n[server]\nport = 9090\n");
+    if (top.owner != "sam") { exit(5); }
+    if (top.server.port != "9090") { exit(6); }
+
+    printline("ini nested parse: ok");
+}

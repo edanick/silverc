@@ -4616,7 +4616,7 @@ int strIdx = this.stringPatchIndices[i];
         Node trackInit = null;
         if (stmt.childCount() > 0) { trackInit = stmt.child(0); }
         this.trackDictDecl(stmt.name, stmt.typeHint, trackInit);
-        if (trackInit != null && this.isParseResultInit(trackInit) && (stmt.typeHint == "" || stmt.typeHint == "var" || stmt.typeHint == "object" || stmt.typeHint == "object?" || stmt.typeHint == "JsonValue" || this.isDictType(stmt.typeHint))) {
+        if (trackInit != null && (this.isParseResultInit(trackInit) || this.isDynValueRoot(trackInit)) && (stmt.typeHint == "" || stmt.typeHint == "var" || stmt.typeHint == "object" || stmt.typeHint == "object?" || stmt.typeHint == "JsonValue" || this.isDictType(stmt.typeHint))) {
             this.noteDynValue(stmt.name);
         } else {
             this.clearDynValue(stmt.name);
@@ -7336,15 +7336,18 @@ int strIdx = this.stringPatchIndices[i];
     }
 
     // True when `e` is a module-qualified `json.parse` / `yaml.parse` /
-    // `yaml.load` call producing a dynamic value (mirrors silverc-rs
+    // `yaml.load` / `toml.parse` / `toml.load` / `ini.parse` / `ini.load`
+    // call producing a dynamic value (mirrors silverc-rs
     // is_parse_result_init; the receiver guard mirrors isBuiltinModuleReceiver
-    // so a shadowing local never reads as the module).
+    // so a shadowing local never reads as the module). The toml/ini
+    // stdlib parsers store every scalar as text the same way, so nested
+    // reads through their results render as text too.
     public bool isParseResultInit(Node e) {
         if (e == null) { return false; }
         if (e.kind != 10 || !e.isMember || e.childCount() < 1) { return false; }
         Node recv = e.child(0);
         if (recv.kind != 6) { return false; }
-        if (recv.name != "json" && recv.name != "yaml") { return false; }
+        if (recv.name != "json" && recv.name != "yaml" && recv.name != "toml" && recv.name != "ini") { return false; }
         if (e.name != "parse" && e.name != "load") { return false; }
         if (this.isUserSymbol(recv.name)) { return false; }
         return true;
@@ -17460,7 +17463,7 @@ public void genNewCall(Node call) {
                     this.recordObjectDynamicType(lhs.name, rhsClass);
                 }
             }
-            if (this.isParseResultInit(rhs)) {
+            if (this.isParseResultInit(rhs) || this.isDynValueRoot(rhs)) {
                 this.noteDynValue(lhs.name);
             } else {
                 this.clearDynValue(lhs.name);
