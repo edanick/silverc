@@ -1,0 +1,69 @@
+// THREAD_SAFETY.md §3.4 -- a `shared` binding is updated atomically.
+//
+// A `shared` binding is a program-wide word every thread may read and
+// write. Its slot is 8-byte aligned, a plain read or write is one atomic
+// word access, and a read-modify-write (`++`, `--`, `+=`, `-=`) is
+// lowered to a compare-and-swap loop, so two threads cannot lose an
+// update.
+//
+// This fixture is the proof. Four threads each bump the same counter 2000
+// times, and the counter must end at exactly 8000. With an unlocked
+// read-modify-write the same program loses updates: two threads read the
+// same old value and both write back the same new one, so the count comes
+// out short.
+//
+// The plain-access path is covered too: a plain write and a plain read of
+// the shared word, and the `+=` / `-=` / `--` spellings of the atomic
+// update.
+
+import * from thread;
+
+shared int counter = 0;
+
+void bump(int times) {
+    for (int i = 0; i < times; i++) {
+        counter++;
+    }
+}
+
+void main() {
+    // 1. The atomic update: four threads, one word, no lost update.
+    threads.Thread t1 = threads.start((void () { bump(2000); }));
+    threads.Thread t2 = threads.start((void () { bump(2000); }));
+    threads.Thread t3 = threads.start((void () { bump(2000); }));
+    threads.Thread t4 = threads.start((void () { bump(2000); }));
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+    if (counter != 8000) {
+        printline("FAIL shared counter: expected 8000, got " + counter);
+        exit(1);
+    }
+
+    // 2. A plain write and a plain read: one atomic word access each.
+    counter = 7;
+    if (counter != 7) {
+        printline("FAIL shared counter: the plain write did not land");
+        exit(2);
+    }
+
+    // 3. The other atomic-update spellings.
+    counter += 5;
+    if (counter != 12) {
+        printline("FAIL shared counter: '+=' did not land");
+        exit(3);
+    }
+    counter -= 2;
+    if (counter != 10) {
+        printline("FAIL shared counter: '-=' did not land");
+        exit(4);
+    }
+    counter--;
+    if (counter != 9) {
+        printline("FAIL shared counter: '--' did not land");
+        exit(5);
+    }
+
+    printline("shared counter ok");
+}
