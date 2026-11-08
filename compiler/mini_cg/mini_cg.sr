@@ -2506,6 +2506,34 @@ class MiniCg {
         this.asm.bindLabel(ok);
     }
 
+    public void emitCallDepthEnter() {
+        int depthIdx = this.findGlobal("__call_depth");
+        this.asm.pushR64(1);
+        this.genGlobalBase(depthIdx);
+        this.asm.movRMBase(1, 0, 0);
+        this.asm.incR64(1);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.cmpRI32(1, 1000);
+        int depthOk = this.newLabel();
+        this.asm.jleLabel(depthOk);
+        this.asm.popR64(1);
+        this.emitThrowException("StackOverflowException");
+        this.asm.bindLabel(depthOk);
+        this.asm.popR64(1);
+    }
+
+    public void emitCallDepthExit() {
+        int depthIdx = this.findGlobal("__call_depth");
+        this.asm.pushR64(0);
+        this.asm.pushR64(1);
+        this.genGlobalBase(depthIdx);
+        this.asm.movRMBase(1, 0, 0);
+        this.asm.decR64(1);
+        this.asm.movMBaseR(0, 1, 0);
+        this.asm.popR64(1);
+        this.asm.popR64(0);
+    }
+
     public void patchGlobalRefs(int[] code, int globalsStart, int rdataRva) {
         // MAC.md Phase D (additive): globals live in the Mach-O __DATA
         // segment at macX64DataVaddr + globalsStart + globalOffsets[gi].
@@ -3022,6 +3050,11 @@ int strIdx = this.stringPatchIndices[i];
         this.globalOffsets.add(this.globalOffsets.length * 8);
         Node excMissing3 = new Node(); excMissing3.kind = 255;
         this.globalInits.add(excMissing3);
+        this.globalNames.add("__call_depth");
+        this.globalTypes.add("int");
+        this.globalOffsets.add(this.globalOffsets.length * 8);
+        Node depthMissing = new Node(); depthMissing.kind = 255;
+        this.globalInits.add(depthMissing);
         if (this.isLinuxTarget()) {
             this.globalNames.add("__linux_stack_top");
             this.globalTypes.add("int");
@@ -4317,6 +4350,7 @@ int strIdx = this.stringPatchIndices[i];
                     }
                 }
             }
+            this.emitCallDepthEnter();
             if (this.currentIsMain) {
                 this.emitUtf8ConsoleSetup();
             }
@@ -4351,6 +4385,7 @@ int strIdx = this.stringPatchIndices[i];
                 if (this.isLinuxTarget()) { thisReg2 = 7; }
                 this.asm.movMBaseR(5, thisReg2, thisOff);
             }
+            this.emitCallDepthEnter();
         }
         if (this.currentIsMain) {
             // A fall-through void main exits successfully; an explicit
@@ -4359,8 +4394,10 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.jmpLabel(exitLbl);
             this.asm.bindLabel(retLbl);
             this.asm.bindLabel(exitLbl);
+            this.emitCallDepthExit();
         } else {
             this.asm.bindLabel(retLbl);
+            this.emitCallDepthExit();
         }
         if (this.liveSlots.length > 0) {
             this.asm.pushR64(0);
