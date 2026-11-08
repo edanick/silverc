@@ -222,6 +222,17 @@ class MemoryGuard {
     // funcSigNames — the callee's declaration node, inspected for null-safe
     // parameter reads (`??`, `?.`, `== null` guards).
     private prop Node[] funcSigNodes;
+    // Branch-checkpoint pool (branch checkpoint reuse): cpPool holds one
+    // checkpoint per nesting depth, cpDepth the number of checkpoints
+    // currently handed out. The pool's storage is rewritten in place, so
+    // the branch bookkeeping costs the deepest nesting reached instead of
+    // one live-set copy per branch.
+    private prop VarCheckpoint[] cpPool;
+    private prop int cpDepth;
+    // Scratch buffer for the never-used report's position sort: the
+    // report runs once per function and its order array was a fresh
+    // allocation every time.
+    private prop int[] unusedOrder;
     public prop string[] warnings;
 
     construct {
@@ -252,6 +263,9 @@ class MemoryGuard {
         this.currentClass = "";
         this.loopDepth = 0;
         this.funcSigNodes = [];
+        this.cpPool = [];
+        this.cpDepth = 0;
+        this.unusedOrder = [];
         this.warnings = [];
     }
 
@@ -294,8 +308,31 @@ class MemoryGuard {
         while (this.vars.length > start) { this.vars.pop(); }
     }
 
+    // Branch checkpoint (undo state) — POOLED storage.
+    //
+    // Every branch, loop and try join needs a copy of the live set's
+    // mutable flags. Handing out a fresh copy per branch made the
+    // compiler's peak memory grow with the number of branches instead of
+    // with the size of the program: the runtime never frees an abandoned
+    // array, so each copy stayed resident for the whole compile. The pool
+    // hands out one checkpoint per NESTING DEPTH and rewrites its storage
+    // in place, so the footprint is the deepest nesting reached, not the
+    // branch count. A construct releases its checkpoints when it is done
+    // (releaseCheckpoints), and the next branch at that depth reuses the
+    // same storage.
     private VarCheckpoint saveVars() {
-        VarCheckpoint cp = new VarCheckpoint();
+        if (this.cpDepth >= this.cpPool.length) {
+            this.cpPool.add(new VarCheckpoint());
+        }
+        VarCheckpoint cp = this.cpPool[this.cpDepth];
+        this.cpDepth++;
+        // Truncate the reused storage in place: the block's capacity
+        // survives a pop, so the refill below never reallocates.
+        while (cp.init.length > 0) { cp.init.pop(); }
+        while (cp.alive.length > 0) { cp.alive.pop(); }
+        while (cp.holds.length > 0) { cp.holds.pop(); }
+        while (cp.aliasOfs.length > 0) { cp.aliasOfs.pop(); }
+        while (cp.addr.length > 0) { cp.addr.pop(); }
         cp.len = this.vars.length;
         for (int i = 0; i < cp.len; i++) {
             GuardVar v = this.vars[i];
@@ -306,6 +343,13 @@ class MemoryGuard {
             cp.addr.add(v.addrTarget);
         }
         return cp;
+    }
+
+    // Release the checkpoints taken since `mark` (the depth the enclosing
+    // construct started at): the next branch at that depth reuses the
+    // storage.
+    private void releaseCheckpoints(int mark) {
+        this.cpDepth = mark;
     }
 
     private void restoreVars(VarCheckpoint cp) {
@@ -605,12 +649,21 @@ class MemoryGuard {
     // Any assignment may reintroduce null into a previously narrowed
     // nullable; the flow fact dies here (the assignment replaces the
     // narrowed type).
+    //
+    // The removal happens IN PLACE: the fact set is rewritten with the
+    // surviving names and the tail is truncated. Rebuilding a fresh
+    // `kept` array here allocated a copy on every declaration and every
+    // assignment, and the abandoned copy stayed resident for the whole
+    // compile (the runtime never frees it).
     private void dropNonNull(string name) {
-        string[] kept = [];
+        int kept = 0;
         for (int i = 0; i < this.nonNullNames.length; i++) {
-            if (this.nonNullNames[i] != name) { kept.add(this.nonNullNames[i]); }
+            if (this.nonNullNames[i] != name) {
+                this.nonNullNames[kept] = this.nonNullNames[i];
+                kept++;
+            }
         }
-        this.nonNullNames = kept;
+        while (this.nonNullNames.length > kept) { this.nonNullNames.pop(); }
     }
 
     private void dropNarrowings(string[] names) {
@@ -1241,12 +1294,16 @@ class MemoryGuard {
     // for deterministic output.
     private void reportUnusedLocals() {
         if (!this.unusedTracking) { return; }
-        int[] order = [];
+        // The order buffer is reused across functions: the report runs once
+        // per function and a fresh `int[]` per run was an allocation per
+        // function for the whole compile.
+        while (this.unusedOrder.length > 0) { this.unusedOrder.pop(); }
         for (int i = 0; i < this.candNames.length; i++) {
             if (this.usedNames.contains(this.candNames[i])) { continue; }
             if (this.suppressedNames.contains(this.candNames[i])) { continue; }
-            order.add(i);
+            this.unusedOrder.add(i);
         }
+        int[] order = this.unusedOrder;
         for (int a = 0; a < order.length; a++) {
             int best = a;
             for (int b = a + 1; b < order.length; b++) {
@@ -1444,6 +1501,7 @@ class MemoryGuard {
     }
 
     private void checkIf(Node n) {
+        int cpMark = this.cpDepth;
         Node cond = n.child(0);
         this.checkExpr(cond);
         // Constant-condition reachability (constant-fold
@@ -1500,9 +1558,11 @@ class MemoryGuard {
             v.isAlive = afterThen.alive[i] || afterElse.alive[i];
             v.holdsAddress = afterThen.holds[i] || afterElse.holds[i];
         }
+        this.releaseCheckpoints(cpMark);
     }
 
     private void checkWhile(Node n) {
+        int cpMark = this.cpDepth;
         this.checkExpr(n.child(0));
         // Constant-condition reachability: `while (false)` never runs its
         // body — `while (true)` is the intentional-infinite-loop idiom and
@@ -1537,9 +1597,11 @@ class MemoryGuard {
         // facts (they hold at every condition re-test).
         this.nonNullNames = this.copyWithFacts(this.meetNonNull(savedNN, bodyNN), exitNarrowed);
         this.restoreVars(before);
+        this.releaseCheckpoints(cpMark);
     }
 
     private void checkFor(Node n) {
+        int cpMark = this.cpDepth;
         this.pushScope();
         this.checkStmt(n.child(0));
         VarCheckpoint before = this.saveVars();
@@ -1558,6 +1620,7 @@ class MemoryGuard {
         this.nonNullNames = bodyNN;
         this.checkExpr(n.child(2));
         this.popScope();
+        this.releaseCheckpoints(cpMark);
     }
 
     private void checkForeach(Node n) {
@@ -1583,6 +1646,7 @@ class MemoryGuard {
     }
 
     private void checkTryCatch(Node n) {
+        int cpMark = this.cpDepth;
         string[] savedNN = this.snapshotNonNull();
         this.pushScope();
         this.checkStmt(n.child(0));
@@ -1633,6 +1697,7 @@ class MemoryGuard {
             this.popScope();
             this.nonNullNames = preFinally;
         }
+        this.releaseCheckpoints(cpMark);
     }
 
     // Switch node shape: child(0) = subject, then alternating (case value,
@@ -1644,6 +1709,7 @@ class MemoryGuard {
     // reference keeps the no-match path unassigned). Liveness unions across
     // branches plus the pre-switch state, like if-without-else.
     private void checkSwitch(Node n) {
+        int cpMark = this.cpDepth;
         this.checkExpr(n.child(0));
         this.checkEnumExhaustiveSwitch(n);
         VarCheckpoint before = this.saveVars();
@@ -1732,6 +1798,7 @@ class MemoryGuard {
         }
         if (!haveJoin) { joined = savedNN; }
         this.nonNullNames = joined;
+        this.releaseCheckpoints(cpMark);
     }
 
     private void checkMatchBody(Node body) {
