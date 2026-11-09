@@ -94,15 +94,31 @@ public document parse(string raw) {
     int len = raw.length;
     node current = root;
     node[] stack = [];
+    string[] texts = [];
     stack.push(current);
+    texts.push("");
 
     while (i < len) {
         if (raw[i] == '<') {
             if (i + 1 < len && raw[i + 1] == '/') {
                 int end = raw.indexOf(">", i);
                 if (end < 0) { break; }
+                // Close: finalize the current node with its buffered
+                // text and link it into its parent's child list. The
+                // text cannot be assigned to the stack copy earlier:
+                // under copy-on-assign a field set on a read copy never
+                // reaches the node stored in the parent, so the node
+                // is only pushed once complete (text already set).
+                node doneNode = current;
+                string doneText = texts[texts.length - 1];
+                doneNode.text = doneText;
+                texts.pop();
                 stack.pop();
-                if (stack.length > 0) { current = stack[stack.length - 1]; }
+                if (stack.length > 0) {
+                    node parent = stack[stack.length - 1];
+                    parent.childNodes.push(doneNode);
+                    current = parent;
+                }
                 i = end + 1;
             } else if (i + 1 < len && raw[i + 1] == '?') {
                 int end = raw.indexOf("?>", i);
@@ -119,6 +135,11 @@ public document parse(string raw) {
                 int space = tag.indexOf(" ");
                 string name = tag;
                 if (space >= 0) { name = tag.substr(0, space); }
+                // Self-closing tags end in "/": the slash is not part of
+                // the element name (<br/> is "br", not "br/").
+                if (name.length > 0 && name[name.length - 1] == '/') {
+                    name = name.substr(0, name.length - 1);
+                }
                 node n = new node();
                 n.name = name;
                 // Attribute extraction: the tag text past the first space is
@@ -141,11 +162,14 @@ public document parse(string raw) {
                         }
                     }
                 }
-                if (current != null) {
-                    current.childNodes.push(n);
-                }
-                if (tag[tag.length - 1] != '/') {
+                if (tag[tag.length - 1] == '/') {
+                    n.text = "";
+                    if (current != null) {
+                        current.childNodes.push(n);
+                    }
+                } else {
                     stack.push(n);
+                    texts.push("");
                     current = n;
                 }
                 i = end + 1;
@@ -155,11 +179,23 @@ public document parse(string raw) {
             if (next < 0) { next = len; }
             string t = raw.substr(i, next - i);
             string trimmed = t.trim();
-            if (current != null && trimmed.length > 0) {
-                current.text = trimmed;
+            if (current != null && trimmed.length > 0 && texts.length > 0) {
+                texts[texts.length - 1] = trimmed;
             }
             i = next;
         }
+    }
+
+    // Flush unclosed nodes (truncated input): every still-open node is
+    // finalized and linked into its parent, innermost first, so a
+    // truncated document still links its tail.
+    while (stack.length > 1) {
+        node tailNode = stack[stack.length - 1];
+        tailNode.text = texts[texts.length - 1];
+        texts.pop();
+        stack.pop();
+        node tailParent = stack[stack.length - 1];
+        tailParent.childNodes.push(tailNode);
     }
 
     // A well-formed document has exactly one top-level element; expose it as

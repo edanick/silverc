@@ -10615,6 +10615,8 @@ int strIdx = this.stringPatchIndices[i];
             this.genInputCall(call);
         } else if (builtinName && name == "writeBytes") {
             this.genWriteBytesCall(call);
+        } else if (builtinName && name == "writeBytesAt") {
+            this.genWriteBytesAtCall(call);
         } else if (builtinName && name == "writeFile") {
             this.genWriteBytesCall(call);
         } else if (builtinName && name == "writeString") {
@@ -10745,15 +10747,15 @@ int strIdx = this.stringPatchIndices[i];
             // grant check below (`write` is a libc export) and fails the
             // compile spuriously. Bare write(fd, buf, n) (POSIX, fs.sr
             // LINUX bodies) is not a member call and keeps resolving below.
-            this.asm.xorRR64(0, 0);
+            this.genWriteBytesCall(call);
         } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "file" || call.child(0).name == "folder") && call.name == "isDriveRoot") {
             this.genIsDriveRootCall(call);
-        } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "folder") && (call.name == "getEntries" || call.name == "entries" || call.name == "list" || call.name == "getFiles" || call.name == "files" || call.name == "getFolders" || call.name == "folders")) {
+        } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && !recvIsUserSymbol && (call.child(0).name == "fs" || call.child(0).name == "folder") && (call.name == "getEntries" || call.name == "entries" || call.name == "list" || call.name == "getFiles" || call.name == "files" || call.name == "getFolders" || call.name == "folders" || call.name == "listDir")) {
             int entFilter = 0;
             if (call.name == "getFiles" || call.name == "files") { entFilter = 1; }
             else if (call.name == "getFolders" || call.name == "folders") { entFilter = 2; }
             this.genFolderEntriesCall(call, entFilter);
-        } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.isFileOpsReceiver(call.child(0)) && (call.name == "readString" || call.name == "readFile" || call.name == "writeString" || call.name == "writeBytes" || call.name == "writeFile" || call.name == "exists" || call.name == "delete" || call.name == "rename" || call.name == "move" || call.name == "copy" || call.name == "getSize" || call.name == "size" || call.name == "modification" || call.name == "isDir" || call.name == "isFile" || call.name == "isDriveRoot" || call.name == "getExt" || call.name == "getExtension" || call.name == "getEntries" || call.name == "entries" || call.name == "list" || call.name == "getFiles" || call.name == "files" || call.name == "getFolders" || call.name == "folders")) {
+        } else if (call.isMember && call.childCount() > 0 && call.child(0).kind == 6 && this.isFileOpsReceiver(call.child(0)) && (call.name == "readString" || call.name == "readFile" || call.name == "writeString" || call.name == "writeBytes" || call.name == "writeBytesAt" || call.name == "writeFile" || call.name == "exists" || call.name == "delete" || call.name == "rename" || call.name == "move" || call.name == "copy" || call.name == "getSize" || call.name == "size" || call.name == "modification" || call.name == "isDir" || call.name == "isFile" || call.name == "isDriveRoot" || call.name == "getExt" || call.name == "getExtension" || call.name == "getEntries" || call.name == "entries" || call.name == "list" || call.name == "getFiles" || call.name == "files" || call.name == "getFolders" || call.name == "folders" || call.name == "listDir")) {
             // Instance call on a FileOps/FolderOps-typed value (e.g.
             // `FileOps file; file.readString(p)`). fs.sr sources are
             // builtin-reserved so these classes have no collected methods;
@@ -10769,6 +10771,8 @@ int strIdx = this.stringPatchIndices[i];
                 this.genReadBytesCall(call);
             } else if (call.name == "writeString" || call.name == "writeBytes" || call.name == "writeFile") {
                 this.genWriteBytesCall(call);
+            } else if (call.name == "writeBytesAt") {
+                this.genWriteBytesAtCall(call);
             } else if (call.name == "exists") {
                 this.genFileExistsCall(call);
             } else if (call.name == "delete") {
@@ -22554,6 +22558,18 @@ public void genNewCall(Node call) {
     }
 
     public void genFolderEntriesCall(Node call, int filter) {
+        // No-arg enumeration (folder.files/folders/entries/list) lists the
+        // current directory, mirroring FolderOps.list() = list(".") and
+        // silverc-rs's synthesized "." arg.
+        int pathIdx0 = 1;
+        if (call.childCount() <= pathIdx0) {
+            Node dot = new Node();
+            dot.kind = 2;
+            dot.strVal = ".";
+            dot.line = call.line;
+            dot.col = call.col;
+            call.children.add(dot);
+        }
         // LINUX SysV backend (additive): opendir/readdir/closedir via libc.
         // The WINDOWS block below is byte-identical to before.
         if (this.isLinuxTarget()) {
@@ -24277,6 +24293,175 @@ public void genNewCall(Node call) {
     // holds the compacted bytes (int[]) or the literal chars (string),
     // sizeOff their count. Mirrors silverc-rs gen_write_bytes_linux and the
     // genLinuxEprintCall write shape (SysV regs + addImportPatchDirect).
+    // writeBytesAt(path, offset, data): write `data` at `offset` without
+    // truncating or reading the file (creates it when absent); a negative
+    // offset is a no-op (size unchanged). Bare `writeBytesAt(...)` (from
+    // `import * from fs`) takes path/offset/data at children 0/1/2; the
+    // member `fs.writeBytesAt(...)` at 1/2/3. Mirrors silverc-rs's native
+    // gen_write_bytes_at (LINUX: open O_WRONLY|O_CREAT without O_TRUNC,
+    // lseek(fd, offset, SEEK_SET = 0), write, close; an empty write at EOF
+    // writes nothing), sharing the genWriteBytesCall data-compaction above.
+    public void genWriteBytesAtCall(Node call) {
+        int pathIdx = 0;
+        int offIdx = 1;
+        int dataIdx = 2;
+        if (call.isMember) { pathIdx = 1; offIdx = 2; dataIdx = 3; }
+        if (call.childCount() <= dataIdx) { return; }
+        this.genExpr(call.child(pathIdx));
+        int pathOff = this.allocLocal("__wba_path");
+        this.asm.movMBaseR(5, 0, pathOff);
+
+        this.genExpr(call.child(offIdx));
+        int offOff = this.allocLocal("__wba_off");
+        this.asm.movMBaseR(5, 0, offOff);
+
+        int noopLbl = this.newLabel();
+        int okLbl = this.newLabel();
+        int doneLbl = this.newLabel();
+        this.asm.movRMBase(0, 5, offOff);
+        this.asm.cmpRI32(0, 0);
+        this.asm.jlLabel(noopLbl);
+        this.asm.jmpLabel(okLbl);
+        this.asm.bindLabel(noopLbl);
+        this.asm.xorRR64(0, 0);
+        this.asm.jmpLabel(doneLbl);
+        this.asm.bindLabel(okLbl);
+
+        this.genExpr(call.child(dataIdx));
+        int dataOff = this.allocLocal("__wba_data");
+        this.asm.movMBaseR(5, 0, dataOff);
+
+        string dataType = this.inferExprType(call.child(dataIdx));
+        int isString = 0;
+        if (dataType == "string") { isString = 1; }
+
+        int sizeOff = this.allocLocal("__wba_size");
+        int bufOff = dataOff;
+        if (isString == 1) {
+            this.asm.emitCallSetup(0);
+            this.asm.movRMBase(1, 5, dataOff);
+            this.addImportPatch("kernel32.dll", "lstrlenA");
+            this.asm.emitImm64(0, 0);
+            this.asm.movRMBase(0, 0, 0);
+            this.asm.callR64(0);
+            this.asm.emitCallTeardown();
+            this.asm.movMBaseR(5, 0, sizeOff);
+        } else {
+            this.asm.movRMBase(10, 5, dataOff);
+            this.asm.movRMBase(0, 10, -8);
+            this.asm.movMBaseR(5, 0, sizeOff);
+            this.emitLlmaiHeapAlloc(sizeOff);
+            int scratchOff = this.allocLocal("__wba_scratch");
+            this.asm.movMBaseR(5, 0, scratchOff);
+            bufOff = scratchOff;
+
+            int iOff = this.allocLocal("__wba_i");
+            this.asm.movRI64(0, 0);
+            this.asm.movMBaseR(5, 0, iOff);
+
+            this.asm.movRMBase(10, 5, dataOff);
+            this.asm.movRMBase(11, 5, scratchOff);
+            int loopLbl = this.newLabel();
+            int doneCompLbl = this.newLabel();
+            this.asm.bindLabel(loopLbl);
+            this.asm.movRMBase(0, 5, iOff);
+            this.asm.movRMBase(8, 5, sizeOff);
+            this.asm.cmpRR64(0, 8);
+            this.asm.jgeLabel(doneCompLbl);
+            this.asm.movRMBase(8, 10, 0);
+            this.asm.andRImm(8, 0xFF);
+            this.asm.movMBaseByteR(11, 8, 0);
+            this.asm.addRI32(10, 8);
+            this.asm.addRI32(11, 1);
+            this.asm.movRMBase(0, 5, iOff);
+            this.asm.addRI32(0, 1);
+            this.asm.movMBaseR(5, 0, iOff);
+            this.asm.jmpLabel(loopLbl);
+            this.asm.bindLabel(doneCompLbl);
+        }
+
+        if (this.isLinuxTarget()) {
+            this.genLinuxWriteBytesAtFile(pathOff, offOff, bufOff, sizeOff);
+            this.asm.bindLabel(doneLbl);
+            return;
+        }
+
+        int hfileOff = this.allocLocal("__wba_hfile");
+        this.asm.emitCallSetup(24);
+        this.asm.movRI64(0, 2);
+        this.asm.movMBaseR(4, 0, 32);
+        this.asm.movRI64(0, 4);
+        this.asm.movMBaseR(4, 0, 40);
+        this.asm.movRI64(0, 0x80);
+        this.asm.movMBaseR(4, 0, 48);
+        this.asm.movRMBase(1, 5, pathOff);
+        this.asm.movRI64(2, 0x40000000);
+        this.asm.xorRR64(8, 8);
+        this.asm.xorRR64(9, 9);
+        this.addImportPatch("kernel32.dll", "CreateFileA");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.movMBaseR(5, 0, hfileOff);
+        int skipLbl = this.newLabel();
+        int wroteOff = this.allocLocal("__wba_written");
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(5, 0, wroteOff);
+        this.asm.movRMBase(0, 5, hfileOff);
+        this.asm.movRI64(1, -1);
+        this.asm.cmpRR64(0, 1);
+        this.asm.jeLabel(skipLbl);
+        this.asm.emitCallSetup(8);
+        this.asm.movRI64(0, 0);
+        this.asm.movMBaseR(4, 0, 32);
+        this.asm.movRMBase(1, 5, hfileOff);
+        this.asm.movRMBase(0, 5, offOff);
+        this.asm.xorRR64(2, 2);
+        this.asm.movRI64(8, 0);
+        this.addImportPatch("kernel32.dll", "SetFilePointer");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.emitCallSetup(8);
+        this.asm.xorRR64(0, 0);
+        this.asm.movMBaseR(4, 0, 32);
+        this.asm.movRMBase(1, 5, hfileOff);
+        this.asm.movRMBase(0, 5, bufOff);
+        this.asm.movRMBase(2, 5, sizeOff);
+        this.asm.leaRBase(9, 5, wroteOff);
+        this.addImportPatch("kernel32.dll", "WriteFile");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.bindLabel(skipLbl);
+        this.asm.emitCallSetup(0);
+        this.asm.movRMBase(1, 5, hfileOff);
+        this.addImportPatch("kernel32.dll", "CloseHandle");
+        this.asm.emitImm64(0, 0);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        this.asm.bindLabel(doneLbl);
+    }
+
+    // LINUX SysV backend (additive): open/write/close tail for writeBytes
+    // (writeFile/writeString route through genWriteBytesCall too). bufOff
+    // holds the compacted bytes (int[]) or the literal chars (string),
+    // sizeOff their count. Mirrors silverc-rs gen_write_bytes_linux and the
+    // genLinuxEprintCall write shape (SysV regs + addImportPatchDirect).
+    public void genLinuxWriteBytesFile(int pathOff, int bufOff, int sizeOff) {
+        this.linuxBackend.genLinuxWriteBytesFile(this, pathOff, bufOff, sizeOff);
+    }
+
+    // LINUX SysV backend (additive): open/lseek/write/close tail for
+    // writeBytesAt (open O_WRONLY|O_CREAT without O_TRUNC = 0x41, lseek to
+    // the caller offset, write only when there are bytes, close).
+    public void genLinuxWriteBytesAtFile(int pathOff, int offOff, int bufOff, int sizeOff) {
+        this.linuxBackend.genLinuxWriteBytesAtFile(this, pathOff, offOff, bufOff, sizeOff);
+    }
     public void genLinuxWriteBytesFile(int pathOff, int bufOff, int sizeOff) {
         this.linuxBackend.genLinuxWriteBytesFile(this, pathOff, bufOff, sizeOff);
     }

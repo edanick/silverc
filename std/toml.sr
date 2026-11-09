@@ -55,7 +55,83 @@ public object load(string path) {
     return toml.parse(content);
 }
 
-public string stringify(object data) { return json.stringify(data); }
+private string tomlScalarAt(object o, string k) {
+    string v = o[k];
+    if (v == null) { return ""; }
+    return v;
+}
+
+private int tomlProbeLen(object o) {
+    // A read-only header load: the dict count for a table, the first
+    // eight bytes of heap text for a string -- never an allocation
+    // or iteration, so it cannot hang on string payloads the way
+    // .keys() does (garbage-count allocation).
+    return o.length;
+}
+
+private bool tomlIsDictAt(object container, string key) {
+    // Discriminate tables from scalars over erased `object` values.
+    // A table has a small count AND its payload read as text is the
+    // count's low byte followed by NUL (one char matching count
+    // mod 256, or empty when the count is a multiple of 256); a
+    // string payload read as text is its own content. Single-byte
+    // strings are byte-identical to one-entry tables and therefore
+    // read as tables (documented std limitation).
+    if (container[key] == null) { return false; }
+    object inner = container[key];
+    int p = tomlProbeLen(inner);
+    if (p >= 1000000 || p < 0) { return false; }
+    string s = tomlScalarAt(container, key);
+    if (s.length == 1 && int(s[0]) == p % 256) { return true; }
+    if (s.length == 0 && p == 0) { return true; }
+    return false;
+}
+
+private string tomlSectionText(object section, string path) {
+    string result = "[" + path + "]\n";
+    string[] skeys = section.keys();
+    for (int j = 0; j < skeys.length; j++) {
+        string sk = skeys[j];
+        if (!tomlIsDictAt(section, sk)) {
+            result += sk + " = '" + tomlScalarAt(section, sk) + "'\n";
+        }
+    }
+    for (int j = 0; j < skeys.length; j++) {
+        string sk = skeys[j];
+        if (tomlIsDictAt(section, sk)) {
+            object sub = section[sk];
+            result += tomlSectionText(sub, path + "." + sk);
+        }
+    }
+    result += "\n";
+    return result;
+}
+
+public string stringify(object data) {
+    // TOML layout: top-level scalars first (key = 'value', matching
+    // parse's single-quote removal), then one [section] block per
+    // table (nested tables recurse into dotted paths). The old body
+    // delegated to json.stringify, which renders string payloads as
+    // pointer ints for opaque object parameters. Nested tables read
+    // through direct parameter passes (reading container[key] into
+    // an `object` local decays it to pointer-as-int).
+    string result = "";
+    string[] keys = data.keys();
+    for (int i = 0; i < keys.length; i++) {
+        string key = keys[i];
+        if (!tomlIsDictAt(data, key)) {
+            result += key + " = '" + tomlScalarAt(data, key) + "'\n";
+        }
+    }
+    for (int i = 0; i < keys.length; i++) {
+        string key = keys[i];
+        if (tomlIsDictAt(data, key)) {
+            object sub = data[key];
+            result += tomlSectionText(sub, key);
+        }
+    }
+    return result;
+}
 
 public void save(string path, object data) {
     fs.writeString(path, stringify(data));

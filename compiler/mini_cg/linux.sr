@@ -1671,4 +1671,62 @@ class MiniCgLinux {
         cg.asm.callR64(0);
         cg.emitAbiCallTeardown();
     }
+
+    public void genLinuxWriteBytesAtFile(MiniCg cg, int pathOff, int offOff, int bufOff, int sizeOff) {
+        // writeBytesAt(path, offset, data): open O_WRONLY|O_CREAT without
+        // O_TRUNC, lseek(fd, offset, SEEK_SET = 0), write only when there
+        // are bytes (an empty write at EOF must not extend the file),
+        // close. Mirrors silverc-rs gen_write_bytes_at.
+        int hfileOff = cg.allocLocal("__wba_hfile");
+        int writtenOff = cg.allocLocal("__wba_written");
+        cg.asm.movRI64(0, 0);
+        cg.asm.movMBaseR(5, 0, writtenOff);
+        cg.asm.movRMBase(7, 5, pathOff);
+        cg.asm.movRI64(6, 0x41);
+        cg.asm.movRI64(2, 0x1A4);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "open");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movMBaseR(5, 0, hfileOff);
+        cg.asm.movRMBase(7, 5, hfileOff);
+        cg.asm.movRMBase(6, 5, offOff);
+        cg.asm.movRI64(2, 0);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "lseek");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        int noWrite = cg.newLabel();
+        int doWrite = cg.newLabel();
+        cg.asm.movRMBase(0, 5, sizeOff);
+        cg.asm.cmpRI32(0, 0);
+        cg.asm.jleLabel(noWrite);
+        cg.asm.jmpLabel(doWrite);
+        cg.asm.bindLabel(noWrite);
+        cg.asm.jmpLabel(doWrite);
+        cg.asm.bindLabel(doWrite);
+        cg.asm.movRMBase(7, 5, hfileOff);
+        cg.asm.movRMBase(6, 5, bufOff);
+        cg.asm.movRMBase(2, 5, sizeOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "write");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movMBaseR(5, 0, writtenOff);
+        cg.asm.movRMBase(7, 5, hfileOff);
+        cg.emitAbiCallSetup(0);
+        cg.addImportPatchDirect("libc.so.6", "close");
+        cg.asm.emitImm64(0, 0);
+        cg.asm.movRMBase(0, 0, 0);
+        cg.asm.callR64(0);
+        cg.emitAbiCallTeardown();
+        cg.asm.movRMBase(0, 5, writtenOff);
+    }
+
 }

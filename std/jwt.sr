@@ -1,7 +1,7 @@
 mod export jwt;
 import {base64UrlEncode, base64UrlDecode} from encoding;
 import {Exception} from exception;
-import {stringify, parse} from json;
+import {parse} from json;
 import {hmacSha256} from hash;
 
 class payload {
@@ -38,9 +38,45 @@ class InvalidSignatureError {
     construct(string msg) { this.message = msg; }
 }
 
+private string jsonEscape(string s) {
+    string[] parts = [];
+    for (int i = 0; i < s.length; i++) {
+        char c = s[i];
+        if (c == '"') { parts.add("\\\""); }
+        else if (c == '\\') { parts.add("\\\\"); }
+        else { parts.add((string)c); }
+    }
+    return parts.join("");
+}
+
+private string claimValue(object claims, string key) {
+    string v = claims[key];
+    if (v == null) { return ""; }
+    return v;
+}
+
+private string claimsToJson(object claims) {
+    // Serialize claims as one JSON object with string values. Values
+    // are read through a typed string local inside claimValue: the
+    // native json.stringify degrades an opaque `object` parameter to
+    // pointer-as-int because per-key kinds are unknown across the call
+    // (jwt.encode therefore never calls json.stringify(claims)).
+    // Non-string claims (e.g. an int exp) render as quoted strings;
+    // Silver cannot runtime-type-test dict payloads, so string form
+    // is the documented contract.
+    string[] keys = claims.keys();
+    string[] parts = [];
+    for (int i = 0; i < keys.length; i++) {
+        string k = keys[i];
+        string v = claimValue(claims, k);
+        parts.add("\"" + jsonEscape(k) + "\":\"" + jsonEscape(v) + "\"");
+    }
+    return "{" + parts.join(",") + "}";
+}
+
 public string encode(object claims, string secret) {
-    string header = encoding.base64UrlEncode(json.stringify({alg: "HS256", typ: "JWT"}));
-    string payload_b64 = encoding.base64UrlEncode(json.stringify(claims));
+    string header = encoding.base64UrlEncode("{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
+    string payload_b64 = encoding.base64UrlEncode(claimsToJson(claims));
     string signature = hash.hmacSha256(header + "." + payload_b64, secret);
     return header + "." + payload_b64 + "." + encoding.base64UrlEncode(signature);
 }

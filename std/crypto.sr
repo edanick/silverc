@@ -107,7 +107,31 @@ public string bcrypt(string password) {
 }
 
 private string bcryptHash(string password, string salt) {
-    return salt + "SilverHash";
+    // FNV-1a (32-bit) seeded by the 29-char salt and folded with the
+    // password, then expanded into 10 chars of the bcrypt base64
+    // alphabet. Deterministic in (salt, password), so bcryptVerify
+    // recomputes and compares; a wrong password avalanches to a
+    // different suffix. Total length stays 39 (29 + 10), keeping the
+    // prefix/length contract. Every intermediate stays under 2^56
+    // (32-bit h times the FNV prime), so the 64-bit int never
+    // overflows and the mask restores 32-bit wraparound.
+    int h = 2166136261;
+    for (int i = 0; i < salt.length; i++) {
+        int b = int(salt[i]) & 0xFF;
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF;
+    }
+    for (int i = 0; i < password.length; i++) {
+        int b = int(password[i]) & 0xFF;
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF;
+    }
+    string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789./";
+    string[] parts = [];
+    for (int k = 0; k < 10; k++) {
+        h = ((h ^ k) * 16777619) & 0xFFFFFFFF;
+        int idx = (h >> 26) & 0x3F;
+        parts.add((string)chars[idx]);
+    }
+    return salt + parts.join("");
 }
 
 public bool bcryptVerify(string password, string hash) {
