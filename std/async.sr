@@ -29,16 +29,17 @@ import {Exception} from exception;
 //
 // DISPATCH (per compiler, probed):
 // `async` is a RESERVED KEYWORD token on silverc-rs (token.rs maps "async" =>
-// TokenKind::Async) and the parser's module-name position only accepts
-// Identifier, so `mod export async;` and `import * from async;` are hard
-// parse errors there. Neither compiler reserves `async` as a builtin module
-// (silverc-rs main.rs builtin_modules_set and the self-hosted
-// parser/visibility tables have no native async dispatch), so no
-// per-compiler call interception exists: on the self-hosted compiler, where
-// `async` is an ordinary identifier (the lexer's keywordKind table has no
-// async entry), every `async.*` call resolves to the collected
-// globals/classes of this module. The module is SELF-HOST-ONLY: it does not
-// compile on silverc-rs (the keyword rejection above).
+// TokenKind::Async). The parser accepts the keyword in module-name and
+// expression-reference positions (expect_import_module_name and
+// is_nameable_keyword), so `mod export async;`, `import * from async;`
+// and `async.run(...)` resolve like any other module -- the module compiles
+// on both compilers now (it was SELF-HOST-ONLY before that fix). Neither
+// compiler reserves `async` as a builtin module (silverc-rs main.rs
+// builtin_modules_set and the self-hosted parser/visibility tables have no
+// native async dispatch), so no per-compiler call interception exists: on
+// the self-hosted compiler, where `async` is an ordinary identifier (the
+// lexer's keywordKind table has no async entry), every `async.*` call
+// resolves to the collected globals/classes of this module.
 //
 // WHY THE WAITS DO NOT DELEGATE TO time (deviation, documented): delegation
 // is unexpressible on the self-hosted compiler -- a module-qualified call
@@ -63,12 +64,10 @@ import {Exception} from exception;
 //   spelling is rejected on both -- probed). `run` and `task` use it, and
 //   invoking the parameter (`mainFunc()`) is probed end-to-end through the
 //   module-qualified call `async.run((void () { ... }))`.
-// - CLASS CONSTRUCTORS are the mirror image: the DOCS spelling
-//   `construct(void () c)` is rejected on BOTH compilers ("expected { but
-//   found c" self-host / "Expected 'identifier' but found 'LeftParen'"
-//   silverc-rs), while `construct(void cb())` parses and compiles on the
-//   self-host. The task constructor therefore uses that spelling -- the
-//   only fn-param form constructors accept.
+// - CLASS CONSTRUCTORS use the DOCS spelling `construct(void () c)`
+//   (accepted on both compilers now; the old spelling `construct(void cb())`
+//   is rejected on silverc-rs). The task constructor therefore uses the
+//   DOCS spelling -- the fn-param form both compilers accept.
 // - FN-TYPED PROPS do not parse on either compiler (probed), so the callback
 //   slot is `private object callback` -- the object-slot idiom std/thread.sr
 //   uses; a `void ()` value flows into the object slot unchanged (an 8-byte
@@ -123,7 +122,7 @@ class task {
     private object callback;
 
     construct {}
-    construct(void cb()) { this.callback = cb; }
+    construct(void () cb) { this.callback = cb; }
 
     private void runCallback(void () c) {
         c();
