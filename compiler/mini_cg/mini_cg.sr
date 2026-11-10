@@ -275,6 +275,21 @@ class MiniCg {
     public prop string[] dictNestedVars;
     public prop string[] dictNestedKeys;
     public prop string[] dictNestedNames;
+    // The field a CONSTRUCTOR parameter is stored into, per class and per
+    // parameter index (index 0 is `this`): the constructor says WHICH
+    // field the parameter fills (`this.data = data;`), so the `new` site
+    // can say what class the field will hold (the parameter itself
+    // carries no class).
+    public prop string[] ctorParamFieldClasses;
+    public prop int[] ctorParamFieldIndexes;
+    public prop string[] ctorParamFieldNames;
+    // The class of the value stored in an `object`-typed CLASS FIELD
+    // (owner class + field + class triples): the class the `new` site
+    // passed for that field. A read through such a field binds the
+    // class's field slots instead of the record layout.
+    public prop string[] objectFieldClassOwners;
+    public prop string[] objectFieldClassFields;
+    public prop string[] objectFieldClassNames;
     // Object-record variables (struct literals, declared `object` unless
     // built from a string-keyed dict literal): whole-value prints render
     // `{...}` like the interpreter, plain dicts render `dict{...}`.
@@ -589,6 +604,12 @@ class MiniCg {
         this.dictNestedVars = [];
         this.dictNestedKeys = [];
         this.dictNestedNames = [];
+        this.ctorParamFieldClasses = [];
+        this.ctorParamFieldIndexes = [];
+        this.ctorParamFieldNames = [];
+        this.objectFieldClassOwners = [];
+        this.objectFieldClassFields = [];
+        this.objectFieldClassNames = [];
         this.objectVars = [];
         this.globalDictValueNames = [];
         this.globalDictValueKinds = [];
@@ -866,6 +887,13 @@ class MiniCg {
                             if (cmember.kind == 100) {
                                 this.methodNames.add(cmember.name);
                                 this.methodClassNames.add(citem.name);
+                                // The field a constructor parameter is
+                                // stored into: the `new` site says what
+                                // class that field will hold (the
+                                // parameter itself carries no class).
+                                if (cmember.name == "construct") {
+                                    this.noteCtorParamFields(citem.name, cmember);
+                                }
                             }
                         }
                         // Inherited methods: left-to-right depth-first MRO
@@ -6921,7 +6949,7 @@ int strIdx = this.stringPatchIndices[i];
         // all: the read binds the class's field offsets, so it must not
         // take the dict path (the entry table has no such key and the
         // read found nothing).
-        if (fieldName != "length" && this.recordEntryClass(obj) == "" && (this.isDictOrObjectType(this.inferExprType(obj)) || this.isDynValueRoot(obj))) {
+        if (fieldName != "length" && this.recordEntryClass(obj) == "" && this.recordedFieldClass(obj) == "" && (this.isDictOrObjectType(this.inferExprType(obj)) || this.isDynValueRoot(obj))) {
             Node idxNode = new Node();
             idxNode.kind = 24;
             idxNode.children.add(obj);
@@ -7066,6 +7094,10 @@ int strIdx = this.stringPatchIndices[i];
             // type is the record type, which has no field layout).
             string entryCls = this.recordEntryClass(obj);
             if (entryCls != "") { objType = entryCls; }
+            // A class FIELD that holds an instance: the class recorded
+            // for that field binds the slot.
+            string fieldCls = this.recordedFieldClass(obj);
+            if (fieldCls != "") { objType = fieldCls; }
             int fieldOff = this.findFieldOffset(objType, fieldName);
             if (fieldOff < 0) {
                 fieldOff = this.findFieldOffsetInAllClasses(fieldName);
@@ -7659,6 +7691,13 @@ int strIdx = this.stringPatchIndices[i];
         if (entryCls != "") {
             string entryFieldType = this.findFieldType(entryCls, fieldName);
             if (entryFieldType != "") { return entryFieldType; }
+        }
+        // A class FIELD that holds an instance: the member is the CLASS's
+        // field the same way.
+        string fieldCls = this.recordedFieldClass(obj);
+        if (fieldCls != "") {
+            string fieldFieldType = this.findFieldType(fieldCls, fieldName);
+            if (fieldFieldType != "") { return fieldFieldType; }
         }
         // A dict/object member read (`d.key`, `o.key`): the per-key kind
         // is the member's own type when the receiver is a record. Without
@@ -12122,8 +12161,12 @@ int strIdx = this.stringPatchIndices[i];
         return ctorIdx;
     }
 
-public void genNewCall(Node call) {
-    int size = 16;
+    public void genNewCall(Node call) {
+        // The class of the value each `object`-typed field of the
+        // constructed class will hold: the argument's class at this
+        // `new` site (the constructor parameter carries no class).
+        this.noteNewSiteFieldClasses(call.name, call);
+        int size = 16;
     for (int i = 0; i < this.classNames.length; i++) {
         if (this.classNames[i] == call.name) {
             int cnt = this.classFieldCounts[i];
@@ -18798,6 +18841,12 @@ public void genNewCall(Node call) {
                 if (entryCls != "") {
                     return this.findFieldType(entryCls, expr.name) == "string";
                 }
+                // A class FIELD that holds an instance reads the class's
+                // field the same way.
+                string fieldCls = this.recordedFieldClass(expr.child(0));
+                if (fieldCls != "") {
+                    return this.findFieldType(fieldCls, expr.name) == "string";
+                }
             }
             // Dict/object member reads (`d.key`, `o.key`): per-key kind
             // first, then the whole-dict kind; string only when "string"
@@ -20163,6 +20212,172 @@ public void genNewCall(Node call) {
         string owner = this.dictVarOf(expr.child(0));
         if (owner == "") { return ""; }
         return this.dictKeyClassOf(owner, expr.name);
+    }
+
+    // Record the field a CONSTRUCTOR parameter is stored into: a
+    // constructor that stores one of its parameters in a field (`this.data
+    // = data;`) tells the compiler WHICH field that parameter fills, so
+    // the `new` site can say what class the field will hold (the
+    // parameter itself carries no class).
+    public void noteCtorParamFields(string className, Node method) {
+        if (method.childCount() < 2) { return; }
+        Node params = method.child(0);
+        Node body = method.child(1);
+        for (int i = 0; i < body.childCount(); i++) {
+            this.scanCtorFieldAssign(body.child(i), params, className);
+        }
+    }
+
+    // Scan a constructor body statement for `this.field = param`.
+    public void scanCtorFieldAssign(Node stmt, Node params, string className) {
+        if (stmt.kind == 61 && stmt.childCount() > 0) {
+            Node e = stmt.child(0);
+            // A plain assignment is a binary node with op 20 (`=`).
+            if (e.kind == 7 && e.op == 20 && e.childCount() >= 2) {
+                Node lhs = e.child(0);
+                Node rhs = e.child(1);
+                if (lhs.kind == 13 && lhs.childCount() > 0 && lhs.child(0).kind == 6 && lhs.child(0).name == "this" && rhs.kind == 6) {
+                    int pidx = -1;
+                    for (int p = 0; p < params.childCount(); p++) {
+                        if (params.child(p).name == rhs.name) { pidx = p; }
+                    }
+                    if (pidx >= 0) { this.noteCtorParamField(className, pidx, lhs.name); }
+                }
+            }
+        }
+        // A nested block (an `if` in the constructor) can store the
+        // parameter as well.
+        if (stmt.kind == 53) {
+            for (int i = 1; i < stmt.childCount(); i++) {
+                Node sub = stmt.child(i);
+                if (sub.kind == 16) {
+                    for (int j = 0; j < sub.childCount(); j++) { this.scanCtorFieldAssign(sub.child(j), params, className); }
+                } else {
+                    this.scanCtorFieldAssign(sub, params, className);
+                }
+            }
+        }
+    }
+
+    // Record one constructor parameter -> field pair.
+    public void noteCtorParamField(string className, int index, string field) {
+        for (int i = 0; i < this.ctorParamFieldClasses.length; i++) {
+            if (this.ctorParamFieldClasses[i] == className && this.ctorParamFieldIndexes[i] == index) {
+                this.ctorParamFieldNames[i] = field;
+                return;
+            }
+        }
+        this.ctorParamFieldClasses.add(className);
+        this.ctorParamFieldIndexes.add(index);
+        this.ctorParamFieldNames.add(field);
+    }
+
+    // The field the constructor parameter at `index` fills, else "".
+    public string ctorParamFieldOf(string className, int index) {
+        for (int i = 0; i < this.ctorParamFieldClasses.length; i++) {
+            if (this.ctorParamFieldClasses[i] == className && this.ctorParamFieldIndexes[i] == index) {
+                return this.ctorParamFieldNames[i];
+            }
+        }
+        return "";
+    }
+
+    // Record the class of the value each `object`-typed field of the
+    // constructed class will hold: the argument's class at this `new`
+    // site (the constructor parameter carries no class). Two `new` sites
+    // that disagree about the same field leave it unrecorded -- the
+    // field's class is then not statically known, so a read through it
+    // keeps the record path.
+    public void noteNewSiteFieldClasses(string className, Node call) {
+        for (int idx = 0; idx < call.childCount(); idx++) {
+            string field = this.ctorParamFieldOf(className, idx);
+            if (field == "") { continue; }
+            string cls = this.classOfExpr(call.child(idx));
+            if (cls == "") { continue; }
+            bool isClass = false;
+            for (int ci = 0; ci < this.classNames.length; ci++) {
+                if (this.classNames[ci] == cls) { isClass = true; }
+            }
+            if (!isClass) { continue; }
+            this.noteClassFieldClass(className, field, cls);
+        }
+    }
+
+    // Record the class an `object`-typed class field holds. A second
+    // site that disagrees drops the record: the field's class is then
+    // not statically known.
+    public void noteClassFieldClass(string ownerClass, string field, string cls) {
+        for (int i = 0; i < this.objectFieldClassOwners.length; i++) {
+            if (this.objectFieldClassOwners[i] == ownerClass && this.objectFieldClassFields[i] == field) {
+                if (this.objectFieldClassNames[i] != cls) {
+                    this.objectFieldClassOwners[i] = "";
+                    this.objectFieldClassFields[i] = "";
+                    this.objectFieldClassNames[i] = "";
+                }
+                return;
+            }
+        }
+        this.objectFieldClassOwners.add(ownerClass);
+        this.objectFieldClassFields.add(field);
+        this.objectFieldClassNames.add(cls);
+    }
+
+    // The class recorded for a CLASS FIELD (the class the `new` site
+    // passed for it), else "".
+    public string classFieldClassOf(string ownerClass, string field) {
+        for (int i = 0; i < this.objectFieldClassOwners.length; i++) {
+            if (this.objectFieldClassOwners[i] == ownerClass && this.objectFieldClassFields[i] == field) {
+                return this.objectFieldClassNames[i];
+            }
+        }
+        return "";
+    }
+
+    // The class an expression's value HAS at runtime, when the compiler
+    // can tell: the declared class of a typed receiver, the recorded
+    // dynamic class of an `object`-typed one, or the class recorded for
+    // the class field the expression reads. "" when the value's class is
+    // not statically known (a record, a scalar, ...).
+    public string receiverRuntimeClass(Node expr) {
+        if (expr == null) { return ""; }
+        if (expr.kind == 6) {
+            string t = this.getLocalType(expr.name);
+            if (t == "") { return ""; }
+            if (t == "object" || t == "object?" || this.isFoundationName(t)) {
+                return this.objectDynamicTypeOf(expr.name);
+            }
+            return t;
+        }
+        if (expr.kind == 13) {
+            if (expr.childCount() < 1) { return ""; }
+            string owner = this.receiverRuntimeClass(expr.child(0));
+            if (owner == "") { return ""; }
+            string recorded = this.classFieldClassOf(owner, expr.name);
+            if (recorded != "") { return recorded; }
+            string ft = this.findFieldType(owner, expr.name);
+            // The RECORD type is not a class: a field declared `object`
+            // holds a record unless the `new` site recorded the class of
+            // an instance.
+            if (ft == "" || ft == "object" || ft == "object?" || ft == "JsonValue") { return ""; }
+            return ft;
+        }
+        if (expr.kind == 23) {
+            if (expr.childCount() > 0) { return this.receiverRuntimeClass(expr.child(0)); }
+            return "";
+        }
+        return "";
+    }
+
+    // The class recorded for the CLASS FIELD the expression reads
+    // (`note.data` where the `data` field holds a `payload` instance).
+    // "" when the field's class is not statically known.
+    public string recordedFieldClass(Node expr) {
+        if (expr == null) { return ""; }
+        if (expr.kind != 13) { return ""; }
+        if (expr.childCount() < 1) { return ""; }
+        string owner = this.receiverRuntimeClass(expr.child(0));
+        if (owner == "") { return ""; }
+        return this.classFieldClassOf(owner, expr.name);
     }
 
     // Refresh print kinds after a keyed dict write so a stale "string"
