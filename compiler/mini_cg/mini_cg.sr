@@ -361,6 +361,34 @@ class MiniCg {
     // parameter slot's stored address.
     public prop string[] fnPtrParamNames;
 
+    // DOCS/259 -- CLOSURE CAPTURE. A `(void () { ... })` body captures the
+    // enclosing function's locals BY VALUE. The closure value is a tagged
+    // pointer to a descriptor block that holds the generated body's code
+    // address, the number of captured values and the values themselves; the
+    // call hands the descriptor to the callee as its hidden first argument
+    // (`__closure_env`), and the body copies the captured values out of it
+    // into its own frame at entry.
+    //
+    // The capture list of the body being emitted: the captured names, the
+    // body's own frame slot for each and the type the enclosing frame gave
+    // the name (so a read inside the body formats the captured value
+    // exactly as the enclosing function would).
+    public prop string[] closureEnvCaptureNames;
+    public prop int[] closureEnvCaptureOffsets;
+    public prop string[] closureEnvCaptureTypes;
+    public prop bool closureEnvActive;
+    // The capture lists of the queued anonymous bodies, flattened: the
+    // names, the ENCLOSING frame's slot of each and its declared type.
+    // `pendingAnonCaptureCounts` gives every queued body its own slice.
+    public prop string[] pendingAnonCaptureNames;
+    public prop int[] pendingAnonCaptureOffsets;
+    public prop string[] pendingAnonCaptureTypes;
+    public prop int[] pendingAnonCaptureCounts;
+    // The locals DECLARED SO FAR in the frame being emitted, in
+    // declaration order: a closure captures exactly these. A local
+    // declared later is not yet initialized, so it is not captured.
+    public prop string[] declaredLocalNames;
+
     // Overload dispatch by argument count: resolved function index of every forward call so same-named overload
     // entries patch to their own body instead of the last declaration's.
     public prop int[] forwardCallFuncIdxs;
@@ -610,6 +638,15 @@ class MiniCg {
         this.fnAddrRefNames = [];
         this.fnAddrRefPatchOffsets = [];
         this.fnPtrParamNames = [];
+        this.closureEnvCaptureNames = [];
+        this.closureEnvCaptureOffsets = [];
+        this.closureEnvCaptureTypes = [];
+        this.closureEnvActive = false;
+        this.pendingAnonCaptureNames = [];
+        this.pendingAnonCaptureOffsets = [];
+        this.pendingAnonCaptureTypes = [];
+        this.pendingAnonCaptureCounts = [];
+        this.declaredLocalNames = [];
         this.userModuleNames = [];
         this.linuxBackend = new MiniCgLinux();
         this.windowsBackend = new MiniCgWindows();
@@ -4131,6 +4168,7 @@ int strIdx = this.stringPatchIndices[i];
         while (this.liveSlotIsArray.length > 0) { this.liveSlotIsArray.pop(); }
         while (this.aliasVarNames.length > 0) { this.aliasVarNames.pop(); }
         while (this.fnPtrParamNames.length > 0) { this.fnPtrParamNames.pop(); }
+        while (this.declaredLocalNames.length > 0) { this.declaredLocalNames.pop(); }
     }
     public void emitMethod(Node func, string className) {
     this.currentFunctionName = func.name;
@@ -4166,6 +4204,9 @@ int strIdx = this.stringPatchIndices[i];
         for (int i = 0; i < params.childCount(); i++) {
             this.allocLocal(params.child(i).name);
             this.localTypes[this.localTypes.length - 1] = params.child(i).typeHint;
+            // A parameter is a local of the frame: a closure created in
+            // this method captures it BY VALUE.
+            this.declaredLocalNames.add(params.child(i).name);
             if (params.child(i).typeHint == "void ()") {
                 // DOCS/259: an 8-byte function address, stored like an int.
                 this.fnPtrParamNames.add(params.child(i).name);
@@ -4227,6 +4268,9 @@ int strIdx = this.stringPatchIndices[i];
         for (int i = 0; i < paramsFn.childCount(); i++) {
             this.allocLocal(paramsFn.child(i).name);
             this.localTypes[this.localTypes.length - 1] = paramsFn.child(i).typeHint;
+            // A parameter is a local of the frame: a closure created in
+            // this function captures it BY VALUE.
+            this.declaredLocalNames.add(paramsFn.child(i).name);
             if (paramsFn.child(i).typeHint == "void ()") {
                 // DOCS/259: an 8-byte function address, stored like an int.
                 this.fnPtrParamNames.add(paramsFn.child(i).name);
@@ -4357,6 +4401,21 @@ int strIdx = this.stringPatchIndices[i];
                             }
                         }
                     }
+                }
+            }
+            // DOCS/259 -- CLOSURE CAPTURE. A closure body receives its
+            // descriptor as the hidden first argument (`__closure_env`).
+            // The values the closure captured at creation time are copied
+            // out of the descriptor into the body's own frame slots, so a
+            // read of an enclosing local inside the body finds the captured
+            // value.
+            if (this.closureEnvActive) {
+                int envOff = this.findLocal("__closure_env");
+                for (int ci = 0; ci < this.closureEnvCaptureNames.length; ci++) {
+                    int capOff = this.closureEnvCaptureOffsets[ci];
+                    this.asm.movRMBase(0, 5, envOff);
+                    this.asm.movRMBase(0, 0, 16 + 8 * ci);
+                    this.asm.movMBaseR(5, 0, capOff);
                 }
             }
             this.emitCallDepthEnter();
@@ -4619,6 +4678,9 @@ int strIdx = this.stringPatchIndices[i];
     } else if (stmt.kind == 50) {
         int off = this.findLocal(stmt.name);
         if (stmt.localBindingSlot > 0) { off = this.localOffsets[stmt.localBindingSlot - 1]; }
+        // The declaration is reached: the name is now a local of this
+        // frame, so a closure created from here on captures it BY VALUE.
+        this.declaredLocalNames.add(stmt.name);
         // Dict/object print tracking (member reads, whole-dict prints):
         // declared dicts use V's kind, `object` and untyped `var` classify
         // a literal initializer.
@@ -6087,14 +6149,11 @@ int strIdx = this.stringPatchIndices[i];
             // DOCS/259 G3: call through a function-typed value — child(0) is
             // the full index expression; evaluating it performs the
             // bounds-checked element load and leaves the stored function
-            // address in RAX. The address is staged in R10 BEFORE the aligned
-            // call setup (the proven fn-field pattern; R10 survives setup).
+            // address in RAX. The value may also be a CLOSURE (a tagged
+            // descriptor pointer): the call tells the two apart and hands a
+            // closure its descriptor.
             this.genExpr(expr.child(0));
-            this.asm.movRR64(10, 0);
-            this.asm.emitCallSetup(0);
-            this.asm.callR64(10);
-            this.asm.emitCallTeardown();
-            this.emitExcCheck();
+            this.genCallThroughFnValue();
         }
     }
 
@@ -6115,10 +6174,86 @@ int strIdx = this.stringPatchIndices[i];
         this.objAnonLabels.add(lbl);
         this.objAnonNames.add(name);
         this.objAnonOwners.add(this.objCurOwner);
+        // DOCS/259 -- CLOSURE CAPTURE. The body captures the enclosing
+        // frame's locals BY VALUE: the capture list is snapshotted here
+        // (the enclosing frame's locals declared so far), copied into the
+        // closure's descriptor when the closure is created, and read back
+        // by the body from the descriptor it is handed at call time.
+        int capStart = this.pendingAnonCaptureNames.length;
+        for (int i = 0; i < this.declaredLocalNames.length; i++) {
+            string capName = this.declaredLocalNames[i];
+            if (capName.length == 0) { continue; }
+            // `this` is not captured: a closure is not a method and has no
+            // receiver.
+            if (capName == "this") { continue; }
+            // A name declared twice: the innermost binding wins, so the
+            // name is captured once.
+            bool seen = false;
+            for (int j = 0; j < i; j++) {
+                if (this.declaredLocalNames[j] == capName) { seen = true; }
+            }
+            if (seen) { continue; }
+            int capOff = this.findLocal(capName);
+            if (capOff == 0) { continue; }
+            this.pendingAnonCaptureNames.add(capName);
+            this.pendingAnonCaptureOffsets.add(capOff);
+            this.pendingAnonCaptureTypes.add(this.getLocalType(capName));
+        }
+        this.pendingAnonCaptureCounts.add(this.pendingAnonCaptureNames.length - capStart);
+        // The closure value: the descriptor pointer, tagged as a closure.
+        this.genClosureDescriptor(lbl, capStart, this.pendingAnonCaptureNames.length - capStart);
+    }
+
+    // DOCS/259 -- CLOSURE CAPTURE. Build the descriptor of a closure value
+    // and leave it in RAX.
+    //
+    // The descriptor is a heap block laid out as
+    //
+    //   [0]  the generated body's code address
+    //   [8]  the number of captured values
+    //   [16] the captured values, one word each
+    //
+    // The VALUE is the descriptor pointer with the closure tag bit set, so
+    // a call site tells a closure from a plain function address without
+    // dereferencing anything: bit 63 is never set in a user-space pointer.
+    public void genClosureDescriptor(int labelId, int capStart, int capCount) {
+        int size = 16 + 8 * capCount;
+        // The descriptor block: malloc(size). The import call carries its
+        // size in the first argument register (the Linux backend shuffles
+        // the Win64 registers into SysV position at the import boundary).
+        this.asm.emitImm64(1, size);
+        this.addImportPatch("msvcrt.dll", "malloc");
+        this.asm.emitImm64(0, 0xDEADBEEFCAFEBAB1);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        int descOff = this.allocLocal("__closure_desc");
+        this.asm.movMBaseR(5, 0, descOff);
+        // [0] the body's code address: the placeholder immediate is patched
+        // to the generated function's VA at layout time, so the runtime
+        // copies the real address into the descriptor.
+        this.asm.movRMBase(0, 5, descOff);
         int sp = this.asm.buf.length;
-        this.asm.emitImm64(0, 0xDEADBEEFCAFEF00D);
-        this.anonRelocLabelIds.add(lbl);
+        this.asm.emitImm64(1, 0xDEADBEEFCAFEF00D);
+        this.anonRelocLabelIds.add(labelId);
         this.anonRelocPatchOffsets.add(sp + 2);
+        this.asm.movMBaseR(0, 1, 0);
+        // [8] the capture count.
+        this.asm.movRMBase(0, 5, descOff);
+        this.asm.emitImm64(1, capCount);
+        this.asm.movMBaseR(0, 1, 8);
+        // [16..] the captured values, copied out of the enclosing frame.
+        for (int i = 0; i < capCount; i++) {
+            this.asm.movRMBase(1, 5, this.pendingAnonCaptureOffsets[capStart + i]);
+            this.asm.movRMBase(0, 5, descOff);
+            this.asm.movMBaseR(0, 1, 16 + 8 * i);
+        }
+        // The value: the descriptor pointer, tagged as a closure.
+        this.asm.movRMBase(0, 5, descOff);
+        this.asm.movRI64(1, 0x7FFFFFFFFFFFFFFF);
+        this.asm.notR64(1);
+        this.asm.orRR64(0, 1);
     }
 
     // True when `name` names a free user function of this unit (a method
@@ -6195,13 +6330,16 @@ int strIdx = this.stringPatchIndices[i];
     // empty, then the recorded address placeholders are patched to the
     // generated functions' absolute VAs (code is placed at text_rva).
     public void drainAnonFunctions() {
+        int capCursor = 0;
         while (this.pendingAnonNames.length > 0) {
             string[] names = this.pendingAnonNames;
             int[] labels = this.pendingAnonLabels;
             Node[] bodies = this.pendingAnonBodies;
+            int[] counts = this.pendingAnonCaptureCounts;
             this.pendingAnonNames = [];
             this.pendingAnonLabels = [];
             this.pendingAnonBodies = [];
+            this.pendingAnonCaptureCounts = [];
             for (int i = 0; i < names.length; i++) {
                 // Each body emits under its own owner (recorded at queue
                 // time), so nested queues inherit the enclosing body's owner.
@@ -6211,7 +6349,12 @@ int strIdx = this.stringPatchIndices[i];
                     this.objCurOwner = this.objAnonOwnerFor(labels[i]);
                     this.pushObjMark(names[i]);
                 }
-                this.emitAnonFunction(names[i], labels[i], bodies[i]);
+                // The body's capture list: its own slice of the flattened
+                // capture arrays (the cursor never rewinds, so the bodies
+                // queued by a body land after it).
+                int capCount = counts[i];
+                this.emitAnonFunction(names[i], labels[i], bodies[i], capCursor, capCount);
+                capCursor += capCount;
             }
         }
         for (int r = 0; r < this.anonRelocLabelIds.length; r++) {
@@ -6240,10 +6383,16 @@ int strIdx = this.stringPatchIndices[i];
     }
 
     // Emit one anonymous function body: a plain prologue + block + epilogue
-    // at the label bound at the expression site. No parameters, no return
-    // value -- exactly the standalone function whose address the argument
-    // expression evaluates to.
-    public void emitAnonFunction(string name, int labelId, Node body) {
+    // at the label bound at the expression site. No declared parameters, no
+    // return value -- exactly the standalone function whose address the
+    // argument expression evaluates to.
+    //
+    // DOCS/259 -- CLOSURE CAPTURE. The body takes the closure descriptor as
+    // its hidden first argument (`__closure_env`): the caller passes it, and
+    // the body copies the captured values out of it into its own frame at
+    // entry, so a read of an enclosing local inside the body finds the
+    // captured value.
+    public void emitAnonFunction(string name, int labelId, Node body, int capStart, int capCount) {
         this.currentFunctionName = name;
         this.currentReturnType = "void";
         this.localOffsets = [];
@@ -6252,11 +6401,47 @@ int strIdx = this.stringPatchIndices[i];
         this.stackSize = 0;
         this.currentClassName = "";
         while (this.fnPtrParamNames.length > 0) { this.fnPtrParamNames.pop(); }
+        // The body is a frame of its own: the scope bindings of the frame
+        // that emitted it do not belong to it.
+        while (this.scopeBindingIndices.length > 0) {
+            this.scopeBindingIndices.pop();
+            this.scopeBindingNames.pop();
+            this.scopeBindingTypes.pop();
+            this.scopeBindingOffsets.pop();
+        }
+        // The frame of the body: the hidden descriptor parameter plus one
+        // slot per captured value. The body's own locals are allocated
+        // after these, so a name the body declares itself shadows the
+        // captured one.
+        string[] savedDeclared = this.declaredLocalNames;
+        this.declaredLocalNames = [];
+        this.allocLocal("__closure_env");
+        this.localTypes[this.localTypes.length - 1] = "int64";
+        this.closureEnvCaptureNames = [];
+        this.closureEnvCaptureOffsets = [];
+        this.closureEnvCaptureTypes = [];
+        for (int i = 0; i < capCount; i++) {
+            string capName = this.pendingAnonCaptureNames[capStart + i];
+            string capType = this.pendingAnonCaptureTypes[capStart + i];
+            int capOff = this.allocLocal(capName);
+            this.localTypes[this.localTypes.length - 1] = capType;
+            this.closureEnvCaptureNames.add(capName);
+            this.closureEnvCaptureOffsets.add(capOff);
+            this.closureEnvCaptureTypes.add(capType);
+            // A captured name is a local of this frame too: a closure
+            // created inside this body captures it as well.
+            this.declaredLocalNames.add(capName);
+        }
+        this.closureEnvActive = true;
         Node f = new Node();
         f.kind = 100;
         f.name = name;
         f.typeHint = "void";
         Node params = new Node();
+        Node envParam = new Node();
+        envParam.name = "__closure_env";
+        envParam.typeHint = "int64";
+        params.children.add(envParam);
         f.children.add(params);
         f.children.add(body);
         this.scanRefCalls(f);
@@ -6267,15 +6452,54 @@ int strIdx = this.stringPatchIndices[i];
         this.asm.movRR64(5, 4);
         this.emitFunctionBody(f);
         this.inAnonBody = savedAnon;
+        this.closureEnvActive = false;
+        this.declaredLocalNames = savedDeclared;
     }
 
     // DOCS/259 -- invoke a function-typed parameter: load the stored function
-    // address from the parameter's stack slot into R10 and call through it
-    // with the standard 16-byte-aligned call setup.
+    // address from the parameter's stack slot and call through it with the
+    // standard 16-byte-aligned call setup. The stored value may be a
+    // CLOSURE (a tagged descriptor pointer): the call hands the callee its
+    // descriptor, so the body sees what it captured.
     public void genFnPtrCall(string name) {
         int off = this.findLocal(name);
-        this.asm.movRMBase(10, 5, off);
+        this.asm.movRMBase(0, 5, off);
+        this.genCallThroughFnValue();
+    }
+
+    // DOCS/259 -- CLOSURE CAPTURE. Call through a function-typed VALUE that
+    // is already in RAX.
+    //
+    // The value is either a plain function address (a named function) or a
+    // CLOSURE (a descriptor pointer, tagged with the closure bit). The tag
+    // bit tells the two apart without dereferencing anything: bit 63 is
+    // never set in a user-space pointer, so a negative value is a closure.
+    // A closure's descriptor is handed to the callee as its hidden first
+    // argument (`__closure_env`), so the body can read the values it
+    // captured; a plain function ignores that argument.
+    public void genCallThroughFnValue() {
+        // R11 = the value, RCX = the scratch mask.
+        this.asm.movRR64(11, 0);
+        this.asm.xorRR64(1, 1);
+        this.asm.cmpRR64(11, 1);
+        int closureLbl = this.newLabel();
+        int callLbl = this.newLabel();
+        this.asm.jlLabel(closureLbl);
+        // A plain function address: R10 = the address, R11 = no closure.
+        this.asm.movRR64(10, 0);
+        this.asm.xorRR64(11, 11);
+        this.asm.jmpLabel(callLbl);
+        this.asm.bindLabel(closureLbl);
+        // A closure: R11 = the descriptor pointer (the tag bit cleared),
+        // R10 = the body's code address.
+        this.asm.movRI64(1, 0x7FFFFFFFFFFFFFFF);
+        this.asm.andRR64(11, 1);
+        this.asm.movRMBase(10, 11, 0);
+        this.asm.bindLabel(callLbl);
+        // The closure descriptor rides in the callee's first argument
+        // register; a plain function has no parameters and ignores it.
         this.asm.emitCallSetup(0);
+        this.asm.movRR64(this.abiFirstArgReg(), 11);
         this.asm.callR64(10);
         this.asm.emitCallTeardown();
         this.emitExcCheck();
@@ -15984,11 +16208,10 @@ public void genNewCall(Node call) {
                 if (fnFieldOff >= 0) {
                     this.genExpr(call.child(0));
                     this.asm.movRMBase(0, 0, fnFieldOff);
-                    this.asm.movRR64(10, 0);
-                    this.asm.emitCallSetup(0);
-                    this.asm.callR64(10);
-                    this.asm.emitCallTeardown();
-                    this.emitExcCheck();
+                    // The stored value may be a CLOSURE (a tagged
+                    // descriptor pointer): the call hands the callee its
+                    // descriptor, so the body sees what it captured.
+                    this.genCallThroughFnValue();
                     return;
                 }
             }

@@ -39,6 +39,10 @@ int ncKindAlias = 73;
 int ncKindStructLit = 74;
 int ncKindDestructure2 = 79;
 int ncKindLambda = 80;
+// DOCS/259 -- the block-bodied anonymous function `(void () { ... })`:
+// its body is its own frame, but the enclosing function's locals stay
+// visible (a closure captures them BY VALUE).
+int ncKindAnonBody = 85;
 int ncKindObjectInit = 88;
 int ncKindFunction = 100;
 int ncKindStruct = 101;
@@ -111,9 +115,22 @@ bool ncValidName(string name) {
 // silence a diagnostic, never invent one.
 class NcScope {
     public prop dict<string, int> names;
+    // The names the CURRENT frame declares: the function's own locals
+    // (parameters included) outside a closure body, and the names a
+    // closure body declares itself inside one. A closure captures the
+    // frame's names BY VALUE, so an assignment to one inside a closure
+    // body lands in the copy and is refused.
+    public prop string[] frameNames;
+    // The names the closure body being walked declares itself.
+    public prop string[] bodyOwn;
+    // True while the walk is inside a closure body.
+    public prop bool inClosureBody;
 
     construct {
         this.names = {};
+        this.frameNames = [];
+        this.bodyOwn = [];
+        this.inClosureBody = false;
     }
 
     public void add(string name) {
@@ -121,8 +138,30 @@ class NcScope {
         this.names[name] = 1;
     }
 
+    // A name the current frame declares.
+    public void addFrame(string name) {
+        if (name.length == 0) { return; }
+        this.frameNames.add(name);
+    }
+
     public bool has(string name) {
         return this.names.contains(name);
+    }
+
+    // True when the name is one of the frame's declared names.
+    public bool frameHas(string name) {
+        for (int i = 0; i < this.frameNames.length; i++) {
+            if (this.frameNames[i] == name) { return true; }
+        }
+        return false;
+    }
+
+    // True when the name is one the closure body declares itself.
+    public bool bodyOwnHas(string name) {
+        for (int i = 0; i < this.bodyOwn.length; i++) {
+            if (this.bodyOwn[i] == name) { return true; }
+        }
+        return false;
     }
 }
 
@@ -226,12 +265,16 @@ class NameChecker {
                 Node params = item.child(0);
                 for (int p = 0; p < params.childCount(); p++) {
                     scope.add(params.child(p).name);
+                    scope.addFrame(params.child(p).name);
                 }
             }
             dict<string, int> seen = {};
             this.addClassFields(scope, className, seen);
             if (item.childCount() > 1) {
                 this.collectLocals(item.child(1), scope);
+                // The names the function's own frame declares: a closure
+                // body written in it captures exactly these.
+                this.collectFrameNames(item.child(1), scope);
                 this.walk(item.child(1), scope);
             }
         } else if (item.kind == ncKindClass || item.kind == ncKindStruct) {
@@ -305,6 +348,54 @@ class NameChecker {
         }
     }
 
+    // The names the CURRENT frame declares: the function's own locals.
+    // A closure body written in the function has its own frame, so its
+    // declarations are not part of the function's -- the walk stops at an
+    // anonymous body.
+    private void collectFrameNames(Node n, NcScope scope) {
+        if (n.kind == ncKindAnonBody) { return; }
+        if (n.kind == ncKindVarDecl || n.kind == ncKindAlias) {
+            scope.addFrame(n.name);
+        } else if (n.kind == ncKindDestructure || n.kind == ncKindDestructure2) {
+            // The LAST child is the value expression; the rest are names.
+            for (int i = 0; i + 1 < n.childCount(); i++) {
+                scope.addFrame(n.child(i).name);
+            }
+        } else if (n.kind == ncKindTry && n.name.length > 0) {
+            scope.addFrame(n.name);
+        } else if (n.kind == ncKindMatchArm && n.childCount() > 0) {
+            Node pat = n.child(0);
+            if (pat.kind == 0 && pat.name.length > 0 && pat.name != "_") {
+                scope.addFrame(pat.name);
+            }
+        }
+        for (int i = 0; i < n.childCount(); i++) {
+            this.collectFrameNames(n.child(i), scope);
+        }
+    }
+
+    // The names a closure body declares itself (its own frame).
+    private void collectBodyOwnNames(Node n, string[] out) {
+        if (n.kind == ncKindAnonBody) { return; }
+        if (n.kind == ncKindVarDecl || n.kind == ncKindAlias) {
+            out.add(n.name);
+        } else if (n.kind == ncKindDestructure || n.kind == ncKindDestructure2) {
+            for (int i = 0; i + 1 < n.childCount(); i++) {
+                out.add(n.child(i).name);
+            }
+        } else if (n.kind == ncKindTry && n.name.length > 0) {
+            out.add(n.name);
+        } else if (n.kind == ncKindMatchArm && n.childCount() > 0) {
+            Node pat = n.child(0);
+            if (pat.kind == 0 && pat.name.length > 0 && pat.name != "_") {
+                out.add(pat.name);
+            }
+        }
+        for (int i = 0; i < n.childCount(); i++) {
+            this.collectBodyOwnNames(n.child(i), out);
+        }
+    }
+
     private void walk(Node n, NcScope scope) {
         if (n.kind == ncKindIdent) {
             this.checkIdent(n, scope);
@@ -362,6 +453,38 @@ class NameChecker {
             }
             return;
         }
+        if (n.kind == ncKindAnonBody) {
+            // DOCS/259 -- a closure body is its own frame, but the
+            // enclosing function's locals stay visible: a closure captures
+            // them BY VALUE, so a read of an enclosing local inside the
+            // body is legal and sees the captured value.
+            string[] savedFrame = scope.frameNames;
+            string[] savedOwn = scope.bodyOwn;
+            bool savedInBody = scope.inClosureBody;
+            // The names the body declares itself.
+            string[] own = [];
+            this.collectBodyOwnNames(n.child(0), own);
+            // The frame the body captures: the enclosing frame's declared
+            // names (the function's own, plus the names the enclosing body
+            // declared when the closure is nested).
+            string[] frame = [];
+            for (int i = 0; i < scope.frameNames.length; i++) {
+                frame.add(scope.frameNames[i]);
+            }
+            for (int i = 0; i < scope.bodyOwn.length; i++) {
+                frame.add(scope.bodyOwn[i]);
+            }
+            scope.frameNames = frame;
+            scope.bodyOwn = own;
+            scope.inClosureBody = true;
+            for (int i = 0; i < n.childCount(); i++) {
+                this.walk(n.child(i), scope);
+            }
+            scope.frameNames = savedFrame;
+            scope.bodyOwn = savedOwn;
+            scope.inClosureBody = savedInBody;
+            return;
+        }
         if (n.kind == ncKindMember || (n.kind == ncKindCall && n.isMember)) {
             // A member access `X.f` / method call `X.f(...)` reads its
             // receiver in the one position a module name is ever used.
@@ -401,7 +524,16 @@ class NameChecker {
         if (n.kind != ncKindIdent) { return; }
         string name = n.name;
         if (!ncValidName(name)) { return; }
-        if (scope.has(name)) { return; }
+        if (scope.has(name)) {
+            // DOCS/259 -- a closure body may READ an enclosing local (it
+            // captures it BY VALUE) but may not ASSIGN to one: the capture
+            // is a copy, so the assignment would land in the copy and the
+            // enclosing binding would silently keep its value.
+            if (scope.inClosureBody && scope.frameHas(name) && !scope.bodyOwnHas(name)) {
+                this.errors.add((string)n.line + ":" + (string)n.col + ": Cannot assign to '" + name + "' inside a closure: it is captured by value");
+            }
+            return;
+        }
         if (this.declNames.contains(name)) { return; }
         if (ncBuiltinName(name)) { return; }
         if (this.fieldNameSet.contains(name)) { return; }

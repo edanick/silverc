@@ -146,8 +146,14 @@ class Parser {
     // DOCS/259 -- top-level variable names, collected before the diagnostics
     // walk. Anonymous function bodies are isolated scopes: their identifier
     // uses resolve against their own locals, these globals, and the file's
-    // known symbols -- never against the enclosing function's locals.
+    // known symbols.
     private string[] anonKnownGlobals;
+    // DOCS/259 -- CLOSURE CAPTURE. The locals of the frame an anonymous
+    // function body is written in: a closure captures them BY VALUE, so a
+    // read of one inside the body is legal and sees the captured value.
+    // The names ride the diagnostics walk (the enclosing function's own
+    // locals, then the enclosing body's own locals for a nested closure).
+    private string[] anonEnclosingLocals;
     // Depth of anonymous-function bodies the diagnostics walk is inside.
     private int anonWalkDepth;
     // DOCS/261 / SPEC 15.6 -- membership operators: nesting depth of `(`
@@ -234,6 +240,7 @@ class Parser {
         this.classSectionInternal = false;
         this.fnPtrCallScope = [];
         this.anonKnownGlobals = [];
+        this.anonEnclosingLocals = [];
         this.anonWalkDepth = 0;
         this.parenDepth = 0;
         this.inMembershipOperand = false;
@@ -693,28 +700,55 @@ class Parser {
                 }
             }
             this.fnPtrCallScope = extended;
+            // DOCS/259 -- CLOSURE CAPTURE. A closure body may READ the
+            // enclosing function's locals (it captures them BY VALUE), so
+            // the function's own names stay visible inside a body written
+            // in it.
+            string[] savedEnclosing = this.anonEnclosingLocals;
+            string[] fnLocals = [];
+            this.collectFunctionLocals(n, fnLocals);
+            this.anonEnclosingLocals = fnLocals;
             for (int fc = 0; fc < n.childCount(); fc++) {
                 this.walkCallDiagnostics(n.child(fc));
             }
+            this.anonEnclosingLocals = savedEnclosing;
             this.fnPtrCallScope = savedScope;
             return;
         }
         if (n.kind == 85) {
-            // DOCS/259 -- an anonymous function body is an isolated scope:
-            // enclosing fn-typed parameters and locals are not visible, so
-            // its identifier uses are validated against its own locals, the
-            // file's globals, and the known symbol table. Its calls are
-            // walked too (with the isolation still active): a free call
-            // inside the body that resolves against no declaration reports
-            // the missing function itself.
+            // DOCS/259 -- an anonymous function body is its own scope, but
+            // the enclosing function's LOCALS stay visible: a closure
+            // captures them BY VALUE, so a read of an enclosing local
+            // inside the body is legal and sees the captured value. Its
+            // identifier uses are validated against its own locals, the
+            // enclosing frame's locals, the file's globals, and the known
+            // symbol table. Its calls are walked too: a free call inside
+            // the body that resolves against no declaration reports the
+            // missing function itself.
             string[] savedScope = this.fnPtrCallScope;
-            this.fnPtrCallScope = [];
+            string[] extended = [];
+            for (int sc = 0; sc < savedScope.length; sc++) { extended.add(savedScope[sc]); }
+            this.fnPtrCallScope = extended;
             this.anonWalkDepth++;
             Node anonBody = n.child(0);
             string[] anonLocals = [];
             this.collectAnonBodyLocals(anonBody, anonLocals);
-            this.checkAnonBodyIdentifiers(anonBody, anonLocals);
+            // The names visible inside the body: the enclosing frame's
+            // locals (captured by value) plus the body's own.
+            string[] visible = [];
+            for (int ve = 0; ve < this.anonEnclosingLocals.length; ve++) {
+                visible.add(this.anonEnclosingLocals[ve]);
+            }
+            for (int vl = 0; vl < anonLocals.length; vl++) {
+                visible.add(anonLocals[vl]);
+            }
+            this.checkAnonBodyIdentifiers(anonBody, visible);
+            // A closure written inside this body captures the body's frame:
+            // its own locals and the values it captured itself.
+            string[] savedEnclosing = this.anonEnclosingLocals;
+            this.anonEnclosingLocals = visible;
             this.walkCallDiagnostics(anonBody);
+            this.anonEnclosingLocals = savedEnclosing;
             this.anonWalkDepth--;
             this.fnPtrCallScope = savedScope;
             return;
@@ -741,8 +775,10 @@ class Parser {
         if (name.length == 0) { return; }
         // DOCS/259 -- invoking a function-typed parameter of the enclosing
         // function: allowed for zero-arg calls only (the stored address is
-        // called, arguments cannot be passed).
-        if (this.anonWalkDepth == 0 && call.childCount() == 0 && this.fnPtrCallScopeHas(name)) { return; }
+        // called, arguments cannot be passed). Inside a closure body the
+        // enclosing function's function-typed locals stay visible too: a
+        // closure captures them BY VALUE, like any other local.
+        if (call.childCount() == 0 && this.fnPtrCallScopeHas(name)) { return; }
         // Dotted names (dotted-new candidates) are never free functions of
         // this pass — in anonymous bodies too:
         // codegen resolves them through the module namespace or reports
@@ -780,6 +816,36 @@ class Parser {
         }
         for (int i = 0; i < n.childCount(); i++) {
             this.collectAnonBodyLocals(n.child(i), locals);
+        }
+    }
+
+    // DOCS/259 -- CLOSURE CAPTURE. The locals of one function: its
+    // parameters and every name its body declares. The names an anonymous
+    // body writes in are NOT part of them (a closure body is its own
+    // frame), so the walk stops at an anonymous body.
+    private void collectFunctionLocals(Node n, string[] locals) {
+        if (n.kind == 85) { return; }
+        if (n.kind == 50 && n.name.length > 0) { locals.add(n.name); }
+        if (n.kind == 73 && n.name.length > 0) { locals.add(n.name); }
+        if (n.kind == 59 && n.name.length > 0) { locals.add(n.name); }
+        if (n.kind == 71 || n.kind == 79) {
+            // A destructuring declaration binds every leading name.
+            for (int i = 0; i + 1 < n.childCount(); i++) {
+                if (n.child(i).name.length > 0) { locals.add(n.child(i).name); }
+            }
+        }
+        if (n.kind == 21 && n.childCount() > 0) {
+            Node pat = n.child(0);
+            if (pat.kind == 6 && pat.name.length > 0 && pat.name != "_") { locals.add(pat.name); }
+        }
+        if (n.kind == 80) {
+            // An arrow lambda's parameters are locals of its body.
+            for (int i = 0; i + 1 < n.childCount(); i++) {
+                if (n.child(i).name.length > 0) { locals.add(n.child(i).name); }
+            }
+        }
+        for (int i = 0; i < n.childCount(); i++) {
+            this.collectFunctionLocals(n.child(i), locals);
         }
     }
 
