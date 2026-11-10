@@ -17515,8 +17515,12 @@ int strIdx = this.stringPatchIndices[i];
             this.asm.pushR64(0);
             this.genExpr(idxNode);
             this.asm.movRR64(1, 0);
-            this.asm.shlR64Imm(1, 3);
             this.asm.popR64(0);
+            // The compound store reads AND writes the element, so the
+            // index is bounds-checked first: an index past the end is
+            // refused, not read and written.
+            this.emitIndexBoundsCheck();
+            this.asm.shlR64Imm(1, 3);
             this.asm.addRR64(0, 1);
             // Spill the element address: genExpr(rhs) is free to scratch
             // rax/r11 and may call.
@@ -18220,8 +18224,22 @@ int strIdx = this.stringPatchIndices[i];
                 }
                 this.asm.popR64(12);
                 this.asm.popR64(0);
-                if (!arrIsStrideOne) { this.asm.shlR64Imm(0, 3); }
-                this.asm.addRR64(11, 0);
+                if (!arrIsStrideOne) {
+                    // A store past the end of the array is refused, not
+                    // written through: the index is checked against the
+                    // length (at [base-8]) before the element address is
+                    // computed. A string's length is NOT stored in front
+                    // of its bytes (it is computed with strlen), so only
+                    // an ARRAY element is checked -- exactly what the
+                    // READ path checks.
+                    this.asm.movRR64(1, 0);
+                    this.asm.movRR64(0, 11);
+                    this.emitIndexBoundsCheck();
+                    this.asm.shlR64Imm(1, 3);
+                    this.asm.addRR64(11, 1);
+                } else {
+                    this.asm.addRR64(11, 0);
+                }
                 if (arrIsStrideOne) {
                     this.asm.movMBaseByteR(11, 12, 0);
                 } else {
@@ -18238,10 +18256,20 @@ int strIdx = this.stringPatchIndices[i];
                 this.genExpr(arrNode);
                 this.asm.pushR64(0);
                 this.genExpr(idxNode);
-                if (!arrIsStrideOne) { this.asm.shlR64Imm(0, 3); }
-                this.asm.movRR64(11, 0);
+                this.asm.movRR64(1, 0);
                 this.asm.popR64(0);
-                this.asm.addRR64(0, 11);
+                if (!arrIsStrideOne) {
+                    // A store past the end of the array is refused, not
+                    // written through: the index is checked against the
+                    // length (at [base-8]) before the element address is
+                    // computed. A string's length is NOT stored in front
+                    // of its bytes (it is computed with strlen), so only
+                    // an ARRAY element is checked -- exactly what the
+                    // READ path checks.
+                    this.emitIndexBoundsCheck();
+                    this.asm.shlR64Imm(1, 3);
+                }
+                this.asm.addRR64(0, 1);
                 this.asm.pushR64(0);
                 string idxElemType2 = this.arrayElementType(this.inferExprType(arrNode));
                 if (rhs.kind == 74 && this.isStructTypeName(idxElemType2)) {
