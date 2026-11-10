@@ -3,7 +3,8 @@ mod export regex;
 // A regular-expression engine (DOCS/175). Patterns support literals, `.`,
 // character classes with ranges and negation (`[a-z]`, `[^0-9]`), the
 // anchors `^` and `$`, alternation `|`, captures — named `(?<name>...)`
-// and plain `(...)` — the classes \d \D \w \W \s \S, the escapes
+// (also `(?P<name>...)` and `(?'name'...)`) and plain `(...)` — the
+// classes \d \D \w \W \s \S, the escapes
 // \n \t \r \f \0 and any escaped metacharacter, and the greedy
 // quantifiers `*` `+` `?` on any atom. test / match / findAll / replace
 // SEARCH the input (unanchored); match() answers a match object (null
@@ -429,6 +430,22 @@ class pattern {
         return seq;
     }
 
+    /// Read a capture-group NAME that starts at the cursor and ends at
+    /// `close`; the cursor is left after the closing character. A name
+    /// that never closes reads as the text up to the `)` (or the end of
+    /// the pattern) and leaves the cursor there.
+    private string readGroupName(cursor cur, string close) {
+        string nm = "";
+        while (this.peek(cur) != "" && this.peek(cur) != close && this.peek(cur) != ")") {
+            nm += this.peek(cur);
+            cur.i++;
+        }
+        if (this.peek(cur) == close) {
+            cur.i++;
+        }
+        return nm;
+    }
+
     private node parseAtom(cursor cur) {
         string c = this.peek(cur);
         if (c == "(") {
@@ -440,15 +457,25 @@ class pattern {
                 if (c2 == ":") {
                     cur.i++;
                 } else if (c2 == "<") {
+                    // `(?<name>...)` -- the name ends at the `>`.
                     cur.i++;
-                    string nm = "";
-                    while (this.peek(cur) != "" && this.peek(cur) != ">" && this.peek(cur) != ")") {
-                        nm += this.peek(cur);
-                        cur.i++;
-                    }
-                    if (this.peek(cur) == ">") {
-                        cur.i++;
-                    }
+                    string nm = this.readGroupName(cur, ">");
+                    g.name = nm;
+                    this.groupNames.push(nm);
+                } else if (c2 == "P" && this.peekAt(cur, 1) == "<") {
+                    // `(?P<name>...)` -- the Python/Perl spelling of a named
+                    // capture. Without this arm the `P` and the name text
+                    // were parsed as ordinary pattern characters, so the
+                    // pattern matched nothing.
+                    cur.i++;
+                    cur.i++;
+                    string nm = this.readGroupName(cur, ">");
+                    g.name = nm;
+                    this.groupNames.push(nm);
+                } else if (c2 == "'") {
+                    // `(?'name'...)` -- the PCRE spelling of a named capture.
+                    cur.i++;
+                    string nm = this.readGroupName(cur, "'");
                     g.name = nm;
                     this.groupNames.push(nm);
                 }
