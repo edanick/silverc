@@ -279,6 +279,24 @@ class MiniCg {
     // built from a string-keyed dict literal): whole-value prints render
     // `{...}` like the interpreter, plain dicts render `dict{...}`.
     public prop string[] objectVars;
+    // The GLOBAL record/dict tracking. A global binding is read from
+    // every function, so its per-key kinds, the record it nests and the
+    // class of a stored instance are computed ONCE (genProgram) and
+    // re-applied to the per-function scratch tables (clearScratch). The
+    // snapshot mirrors the scratch tables it copies.
+    public prop string[] globalDictValueNames;
+    public prop string[] globalDictValueKinds;
+    public prop string[] globalDictValueVerdicts;
+    public prop string[] globalDictFieldVars;
+    public prop string[] globalDictFieldKeys;
+    public prop string[] globalDictFieldKinds;
+    public prop string[] globalDictFieldClassVars;
+    public prop string[] globalDictFieldClassKeys;
+    public prop string[] globalDictFieldClassNames;
+    public prop string[] globalDictNestedVars;
+    public prop string[] globalDictNestedKeys;
+    public prop string[] globalDictNestedNames;
+    public prop string[] globalObjectVars;
     public prop int[] forwardCalls;
     public prop string[] forwardCallNames;
     public prop string[] forwardCallClasses;
@@ -572,6 +590,19 @@ class MiniCg {
         this.dictNestedKeys = [];
         this.dictNestedNames = [];
         this.objectVars = [];
+        this.globalDictValueNames = [];
+        this.globalDictValueKinds = [];
+        this.globalDictValueVerdicts = [];
+        this.globalDictFieldVars = [];
+        this.globalDictFieldKeys = [];
+        this.globalDictFieldKinds = [];
+        this.globalDictFieldClassVars = [];
+        this.globalDictFieldClassKeys = [];
+        this.globalDictFieldClassNames = [];
+        this.globalDictNestedVars = [];
+        this.globalDictNestedKeys = [];
+        this.globalDictNestedNames = [];
+        this.globalObjectVars = [];
         this.forwardCalls = [];
 
         this.forwardCallNames = [];
@@ -3064,8 +3095,30 @@ int strIdx = this.stringPatchIndices[i];
                     Node missing = new Node(); missing.kind = 255;
                     this.globalInits.add(missing);
                 }
+                // A GLOBAL record/dict binding resolves member reads and
+                // whole-dict prints like a local: its per-key kinds, the
+                // record it nests and the class of a stored instance are
+                // tracked here. The tracking is snapshotted after this
+                // loop and re-applied to every function's scratch tables
+                // (a global is read from every function).
+                Node globalInit = null;
+                if (pg.childCount() > 0) { globalInit = pg.child(0); }
+                this.trackDictDecl(pg.name, pg.typeHint, globalInit);
+                if (globalInit != null) {
+                    string globalInitType = this.inferExprType(globalInit);
+                    bool globalInitIsClass = false;
+                    for (int ci = 0; ci < this.classNames.length; ci++) {
+                        if (this.classNames[ci] == globalInitType) { globalInitIsClass = true; }
+                    }
+                    if (globalInitIsClass && (pg.typeHint == "object" || pg.typeHint == "" || pg.typeHint == "var")) {
+                        this.recordObjectDynamicType(pg.name, globalInitType);
+                    }
+                }
             }
         }
+        // The global record/dict tracking is complete: snapshot it, so it
+        // can be re-applied to every function's scratch tables.
+        this.snapshotGlobalDictTracking();
         // Exception-state globals of the cooperative throw/catch model
         // (__exc_active flag + __exc_value object slot + __exc_rawstr
         // raw-string marker): three writable slots registered after user
@@ -4169,6 +4222,60 @@ int strIdx = this.stringPatchIndices[i];
         while (this.aliasVarNames.length > 0) { this.aliasVarNames.pop(); }
         while (this.fnPtrParamNames.length > 0) { this.fnPtrParamNames.pop(); }
         while (this.declaredLocalNames.length > 0) { this.declaredLocalNames.pop(); }
+        // The GLOBAL record/dict tracking is live again: a global record
+        // is read from every function, so its per-key kinds, the record
+        // it nests and the class of a stored instance must be in the
+        // scratch tables of each of them.
+        this.applyGlobalDictTracking();
+    }
+
+    // Snapshot the global record/dict tracking into the global tables.
+    // Called once, after every global declaration has been tracked: the
+    // scratch tables are cleared per function, so the global entries are
+    // copied out and re-applied (see applyGlobalDictTracking).
+    public void snapshotGlobalDictTracking() {
+        this.globalDictValueNames = this.dictValueNames.slice(0, this.dictValueNames.length);
+        this.globalDictValueKinds = this.dictValueKinds.slice(0, this.dictValueKinds.length);
+        this.globalDictValueVerdicts = this.dictValueVerdicts.slice(0, this.dictValueVerdicts.length);
+        this.globalDictFieldVars = this.dictFieldVars.slice(0, this.dictFieldVars.length);
+        this.globalDictFieldKeys = this.dictFieldKeys.slice(0, this.dictFieldKeys.length);
+        this.globalDictFieldKinds = this.dictFieldKinds.slice(0, this.dictFieldKinds.length);
+        this.globalDictFieldClassVars = this.dictFieldClassVars.slice(0, this.dictFieldClassVars.length);
+        this.globalDictFieldClassKeys = this.dictFieldClassKeys.slice(0, this.dictFieldClassKeys.length);
+        this.globalDictFieldClassNames = this.dictFieldClassNames.slice(0, this.dictFieldClassNames.length);
+        this.globalDictNestedVars = this.dictNestedVars.slice(0, this.dictNestedVars.length);
+        this.globalDictNestedKeys = this.dictNestedKeys.slice(0, this.dictNestedKeys.length);
+        this.globalDictNestedNames = this.dictNestedNames.slice(0, this.dictNestedNames.length);
+        this.globalObjectVars = this.objectVars.slice(0, this.objectVars.length);
+    }
+
+    // Re-apply the global record/dict tracking to the scratch tables.
+    // Plain appends: the tables were popped, so their backing store is
+    // reused and nothing is allocated per function.
+    public void applyGlobalDictTracking() {
+        for (int i = 0; i < this.globalDictValueNames.length; i++) {
+            this.dictValueNames.add(this.globalDictValueNames[i]);
+            this.dictValueKinds.add(this.globalDictValueKinds[i]);
+            this.dictValueVerdicts.add(this.globalDictValueVerdicts[i]);
+        }
+        for (int i = 0; i < this.globalDictFieldVars.length; i++) {
+            this.dictFieldVars.add(this.globalDictFieldVars[i]);
+            this.dictFieldKeys.add(this.globalDictFieldKeys[i]);
+            this.dictFieldKinds.add(this.globalDictFieldKinds[i]);
+        }
+        for (int i = 0; i < this.globalDictFieldClassVars.length; i++) {
+            this.dictFieldClassVars.add(this.globalDictFieldClassVars[i]);
+            this.dictFieldClassKeys.add(this.globalDictFieldClassKeys[i]);
+            this.dictFieldClassNames.add(this.globalDictFieldClassNames[i]);
+        }
+        for (int i = 0; i < this.globalDictNestedVars.length; i++) {
+            this.dictNestedVars.add(this.globalDictNestedVars[i]);
+            this.dictNestedKeys.add(this.globalDictNestedKeys[i]);
+            this.dictNestedNames.add(this.globalDictNestedNames[i]);
+        }
+        for (int i = 0; i < this.globalObjectVars.length; i++) {
+            this.objectVars.add(this.globalObjectVars[i]);
+        }
     }
     public void emitMethod(Node func, string className) {
     this.currentFunctionName = func.name;
@@ -6810,7 +6917,11 @@ int strIdx = this.stringPatchIndices[i];
         // lookup, mirroring `dict["key"]` (genDictIndexGet). Without this,
         // unknown-typed receivers fell through to the struct field path,
         // which emitted nothing, and reads came back stale registers.
-        if (fieldName != "length" && (this.isDictOrObjectType(this.inferExprType(obj)) || this.isDynValueRoot(obj))) {
+        // A record entry that holds a CLASS INSTANCE is not a record at
+        // all: the read binds the class's field offsets, so it must not
+        // take the dict path (the entry table has no such key and the
+        // read found nothing).
+        if (fieldName != "length" && this.recordEntryClass(obj) == "" && (this.isDictOrObjectType(this.inferExprType(obj)) || this.isDynValueRoot(obj))) {
             Node idxNode = new Node();
             idxNode.kind = 24;
             idxNode.children.add(obj);
@@ -6950,6 +7061,11 @@ int strIdx = this.stringPatchIndices[i];
         if (obj.kind == 13) {
             this.genMemberAccess(obj);
             string objType = this.inferMemberAccessType(obj);
+            // A record entry that holds a CLASS INSTANCE: the entry's
+            // class binds the field's slot (the receiver's own inferred
+            // type is the record type, which has no field layout).
+            string entryCls = this.recordEntryClass(obj);
+            if (entryCls != "") { objType = entryCls; }
             int fieldOff = this.findFieldOffset(objType, fieldName);
             if (fieldOff < 0) {
                 fieldOff = this.findFieldOffsetInAllClasses(fieldName);
@@ -7534,6 +7650,24 @@ int strIdx = this.stringPatchIndices[i];
                     }
                 }
             }
+        }
+        // A record entry that holds a CLASS INSTANCE: the member is the
+        // CLASS's field, so the class's own field type decides (the
+        // receiver's inferred type is the record type, which carries no
+        // field layout).
+        string entryCls = this.recordEntryClass(obj);
+        if (entryCls != "") {
+            string entryFieldType = this.findFieldType(entryCls, fieldName);
+            if (entryFieldType != "") { return entryFieldType; }
+        }
+        // A dict/object member read (`d.key`, `o.key`): the per-key kind
+        // is the member's own type when the receiver is a record. Without
+        // this the member typed as the record type, so a string member's
+        // method call (`rec.user.toString()`) did not resolve and the call
+        // answered null instead of the text.
+        if (this.isDictReadReceiver(obj)) {
+            string perKeyKind = this.dictReadKind(obj, fieldName);
+            if (perKeyKind == "string") { return "string"; }
         }
         string objType = this.inferExprType(obj);
         // Object/dict receivers: any member of a dict-valued object is an
@@ -18655,6 +18789,16 @@ public void genNewCall(Node call) {
             return t == "string";
         }
         if (expr.kind == 13) {
+            // A record entry that holds a CLASS INSTANCE reads the
+            // class's field, not a dict key: the class's own field type
+            // decides (the same answer the class-receiver arm gives for
+            // a statically typed receiver).
+            if (expr.childCount() > 0) {
+                string entryCls = this.recordEntryClass(expr.child(0));
+                if (entryCls != "") {
+                    return this.findFieldType(entryCls, expr.name) == "string";
+                }
+            }
             // Dict/object member reads (`d.key`, `o.key`): per-key kind
             // first, then the whole-dict kind; string only when "string"
             // (never %s on unknown — it would dereference a non-pointer).
@@ -19986,9 +20130,39 @@ public void genNewCall(Node call) {
                 if (keyNode.kind == 2) { keyText = keyNode.strVal; }
                 else if (keyNode.kind == 6) { keyText = keyNode.name; }
                 else { continue; }
-                this.trackDictKey(name, keyText, this.classifyDictValue(pair.child(1)));
+                Node entryValue = pair.child(1);
+                this.trackDictKey(name, keyText, this.classifyDictValue(entryValue));
+                // What the entry HOLDS is tracked too, so a read through
+                // a chain (`outer.data.user`) resolves to the layout the
+                // entry really holds:
+                //   - a nested RECORD: the variable it is held in, so the
+                //     read through the entry finds that record's own
+                //     entries (without it the value printed as an
+                //     address instead of as its text);
+                //   - a CLASS INSTANCE: the class whose field offsets a
+                //     read through the entry must bind (without it the
+                //     read looked the field up in the record's entry
+                //     table, where it does not exist).
+                string nestedName = "";
+                if (this.holdsDictValue(entryValue)) { nestedName = entryValue.name; }
+                this.trackDictKeyNested(name, keyText, nestedName);
+                this.trackDictKeyClass(name, keyText, this.classOfExpr(entryValue));
             }
         }
+    }
+
+    // The class a record ENTRY holds (`outer.data` where `data` holds a
+    // `payload` instance), when the compiler knows it. A read through
+    // such an entry binds the class's field offsets; without this the
+    // read looked the field up in the record's entry table and found
+    // nothing. Mirrors silverc-rs record_entry_class.
+    public string recordEntryClass(Node expr) {
+        if (expr == null) { return ""; }
+        if (expr.kind != 13) { return ""; }
+        if (expr.childCount() < 1) { return ""; }
+        string owner = this.dictVarOf(expr.child(0));
+        if (owner == "") { return ""; }
+        return this.dictKeyClassOf(owner, expr.name);
     }
 
     // Refresh print kinds after a keyed dict write so a stale "string"

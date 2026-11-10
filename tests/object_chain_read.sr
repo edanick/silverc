@@ -1,0 +1,56 @@
+// A member read through a CHAIN of records must find the entry.
+//
+// `object` is the record type (SPEC 6.5). A record reached through
+// another record (`outer.data.user`) used to read the wrong slot: the
+// chain fell through to the struct-field lowering, so the read answered
+// an address -- or, for a class instance, nothing at all -- instead of
+// the entry's value.
+//
+// The shapes covered here:
+//   - a RECORD held by a record (`outer.data` holds the record `inner`);
+//   - a CLASS INSTANCE held by a record (`outer.data` holds a `payload`)
+//     read through the chain: the read binds the class's field offsets;
+//   - the same two shapes with the records bound as globals.
+class payload {
+    public string user;
+
+    construct(string user) {
+        this.user = user;
+    }
+}
+
+object globalInner = { user: "dee" };
+object globalOuter = { data: globalInner };
+object globalData = new payload("eve");
+object globalHolder = { data: globalData };
+
+void check(bool ok, string label) {
+    if (!ok) {
+        printline("FAIL " + label);
+        exit(1);
+    }
+}
+
+void main() {
+    // A record in a record: the chain finds the entry.
+    object inner = { user: "bob" };
+    object outer = { data: inner };
+    check(outer.data.user == "bob", "record in record");
+    check(outer.data.user.toString() == "bob", "record in record text");
+
+    // A class instance in a record: the chain binds the class's fields.
+    object data = new payload("ann");
+    object holder = { data: data };
+    check(holder.data.user == "ann", "class in record");
+    check(holder.data.user.toString() == "ann", "class in record text");
+
+    // The instance built in place.
+    object direct = { data: new payload("cid") };
+    check(direct.data.user == "cid", "class in record direct");
+
+    // The same two shapes as globals.
+    check(globalOuter.data.user == "dee", "global record in record");
+    check(globalHolder.data.user == "eve", "global class in record");
+
+    printline("ok");
+}
