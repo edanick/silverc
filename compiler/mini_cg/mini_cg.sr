@@ -2592,6 +2592,67 @@ class MiniCg {
         this.asm.bindLabel(ok);
     }
 
+    // True when the receiver of an index expression is a STRING: the
+    // element is then a BYTE at base+index, bounded by the string's own
+    // length, and not an eight byte cell at base+index*8.
+    public bool isStringIndexReceiver(Node arrNode) {
+        if (arrNode.kind == 6) {
+            return this.isStrideOneType(this.getLocalType(arrNode.name));
+        }
+        if (arrNode.kind == 13) {
+            Node arrObj = arrNode.child(0);
+            if (arrObj.kind == 6 && arrObj.name == "this") {
+                return this.isStrideOneType(this.findFieldType(this.currentClassName, arrNode.name));
+            }
+        }
+        return this.isStrideOneType(this.inferExprType(arrNode));
+    }
+
+    // The ONE bound for a string element access.
+    //
+    // RAX = string base, RCX = index (unscaled). A string element is a
+    // BYTE at base+index, and it is bounded by the string's OWN length: a
+    // string carries NO length header (its length is computed with
+    // strlen), so the [-8] word the array check reads means nothing for
+    // it. Throws IndexOutOfRangeException ("index out of range") when the
+    // index is negative or at/past the length of the string, so a string
+    // element is never read or written outside the string's bytes.
+    //
+    // RAX (the base) and RCX (the index) are unchanged on the normal
+    // path, so the caller computes the element address itself.
+    public void emitStringIndexBoundsCheck() {
+        int oob = this.newLabel();
+        int ok = this.newLabel();
+        // The strlen call clobbers the volatile registers, so the base and
+        // the index are spilled to slots first.
+        int baseOff = this.allocLocal("__strbound_base");
+        int idxOff = this.allocLocal("__strbound_i");
+        this.asm.movMBaseR(5, 0, baseOff);
+        this.asm.movMBaseR(5, 1, idxOff);
+        this.asm.movRMBase(1, 5, baseOff);
+        this.addImportPatch("ucrtbase.dll", "strlen");
+        int sStrBoundLen = 0xDEADBEEFCAFEBAC5;
+        this.asm.emitImm64(0, sStrBoundLen);
+        this.asm.movRMBase(0, 0, 0);
+        this.asm.emitCallSetup(0);
+        this.asm.callR64(0);
+        this.asm.emitCallTeardown();
+        // RAX = the length of the string; the index must be below it and
+        // must not be negative.
+        this.asm.movRR64(2, 0);
+        this.asm.movRMBase(1, 5, idxOff);
+        this.asm.cmpRR64(1, 2);
+        this.asm.jgeLabel(oob);
+        this.asm.cmpRI32(1, 0);
+        this.asm.jlLabel(oob);
+        this.asm.jmpLabel(ok);
+        this.asm.bindLabel(oob);
+        this.emitThrowException("index out of range");
+        this.asm.bindLabel(ok);
+        this.asm.movRMBase(0, 5, baseOff);
+        this.asm.movRMBase(1, 5, idxOff);
+    }
+
     public void emitExcCheck() {
         // After a user-function call, branch to the nearest handler (or unwind
         // via the return label) when the exception flag is set. Uses RCX as
@@ -7847,6 +7908,14 @@ int strIdx = this.stringPatchIndices[i];
                     }
                     this.asm.movRR64(11, 0);
                     this.asm.popR64(0);
+                    if (fieldType == "string") {
+                        // A string element is bounded by the string's OWN
+                        // length: a string carries no length header, so the
+                        // [-8] word the array check reads means nothing for
+                        // it.
+                        this.asm.movRR64(1, 11);
+                        this.emitStringIndexBoundsCheck();
+                    }
                     this.asm.addRR64(0, 11);
                     if (fieldType == "string") {
                         this.asm.movzxByteMBase(0, 0, 0);
@@ -7874,6 +7943,14 @@ int strIdx = this.stringPatchIndices[i];
                     }
                     this.asm.movRR64(11, 0);
                     this.asm.popR64(0);
+                    if (fieldType == "string") {
+                        // A string element is bounded by the string's OWN
+                        // length: a string carries no length header, so the
+                        // [-8] word the array check reads means nothing for
+                        // it.
+                        this.asm.movRR64(1, 11);
+                        this.emitStringIndexBoundsCheck();
+                    }
                     this.asm.addRR64(0, 11);
                     if (fieldType == "string") {
                         this.asm.movzxByteMBase(0, 0, 0);
@@ -7930,6 +8007,10 @@ int strIdx = this.stringPatchIndices[i];
                 this.asm.addRR64(0, 1);
                 this.asm.movRMBase(0, 0, 0);
             } else {
+                // A string element is bounded by the string's OWN length:
+                // a string carries no length header, so the [-8] word the
+                // array check reads means nothing for it.
+                this.emitStringIndexBoundsCheck();
                 this.asm.addRR64(0, 1);
                 this.asm.movzxByteMBase(0, 0, 0);
             }
@@ -7945,6 +8026,10 @@ int strIdx = this.stringPatchIndices[i];
                 this.asm.addRR64(0, 1);
                 this.asm.movRMBase(0, 0, 0);
             } else {
+                // A string element is bounded by the string's OWN length:
+                // a string carries no length header, so the [-8] word the
+                // array check reads means nothing for it.
+                this.emitStringIndexBoundsCheck();
                 this.asm.addRR64(0, 1);
                 this.asm.movzxByteMBase(0, 0, 0);
             }
@@ -17484,6 +17569,13 @@ int strIdx = this.stringPatchIndices[i];
                 this.genExpr(idxNode);
                 this.asm.movRR64(11, 0);
                 this.asm.popR64(0);
+                // A string element is bounded by the string's OWN length:
+                // a string carries no length header, so the [-8] word the
+                // array check reads means nothing for it. The compound
+                // store reads AND writes the element, so an index past the
+                // end is refused, not read and written.
+                this.asm.movRR64(1, 11);
+                this.emitStringIndexBoundsCheck();
                 this.asm.addRR64(0, 11);
                 this.asm.pushR64(0);
                 this.asm.movzxByteMBase(0, 0, 0);
@@ -18228,17 +18320,22 @@ int strIdx = this.stringPatchIndices[i];
                     // A store past the end of the array is refused, not
                     // written through: the index is checked against the
                     // length (at [base-8]) before the element address is
-                    // computed. A string's length is NOT stored in front
-                    // of its bytes (it is computed with strlen), so only
-                    // an ARRAY element is checked -- exactly what the
-                    // READ path checks.
+                    // computed.
                     this.asm.movRR64(1, 0);
                     this.asm.movRR64(0, 11);
                     this.emitIndexBoundsCheck();
                     this.asm.shlR64Imm(1, 3);
                     this.asm.addRR64(11, 1);
                 } else {
-                    this.asm.addRR64(11, 0);
+                    // A string element is bounded by the string's OWN
+                    // length: a string's length is NOT stored in front of
+                    // its bytes (it is computed with strlen), so the [-8]
+                    // word means nothing for it. A store past the end of
+                    // the string is refused, not written through.
+                    this.asm.movRR64(1, 0);
+                    this.asm.movRR64(0, 11);
+                    this.emitStringIndexBoundsCheck();
+                    this.asm.addRR64(11, 1);
                 }
                 if (arrIsStrideOne) {
                     this.asm.movMBaseByteR(11, 12, 0);
@@ -18262,12 +18359,16 @@ int strIdx = this.stringPatchIndices[i];
                     // A store past the end of the array is refused, not
                     // written through: the index is checked against the
                     // length (at [base-8]) before the element address is
-                    // computed. A string's length is NOT stored in front
-                    // of its bytes (it is computed with strlen), so only
-                    // an ARRAY element is checked -- exactly what the
-                    // READ path checks.
+                    // computed.
                     this.emitIndexBoundsCheck();
                     this.asm.shlR64Imm(1, 3);
+                } else {
+                    // A string element is bounded by the string's OWN
+                    // length: a string's length is NOT stored in front of
+                    // its bytes (it is computed with strlen), so the [-8]
+                    // word means nothing for it. A store past the end of
+                    // the string is refused, not written through.
+                    this.emitStringIndexBoundsCheck();
                 }
                 this.asm.addRR64(0, 1);
                 this.asm.pushR64(0);
@@ -18488,6 +18589,36 @@ int strIdx = this.stringPatchIndices[i];
             string idxTmpName = "__coal_idx";
             int idxOff = this.allocLocal(idxTmpName);
             this.asm.movMBaseR(5, 0, idxOff);
+            if (this.isStringIndexReceiver(arrNode)) {
+                // A string element is a BYTE at base+index, bounded by the
+                // string's OWN length (a string carries no length header):
+                // the element is read as a byte, and the coalescing store
+                // writes it when the byte is the NUL byte -- the same
+                // "write only when the element is empty" rule the array
+                // coalescing store follows.
+                this.asm.movRMBase(0, 5, arrOff);
+                this.asm.movRMBase(1, 5, idxOff);
+                this.emitStringIndexBoundsCheck();
+                this.asm.addRR64(0, 1);
+                this.asm.movzxByteMBase(0, 0, 0);
+                this.asm.cmpRI32(0, 0);
+                int strDoAssign = this.newLabel();
+                int strDone = this.newLabel();
+                this.asm.jeLabel(strDoAssign);
+                this.asm.jmpLabel(strDone);
+                this.asm.bindLabel(strDoAssign);
+                this.asm.movRMBase(0, 5, arrOff);
+                this.asm.movRMBase(1, 5, idxOff);
+                this.asm.addRR64(0, 1);
+                this.asm.pushR64(0);
+                this.genExpr(rhs);
+                this.asm.movRR64(1, 0);
+                this.asm.popR64(0);
+                this.asm.movMBaseByteR(0, 1, 0);
+                this.asm.movRR64(0, 1);
+                this.asm.bindLabel(strDone);
+                return;
+            }
             this.asm.movRMBase(0, 5, arrOff);
             this.asm.movRMBase(1, 5, idxOff);
             this.emitIndexBoundsCheck();
