@@ -236,6 +236,13 @@ class MiniCg {
     // else renders decimal (a %s on a non-pointer crashes).
     public prop string[] dictValueNames;
     public prop string[] dictValueKinds;
+    // "1" when the recorded whole-dict kind is a real verdict (the
+    // declaration's own literal or its declared `dict<K,V>` value type),
+    // "0" when the binding's runtime kind is simply unknown (it was bound
+    // from a call or from another binding).  Mirrors silverc-rs's
+    // distinction between a recorded per-variable entry and a record read
+    // through a binding the compiler could not classify.
+    public prop string[] dictValueVerdicts;
     // Per-key print kinds ("var" + "key" triples) for heterogeneous
     // records, mirroring silverc-rs dict_field_types.
     public prop string[] dictFieldVars;
@@ -524,6 +531,7 @@ class MiniCg {
         this.localTypes = [];
         this.dictValueNames = [];
         this.dictValueKinds = [];
+        this.dictValueVerdicts = [];
         this.dictFieldVars = [];
         this.dictFieldKeys = [];
         this.dictFieldKinds = [];
@@ -4106,6 +4114,7 @@ int strIdx = this.stringPatchIndices[i];
         while (this.localTypes.length > 0) { this.localTypes.pop(); }
         while (this.dictValueNames.length > 0) { this.dictValueNames.pop(); }
         while (this.dictValueKinds.length > 0) { this.dictValueKinds.pop(); }
+        while (this.dictValueVerdicts.length > 0) { this.dictValueVerdicts.pop(); }
         while (this.dictFieldVars.length > 0) { this.dictFieldVars.pop(); }
         while (this.dictFieldKeys.length > 0) { this.dictFieldKeys.pop(); }
         while (this.dictFieldKinds.length > 0) { this.dictFieldKinds.pop(); }
@@ -5272,6 +5281,16 @@ int strIdx = this.stringPatchIndices[i];
         // prints behave like dicts. Without this the fields were skipped
         // and reads came back uninitialized malloc memory.
         if (typeName == "object" || typeName == "object?" || typeName == "" || typeName == "var") {
+            this.genStructLiteralAsDict(expr);
+            return;
+        }
+        // A `dict<K,V>` type hint names the RECORD type (SPEC 6.5): the
+        // literal is a dict, not a class instance.  Before this the
+        // literal fell through to the struct-field lowering below, which
+        // found no class of that name, allocated an empty block and
+        // stored no field at all -- so every read through the binding
+        // (`data.user`, `data["user"]`) answered nothing.
+        if (this.isDictType(typeName)) {
             this.genStructLiteralAsDict(expr);
             return;
         }
@@ -6984,6 +7003,13 @@ int strIdx = this.stringPatchIndices[i];
                 if (cname == "toString" && this.isScalarValueType(recvType)) { return "string"; }
                 if ((cname == "toFloat" || cname == "toFloat64") && this.isScalarValueType(recvType)) { return "float64"; }
                 if (cname == "toString" && (recvType == "string" || recvType == "char" || recvType == "int" || recvType == "int32" || recvType == "int64" || recvType == "uint" || recvType == "uint64" || recvType == "bool" || recvType == "float64")) {
+                    return "string";
+                }
+                // A whole object record / plain dict renders as `{...}` /
+                // `dict{...}`: its `.toString()` answers that text, so the
+                // call types as a string (mirrors silverc-rs
+                // whole_dict_render).
+                if (cname == "toString" && this.isWholeDictRecord(expr.child(0))) {
                     return "string";
                 }
                 if ((cname == "trim" || cname == "trimEnd" || cname == "trimStart" || cname == "trimLeft" || cname == "trimRight") && recvType == "string") {
@@ -13698,6 +13724,14 @@ public void genNewCall(Node call) {
             if (recvType == "string" || recvType == "char" || recvType == "int" || recvType == "int32" || recvType == "int64" || recvType == "uint" || recvType == "uint64" || recvType == "bool" || recvType == "float64") {
                 return true;
             }
+            // A whole object record / plain dict has no scalar text of its
+            // own: the fallback formats its POINTER with %lld and prints
+            // an address. Render the same whole-value text `print` uses,
+            // as a plain string constant (mirrors silverc-rs
+            // whole_dict_render). A record read through a CHAIN
+            // (`bus.currentEvent.data`) is a whole record too: the field's
+            // declared type decides.
+            if (this.isWholeDictRecord(call.child(0))) { return true; }
         }
         // Primitive no-op casts: toInt/toInt64/toNumber on integral/char/bool
 
@@ -13735,6 +13769,18 @@ public void genNewCall(Node call) {
         string name = call.name;
         string recvType = this.inferExprType(recv);
         if (name == "toString") {
+            if (this.isWholeDictRecord(recv)) {
+                // The whole-value text of a record: `{...}` for an object
+                // record, `dict{...}` for a plain dict.
+                string wholeText = "dict{...}";
+                if (this.isObjectValue(recv)) { wholeText = "{...}"; }
+                int wholeIdx = this.addString(wholeText);
+                int wholeSp = this.asm.buf.length;
+                this.asm.emitImm64(0, 0);
+                this.stringPatchOffsets.add(wholeSp + 2);
+                this.stringPatchIndices.add(wholeIdx);
+                return;
+            }
             if (recvType == "string") {
                 this.genExpr(recv);
             } else if (this.isCharExpr(recv)) {
@@ -19288,7 +19334,21 @@ public void genNewCall(Node call) {
             // drops them, so the tracked whole entry stands in. Without
             // this, `object mix2 = {k: 9}` next to `{k: "str"}` would
             // format the int as %s and crash.
+            //
+            // A binding with NO verdict of its own (an `object`-typed
+            // binding whose runtime kind the compiler could not
+            // determine — it was bound from a call or from another
+            // binding) is the mirror of silverc-rs
+            // is_object_holder_expr: `object` means the RECORD type
+            // (SPEC 6.5), so the read finds the record's entry and its
+            // print kind comes from the unit-wide literal registry.
             if (this.dictVarIsTracked(varName)) {
+                if (this.dictWholeHasVerdict(varName)) {
+                    return this.dictWholeKindOf(varName);
+                }
+                if (key != "" && this.isObjectValue(recv)) {
+                    return this.objectKeyKindOf(key);
+                }
                 return this.dictWholeKindOf(varName);
             }
             string wk = this.dictWholeKindOf(varName);
@@ -19368,22 +19428,51 @@ public void genNewCall(Node call) {
     // Record a variable's whole-dict kind (upsert, "" included so an
     // invalidated kind keeps overriding the declared fallback).
     public void trackDictVar(string name, string kind) {
+        this.trackDictVarVerdict(name, kind, "1");
+    }
+
+    // Record a variable's whole-dict kind TOGETHER WITH the verdict flag:
+    // "1" when the kind is a real verdict (the declaration's own literal
+    // or its declared `dict<K,V>` value type), "0" when the binding's
+    // runtime kind is simply UNKNOWN (it was bound from a call or from
+    // another binding).  The flag matters for the print kind: a binding
+    // with no verdict of its own takes the unit-wide literal registry
+    // (silverc-rs object_record_key_kind), while a binding whose verdict
+    // is the explicit "" keeps it -- formatting that value as %s would
+    // dereference a non-pointer.
+    public void trackDictVarVerdict(string name, string kind, string verdict) {
         this.dropDictVar(name);
         this.dictValueNames.add(name);
         this.dictValueKinds.add(kind);
+        this.dictValueVerdicts.add(verdict);
+    }
+
+    // True when the variable's recorded whole-dict kind is a real verdict
+    // (the kind itself may be "" -- the entry's existence is what counts).
+    public bool dictWholeHasVerdict(string name) {
+        for (int i = 0; i < this.dictValueNames.length; i++) {
+            if (this.dictValueNames[i] == name) {
+                if (i < this.dictValueVerdicts.length) { return this.dictValueVerdicts[i] == "1"; }
+                return true;
+            }
+        }
+        return false;
     }
 
     public void dropDictVar(string name) {
         string[] nn = [];
         string[] nk = [];
+        string[] nv = [];
         for (int i = 0; i < this.dictValueNames.length; i++) {
             if (this.dictValueNames[i] != name) {
                 nn.add(this.dictValueNames[i]);
                 nk.add(this.dictValueKinds[i]);
+                nv.add(i < this.dictValueVerdicts.length ? this.dictValueVerdicts[i] : "1");
             }
         }
         this.dictValueNames = nn;
         this.dictValueKinds = nk;
+        this.dictValueVerdicts = nv;
     }
 
     // Record one per-key kind (upsert; "" drops the entry).
@@ -19643,9 +19732,18 @@ public void genNewCall(Node call) {
         if (hasInit && initNode.kind == 74) { initIsObj = true; }
         if (!isDict && !isObj && !(isUntyped && (initIsDict || initIsObj))) { return; }
         string kind = "";
+        // The verdict flag: "1" when the kind below is a real verdict
+        // (the declaration's own literal, or the declared `dict<K,V>`
+        // value type), "0" when the binding's runtime kind is simply
+        // UNKNOWN -- it was bound from a call or from another binding.
+        // `object` means the RECORD type (SPEC 6.5), so such a binding is
+        // read as a record; its print kind comes from the unit-wide
+        // literal registry (silverc-rs object_record_key_kind).
+        string verdict = "1";
         if (isDict) { kind = this.dictDeclKind(typeHint); }
         else if (initIsDict || initIsObj) { kind = this.dictInitKind(initNode); }
-        this.trackDictVar(name, kind);
+        else { verdict = "0"; }
+        this.trackDictVarVerdict(name, kind, verdict);
         bool isObjVal = false;
         if (isObj && !initIsDict) { isObjVal = true; }
         if (isUntyped && initIsObj) { isObjVal = true; }
@@ -19688,7 +19786,15 @@ public void genNewCall(Node call) {
             string t = this.getLocalType(name);
             if (this.isDictType(t)) { whole = this.dictDeclKind(t); }
         }
-        if (whole != rhsKind) { this.trackDictVar(name, ""); }
+        if (whole != rhsKind) {
+            // Keep the binding's verdict flag: a binding whose runtime
+            // kind the compiler could not determine stays unclassified
+            // (the unit-wide literal registry decides its print kind),
+            // while a binding with a verdict of its own keeps it.
+            string v = "1";
+            if (this.dictVarIsTracked(name) && !this.dictWholeHasVerdict(name)) { v = "0"; }
+            this.trackDictVarVerdict(name, "", v);
+        }
     }
 
     // True when the expression evaluates to an object record value
@@ -19711,6 +19817,17 @@ public void genNewCall(Node call) {
             return ft == "object" || ft == "object?";
         }
         return false;
+    }
+
+    // True when the expression evaluates to a whole dict/object RECORD
+    // (not a class instance): the value `print` renders as `{...}` /
+    // `dict{...}` and whose `.toString()` answers the same text. A
+    // binding that holds a CLASS INSTANCE keeps the class: its
+    // `.toString()` is the class's own method.
+    public bool isWholeDictRecord(Node expr) {
+        if (!this.isWholeDict(expr)) { return false; }
+        if (expr.kind == 6 && this.objectDynamicTypeOf(expr.name) != "") { return false; }
+        return true;
     }
 
     // True when the expression evaluates to a whole dict/object value

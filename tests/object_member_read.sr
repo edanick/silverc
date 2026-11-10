@@ -1,0 +1,82 @@
+// A member read through an `object`-typed value must find the RECORD's
+// entry.
+//
+// `object` is the record type (SPEC 6.5). A binding whose runtime kind the
+// compiler cannot determine -- it was bound from a call -- used to fall
+// through to struct-field lowering on a member read: the compiler read the
+// record's header word as a value pointer, so the read crashed (or printed
+// the address) instead of answering the entry's value.
+//
+// The shapes covered here: a record literal, a record returned by a
+// function, a class instance in an `object` holder (that one keeps the
+// class's field offsets), and a record carried by an `object`-typed class
+// field. Self-hosted-suite mirror of
+// silverc-rs/tests/suite/object_member_read.sr.
+
+class note {
+    public string name;
+    public object data;
+
+    construct(string name, object data) {
+        this.name = name;
+        this.data = data;
+    }
+}
+
+class holder {
+    public string label;
+
+    construct(string label) {
+        this.label = label;
+    }
+}
+
+class localbus {
+    public note currentEvent;
+
+    public void emit(string name, object data) {
+        this.currentEvent = new note(name, data);
+    }
+}
+
+object makeRecord() {
+    return {user: "Zed", ip: "1.2.3.4"};
+}
+
+void main() {
+    // A record literal in an `object` holder.
+    object literal = {user: "Alice"};
+    if (literal.user != "Alice") { exit(1); }
+
+    // A record returned by a function: the member read must find the entry
+    // (this read used to crash).
+    object returned = makeRecord();
+    if (returned.user != "Zed") { exit(2); }
+    if (returned.ip != "1.2.3.4") { exit(3); }
+
+    // A class instance in an `object` holder keeps the class's fields.
+    holder h = new holder("box");
+    object instance = h;
+    if (instance.label != "box") { exit(4); }
+
+    // A record carried by an `object`-typed class field.
+    note n = new note("n", {user: "Bob"});
+    if (n.data.user != "Bob") { exit(5); }
+
+    // The same field read through a CHAIN (`bus.currentEvent.data`):
+    // the record's member answers the entry, and the record itself
+    // renders as a record -- it used to render its ADDRESS.
+    localbus bus = new localbus();
+    bus.emit("user.login", {user: "Carol"});
+    if (bus.currentEvent.data.user != "Carol") { exit(6); }
+    if (bus.currentEvent.data.toString() != "{...}") { exit(7); }
+
+    // A record in a `dict<string, object>` holder, read by index and by
+    // member: both answer the entry's value.
+    dict<string, object> data = {user: "Alice", ip: "1.2.3.4"};
+    object holder2 = data;
+    if (holder2["user"] != "Alice") { exit(8); }
+    if (holder2["ip"] != "1.2.3.4") { exit(9); }
+
+    printline("ok");
+}
