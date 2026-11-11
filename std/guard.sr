@@ -1262,9 +1262,31 @@ class MemoryGuard {
             // in any store form (plain, compound, inc/dec).
             this.checkMemberStore(lhs.child(0), lhs.name, lhs);
         } else {
+            // A store into a string LITERAL is refused: the literal is
+            // program constant data (the static string pool), and there is
+            // no binding here that could own a copy of its bytes, so the
+            // store would write into the program's constant data
+            // (INV-50).
+            if (lhs.kind == GND_INDEX && lhs.childCount() >= 2 && this.isStringLiteralNode(lhs.child(0))) {
+                this.fail("InvalidAssignment", lhs.line, lhs.col, "", "cannot store into a string literal: a literal is constant data");
+            }
             this.checkExpr(lhs);
         }
         return this.checkExpr(rhs);
+    }
+
+    // Is this expression a string LITERAL (kind 2), through parens? A
+    // literal is program constant data: every evaluation of the site names
+    // the same bytes, so a holder that takes one over owns a copy of them
+    // (INV-50).
+    private bool isStringLiteralNode(Node n) {
+        if (n == null) { return false; }
+        if (n.kind == GND_STRING_LIT) { return true; }
+        if (n.kind == GND_PAREN) {
+            if (n.childCount() == 0) { return false; }
+            return this.isStringLiteralNode(n.child(0));
+        }
+        return false;
     }
 
     private bool isPrimitive(string t) {

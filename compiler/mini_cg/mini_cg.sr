@@ -5066,6 +5066,15 @@ int strIdx = this.stringPatchIndices[i];
             // emitted no code and control fell through the statement.
             if (stmt.childCount() > 0) {
                 this.genExprAsType(stmt.child(0), this.currentReturnType);
+                // A string LITERAL is program constant data. Handing it back
+                // to the caller hands back the constant, so the caller would
+                // share it with every other evaluation of the site -- and a
+                // store into the caller's string would write into the
+                // program's constant data. The returned value is therefore
+                // a copy the caller owns (INV-50).
+                if (this.isStringLiteralNode(stmt.child(0)) && this.typeTakesString(this.currentReturnType)) {
+                    this.emitLlmaiStringDup();
+                }
             } else {
                 this.asm.xorRR64(0, 0);
             }
@@ -5751,6 +5760,35 @@ int strIdx = this.stringPatchIndices[i];
         this.arrayLitElemHint = "";
         this.genExprAsType(child, hint);
         this.arrayLitElemHint = saved2;
+        // A string LITERAL element is program constant data: the array
+        // slot that holds it is a holder, and a store into that slot's
+        // string would write into the constant (INV-50).
+        if (this.isStringLiteralNode(child) && this.typeTakesString(hint)) {
+            this.emitLlmaiStringDup();
+        }
+    }
+
+    // Does this type spelling hold a string? A literal is a string, so a
+    // slot that takes one is a holder: the literal must be copied into it
+    // (INV-50).
+    public bool typeTakesString(string t) {
+        if (t == "" || t == "var" || t == "string" || t == "string?") { return true; }
+        if (t == "object" || t == "object?") { return true; }
+        return false;
+    }
+
+    // Is this expression a string LITERAL (kind 2), through parens or a
+    // cast? A literal is program constant data: every evaluation of the
+    // site names the same bytes, so a holder that takes one over owns a
+    // copy of them (INV-50).
+    public bool isStringLiteralNode(Node n) {
+        if (n == null) { return false; }
+        if (n.kind == 2) { return true; }
+        if (n.kind == 23 || n.kind == 86) {
+            if (n.childCount() == 0) { return false; }
+            return this.isStringLiteralNode(n.child(0));
+        }
+        return false;
     }
 
     public void genExpr(Node expr) {
@@ -5812,6 +5850,13 @@ int strIdx = this.stringPatchIndices[i];
                 this.asm.movRMBase(1, 5, dictOff);
                 this.asm.movMBaseR(1, 0, 16 + di * 16);
                 this.genExpr(pair.child(1));
+                // A string LITERAL value is program constant data: the
+                // dict slot that holds it is a holder, and a store into
+                // that slot's string would write into the constant
+                // (INV-50).
+                if (this.isStringLiteralNode(pair.child(1))) {
+                    this.emitLlmaiStringDup();
+                }
                 this.asm.movRMBase(1, 5, dictOff);
                 this.asm.movMBaseR(1, 0, 24 + di * 16);
 
@@ -13558,6 +13603,14 @@ int strIdx = this.stringPatchIndices[i];
                     string paramType = "";
                     if (parameter < this.funcParamTypes.length) { paramType = this.funcParamTypes[parameter]; }
                     this.genExprAsType(argument, paramType);
+                    // A string LITERAL argument is program constant data. A
+                    // string parameter shares the bytes it is given (the
+                    // callee may store into them), so the callee would write
+                    // into the constant. The argument slot therefore holds a
+                    // copy of its own (INV-50).
+                    if (this.isStringLiteralNode(argument) && this.typeTakesString(paramType)) {
+                        this.emitLlmaiStringDup();
+                    }
                 } else {
                     this.asm.xorRR64(0, 0);
                 }
@@ -24461,11 +24514,26 @@ int strIdx = this.stringPatchIndices[i];
     // heap type. `destType` is "" or "var" for untyped destinations
     // (any kind copies). `allowClass` is false for field/element/dict
     // stores, where class values keep their instance identity.
+    //
+    // A string LITERAL is copied too: it is program CONSTANT data (the
+    // static string pool), not a fresh value -- every evaluation of the
+    // site names the same bytes. A holder that takes one over owns its
+    // own copy, so a store into that holder's string never writes into
+    // the program's constant data (INV-50).
     public void maybeCopyForAssign(Node rhs, string destType, bool allowClass) {
         Node r = rhs;
         while (r.kind == 23 || r.kind == 86) {
             if (r.childCount() == 0) { return; }
             r = r.child(0);
+        }
+        if (r.kind == 2) {
+            // A string literal: the copy is the string kind.
+            if (destType != "" && destType != "var") {
+                int destKind0 = this.copyKindForType(destType);
+                if (destKind0 != 1) { return; }
+            }
+            this.emitLlmaiStringDup();
+            return;
         }
         if (r.kind != 6 && r.kind != 13 && r.kind != 24) { return; }
         string rhsType = "";
