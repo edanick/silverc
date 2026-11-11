@@ -168,6 +168,13 @@ class MemoryGuard {
     private prop GuardVar[] vars;
     private prop int[] scopeEnds;
     private prop string[] globalNames;
+    // The declared types of the program-level bindings: parallel to
+    // globalNames, but only the bindings whose type is known are listed
+    // here (an untyped `var` global has no declared type). A program
+    // global is not a local, so the local scope cannot answer for it;
+    // this table is what makes a global's type judgeable.
+    private prop string[] globalTypeNames;
+    private prop string[] globalTypeHints;
     // The `shared` bindings among the globals (THREAD_SAFETY.md §3.4):
     // program-wide words every thread may read and write. A write to one
     // is a legal target (the store is one atomic word access).
@@ -243,6 +250,8 @@ class MemoryGuard {
         this.vars = [];
         this.scopeEnds = [];
         this.globalNames = [];
+        this.globalTypeNames = [];
+        this.globalTypeHints = [];
         this.sharedGlobalNames = [];
         this.nonNullNames = [];
         this.unwrapDepth = 0;
@@ -453,6 +462,25 @@ class MemoryGuard {
             if (this.globalNames[i] == name) { return true; }
         }
         return false;
+    }
+
+    // The declared type of a module-level binding (a global var or a
+    // global const), or "" when the name is not one or its type is
+    // unknown (an untyped `var` global, a C-style const). A module-level
+    // binding is not a local, so the local scope cannot answer for it —
+    // this table is what lets the indexable-receiver check judge a global
+    // receiver the same way it judges a local one.
+    private string globalTypeOf(string name) {
+        for (int i = 0; i < this.globalTypeNames.length; i++) {
+            if (this.globalTypeNames[i] == name) { return this.globalTypeHints[i]; }
+        }
+        return "";
+    }
+
+    // Record the declared type of a module-level binding.
+    private void noteGlobalType(string name, string typeHint) {
+        this.globalTypeNames.add(name);
+        this.globalTypeHints.add(typeHint);
     }
 
     // Is this global one of the `shared` bindings (THREAD_SAFETY.md
@@ -795,6 +823,56 @@ class MemoryGuard {
     private bool isNumericTypeName(string t) {
         return t == "int" || t == "int32" || t == "int64" || t == "uint" || t == "uint64"
             || t == "float" || t == "float64" || t == "double" || t == "byte";
+    }
+
+    // Is this type spelling a SCALAR (a value with no elements to
+    // address)? A nullable scalar is still a scalar: `int?` holds an int
+    // or null, and neither of them has elements, so the nullability is
+    // stripped and the inner type is what the diagnostic names.
+    private bool isScalarTypeName(string t) {
+        string base = t;
+        if (base.endsWith("?")) { base = this.gsSlice(base, 0, base.length - 1); }
+        return base == "int" || base == "int32" || base == "int64" || base == "uint"
+            || base == "uint64" || base == "float" || base == "float64" || base == "double"
+            || base == "bool" || base == "byte" || base == "char";
+    }
+
+    // The receiver type of an index expression, when the guard knows it: a
+    // local or parameter's declared type, a class field's declared type, a
+    // module-level binding's declared type, or a literal's type. Every
+    // other shape (a member read, a call result, an untyped `var`) is
+    // unknown and stays permissive.
+    private string indexReceiverType(Node e) {
+        if (e.kind == GND_IDENT) {
+            int idx = this.findVar(e.name);
+            if (idx >= 0) { return this.vars[idx].typeHint; }
+            return this.globalTypeOf(e.name);
+        }
+        if (e.kind == GND_PAREN) { return this.indexReceiverType(e.child(0)); }
+        if (e.kind == GND_UNARY) { return this.indexReceiverType(e.child(0)); }
+        return this.inferStaticType(e);
+    }
+
+    // Indexable-receiver check: an index expression addresses an element
+    // of a container -- an array, a string, a dict, an `object` record, a
+    // tuple. A receiver whose type is PROVABLY a scalar (int, float,
+    // bool, char, ...) has no elements to address: the index was lowered
+    // as an offset from a number, so the program read or wrote through a
+    // wild address instead of being refused.
+    //
+    // The receiver's type counts as proven only where the guard knows it:
+    // a local, a parameter, a class field, a module-level binding, or a
+    // literal. Everything else -- a member read, a call result, an
+    // untyped `var` -- stays permissive, because an unknown shape is not a
+    // proven scalar. A NAMED type (a class instance, a struct, a type
+    // alias) stays permissive too: the guard does not resolve aliases, so
+    // the name proves nothing.
+    private void checkIndexableReceiver(Node recv, Node at) {
+        string t = this.indexReceiverType(recv);
+        if (!this.isScalarTypeName(t)) { return; }
+        string base = t;
+        if (base.endsWith("?")) { base = this.gsSlice(base, 0, base.length - 1); }
+        this.fail("TypeMismatch", at.line, at.col, "", "expected an indexable value, found " + this.gArticle(this.typeDisplayName(base)));
     }
 
     // Assignability relations (type relations concept, restricted to Silver's
@@ -2402,6 +2480,9 @@ class MemoryGuard {
                     this.fail("TypeMismatch", n.line, n.col, "", "expected an int index, found " + this.gArticle(this.typeDisplayName(it)));
                 }
             }
+            // Indexable-receiver check: a scalar has no elements to
+            // address, so the index was a wild offset from a number.
+            this.checkIndexableReceiver(n.child(0), n);
             return 0;
         }
         if (k == GND_SLICE) {
@@ -2810,6 +2891,9 @@ class MemoryGuard {
             Node n = program[i];
             if (n.kind == GND_CONST) {
                 this.globalNames.add(n.name);
+                // A typed global const has a known type; a C-style const
+                // (`const NAME = "x";`) has none, and stays unknown.
+                if (n.typeHint.length > 0) { this.noteGlobalType(n.name, n.typeHint); }
             } else if (n.kind == GND_CLASS_DEF) {
                 this.typeNames.add(n.name);
                 // Class table (class-body flow checking + member-store
@@ -2823,6 +2907,9 @@ class MemoryGuard {
                 }
             } else if (n.kind == GND_VAR_DECL) {
                 this.globalNames.add(n.name);
+                // The declared type of a module-level binding (a `var`
+                // global has no declared type and stays unknown).
+                this.noteGlobalType(n.name, n.typeHint);
                 if (n.isShared) {
                     // A `shared` binding is a program-wide word every
                     // thread may read and write (THREAD_SAFETY.md §3.4).
