@@ -1,0 +1,69 @@
+// A string LITERAL is program constant data: its bytes live in the
+// program's own string pool and every evaluation of the site names the
+// same bytes.
+//
+// Silver strings are values (SPEC §9.2: assigning a value creates a
+// copy, and a string is copied), so a binding that takes a literal over
+// owns a COPY of its bytes. A store into that string therefore acts on
+// the binding's own copy and never on the constant: the literal another
+// reference sees is unchanged.
+//
+// Before the fix the compiled trees handed out a pointer into the
+// constant data, so the store wrote into the program's own data and a
+// later evaluation of the same literal site saw the change -- a shared
+// mutable constant.
+
+string lit() {
+    return "abc";
+}
+
+void mutate(string s) {
+    s[0] = 88;
+}
+
+void main() {
+    // A binding that takes a literal over owns its bytes: the store
+    // lands in the binding, and the copy another binding holds is
+    // untouched.
+    string a = "abc";
+    string b = a;
+    a[0] = 65;
+    if (b != "abc") {
+        printline("FAIL: the copy of the literal changed with the binding");
+        throw "the copy of the literal changed with the binding";
+    }
+    if (a != "Abc") {
+        printline("FAIL: the store did not land in the binding's own copy");
+        throw "the store did not land in the binding's own copy";
+    }
+
+    // The same literal SITE evaluated twice: the second evaluation must
+    // not see the store the first one made.
+    string c = lit();
+    c[0] = 66;
+    string d = lit();
+    if (d != "abc") {
+        printline("FAIL: a store into a literal reached the constant");
+        throw "a store into a literal reached the constant";
+    }
+
+    // A literal handed to a callee that stores into it: the callee's
+    // store must not reach the constant either.
+    mutate(lit());
+    if (lit() != "abc") {
+        printline("FAIL: a store through a callee reached the constant");
+        throw "a store through a callee reached the constant";
+    }
+
+    // Two bindings of one literal: the store through one of them leaves
+    // the other alone.
+    string e = "xyz";
+    string f = "xyz";
+    e[0] = 67;
+    if (f != "xyz") {
+        printline("FAIL: a store into one literal changed the other");
+        throw "a store into one literal changed the other";
+    }
+
+    printline("ok");
+}
