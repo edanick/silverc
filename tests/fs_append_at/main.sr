@@ -1,0 +1,57 @@
+// FS append-at fixture (C9 streamed-output enabler): pins the
+// `writeBytesAt(path, offset, data)` primitive in std/fs.sr — writes
+// at an offset WITHOUT truncating the file and WITHOUT reading it back,
+// creating the file when absent. Out-of-order chunks assemble
+// byte-exactly including a sparse zero gap, a middle overwrite leaves
+// the bytes outside the write radius untouched, a negative offset is
+// a no-op (size unchanged), and an empty write at EOF only extends
+// nothing (size unchanged). Uses the bare imported name: the `file.*`
+// builtin table does not know writeBytesAt yet (mini_cg/parser
+// registration is the follow-up), so the member form is deliberately
+// not exercised here. It must print exactly `fs-append-at-ok N`.
+import * from fs;
+
+void main() {
+    int checks = 0;
+    string p = "tests/output/fs_append_at.bin";
+    if (file.exists(p)) { file.delete(p); }
+    checks++;
+    writeBytesAt(p, 0, [65, 65, 65, 65]);
+    checks++;
+    writeBytesAt(p, 20, [67, 67, 67, 67]);
+    checks++;
+    writeBytesAt(p, 4, [66, 66, 66, 66]);
+    checks++;
+    if (file.size(p) != 24) { exit(1); }
+    checks++;
+    byte[] back = fs.read(p);
+    if (back.length != 24) { exit(1); }
+    checks++;
+    if (back[0] != 65 || back[3] != 65 || back[4] != 66 || back[7] != 66) { exit(1); }
+    checks++;
+    if (back[8] != 0 || back[15] != 0 || back[19] != 0) { exit(1); }
+    checks++;
+    if (back[20] != 67 || back[23] != 67) { exit(1); }
+    checks++;
+    writeBytesAt(p, 2, [122, 122]);
+    checks++;
+    byte[] mid = fs.read(p);
+    if (mid[0] != 65 || mid[1] != 65 || mid[2] != 122 || mid[3] != 122) { exit(1); }
+    checks++;
+    if (mid[4] != 66 || mid[23] != 67 || file.size(p) != 24) { exit(1); }
+    checks++;
+    writeBytesAt(p, -1, [88, 88]);
+    checks++;
+    if (file.size(p) != 24) { exit(1); }
+    checks++;
+    writeBytesAt(p, 24, []);
+    checks++;
+    if (file.size(p) != 24) { exit(1); }
+    checks++;
+    file.delete(p);
+    checks++;
+    if (file.exists(p)) { exit(1); }
+    checks++;
+    if (checks != 18) { exit(1); }
+    printline("fs-append-at-ok " + (string)checks);
+}

@@ -1,0 +1,30 @@
+pipeline-lex OK
+
+Final-phase checks (NOT run in the no-launch phase):
+1. Build+run with the self-host compiler (pipeline_lex_handoff.srp): output
+   must match the one line above byte-for-byte. The program lexes clean, so
+   the holder's errs is empty and the token stream is the lexer's untouched
+   — the valid-source path pins that the handoff changed nothing about
+   lexing.
+2. Negative mutations in scratch copies (never in the fixture itself):
+   a. Lex-diagnostic path: an unterminated string literal must fail with the
+      same lexical diagnostic ("you forgot to close your string quotes"),
+      byte-for-byte, before and after the fix. out.errs = lx.lexErrors
+      carries the exact strings in the exact order the lexer appended them,
+      and drvPrintDiagnostics walks them in order, so the grouped output and
+      the exit(1) path are unchanged. A scratch mutation that instead copies
+      element by element (out.errs.add(...) loop) must produce the same
+      bytes — proving the move, not a re-encode. A scratch mutation that
+      drops or reorders the assignment (out.errs = []) must lose or
+      misorder the diagnostic, proving the fixture would catch a dropped hand.
+   b. Many-error ordering: a source with more than a handful of lexical
+      diagnostics must print every one in lexer-append order. The old
+      bare-array-through-helper shape is the §2-rule-5 truncate shape; the
+      holder removes it, so this step pins the full intended list.
+3. Measurement: build this fixture with the self-host compiler before and
+   after the fix on the same host; the pre-fix lex holds the diagnostic
+   array twice (lexer original + grown destination + abandoned growth
+   intermediates) per lex, the post-fix lex holds each once. Peak RSS
+   after the fix drops by ~one full copy of the diagnostic array plus its
+   growth intermediates per lex (one driver lex here; visibility and the
+   cache tiers lex once per file). Compare /usr/bin/time -v before/after.

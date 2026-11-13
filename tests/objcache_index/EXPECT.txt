@@ -1,0 +1,26 @@
+objcache-index-ok
+
+Final-phase checks (NOT run in the no-launch phase):
+1. Build+run this fixture twice with the self-host compiler with
+   --cache-object: the first build populates the per-target object cache
+   (cold path: extractUnit + emitCoff strtab index + writeUnit), the
+   second (all-hit path: plan single-read + staged readUnit + linkUnits
+   definition index + finishRecords compare) must print the one line
+   above byte-for-byte, and a third build must leave the record files
+   untouched (no re-write on a clean full-hit run).
+2. Byte-identity: compile the same fixture with HEAD and with the
+   objcache commit (fresh profile on both sides) and compare the cached
+   .o bytes, the record project.sbcr/project.sbcri bytes, and the linked
+   binaries (must be identical). Repeat for the Linux and mac tiers
+   (emitElfRel blob-free emit, macEmitExec + code-signature imgLen
+   path, mac link definition build).
+3. Negative mutation: in a scratch copy, rename one __slv_imp_<idx>
+   symbol inside a cached .o to a 19-digit index (e.g. __slv_imp_9999999999999999999).
+   The link must fail loudly with "import symbol ... out of range" --
+   before the fix the parse wrapped int64 and could resolve a wrong
+   in-range import silently.
+4. Measurement: on a many-function bench (e.g. a generated 50-file
+   program), compare /usr/bin/time -v before/after: link-time peak and
+   wall time drop the O(syms^2) definition scans and the whole-blob
+   copies (code/blob merge, mac text-image copy), and per-file emission
+   cost drops the per-byte passes behind the record text builders.

@@ -1,0 +1,65 @@
+// Hash helpers fixture (std/hash.sr audit): bytesToHex built its hex with
+// per-nibble `out +=` (quadratic abandoned garbage in the never-free
+// runtime), every string hash loop re-read `data.length` per iteration
+// (a strlen per item), and each SHA core computed `totalBits` with an
+// int multiply (`(int)len * 8`) that wraps for messages of 256 MiB or
+// more before widening. This program pins the fixed kernels'
+// byte-identical outputs: FNV-1 over the empty string is the offset
+// basis, DJB2 matches the hand-computed value, each universal-overload
+// arm equals its dedicated kernel, the published hex digests for
+// "abc" hold for SHA-256 / SHA-1 / MD-5 / SHA-512, the HMAC-SHA-256
+// vector holds, and compare/range forms keep their semantics. It must
+// compile and print exactly `hash-helpers-ok 22`.
+import * from hash;
+
+void main() {
+    int checks = 0;
+    if (fnv1("") != 14695981039346656037) { exit(1); }
+    checks++;
+    if (djb2("") != 5381) { exit(1); }
+    checks++;
+    if (djb2("abc") != 193485963) { exit(1); }
+    checks++;
+    if (hash(0, "abc") != fnv1("abc")) { exit(1); }
+    checks++;
+    if (hash(1, "abc") != fnv1("abc", 1)) { exit(1); }
+    checks++;
+    if (hash(2, "abc") != djb2("abc")) { exit(1); }
+    checks++;
+    if (crc32("123456789") != 0xCBF43926) { exit(1); }
+    checks++;
+    if (crc32c("123456789") != 0xE3069283) { exit(1); }
+    checks++;
+    if (hash(3, "123456789") != 0xE3069283) { exit(1); }
+    checks++;
+    if (hash(4, "123456789") != 0xCBF43926) { exit(1); }
+    checks++;
+    if (sha256("abc") != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") { exit(1); }
+    checks++;
+    if (sha1("abc") != "a9993e364706816aba3e25717850c26c9cd0d89d") { exit(1); }
+    checks++;
+    if (md5("abc") != "900150983cd24fb0d6963f7d28e17f72") { exit(1); }
+    checks++;
+    string s512 = sha512("abc");
+    if (s512.length != 128) { exit(1); }
+    if (s512.substring(0, 8) != "ddaf35a1") { exit(1); }
+    checks++;
+    if (hmacSha256("key", "The quick brown fox jumps over the lazy dog") != "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8") { exit(1); }
+    checks++;
+    if (!compare("silver", "silver")) { exit(1); }
+    checks++;
+    if (compare("silver", "silvex")) { exit(1); }
+    checks++;
+    if (compare("a", "ab")) { exit(1); }
+    checks++;
+    if (fnv1("abc", 0, 3) != fnv1("abc")) { exit(1); }
+    checks++;
+    if (fnv1("xabc", 1, 4) != fnv1("abc")) { exit(1); }
+    checks++;
+    if (sha256("") != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") { exit(1); }
+    checks++;
+    if (fnv1("abc", 0) != fnv1("abc")) { exit(1); }
+    checks++;
+    if (checks != 22) { exit(1); }
+    printline("hash-helpers-ok " + (string)checks);
+}

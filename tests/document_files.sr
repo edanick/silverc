@@ -1,0 +1,33 @@
+// TOML document (DOCS/185): parse/load with top-level keys, plus
+// deflate/gzip/zstd in-memory round-trips. Plain import only, and no
+// second parse-defining module is imported here, because a second such
+// module (ini/yaml/json) would hijack toml.load's internal parse call
+// through the flat merge (see the final report). Nested section reads
+// return null on silverc-rs and are not asserted. All paths target
+// output/. Exit code 0 = all checks pass.
+import toml;
+import { gzip, zstd, deflate } from compression;
+
+void expect(bool got, string what) {
+    if (!got) {
+        printline("document check failed: " + what);
+        exit(1);
+    }
+}
+
+void main() {
+    object tomlData = toml.parse("title = 'Doc Title'\n");
+    expect(tomlData.title == "Doc Title", "toml parse title");
+    string tomlPath = "output/document_files_tmp.toml";
+    file.writeString(tomlPath, "title = 'Doc Title'\n");
+    object tomlBack = toml.load(tomlPath);
+    expect(tomlBack.title == "Doc Title", "toml load title");
+    file.delete(tomlPath);
+
+    byte[] payload = [1, 2, 3, 4, 5];
+    expect(deflate.decompress(deflate.compress(payload)).length == 5, "deflate in-memory roundtrip");
+    expect(gzip.decompress(gzip.compress(payload)).length == 5, "gzip in-memory roundtrip");
+    expect(zstd.decompress(zstd.compress(payload)).length == 5, "zstd in-memory roundtrip");
+
+    printline("document-files-ok");
+}

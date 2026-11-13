@@ -1,0 +1,75 @@
+// Mail protocols (DOCS/168, DOCS/169, DOCS/181): compile-only, no main,
+// so no socket is opened. Typechecks pop, smtp, and imap surfaces.
+import * from pop;
+import * from smtp;
+import * from imap;
+
+void checkMailSurface() {
+    bool popOk = pop.isOk("+OK hello");
+    bool popErr = pop.isErr("-ERR nope");
+    bool popDone = pop.multiLineComplete("done");
+    int popCount = pop.statCount("+OK 3 100");
+    int popSize = pop.statSize("+OK 3 100");
+    string popHead = pop.headerValue("Subject: hi", "Subject");
+    string popBody = pop.messageBody("body text");
+    pop.client popCli = new pop.client("pop.example.com", 110);
+    string popReply = popCli.getLastReply();
+    bool popIn = popCli.isLoggedIn();
+    popCli.login("user", "pass");
+    int popTotal = popCli.count();
+    string[] popIds = popCli.list();
+    pop.message popMsg = popCli.retrieve(1);
+    bool popRemoved = popCli.remove(1);
+    popCli.quit();
+    if (popOk) { printline(popReply); }
+    if (popErr) { printline((string)popCount); }
+    if (popDone) { printline((string)popSize); }
+    if (popIn) { printline(popHead); }
+    if (popTotal == 0) { printline(popBody); }
+    if (popRemoved) { printline(popMsg.subject); }
+    if (popIds.length == 0) { printline("never"); }
+
+    string built = smtp.buildMessage("from@x.com", "to@x.com", "", "Subject", "Body", false);
+    smtp.client smtpCli = new smtp.client("smtp.example.com", 25);
+    smtpCli.startTLS();
+    string smtpReply = smtpCli.getLastReply();
+    bool smtpIn = smtpCli.isLoggedIn();
+    smtpCli.login("user", "pass");
+    smtpCli.setFrom("from@x.com");
+    smtpCli.setTo("to@x.com");
+    smtpCli.cc("cc@x.com");
+    smtpCli.subject("Subject");
+    smtpCli.body("Body");
+    smtpCli.html("<p>Body</p>");
+    smtpCli.attach("output/attach.txt");
+    smtpCli.send();
+    smtpCli.close();
+    if (built.length == 0) { printline(smtpReply); }
+    if (smtpIn) { printline("never"); }
+
+    string tag = imap.nextTag(1);
+    bool greeting = imap.greetingOk("* OK ready");
+    string status = imap.replyStatus("* OK ready", tag);
+    bool okTag = imap.replyOk("* OK ready", tag);
+    int[] ids = imap.searchIds("* 1 2");
+    string literal = imap.literalText("text");
+    string fetchedBody = imap.messageBody("body");
+    string imapHead = imap.headerValue("Subject: hi", "Subject");
+    string[] imapLines = imap.listLines("a\nb");
+    imap.client imapCli = new imap.client("imap.example.com", 143);
+    string imapReply = imapCli.getLastReply();
+    bool imapIn = imapCli.isLoggedIn();
+    imapCli.login("user", "pass");
+    imapCli.select("INBOX");
+    int[] found = imapCli.search("ALL");
+    imap.message imapMsg = imapCli.fetch(1);
+    string[] boxes = imapCli.list();
+    imapCli.logout();
+    if (greeting) { printline(imapReply); }
+    if (okTag) { printline(status); }
+    if (ids.length == 0) { printline(literal); }
+    if (imapIn) { printline(fetchedBody); }
+    if (found.length == 0) { printline(imapHead); }
+    if (boxes.length == 0) { printline(imapLines[0]); }
+    if (imapMsg.subject == "") { printline("never"); }
+}

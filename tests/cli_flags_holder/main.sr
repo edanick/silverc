@@ -1,0 +1,59 @@
+// CLI flags fixture (compiler/cli_flags.sr audit): the forbidden_flags list
+// was grown through cliAddUnique's bare string[] parameter (the helper-growth
+// shape documented in std/project.sr:181, where growing a bare array inside
+// a helper leaves the caller's length stale). The fix grows a CliFlagNames
+// holder's property array instead, and the manifest scans read the string
+// length once (mlen) instead of re-strlen per loop iteration. This program
+// mirrors both fixed shapes in user code: a helper that grows a 12-entry
+// deduped list (past the truncate-at-8 bound) and a marker scan that reads
+// the length once before its index walk — both must survive with the exact
+// contents. It must compile and print exactly `cli-flags-ok 12 7`.
+class FlagNameList {
+    public prop string[] items;
+
+    construct {
+        this.items = [];
+    }
+
+    public void addUnique(string flagName) {
+        if (flagName.length == 0) { return; }
+        for (int i = 0; i < this.items.length; i++) {
+            if (this.items[i] == flagName) { return; }
+        }
+        this.items.add(flagName);
+    }
+}
+
+void addFlagNames(FlagNameList out, int count) {
+    for (int i = 0; i < count; i++) {
+        out.addUnique("flag" + (string)i);
+    }
+}
+
+int countMarker(string text, string marker) {
+    int mlen = text.length;
+    int hits = 0;
+    int i = 0;
+    while (i < mlen) {
+        if (text[i] == marker[0]) { hits++; }
+        i++;
+    }
+    return hits;
+}
+
+void main() {
+    FlagNameList list = new FlagNameList();
+    addFlagNames(list, 12);
+    if (list.items.length != 12) { exit(1); }
+    if (list.items[0] != "flag0") { exit(1); }
+    if (list.items[11] != "flag11") { exit(1); }
+    list.addUnique("flag0");
+    list.addUnique("");
+    list.addUnique("flag11");
+    if (list.items.length != 12) { exit(1); }
+    if (countMarker("abxcdxefxgh", "x") != 3) { exit(1); }
+    if (countMarker("aaaa", "x") != 0) { exit(1); }
+    if (countMarker("", "x") != 0) { exit(1); }
+    if (countMarker("xxxxxxx", "x") != 7) { exit(1); }
+    printline("cli-flags-ok 12 7");
+}

@@ -1,0 +1,32 @@
+watch-scan-ok 12
+
+Final-phase checks (NOT run in the no-launch phase):
+1. Build+run with the self-host compiler (watch_scan_files.srp):
+   program output must match the one line above byte-for-byte. The holder
+   shape in main.sr is a deliberate mirror of compiler/watcher.sr's fixed
+   WatchFiles + watchScanInto pair (same add/clear spellings, same
+   free-function holder parameter, same pop-drain) — watcher.sr itself is
+   compiler-internal and cannot be imported from a user fixture, so the
+   integration proof is check 2, not this main.sr alone.
+2. Integration: run the fixed compiler in --watch mode over a scratch
+   project with more than 8 .sr sources (12 files is enough to cross the
+   truncate-at-8 bound; include a nested subdir to exercise wtWalk
+   recursion). The watch banner must report the full file count (12+),
+   an edit+save must fire `watch: idle timer expired, precompiling`
+   after the configured idle time, and the rebuild exit code must reach
+   the watcher unchanged (INV-16 child-process path). On WINDOWS/MAC
+   this fires for real; on LINUX file.modification() still returns
+   epoch-zero (std/fs.sr LINUX shadowing bug — see MEMORY.md §7), so
+   the LINUX watch loop will report a change every tick and never
+   precompile; that is the fs.sr defect, NOT this fix, and it must be
+   observed, not worked around.
+3. Measurement: leave the watcher running over a 12-file project for
+   several minutes and compare /usr/bin/time -v / ps peak RSS against
+   HEAD. Before the fix every ~500 ms tick abandoned a fresh file list
+   (list + growth intermediates) in the never-free runtime, so watcher
+   RSS grew with the number of ticks; after the driver migration to
+   watchScanInto (held WatchFiles drained per tick) the list's backing
+   capacity is reused and watcher RSS is flat in the tick count. The
+   holder half is in compiler/watcher.sr; the per-tick call-site
+   migration in runWatchLoop (compiler_driver.sr) is the documented
+   follow-up for the driver agent.

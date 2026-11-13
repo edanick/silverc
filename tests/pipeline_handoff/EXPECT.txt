@@ -1,0 +1,33 @@
+pipeline OK
+
+Final-phase checks (NOT run in the no-launch phase):
+1. Build+run with the self-host compiler (pipeline_handoff.srp): output
+   must match the one line above byte-for-byte. The program exercises all
+   three mod-export record shapes the handoff carries: declaration exports
+   (mod export alpha / gamma), internal declaration exports (internal mod
+   export beta), and the internal inline block (internal mod stats { ... }
+   with the member-qualified call stats.bonus). The mixed internal flags
+   in declaration order pin the parallel modExportNames/modExportInternal
+   pairing; the qualified call pins the name-check seeding (declNames from
+   pout.modExportNames). Diagnostic, emission and visibility behaviour must
+   be identical to the pre-fix build because the move is a pointer move,
+   not a re-encode.
+2. Negative mutations in scratch copies (never in the fixture itself):
+   a. Lex-diagnostic path (pipeLexUnit, closed by INV-38): an unterminated
+      string literal must fail with the same lexical diagnostic before and
+      after the fix. The lexErrs copy loop in pipeline.sr is now closed:
+      out.errs = lx.lexErrors (PipeLexOut holder, six caller sites across
+      driver, visibility and bcache) carries the same strings in the same
+      order; see silverc/tests/pipeline_lex_handoff/EXPECT.txt.
+   b. Handoff path: deleting or swapping the out.modExportNames /
+      out.modExportInternal assignment in a scratch build must break (a)
+      stats.bonus resolution in the name check and/or (b) the internal
+      flag pairing in the visibility pass — proving the fixture would
+      catch a dropped hand.
+3. Measurement: build this fixture with the self-host compiler before and
+   after the fix on the same host; the pre-fix parse holds both export
+   arrays twice (parser original + grown destination + abandoned growth
+   intermediates) per parse, the post-fix parse holds each once. Peak RSS
+   after the fix drops by ~one full copy of both arrays plus their growth
+   intermediates per parse (one driver parse here; visibility parses once
+   per external file). Compare /usr/bin/time -v before/after.

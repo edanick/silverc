@@ -1,0 +1,28 @@
+fs-append-at-ok 18
+
+Final-phase checks (NOT run in the no-launch phase):
+1. Build+run with the self-host compiler (fs_append_at.srp): program
+   output must match the one line above byte-for-byte. Covers the
+   writeBytesAt kernel: create-if-absent, out-of-order chunks at
+   offsets 0/20/4 assembling byte-exact with a zero gap [8,20), a
+   2-byte middle overwrite preserving prefix/suffix/size, a negative
+   offset as a no-op, an empty write at EOF as a no-op, size matching
+   24 throughout, and file.exists/file.delete cleanup.
+2. Byte-identity: the primitive is additive (no existing function
+   changed), so every existing fs behavior must be unchanged; the
+   writeBytesAt writes themselves must produce byte-identical files
+   to whole-file writes of the same bytes (compare fs.read output
+   against a full-write baseline, incl. NULs in the gap).
+3. Negative (future-regression proof): mutate any kernel the fixture
+   pins in a scratch copy of main.sr (e.g. open with the O_TRUNC /
+   CREATE_ALWAYS disposition, or drop the seek) — the fixture must
+   fail with exit code 1 (size/gap/middle-overwrite checks fail).
+4. Call-shape caveat: the fixture calls the bare imported name only.
+   The `file.writeBytesAt` member form needs a mini_cg lowering +
+   parser builtin registration (follow-up contract, see INV-33); until
+   that lands the member form must NOT be added to this fixture, or
+   the fixture could fail to compile on the self-host backend.
+5. Measurement: a streamed image write (chunks of one page each)
+   must show peak RSS bounded by the largest chunk plus the layout
+   headers, not by the whole image — compare peak on a large-image
+   bench before/after the emitter migration (final phase).

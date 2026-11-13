@@ -1,0 +1,108 @@
+// Text encodings (DOCS/182, DOCS/260): ascii, latin1, utf8/utf16/utf32
+// round-trips, base64, hex, url-safe base64, toUtf8/fromUtf8, code points,
+// detect, checksum, and hex strings. String-shaped codecs take text and
+// byte-shaped codecs take byte[], so binary round-trips are byte-exact.
+// Exit code 0 = all checks pass.
+import * from encoding;
+
+void expect(bool got, string what) {
+    if (!got) {
+        printline("encoding check failed: " + what);
+        exit(1);
+    }
+}
+
+void main() {
+    expect(encoding.base64Encode("hello") == "aGVsbG8=", "base64 hello");
+    expect(encoding.base64Encode("hello world") == "aGVsbG8gd29ybGQ=", "base64 hello world");
+    expect(encoding.base64Encode("Silver") == "U2lsdmVy", "base64 Silver");
+    expect(encoding.base64Decode("aGVsbG8=") == "hello", "base64 decode");
+    expect(encoding.base64Decode("U2lsdmVy") == "Silver", "base64 decode Silver");
+
+    byte[] helloBytes = [104, 101, 108, 108, 111];
+    expect(encoding.base64EncodeBytes(helloBytes) == "aGVsbG8=", "base64 bytes encode");
+    byte[] backFromB64 = encoding.base64DecodeBytes("aGVsbG8=");
+    expect(backFromB64.length == 5 && backFromB64[0] == 104 && backFromB64[4] == 111, "base64 decode bytes");
+
+    expect(encoding.hexEncode("hello") == "68656c6c6f", "hex hello");
+    expect(encoding.hexDecode("68656c6c6f") == "hello", "hex decode");
+    expect(encoding.hexEncodeBytes(helloBytes) == "68656c6c6f", "hex bytes encode");
+    byte[] backFromHex = encoding.hexDecodeBytes("68656c6c6f");
+    expect(backFromHex.length == 5 && backFromHex[0] == 104 && backFromHex[4] == 111, "hex decode bytes");
+
+    expect(encoding.base64UrlEncode("hello?") == "aGVsbG8_", "base64 url encode");
+    expect(encoding.base64UrlDecode("aGVsbG8_") == "hello?", "base64 url decode");
+    expect(encoding.base64UrlEncode("hello") == "aGVsbG8", "base64 url strips padding");
+
+    byte[] asciiOut = new byte[5];
+    expect(encoding.asciiEncode("hello", asciiOut) == 5, "ascii encode count");
+    expect(asciiOut[0] == 104 && asciiOut[4] == 111, "ascii encode bytes");
+    expect(encoding.asciiEncode("hi", new byte[1]) == -1, "ascii encode small buffer");
+    byte[] notAscii = [200];
+    expect(!encoding.isAscii(notAscii), "isAscii rejects high byte");
+    expect(encoding.isAscii(helloBytes), "isAscii accepts hello");
+    string[] asciiDecOut = new string[1];
+    int asciiDecCount = encoding.asciiDecode(helloBytes, asciiDecOut);
+    expect(asciiDecCount == 5 && asciiDecOut[0] == "hello", "ascii decode roundtrip");
+    string[] highDecOut = new string[1];
+    encoding.asciiDecode(notAscii, highDecOut);
+    expect(highDecOut[0] == "?", "ascii decode high byte is question mark");
+
+    byte[] latin = encoding.latin1Encode("hello");
+    expect(latin.length == 5 && latin[0] == 104 && latin[4] == 111, "latin1 encode");
+    expect(encoding.latin1Decode(helloBytes) == "hello", "latin1 decode");
+
+    byte[] utf8Bytes = encoding.toUtf8("hello");
+    expect(utf8Bytes.length == 5 && utf8Bytes[0] == 104, "toUtf8 hello");
+    expect(encoding.fromUtf8(utf8Bytes) == "hello", "fromUtf8 hello");
+
+    int[] points = encoding.toCodePoints("hello");
+    expect(points.length == 5 && points[0] == 104 && points[4] == 111, "toCodePoints hello");
+    int[] points2 = encoding.codePointsOf("hello");
+    expect(points2.length == 5 && points2[0] == 104, "codePointsOf hello");
+
+    expect(encoding.detect(utf8Bytes) == "utf-8", "detect utf8");
+    byte[] badUtf8 = [200, 201];
+    expect(encoding.detect(badUtf8) == "latin-1", "detect latin1 fallback");
+
+    expect(encoding.toHexString(helloBytes) == "68656C6C6F", "toHexString uppercase");
+    byte[] fromHex = encoding.fromHexString("68656C6C6F");
+    expect(fromHex.length == 5 && fromHex[0] == 104 && fromHex[4] == 111, "fromHexString roundtrip");
+    byte[] fromHexLower = encoding.fromHexString("68656c6c6f");
+    expect(fromHexLower.length == 5 && fromHexLower[0] == 104, "fromHexString lowercase");
+
+    expect(encoding.checksum(helloBytes).length > 0, "checksum non-empty decimal");
+    expect(encoding.checksum(helloBytes) == encoding.checksum(helloBytes), "checksum stable");
+    expect(encoding.checksum([]) != encoding.checksum(helloBytes), "checksum differs on content");
+
+    int[] asciiPoints = [72, 101];
+    expect(encoding.utf8Length(asciiPoints) == 2, "utf8 length ascii");
+    byte[] utf8Buf = new byte[2];
+    expect(encoding.utf8Encode(asciiPoints, utf8Buf) == 2 && utf8Buf[0] == 72, "utf8 encode ascii");
+    int[] utf8Back = new int[2];
+    expect(encoding.utf8Decode(utf8Buf, utf8Back) == 2 && utf8Back[0] == 72 && utf8Back[1] == 101, "utf8 decode ascii");
+    int[] latin1Points = [233];
+    expect(encoding.utf8Length(latin1Points) == 2, "utf8 length two-byte");
+    byte[] utf8Two = new byte[2];
+    expect(encoding.utf8Encode(latin1Points, utf8Two) == 2, "utf8 encode two-byte");
+    expect(utf8Two[0] == 195 && utf8Two[1] == 169, "utf8 e-acute bytes");
+
+    expect(encoding.utf16Length(asciiPoints) == 4, "utf16 length ascii");
+    byte[] u16Buf = new byte[4];
+    expect(encoding.utf16LeEncode(asciiPoints, u16Buf) == 4, "utf16 le encode count");
+    expect(u16Buf[0] == 72 && u16Buf[1] == 0, "utf16 le first unit");
+    int[] u16Back = new int[2];
+    expect(encoding.utf16LeDecode(u16Buf, u16Back) == 2 && u16Back[0] == 72, "utf16 le decode");
+    byte[] u16BeBuf = new byte[4];
+    expect(encoding.utf16BeEncode(asciiPoints, u16BeBuf) == 4, "utf16 be encode count");
+    expect(u16BeBuf[0] == 0 && u16BeBuf[1] == 72, "utf16 be first unit");
+
+    expect(encoding.utf32LeEncode(asciiPoints, new byte[16]) == 8, "utf32 le encode count");
+    expect(encoding.utf32BeEncode(asciiPoints, new byte[16]) == 8, "utf32 be encode count");
+    byte[] u32Buf = new byte[8];
+    encoding.utf32LeEncode(asciiPoints, u32Buf);
+    int[] u32Back = new int[2];
+    expect(encoding.utf32LeDecode(u32Buf, u32Back) == 2 && u32Back[0] == 72, "utf32 le decode");
+
+    printline("encoding-text-ok");
+}

@@ -1,0 +1,44 @@
+hash-helpers-ok 22
+
+Final-phase checks (NOT run in the no-launch phase):
+1. Build+run with the self-host compiler (hash_helpers.srp):
+   program output must match the one line above byte-for-byte. This
+   fixture calls the freed kernels directly through the hash module
+   (the bytesToHex parts+one-join hex, the hoisted string-length loops
+   in djb2 / fnv1 / crc32c / crc32 / the kind and algo overloads /
+   compare / strToBytes, and the int64 totalBits in the four SHA
+   cores). It also pins the values the hoists made invisible: the
+   digests for "abc" (SHA-256 ba7816..., SHA-1 a999..., MD-5
+   9001..., SHA-512 ddaf... of length 128) and the empty-string
+   SHA-256, the CRC-32 / CRC-32C check values, the HMAC-SHA-256
+   vector, the FNV-1 offset basis over the empty string, the
+   hand-computed DJB2 value, the universal-overload equivalences
+   (hash(0/1/2/3/4) == fnv1 / fnv1-kind / djb2 / crc32c / crc32),
+   the kind-0 and range-form equivalences, and compare's equal /
+   differing / differing-length cases — same results before and
+   after the fix by construction (shares the loop bounds, the hex
+   digit order and the digest bytes).
+2. Byte-identity: compile the same program with HEAD and with the
+   fix and diff the outputs — every case in main.sr must be
+   identical (each loop ran the same iterations with the same
+   arithmetic; hex bytes come out in high-nibble/low-nibble order
+   from the same table; totalBits is identical for every message
+   under 256 MiB, and was wrapping to a wrong value only above).
+3. Negative (future-regression proof): mutate any mirrored kernel
+   in a scratch copy of main.sr (e.g. return a per-nibble += hex
+   builder, or drop a hex nibble) — the fixture must fail with exit
+   code 1, and the EXPECT.txt byte-identity half must still hold
+   for the unmutated kernels.
+4. Measurement: on a scratch bench (a 1 MB string hashed with
+   sha256, and a 100 KB compare), pre-fix peak RSS / wall time
+   must be superlinear in the output length for bytesToHex
+   (about 32 pairs of += per 32-byte digest is small, but the
+   string-length re-reads dominate: ~1 strlen per item in every
+   loop) while post-fix it is linear (one join per result, one
+   length read per call). Compare /usr/bin/time -v before/after on
+   the same fixture.
+5. The file-hash wrappers (djb2File / fnv1File / fnv1FileBytes /
+   md5File / sha1File / sha256File / sha512File) are pinned by
+   delegation only: each still reads its file exactly once per
+   call and hashes through the fixed kernels above, so no
+   file-reader change can slip inside these wrappers.

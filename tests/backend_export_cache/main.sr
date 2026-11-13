@@ -1,0 +1,76 @@
+// Backend export-table set cache fixture (MEMORY.md row 12, codegen
+// backend half; INV-19): the three mini_cg backends parse their fixed
+// export tables into word sets ONCE per backend instance and answer
+// membership with slice-free `.contains`, instead of re-slicing the
+// ~50-100-word table per call-resolution. Compilation of the native
+// free calls below exercises win32CallResolves/linuxCallResolves/
+// macCallResolves (mini_cg.sr inferExprType + overload-selection scans),
+// which goes through the backend caches per call node. The class and
+// nullable-receiver paths exercise optMatch (allocation-free
+// `x == y + "?"` comparison) and clearScratch (per-function scratch
+// tables truncated in place). This program must compile with NO
+// unknown-method diagnostics and print exactly
+// `export-table-cache-ok 42` / `hi parser 42`.
+
+#on WINDOWS
+import * from win32.kernel32;
+import * from win32.ws2_32;
+#on LINUX
+import * from linux.libc;
+import * from linux.x11;
+#on MAC
+import * from mac.libsystem;
+import * from mac.objc;
+#off
+
+int add(int a, int b) {
+    return a + b;
+}
+
+string greet(string who) {
+    return "hi " + who;
+}
+
+class Counter {
+    private prop int count;
+    construct {
+        this.count = 0;
+    }
+    public void inc() {
+        this.count = this.count + 1;
+    }
+    public int getCount() {
+        return this.count;
+    }
+}
+
+void nativeProbe() {
+#on WINDOWS
+    Sleep(0);
+    GetTickCount();
+    GetLastError();
+#on LINUX
+    getpid();
+    getuid();
+#on MAC
+    getpid();
+    getuid();
+#off
+}
+
+void main() {
+    int total = 0;
+    for (int i = 0; i < 20; i++) {
+        total += add(1, 1);
+    }
+    Counter c = new Counter();
+    c.inc();
+    total += c.getCount();
+    Counter? n = null;
+    if (n == null) {
+        total += 1;
+    }
+    nativeProbe();
+    printline("export-table-cache-ok " + total.toString());
+    printline(greet("parser") + " " + total.toString());
+}

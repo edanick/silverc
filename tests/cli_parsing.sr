@@ -1,0 +1,47 @@
+// CLI helpers (DOCS/124, DOCS/248): eq, isFlag, isOption, valueAfter,
+// positional, and the args/programName surface. Exit code 0 = all pass.
+import * from cli;
+
+void expect(bool got, string what) {
+    if (!got) {
+        printline("cli check failed: " + what);
+        exit(1);
+    }
+}
+
+void main() {
+    expect(cli.eq("-i", "-i"), "eq same");
+    expect(!cli.eq("-i", "-o"), "eq differs");
+
+    expect(cli.isFlag("-h", ["-h", "--help"]), "isFlag short");
+    expect(cli.isFlag("--help", ["-h", "--help"]), "isFlag long");
+    expect(!cli.isFlag("-x", ["-h", "--help"]), "isFlag miss");
+
+    expect(cli.isOption("-i"), "isOption dash");
+    expect(cli.isOption("/i"), "isOption slash");
+    expect(!cli.isOption("input.sr"), "isOption file");
+    expect(!cli.isOption(""), "isOption empty");
+
+    string[] args = ["prog", "-i", "input.sr", "-o", "out.exe", "extra.txt"];
+    expect(cli.valueAfter(args, 1) == "input.sr", "valueAfter present");
+    expect(cli.valueAfter(args, 3) == "out.exe", "valueAfter second");
+    expect(cli.valueAfter(["x", "-o"], 1) == "", "valueAfter missing");
+    expect(cli.valueAfter(["x", "-o", "-v"], 1) == "", "valueAfter next is option");
+
+    string[] positional = cli.positional(args);
+    expect(positional.length == 4, "positional count");
+    expect(positional[0] == "prog", "positional first");
+    expect(positional[3] == "extra.txt", "positional last");
+    bool sawSlashed = false;
+    for (int i = 0; i < positional.length; i++) {
+        if (positional[i] == "-i" || positional[i] == "-o") { sawSlashed = true; }
+    }
+    expect(!sawSlashed, "positional excludes options");
+
+    string[] rawArgs = cli.args();
+    expect(rawArgs.length >= 0, "args is array");
+    string prog = cli.programName();
+    expect(prog == cli.programName(), "programName stable");
+
+    printline("cli-parsing-ok");
+}

@@ -1,0 +1,148 @@
+// String helpers fixture (MEMORY.md §3.2 row 24, std/string.sr audit):
+// pad / padLeft / padRight / slugify built their results with
+// per-character `+=` (quadratic abandoned garbage in the never-free
+// runtime), equals re-read a.length per iteration (strlen per step),
+// and projectFind's search indexed at a negative start. The fixed
+// helpers are now parts + one join with each length read once per
+// call, and the search start is floored at 0. This program mirrors
+// each fixed kernel in user code and checks it against the builtin
+// methods, so a future edit that breaks one of these helpers fails
+// here. It must compile and print exactly `string-helpers-ok 25`.
+
+bool mirrorEqualsInsens(string a, string b) {
+    int alen = a.length;
+    int blen = b.length;
+    if (alen != blen) { return false; }
+    for (int i = 0; i < alen; i++) {
+        int ca = a[i];
+        int cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') { ca += 32; }
+        if (cb >= 'A' && cb <= 'Z') { cb += 32; }
+        if (ca != cb) { return false; }
+    }
+    return true;
+}
+
+string mirrorPad(string text, int count, string fill) {
+    if (count <= 0 || fill.length == 0) { return text; }
+    string unit = (string)fill[0];
+    string[] parts = [];
+    for (int i = 0; i < count; i++) { parts.add(unit); }
+    parts.add(text);
+    for (int i = 0; i < count; i++) { parts.add(unit); }
+    return parts.join("");
+}
+
+string mirrorPadLeft(string text, int count, string fill) {
+    if (count <= 0 || fill.length == 0) { return text; }
+    string unit = (string)fill[0];
+    string[] parts = [];
+    for (int i = 0; i < count; i++) { parts.add(unit); }
+    parts.add(text);
+    return parts.join("");
+}
+
+string mirrorPadRight(string text, int count, string fill) {
+    if (count <= 0 || fill.length == 0) { return text; }
+    string unit = (string)fill[0];
+    string[] parts = [];
+    parts.add(text);
+    for (int i = 0; i < count; i++) { parts.add(unit); }
+    return parts.join("");
+}
+
+string mirrorSlugify(string text) {
+    int n = text.length;
+    string[] parts = [];
+    int outLen = 0;
+    bool hasOut = false;
+    char lastChar = ' ';
+    for (int i = 0; i < n; i++) {
+        char c = text[i];
+        if (c >= 'a' && c <= 'z') { parts.add((string)c); outLen++; lastChar = c; hasOut = true; }
+        else if (c >= 'A' && c <= 'Z') { parts.add((string)char(c + 32)); outLen++; lastChar = char(c + 32); hasOut = true; }
+        else if (c >= '0' && c <= '9') { parts.add((string)c); outLen++; lastChar = c; hasOut = true; }
+        else if (c == ' ' || c == '-' || c == '_') {
+            if (hasOut && lastChar != '-') { parts.add("-"); outLen++; lastChar = '-'; }
+        }
+    }
+    string result = parts.join("");
+    if (hasOut && lastChar == '-') {
+        result = result.substring(0, outLen - 1);
+    }
+    return result;
+}
+
+int mirrorFind(string text, string needle, int start) {
+    int needleLen = needle.length;
+    if (needleLen == 0) { return start; }
+    int first = start;
+    if (first < 0) { first = 0; }
+    int limit = text.length - needleLen;
+    for (int i = first; i <= limit; i++) {
+        bool same = true;
+        for (int j = 0; j < needleLen; j++) {
+            int needleIndex = i + j;
+            if (text[needleIndex] != needle[j]) { same = false; break; }
+        }
+        if (same) { return i; }
+    }
+    return -1;
+}
+
+void main() {
+    int checks = 0;
+    if (!mirrorEqualsInsens("Mac", "MAC")) { exit(1); }
+    checks++;
+    if (!mirrorEqualsInsens("windows", "WINDOWS")) { exit(1); }
+    checks++;
+    if (mirrorEqualsInsens("Mac", "macx")) { exit(1); }
+    checks++;
+    if (mirrorEqualsInsens("Linux", "macos")) { exit(1); }
+    checks++;
+    if (mirrorEqualsInsens("MAC", "macx64")) { exit(1); }
+    checks++;
+    if (!mirrorEqualsInsens("", "")) { exit(1); }
+    checks++;
+    if (mirrorPad("ab", 3, "*") != "***ab***") { exit(1); }
+    checks++;
+    if (mirrorPadLeft("ab", 2, "xy") != "xxab") { exit(1); }
+    checks++;
+    if (mirrorPadRight("ab", 1, "0") != "ab0") { exit(1); }
+    checks++;
+    if (mirrorPad("ab", 0, "*") != "ab") { exit(1); }
+    checks++;
+    if (mirrorPadLeft("ab", -3, "*") != "ab") { exit(1); }
+    checks++;
+    if (mirrorPadRight("ab", 2, "") != "ab") { exit(1); }
+    checks++;
+    string hello = "hello";
+    if (hello.pad(2, "-") != mirrorPad("hello", 2, "-")) { exit(1); }
+    checks++;
+    if (hello.padLeft(3, "0") != mirrorPadLeft("hello", 3, "0")) { exit(1); }
+    checks++;
+    if (hello.padRight(1, "!") != mirrorPadRight("hello", 1, "!")) { exit(1); }
+    checks++;
+    if (mirrorSlugify("Date A Live") != "date-a-live") { exit(1); }
+    checks++;
+    if (mirrorSlugify("Hello, World!") != "hello-world") { exit(1); }
+    checks++;
+    if (mirrorSlugify("  lead") != "lead") { exit(1); }
+    checks++;
+    if (mirrorSlugify("trail  ") != "trail") { exit(1); }
+    checks++;
+    if (mirrorSlugify("a__b") != "a-b") { exit(1); }
+    checks++;
+    if (mirrorSlugify("") != "") { exit(1); }
+    checks++;
+    if ("Date A Live".slugify() != mirrorSlugify("Date A Live")) { exit(1); }
+    checks++;
+    if ("Hello, World!".slugify() != mirrorSlugify("Hello, World!")) { exit(1); }
+    checks++;
+    if (mirrorFind("xxneedle", "needle", -3) != 2) { exit(1); }
+    checks++;
+    if (mirrorFind("abc", "b", 0) != 1) { exit(1); }
+    checks++;
+    if (checks != 25) { exit(1); }
+    printline("string-helpers-ok " + (string)checks);
+}

@@ -1,0 +1,28 @@
+memory-spill-guards-ok 25
+
+Final-phase checks (NOT run in the no-launch phase):
+1. Build+run with the self-host compiler (memory_spill_guards.srp):
+   program output must match the one line above byte-for-byte. This is
+   a mirror fixture (it re-implements the guarded kernels of
+   runtime/memory.sr in user code rather than importing the runtime
+   module, following the resource_adaptive / hash_helpers pattern),
+   so it runs identically on every host.
+2. Byte-identity: the commit changes no on-disk bytes for valid
+   inputs (every guard is a no-op for valid spill headers: non-negative
+   sizes, in-range counts, budgets that never overflow; the verifier
+   reads the same index bytes at 96 + base instead of via a copied
+   buffer). The fixture pins valid validate/threshold/bump/page/verify
+   results so any future guard that breaks valid inputs fails here.
+3. Negative (future-regression proof): the 25 checks include the
+   pre-fix failures — negative logical/payload passing validation,
+   (int) truncation wrap on a 3e9 chunk count, budget*9/10 wrapping
+   negative at 2e18, wrap-to-negative bump add, chunk-count +1
+   wrapping near INT_MAX (count mirror), negative chunk count and
+   2^32+32 index size verifying true. Rolling any guarded kernel back
+   to its pre-fix form must fail with exit code 1.
+4. Measurement: the verifier change removes one idxSize allocation
+   per fault-in (up to ~1 MB for a 2 GiB page); the rest of the fix is
+   guards with no allocation. Peak-RSS delta on a large-page spill
+   bench (final phase, /usr/bin/time -v before/after on the same
+   fixture) must not regress and should drop by the removed index
+   copy.

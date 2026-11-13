@@ -1,0 +1,21 @@
+cache-streaming-decode-ok
+
+Final-phase checks (NOT run in the no-launch phase):
+1. Build+run this fixture twice with the self-host compiler with
+   --cache-bytecode: the first build must populate the cache, the second
+   build (cache hit) must print the one line above byte-for-byte (a float
+   literal forces the text .srbc.t decode path on the hit; the long string
+   and the interpolation exercise the binary path and both hex decoders).
+   No cache files are required to be seeded by hand.
+2. Byte-identity: compile the same fixture with HEAD and with this commit
+   (cache disabled or a fresh profile on both sides) and compare the two
+   binaries and the two .sbcr/.srbc/.srbc.t payloads (must be empty).
+3. Negative mutation: in a scratch copy, truncate one .srbc.t line or
+   overwrite a <byteLen> field with an oversized value (e.g. 2000000000) —
+   the build must re-lex and re-sync (miss), never read out of bounds.
+   Same for an oversized .srbc length field: miss, not a crash.
+4. Measurement: on a bench with many long string literals and interpolation
+   segments, compare /usr/bin/time -v before/after: the post-fix peak drops
+   by ~one per-byte lstrcatA scan per payload (payload cost is linear);
+   cache warm-build wall time on a float-bearing file no longer shows the
+   per-payload quadratic term.

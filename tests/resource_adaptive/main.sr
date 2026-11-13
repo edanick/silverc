@@ -1,0 +1,103 @@
+// Resource fixture (compiler/resource.sr audit): the adaptive resource
+// layer is pure scalar size arithmetic over sysinfo values — the audit
+// verified every size computation already guarded (cpuCores clamp for the
+// Linux sysconf -1 error, total-2 and hint/cap clamps floored at 1,
+// divisor threads floored at 1, per-worker floored at 1) and the file has
+// no loops, no `+=`, no strings, no arrays and no file reads (the
+// M2/M3/M6/M8 families are absent by grep). This program mirrors each
+// guarded kernel in user code so a future edit that breaks a clamp fails
+// here. It must compile and print exactly `resource-adaptive-ok 24`.
+int defaultThreads(int total) {
+    int n = total - 2;
+    if (n < 1) { n = 1; }
+    return n;
+}
+
+int withMargin(int requested, int total) {
+    if (requested > total) { return -1; }
+    if (requested == total) { return 0; }
+    if (requested < 1) { return 1; }
+    return requested;
+}
+
+int64 mibToBytes(int64 mib) {
+    return mib * 1024 * 1024;
+}
+
+int64 budget90(int64 avail) {
+    float scaled = float(avail) * 0.9;
+    return int64(scaled);
+}
+
+bool lowMemory(int64 bytes) {
+    return bytes < 1073741824;
+}
+
+int chunkSize(int hint, int threads, int64 budget) {
+    if (threads < 1) { threads = 1; }
+    int64 perWorker = budget / threads / 1024;
+    if (perWorker < 1) { perWorker = 1; }
+    int cap = int(perWorker);
+    if (hint < 1) { hint = 1; }
+    if (hint < cap) { return hint; }
+    return cap;
+}
+
+int cpuClamp(int n) {
+    if (n < 1) { n = 1; }
+    return n;
+}
+
+void main() {
+    int checks = 0;
+    if (defaultThreads(1) != 1) { exit(1); }
+    checks++;
+    if (defaultThreads(3) != 1) { exit(1); }
+    checks++;
+    if (defaultThreads(4) != 2) { exit(1); }
+    checks++;
+    if (defaultThreads(8) != 6) { exit(1); }
+    checks++;
+    if (withMargin(9, 8) != -1) { exit(1); }
+    checks++;
+    if (withMargin(8, 8) != 0) { exit(1); }
+    checks++;
+    if (withMargin(0, 8) != 1) { exit(1); }
+    checks++;
+    if (withMargin(4, 8) != 4) { exit(1); }
+    checks++;
+    if (mibToBytes(0) != 0) { exit(1); }
+    checks++;
+    if (mibToBytes(2048) != 2147483648) { exit(1); }
+    checks++;
+    if (budget90(0) != 0) { exit(1); }
+    checks++;
+    if (budget90(1000) != 900) { exit(1); }
+    checks++;
+    if (budget90(1073741824) > 1073741824) { exit(1); }
+    checks++;
+    if (budget90(1000) >= budget90(2000)) { exit(1); }
+    checks++;
+    if (lowMemory(1073741823) != true) { exit(1); }
+    checks++;
+    if (lowMemory(1073741824) != false) { exit(1); }
+    checks++;
+    if (chunkSize(0, 4, 1024000) != 1) { exit(1); }
+    checks++;
+    if (chunkSize(100, 4, 1024000) != 100) { exit(1); }
+    checks++;
+    if (chunkSize(1000, 4, 24576) != 6) { exit(1); }
+    checks++;
+    if (chunkSize(100, 0, 1024000) != 100) { exit(1); }
+    checks++;
+    if (chunkSize(100, 4, 0) != 1) { exit(1); }
+    checks++;
+    if (cpuClamp(-1) != 1) { exit(1); }
+    checks++;
+    if (cpuClamp(0) != 1) { exit(1); }
+    checks++;
+    if (cpuClamp(7) != 7) { exit(1); }
+    checks++;
+    if (checks != 24) { exit(1); }
+    printline("resource-adaptive-ok " + (string)checks);
+}

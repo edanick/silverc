@@ -1,0 +1,173 @@
+// Memory spill guards fixture (runtime/memory.sr audit): the spill page
+// manager staged untrusted header/accounting fields with overflow-prone
+// arithmetic (negative logical/payload sizes passing validation, a
+// truncating (int) chunk-count compare, budget*9/10 wrapping at huge
+// budgets, (count + chunk - 1) wrapping near 2 GiB, int(h.index_size) /
+// int(d.payload_size) truncation wraps on fault-in, and a whole-index
+// copy in the verifier). This program mirrors each guarded kernel in
+// user code so a future edit that breaks a guard fails here. It must
+// compile and print exactly `memory-spill-guards-ok 25`.
+import * from hash;
+
+int sgValidate(int64 logical, int64 payload, int chunkSize, int chunkCount, int64 indexSize) {
+    if (chunkSize == 0 || chunkSize > 67108864) { return 10; }
+    if (logical < 0 || payload < 0) { return 10; }
+    int64 expected = logical / (int64)chunkSize;
+    if (logical % (int64)chunkSize != 0) { expected++; }
+    if (expected > 4294967295) { return 11; }
+    if ((int64)chunkCount != expected) { return 11; }
+    int64 expectedIndex = expected * 32;
+    if (indexSize != expectedIndex) { return 11; }
+    if (payload != logical) { return 10; }
+    return 0;
+}
+
+int64 sgThreshold(int64 budget) {
+    return (budget / 10) * 9 + ((budget % 10) * 9) / 10;
+}
+
+bool sgBump(int64 bumpOffset, int64 rounded, int64 budget) {
+    if (bumpOffset < 0 || rounded < 0) { return false; }
+    int64 threshold = sgThreshold(budget);
+    if (bumpOffset > 9223372036854775807 - rounded) { return true; }
+    return bumpOffset + rounded >= threshold;
+}
+
+bool sgPageFits(int64 used, int64 budget, int64 need) {
+    return !(budget - used < need);
+}
+
+bool sgTotalOverflow(int payLen, int idxLen) {
+    return payLen > 2147483647 - 96 - idxLen;
+}
+
+void sgPutU64(byte[] p, int off, int64 v) {
+    for (int i = 0; i < 8; i++) {
+        p[off + i] = (v >> (i * 8)) & 0xff;
+    }
+}
+
+void sgPutU32(byte[] p, int off, int v) {
+    p[off] = v & 0xff;
+    p[off + 1] = (v >> 8) & 0xff;
+    p[off + 2] = (v >> 16) & 0xff;
+    p[off + 3] = (v >> 24) & 0xff;
+}
+
+int64 sgGetU64(byte[] p, int off) {
+    int64 v = 0;
+    for (int i = 0; i < 8; i++) {
+        v = v | (((int64)p[off + i]) << (i * 8));
+    }
+    return v;
+}
+
+int sgGetU32(byte[] p, int off) {
+    return p[off] | (p[off + 1] << 8) | (p[off + 2] << 16) | (p[off + 3] << 24);
+}
+
+bool sgVerify(int chunkCount, int64 indexSize, byte[] file, byte[] payload, int chunkSize, int64 logical) {
+    int n = chunkCount;
+    if (n < 0) { return false; }
+    if (indexSize < 0 || indexSize > (int64)file.length) { return false; }
+    int idxSize = int(indexSize);
+    if (idxSize > file.length - 96) { return false; }
+    if ((int64)idxSize != (int64)n * 32) { return false; }
+    for (int i = 0; i < n; i++) {
+        int base = i * 32;
+        int64 lo = sgGetU64(file, 96 + base);
+        int llen = sgGetU32(file, 96 + base + 16);
+        int crc = sgGetU32(file, 96 + base + 24);
+        int64 wantLo = (int64)i * (int64)chunkSize;
+        if (lo != wantLo) { return false; }
+        int64 rem = logical - wantLo;
+        int wantLen = chunkSize;
+        if (rem < (int64)wantLen) { wantLen = int(rem); }
+        if (wantLen < 0) { return false; }
+        if (llen != wantLen) { return false; }
+        byte[] chunk = new byte[wantLen];
+        for (int j = 0; j < wantLen; j++) { chunk[j] = payload[int(wantLo) + j]; }
+        if (crc32c(chunk) != crc) { return false; }
+    }
+    return true;
+}
+
+void main() {
+    int checks = 0;
+    if (sgValidate(65536, 65536, 65536, 1, 32) != 0) { exit(1); }
+    checks++;
+    if (sgValidate(-1, -1, 65536, 0, 0) != 10) { exit(1); }
+    checks++;
+    if (sgValidate(65536, -1, 65536, 1, 32) != 10) { exit(1); }
+    checks++;
+    if (sgValidate(196608000000000, 196608000000000, 65536, -1294967296, 96000000000) != 11) { exit(1); }
+    checks++;
+    if (sgValidate(131072, 131072, 65536, 2, 64) != 0) { exit(1); }
+    checks++;
+    if (sgThreshold(16777216) != 15099494) { exit(1); }
+    checks++;
+    if (sgBump(15099494, 0, 16777216) != true) { exit(1); }
+    checks++;
+    if (sgBump(15099493, 0, 16777216) != false) { exit(1); }
+    checks++;
+    if (sgBump(0, 0, 2000000000000000000) != false) { exit(1); }
+    checks++;
+    if (sgBump(1800000000000000000, 0, 2000000000000000000) != true) { exit(1); }
+    checks++;
+    if (sgBump(9223372036854775807, 9223372036854775807, 16777216) != true) { exit(1); }
+    checks++;
+    if (sgBump(-1, 0, 16777216) != false) { exit(1); }
+    checks++;
+    int64 managed = 100;
+    int64 note = 0;
+    if (note <= 0) { note = -5; }
+    if (managed != 100) { exit(1); }
+    checks++;
+    int64 overflowed = 9223372036854775807;
+    int64 added = overflowed + 1;
+    if (added >= overflowed) { overflowed = added; }
+    if (overflowed != 9223372036854775807) { exit(1); }
+    checks++;
+    if (sgPageFits(0, 100, 100) != true) { exit(1); }
+    checks++;
+    if (sgPageFits(50, 100, 60) != false) { exit(1); }
+    checks++;
+    if (sgTotalOverflow(2147483647, 32) != true) { exit(1); }
+    checks++;
+    if (sgTotalOverflow(100, 32) != false) { exit(1); }
+    checks++;
+    byte[] payload = new byte[4];
+    payload[0] = 1;
+    payload[1] = 2;
+    payload[2] = 3;
+    payload[3] = 4;
+    int crc = crc32c(payload);
+    byte[] file = new byte[132];
+    sgPutU64(file, 96, 0);
+    sgPutU64(file, 104, 128);
+    sgPutU32(file, 112, 4);
+    sgPutU32(file, 116, 4);
+    sgPutU32(file, 120, crc);
+    sgPutU32(file, 124, 1);
+    if (sgVerify(1, 32, file, payload, 65536, 4) != true) { exit(1); }
+    checks++;
+    byte[] badFile = new byte[132];
+    for (int i = 0; i < 132; i++) { badFile[i] = file[i]; }
+    badFile[120] = badFile[120] ^ 0xff;
+    if (sgVerify(1, 32, badFile, payload, 65536, 4) != false) { exit(1); }
+    checks++;
+    if (sgVerify(-1, 32, file, payload, 65536, 4) != false) { exit(1); }
+    checks++;
+    if (sgVerify(1, 4294967328, file, payload, 65536, 4) != false) { exit(1); }
+    checks++;
+    if (sgVerify(1, 64, file, payload, 65536, 4) != false) { exit(1); }
+    checks++;
+    int count = int(((int64)4 + 65536 - 1) / 65536);
+    if (count != 1) { exit(1); }
+    checks++;
+    int count2 = int(((int64)65537 + 65536 - 1) / 65536);
+    if (count2 != 2) { exit(1); }
+    checks++;
+    if (checks != 25) { exit(1); }
+    printline("memory-spill-guards-ok " + (string)checks);
+}

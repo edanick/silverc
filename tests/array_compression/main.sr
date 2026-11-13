@@ -1,0 +1,71 @@
+// Array/compression fixture (std/array.sr + std/compression/* audit):
+// findBestMatch re-read string lengths per candidate (strlen per step)
+// and could index candLc[1] when the candidate had one character; the
+// DEFLATE encoder allocated two fresh tables per match probe; GZIP
+// framed its payload with a growable per-byte copy and advanced past
+// FEXTRA with an add-form length check; ZSTD encoded with a growable
+// per-byte copy and checked a raw block with an add-form bound. The
+// fixed code hoists each length once, guards the two-letter tie-break
+// on both spellings, caches the tables per engine, and frames into one
+// exact-size buffer with subtraction-form bounds. This program pins the
+// byte-identical outputs (best-match results, round-trips, exact frame
+// lengths). It must compile and print exactly `array-compression-ok 16`.
+import * from array;
+import { gzip, zstd, deflate } from compression;
+
+bool bytesEqual(byte[] a, byte[] b) {
+    if (a.length != b.length) { return false; }
+    for (int i = 0; i < a.length; i++) { if (a[i] != b[i]) { return false; } }
+    return true;
+}
+
+byte[] makeBytes(int n, int seed) {
+    byte[] r = [];
+    for (int i = 0; i < n; i++) { r.add((i + seed) % 251); }
+    return r;
+}
+
+void main() {
+    int checks = 0;
+    string[] cands = ["apple", "application", "apply"];
+    if (array.findBestMatch(cands, "aple") != "apple") { exit(1); }
+    checks++;
+    if (array.findBestMatch(cands, "") != "") { exit(1); }
+    checks++;
+    if (array.findBestMatch(["a"], "abc") != "") { exit(1); }
+    checks++;
+    if (array.findBestMatch(["cd"], "ab") != "") { exit(1); }
+    checks++;
+    string[] cands2 = ["helzz", "world"];
+    if (array.findBestMatch(cands2, "hello") != "helzz") { exit(1); }
+    checks++;
+
+    byte[] data = [1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4];
+    if (!bytesEqual(deflate.decompress(deflate.compress(data, 9)), data)) { exit(1); }
+    checks++;
+    if (!bytesEqual(deflate.decompress(deflate.compress(data, 0)), data)) { exit(1); }
+    checks++;
+    if (!bytesEqual(gzip.decompress(gzip.compress(data, 6)), data)) { exit(1); }
+    checks++;
+    if (gzip.compress(data, 6).length != deflate.compress(data, 6).length + 18) { exit(1); }
+    checks++;
+    if (gzip.compress(data, 6)[0] != 31) { exit(1); }
+    checks++;
+    if (gzip.compress(data, 6)[1] != 139) { exit(1); }
+    checks++;
+    byte[] zs = zstd.compress(data, 3);
+    if (!bytesEqual(zstd.decompress(zs), data)) { exit(1); }
+    checks++;
+    if (zs.length != 9 + data.length + 3) { exit(1); }
+    checks++;
+    byte[] empty = [];
+    if (!bytesEqual(zstd.decompress(zstd.compress(empty, 22)), empty)) { exit(1); }
+    checks++;
+    byte[] big = makeBytes(140000, 7);
+    if (!bytesEqual(zstd.decompress(zstd.compress(big, 3)), big)) { exit(1); }
+    checks++;
+    if (zstd.compress(big, 3).length != 9 + 140000 + 6) { exit(1); }
+    checks++;
+    if (checks != 16) { exit(1); }
+    printline("array-compression-ok " + (string)checks);
+}

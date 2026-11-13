@@ -1,0 +1,27 @@
+progress-display-ok 121
+
+Final-phase checks (NOT run in the no-launch phase):
+1. Build+run with the self-host compiler (progress_display_path.srp):
+   program output must match the one line above byte-for-byte. The two
+   imported modules give the compile two long module paths, so every
+   progress line exercises progressDisplayPath (verbatim-prefix strip
+   plus separator normalization, and — on non-Windows hosts — the
+   already-normalized early-return path).
+2. Byte-identity of the progress lines: capture stderr from the
+   pre-fix and post-fix builds of this fixture and diff them. In
+   standalone mode (silverc main.sr -o out.exe) the lines are
+   indeterminate (`[N] module <path>`) and must match exactly. In
+   project mode (progress_display_path.srp) the percentage is
+   deterministic but the `~<eta> left` suffix varies with elapsed
+   time, so compare the lines after stripping that suffix — the
+   shown path, counts, and percentages must match exactly before and
+   after the fix.
+3. Measurement: expand this fixture into a bench of ~50 modules with
+   long (deep-directory, ~500-char) module paths and large module
+   counts, then compare /usr/bin/time -v before and after on the same
+   host. Before the fix each progress line rebuilds its display path
+   with a per-character += (~L^2/2 abandoned bytes per line in the
+   never-free runtime, plus a strlen per loop iteration); after the
+   fix the path is verbatim-run slices + one join — linear in L, and
+   zero path garbage when the path needs no separator replacement
+   (the common already-normalized case).

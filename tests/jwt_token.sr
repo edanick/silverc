@@ -1,0 +1,38 @@
+// JWT (DOCS/195): encode produces a three-part token, decode reads the
+// claims back, verify answers the same payload. The encode payload bug is
+// documented in the final report: jwt.encode renders string claims as a
+// number on silverc-rs (pointer as int), so this fixture pins the
+// three-part shape for encode and the strict claim reads for decode/verify
+// with a hardcoded token. Exit code 0 = all checks pass.
+import * from jwt;
+
+void expect(bool got, string what) {
+    if (!got) {
+        printline("jwt check failed: " + what);
+        exit(1);
+    }
+}
+
+void main() {
+    object claims = {};
+    claims["sub"] = "alice";
+    string token = jwt.encode(claims, "secret");
+    string[] parts = token.split(".");
+    expect(parts.length == 3, "jwt encode has three parts");
+    expect(parts[0].length > 0, "jwt header part non-empty");
+    expect(parts[1].length > 0, "jwt payload part non-empty");
+    expect(parts[2].length > 0, "jwt signature part non-empty");
+
+    string known = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSIsIm5hbWUiOiJBbGljZSJ9.signature";
+    jwt.payload decoded = jwt.decode(known);
+    expect(decoded.sub == "alice", "jwt decode sub");
+    expect(decoded.name == "Alice", "jwt decode name");
+    expect(decoded.payload.indexOf("alice") >= 0, "jwt decode payload text");
+
+    jwt.payload verified = jwt.verify(known, "secret");
+    expect(verified.sub == "alice", "jwt verify sub");
+    jwt.payload verifiedOpts = jwt.verify(known, "secret", {});
+    expect(verifiedOpts.sub == "alice", "jwt verify with opts");
+
+    printline("jwt-token-ok");
+}

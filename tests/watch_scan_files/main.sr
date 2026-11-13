@@ -1,0 +1,46 @@
+// Watcher scan fixture (compiler/watcher.sr audit): the watcher's file list
+// was grown through wtWalk's bare string[] parameter (the helper-growth
+// shape documented in std/project.sr:181, where growing a bare array inside
+// a helper leaves the caller's length stale). The fix grows a WatchFiles
+// holder's property array instead, and a held holder drains in place and
+// refills per tick (watchScanInto) rather than abandoning a fresh list per
+// 500 ms poll. This program mirrors that exact holder shape in user code:
+// a helper that grows a 12-entry list (past the truncate-at-8 bound), a
+// drain in place, and a refill — all of which must survive with the exact
+// contents. It must compile and print exactly `watch-scan-ok 12`.
+class WatchFileList {
+    public prop string[] files;
+
+    construct {
+        this.files = [];
+    }
+
+    public void add(string s) {
+        this.files.add(s);
+    }
+
+    public void clear() {
+        while (this.files.length > 0) { this.files.pop(); }
+    }
+}
+
+void wtFillList(WatchFileList out, int count) {
+    for (int i = 0; i < count; i++) {
+        out.add("file" + (string)i + ".sr");
+    }
+}
+
+void main() {
+    WatchFileList list = new WatchFileList();
+    wtFillList(list, 12);
+    if (list.files.length != 12) { exit(1); }
+    if (list.files[0] != "file0.sr") { exit(1); }
+    if (list.files[11] != "file11.sr") { exit(1); }
+    list.clear();
+    if (list.files.length != 0) { exit(1); }
+    wtFillList(list, 12);
+    if (list.files.length != 12) { exit(1); }
+    if (list.files[0] != "file0.sr") { exit(1); }
+    if (list.files[11] != "file11.sr") { exit(1); }
+    printline("watch-scan-ok 12");
+}

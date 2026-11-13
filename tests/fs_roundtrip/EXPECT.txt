@@ -1,0 +1,35 @@
+fs-roundtrip-ok 17
+
+Final-phase checks (NOT run in the no-launch phase):
+1. Build+run with the self-host compiler (fs_roundtrip.srp): program
+   output must match the one line above byte-for-byte. Covers the
+   fixed kernels directly: fs.readString parts+one-join (small and
+   5000-char roundtrips), fs.read/fs.write binary roundtrip (8 bytes
+   incl. NUL and 0xFF tails), file.size matching the written length,
+   fs.listDir containing the written name, file.exists/file.delete,
+   and file.modification returning a real non-zero stamp.
+2. Before/after (Part B): on LINUX with HEAD (before the
+   normalizePath fix), the modification checks fail (epoch-zero,
+   rc != 0 from the shadowed normalize) and the fixture exits 1;
+   with the fix the stamp is real and all 16 checks pass. On WINDOWS
+   and MAC the fixture must pass both before and after (the WINDOWS
+   FILETIME path never normalized, the MAC stat offsets are
+   UNVALIDATED code-only but must not regress).
+3. Byte-identity: compile the same program with HEAD and with the
+   fixes and diff the outputs — every roundtrip, size, listing and
+   delete behavior must be identical (same buffers, same checks,
+   same cleanup; the negative-size guards are no-ops for any real
+   file, since GetFileSize only returns < 0 on failure).
+4. Negative (future-regression proof): mutate any kernel the
+   fixture pins in a scratch copy of main.sr (e.g. restore a
+   per-character += readString builder, or the shadowed
+   path.normalize(path) call) — the fixture must fail with exit
+   code 1 (modification checks and/or roundtrip/memory behavior),
+   and the EXPECT.txt byte-identity half must still hold for the
+   unmutated kernels.
+5. Measurement: on a scratch bench (a 1 MB text file read via
+   fs.readString), pre-fix peak RSS is quadratic in file size
+   (~500 GB of abandoned intermediates for 1 MB, capped by OOM)
+   while post-fix it is linear (one parts array + one join,
+   ~2x file size). Compare /usr/bin/time -v before/after on the
+   same bench; small-file runs differ only by the parts overhead.

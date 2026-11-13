@@ -1,0 +1,52 @@
+// Thread group (DOCS/150, THREAD_SAFETY.md): ThreadGroup add/at,
+// startAll/joinAll, and threads.sleep. Proved by files the callbacks write
+// and the main thread reads back after the join, like thread_spawn.
+// Exit code 0 = all checks pass.
+import * from thread;
+import * from fs;
+
+void markGroup(string path) {
+    fs.writeString(path, "ran");
+}
+
+void main() {
+    threads.ThreadGroup group = new threads.ThreadGroup();
+    threads.Thread first = new threads.Thread((void () {
+        markGroup("output/thread_group_zero.txt");
+    }));
+    threads.Thread second = new threads.Thread((void () {
+        markGroup("output/thread_group_one.txt");
+    }));
+    group.add(first);
+    group.add(second);
+    expect_group(group.at(0) == first, "at zero returns first");
+    expect_group(group.at(1) == second, "at one returns second");
+
+    group.startAll();
+    group.joinAll();
+
+    if (!fs.exists("output/thread_group_zero.txt")) {
+        printline("thread group: first callback never ran");
+        exit(1);
+    }
+    if (!fs.exists("output/thread_group_one.txt")) {
+        printline("thread group: second callback never ran");
+        exit(1);
+    }
+    if (fs.readString("output/thread_group_zero.txt") != "ran") {
+        printline("thread group: wrong content");
+        exit(2);
+    }
+    file.delete("output/thread_group_zero.txt");
+    file.delete("output/thread_group_one.txt");
+
+    threads.sleep(1);
+    printline("thread-group-ok");
+}
+
+void expect_group(bool got, string what) {
+    if (!got) {
+        printline("thread group check failed: " + what);
+        exit(1);
+    }
+}

@@ -1,0 +1,70 @@
+// FS roundtrip fixture (std/fs.sr audit): the free readString built its
+// result with per-character `+=` (WINDOWS foreach, LINUX/MAC for loops —
+// quadratic abandoned garbage in the never-free runtime), readDirNames
+// built every entry name the same way, and every LINUX/MAC body called
+// the shadowed `path.normalize(path)` — so FileOps.modification on LINUX
+// saw stat fail and returned epoch-zero, and --watch rebuilds never fired.
+// This program pins the fixed behavior: small and large text roundtrips
+// byte-identical, a binary roundtrip byte-identical, size matching the
+// written length, directory listing containing the file, and a real
+// non-zero modification stamp. It must print exactly `fs-roundtrip-ok N`.
+import * from fs;
+
+void main() {
+    int checks = 0;
+    string p = "tests/output/fs_roundtrip.txt";
+    string content = "hello silver fs roundtrip";
+    fs.writeString(p, content);
+    checks++;
+    if (!file.exists(p)) { exit(1); }
+    checks++;
+    if (fs.readString(p) != content) { exit(1); }
+    checks++;
+    if (file.size(p) != content.length) { exit(1); }
+    checks++;
+    if (file.modification(p).milliseconds() == 0) { exit(1); }
+    checks++;
+    string big = "x".repeat(5000);
+    fs.writeString(p, big);
+    checks++;
+    if (fs.readString(p) != big) { exit(1); }
+    checks++;
+    if (file.size(p) != 5000) { exit(1); }
+    checks++;
+    string[] names = fs.listDir("tests/output");
+    bool listed = false;
+    for (int i = 0; i < names.length; i++) {
+        if (names[i] == "fs_roundtrip.txt") { listed = true; break; }
+    }
+    if (!listed) { exit(1); }
+    checks++;
+    string pb = "tests/output/fs_roundtrip.bin";
+    byte[] blob = new byte[8];
+    blob[0] = 0;
+    blob[1] = 1;
+    blob[2] = 200;
+    blob[3] = 255;
+    blob[4] = 65;
+    blob[5] = 66;
+    blob[6] = 67;
+    blob[7] = 10;
+    fs.write(pb, blob);
+    checks++;
+    byte[] back = fs.read(pb);
+    if (back.length != 8) { exit(1); }
+    checks++;
+    if (back[0] != 0 || back[1] != 1 || back[2] != 200 || back[3] != 255) { exit(1); }
+    checks++;
+    if (back[4] != 65 || back[5] != 66 || back[6] != 67 || back[7] != 10) { exit(1); }
+    checks++;
+    if (file.modification(pb).milliseconds() == 0) { exit(1); }
+    checks++;
+    file.delete(p);
+    checks++;
+    if (file.exists(p)) { exit(1); }
+    checks++;
+    file.delete(pb);
+    checks++;
+    if (checks != 17) { exit(1); }
+    printline("fs-roundtrip-ok " + (string)checks);
+}

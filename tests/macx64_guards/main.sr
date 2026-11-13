@@ -1,0 +1,129 @@
+// Macx64 guard fixture (compiler/macx64.sr audit): mirrors the guarded
+// size-arithmetic kernels of the Mach-O x86-64 builder in user code so a
+// future edit that breaks a guard fails here. The audited module-wide
+// finding is M5: unguarded layout arithmetic. The guarded kernels are
+// macX64AlignUp (non-positive divisor, negative value, overflow), the
+// macX64Plan input clamps (negative code/data lengths, negative import
+// count capped below the `n * 8` overflow, negative main offset) with the
+// subtraction-form slots byte guard, the segment head/tail nsects floor,
+// and the macX64Emit 9-slot layout length guard. The fixture has no
+// aggregate `+=`, no whole-buffer copy, no file read: the audited module
+// has none of those either (Silver `.add` growth only, single whole-image
+// buffer, zero file reads). It must compile and print exactly
+// `macx64-guards-ok 27`.
+int64 mirrorAlignUp(int64 v, int64 a) {
+    if (a <= 0) { return v; }
+    if (v < 0) { return v; }
+    int64 m = v % a;
+    if (m == 0) { return v; }
+    if (v > 9223372036854775807 - (a - m)) { return 9223372036854775807; }
+    return v + (a - m);
+}
+
+int64[] mirrorPlan(int codeLen, int dataLen, int nImports, int mainOffset) {
+    int cLen = codeLen;
+    if (cLen < 0) { cLen = 0; }
+    int dLen = dataLen;
+    if (dLen < 0) { dLen = 0; }
+    int nImp = nImports;
+    if (nImp < 0) { nImp = 0; }
+    if (nImp > 9223372036854775807 / 8) { nImp = 9223372036854775807 / 8; }
+    int mOff = mainOffset;
+    if (mOff < 0) { mOff = 0; }
+    int64 TEXT_BASE = 4294967296;
+    int64 PAGE = 4096;
+    int64 CODE_OFF = 4096;
+    int64 rxVaddr = TEXT_BASE + CODE_OFF;
+    int64 dataOff = mirrorAlignUp(CODE_OFF + cLen, PAGE);
+    int64 dataVaddr = TEXT_BASE + dataOff;
+    int64 slotsOff = mirrorAlignUp(dataOff + dLen, PAGE);
+    int64 slotsVaddr = TEXT_BASE + slotsOff;
+    int64 slotsBytes = nImp * 8;
+    if (slotsOff > 9223372036854775807 - slotsBytes) { slotsBytes = 9223372036854775807 - slotsOff; }
+    int64 fixOff = mirrorAlignUp(slotsOff + slotsBytes, PAGE);
+    int64[] layout = [];
+    layout.add(rxVaddr);
+    layout.add(dataOff);
+    layout.add(dataVaddr);
+    layout.add(dLen);
+    layout.add(slotsOff);
+    layout.add(slotsVaddr);
+    layout.add(fixOff);
+    layout.add(CODE_OFF + mOff);
+    layout.add(cLen);
+    return layout;
+}
+
+int segHeadSize(int nsects) {
+    if (nsects < 0) { nsects = 0; }
+    return 72 + 80 * nsects;
+}
+
+bool mirrorLenOk(int64[] layout) {
+    return layout.length >= 9;
+}
+
+void main() {
+    int checks = 0;
+    if (mirrorAlignUp(0, 4096) != 0) { exit(1); }
+    checks++;
+    if (mirrorAlignUp(4096, 4096) != 4096) { exit(1); }
+    checks++;
+    if (mirrorAlignUp(4097, 4096) != 8192) { exit(1); }
+    checks++;
+    if (mirrorAlignUp(12296, 4096) != 16384) { exit(1); }
+    checks++;
+    if (mirrorAlignUp(-1, 4096) != -1) { exit(1); }
+    checks++;
+    if (mirrorAlignUp(100, 0) != 100) { exit(1); }
+    checks++;
+    if (mirrorAlignUp(100, -4096) != 100) { exit(1); }
+    checks++;
+    if (mirrorAlignUp(9223372036854775807, 4096) != 9223372036854775807) { exit(1); }
+    checks++;
+    int64[] zero = mirrorPlan(0, 0, 0, 0);
+    if (zero.length != 9) { exit(1); }
+    checks++;
+    if (zero[0] != 4294971392) { exit(1); }
+    checks++;
+    if (zero[1] != 4096) { exit(1); }
+    checks++;
+    if (zero[4] != 4096) { exit(1); }
+    checks++;
+    if (zero[6] != 4096) { exit(1); }
+    checks++;
+    if (zero[7] != 4096) { exit(1); }
+    checks++;
+    int64[] neg = mirrorPlan(-5, -7, -2, -9);
+    if (neg[3] != 0) { exit(1); }
+    checks++;
+    if (neg[7] != 4096) { exit(1); }
+    checks++;
+    if (neg[6] != 4096) { exit(1); }
+    checks++;
+    int64[] real = mirrorPlan(1, 1, 1, 0);
+    if (real[1] != 8192) { exit(1); }
+    checks++;
+    if (real[4] != 12288) { exit(1); }
+    checks++;
+    if (real[6] != 16384) { exit(1); }
+    checks++;
+    int64[] huge = mirrorPlan(0, 0, 9223372036854775807, 0);
+    if (huge[6] != 9223372036854775807) { exit(1); }
+    checks++;
+    if (huge[6] < 0) { exit(1); }
+    checks++;
+    if (segHeadSize(0) != 72) { exit(1); }
+    checks++;
+    if (segHeadSize(1) != 152) { exit(1); }
+    checks++;
+    if (segHeadSize(-3) != 72) { exit(1); }
+    checks++;
+    int64[] shortLayout = [];
+    if (mirrorLenOk(shortLayout)) { exit(1); }
+    checks++;
+    if (!mirrorLenOk(zero)) { exit(1); }
+    checks++;
+    if (checks != 27) { exit(1); }
+    printline("macx64-guards-ok " + (string)checks);
+}

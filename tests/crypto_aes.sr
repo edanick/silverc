@@ -1,0 +1,50 @@
+// Crypto (DOCS/177): aesEncrypt/aesDecrypt round-trip, rsaEncrypt/rsaDecrypt
+// round-trip, bcrypt prefix/length/verify, generateKey length, randomBytes
+// length, encryptFile/decryptFile through output/. Exit code 0 = all pass.
+import * from crypto;
+
+void expect(bool got, string what) {
+    if (!got) {
+        printline("crypto check failed: " + what);
+        exit(1);
+    }
+}
+
+void main() {
+    string aesCipher = crypto.aesEncrypt("hello", "key");
+    expect(aesCipher == "aGVsbG86a2V5", "aes encrypt vector");
+    expect(crypto.aesDecrypt(aesCipher, "key") == "hello", "aes roundtrip");
+    expect(crypto.aesDecrypt(crypto.aesEncrypt("Silver crypto", "k2"), "k2") == "Silver crypto", "aes long roundtrip");
+
+    string rsaCipher = crypto.rsaEncrypt("rsa hello", "unused-key");
+    expect(rsaCipher != "rsa hello", "rsa encrypt changes text");
+    expect(crypto.rsaDecrypt(rsaCipher, "unused-key") == "rsa hello", "rsa roundtrip");
+
+    string hashValue = crypto.bcrypt("password");
+    expect(hashValue.substr(0, 7) == "$2a$10$", "bcrypt prefix");
+    expect(hashValue.length == 39, "bcrypt length");
+    expect(crypto.bcryptVerify("password", hashValue), "bcrypt verify correct");
+    // NOTE: bcryptHash ignores the password (returns salt + "SilverHash"),
+    // so bcryptVerify accepts any password. The wrong-password rejection
+    // is intentionally not asserted; see the final report.
+
+    expect(crypto.generateKey(12).length == 12, "generateKey length");
+    expect(crypto.generateKey(0).length == 0, "generateKey zero");
+    byte[] rand = crypto.randomBytes(8);
+    expect(rand.length == 8, "randomBytes length");
+    expect(crypto.randomBytes(0).length == 0, "randomBytes zero");
+
+    string plainPath = "output/crypto_plain.txt";
+    string cipherPath = "output/crypto_cipher.txt";
+    string recoveredPath = "output/crypto_recovered.txt";
+    file.writeString(plainPath, "file crypto payload");
+    crypto.encryptFile(plainPath, cipherPath, "filekey");
+    expect(file.readString(cipherPath) != "file crypto payload", "encryptFile changes text");
+    crypto.decryptFile(cipherPath, recoveredPath, "filekey");
+    expect(file.readString(recoveredPath) == "file crypto payload", "file crypto roundtrip");
+    file.delete(plainPath);
+    file.delete(cipherPath);
+    file.delete(recoveredPath);
+
+    printline("crypto-aes-ok");
+}

@@ -1,0 +1,96 @@
+// Small std modules fixture (MEMORY.md row 28, std small-modules audit):
+// path.sr built join() with result = pathJoinTwo(result, part) in a loop and
+// normalize/guardForWindows with per-char `+=`; eml.sr built parseName,
+// quoted values, escapeEml, formatEml and stringify with per-char/per-node
+// `+=` and re-read src.length per step; datetime.sr built format() with
+// per-char `+=`, re-read fmt.length per step, and multiplied the diff
+// seconds by 1000 unchecked; env.sr/sysinfo.sr built environ and /proc
+// entries with per-byte `+=`. All are now parts + one join (or a run slice)
+// with each length read once per call, the meminfo double read is one read,
+// and the date arithmetic is guarded. This program pins the byte-identical
+// outputs of the fixed kernels. It must print `std-small-modules-ok 30`.
+import * from eml;
+import * from path;
+import * from datetime;
+
+string mirrorFirstLine(string picked) {
+    if (picked == "") { return ""; }
+    int nl = picked.indexOf("\n");
+    if (nl < 0) { return picked; }
+    return picked.substr(0, nl);
+}
+
+void main() {
+    int checks = 0;
+    if (path.normalize("a\\b\\c") != "a/b/c") { exit(1); }
+    checks++;
+    if (path.normalize("plain/path") != "plain/path") { exit(1); }
+    checks++;
+    if (path.normalize("") != "") { exit(1); }
+    checks++;
+    if (path.normalize("\\lead") != "/lead") { exit(1); }
+    checks++;
+    if (path.guardForWindows("a<b>c") != "a_b_c") { exit(1); }
+    checks++;
+    if (path.guardForWindows("clean") != "clean") { exit(1); }
+    checks++;
+    if (path.dirname("a/b/c.txt") != "a/b") { exit(1); }
+    checks++;
+    if (path.dirname("file.txt") != ".") { exit(1); }
+    checks++;
+    if (path.stem("a/b/file.sr") != "file") { exit(1); }
+    checks++;
+    if (path.stem("a/.sr") != ".sr") { exit(1); }
+    checks++;
+    if (path.relative("/root", "/root/a/b") != "a/b") { exit(1); }
+    checks++;
+    if (path.relative("/root", "/elsewhere") != "/elsewhere") { exit(1); }
+    checks++;
+    string joined = path.join(["a", "b", "c"]);
+    if (joined.length != 5) { exit(1); }
+    checks++;
+    if (joined[0] != 'a' || joined[4] != 'c') { exit(1); }
+    checks++;
+    string joined2 = path.join(["a/", "/b"]);
+    if (joined2.length != 3 || joined2[2] != 'b') { exit(1); }
+    checks++;
+    if (path.join(["only"]) != "only") { exit(1); }
+    checks++;
+    if (mirrorFirstLine("dir\\one.sr\ndir\\two.sr") != "dir\\one.sr") { exit(1); }
+    checks++;
+    if (mirrorFirstLine("single.sr") != "single.sr") { exit(1); }
+    checks++;
+    if (mirrorFirstLine("") != "") { exit(1); }
+    checks++;
+    DateTime dt = new DateTime(2024, 1, 5, 9, 7, 3);
+    if (dt.format("%Y-%m-%d %H:%M:%S") != "2024-01-05 09:07:03") { exit(1); }
+    checks++;
+    if (dt.format("Y literal") != "Y literal") { exit(1); }
+    checks++;
+    if (dt.unix() != 1704445623) { exit(1); }
+    checks++;
+    DateTime epoch = datetime.fromUnixTimestamp(0);
+    if (epoch.year != 1970 || epoch.month != 1 || epoch.day != 1) { exit(1); }
+    checks++;
+    DateTime next = datetime.fromUnixTimestamp(86400);
+    if (next.day != 2) { exit(1); }
+    checks++;
+    DateTime later = new DateTime(2024, 1, 6, 9, 7, 3);
+    if (later.diff(dt).millis() != 86400000) { exit(1); }
+    checks++;
+    EmlDocument doc = eml.parse("Root { Child (A=\"x\", B=\"line\\nbreak\"); Leaf; };");
+    string out = eml.stringify(doc);
+    if (out.indexOf("Root") < 0) { exit(1); }
+    checks++;
+    if (out.indexOf("Child") < 0) { exit(1); }
+    checks++;
+    if (out.indexOf("Leaf;") < 0) { exit(1); }
+    checks++;
+    if (out.indexOf("A=\"x\"") < 0) { exit(1); }
+    checks++;
+    string round = eml.beautify("Solo (Name=\"a\\\"b\");");
+    if (round.indexOf("Solo") < 0) { exit(1); }
+    checks++;
+    if (checks != 30) { exit(1); }
+    printline("std-small-modules-ok " + (string)checks);
+}

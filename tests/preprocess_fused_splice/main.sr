@@ -1,0 +1,32 @@
+// Preprocess fused-splice fixture (MEMORY.md §3.2 row 13, preprocess audit).
+// ppPreprocess used to materialize each kept run through ppNormalizeRange (a
+// per-run join) and then join those strings into the filtered aggregate
+// again — two full copies of the kept text whenever any *"..." literal
+// exists. The fix appends each run's pieces straight into the single output
+// accumulator, so the filtered aggregate is joined exactly once. This
+// program must compile and print `paths OK` identically on every target OS.
+// It exercises the fused shape: kept runs on both sides of a region, real
+// *"... path literals that get rewritten per OS, plus *"... sequences that
+// must NOT rewrite (inside a line comment, inside a char literal, and a *
+// with no quote inside a plain string).
+void main() {
+    string a = *"path/to/file";
+    string b = *"path\to\file";
+    string star = "a*b";
+    char sc = '*';
+    // a path opener inside a comment: *"ignored\file"
+    #on WINDOWS
+    if (a != "path\\to\\file") { printline("FAIL slash"); exit(1); }
+    if (b != "path\\to\\file") { printline("FAIL backslash"); exit(1); }
+    if (star != "a*b") { printline("FAIL star"); exit(1); }
+    if (sc != '*') { printline("FAIL char star"); exit(1); }
+    #else
+    if (a != "path/to/file") { printline("FAIL slash"); exit(1); }
+    if (b != "path/to/file") { printline("FAIL backslash"); exit(1); }
+    if (star != "a*b") { printline("FAIL star"); exit(1); }
+    if (sc != '*') { printline("FAIL char star"); exit(1); }
+    #off
+    string last = *"after/region";
+    if (last.length == 0) { printline("FAIL trailing"); exit(1); }
+    printline("paths OK");
+}

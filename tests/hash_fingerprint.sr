@@ -1,0 +1,57 @@
+// Hash fingerprints (DOCS/176, DOCS/230): djb2, fnv1 (1-arg, range, kind,
+// start/end), crc32, crc32c, generic hash dispatch, and file variants.
+// Absolute vectors are pinned for values below 2^63 (djb2 and CRCs) and
+// cross-checked for fnv1 (unsigned 64-bit offset basis), so no fragile
+// signed-literal expectation is needed. Exit code 0 = all checks pass.
+import hash;
+
+void expect(bool got, string what) {
+    if (!got) {
+        printline("hash check failed: " + what);
+        exit(1);
+    }
+}
+
+void main() {
+    expect(hash.djb2("") == 5381, "djb2 empty");
+    expect((string)hash.djb2("hello") == "210714636441", "djb2 hello");
+    expect((string)hash.djb2("abc") == "193485963", "djb2 abc");
+
+    expect((string)hash.crc32("123456789") == "3421780262", "crc32 check vector");
+    expect((string)hash.crc32c("123456789") == "3808858755", "crc32c check vector");
+    expect(hash.crc32("") == 0, "crc32 empty");
+    expect(hash.crc32c("") == 0, "crc32c empty");
+    expect((string)hash.crc32("hello") == "907060870", "crc32 hello");
+    expect((string)hash.crc32c("hello") == "2591144780", "crc32c hello");
+
+    byte[] helloBytes = [104, 101, 108, 108, 111];
+    expect(hash.crc32(helloBytes) == hash.crc32("hello"), "crc32 bytes match string");
+    expect(hash.crc32c(helloBytes) == hash.crc32c("hello"), "crc32c bytes match string");
+    expect(hash.fnv1(helloBytes) == hash.fnv1("hello"), "fnv1 bytes match string");
+    char[] helloChars = ['h', 'e', 'l', 'l', 'o'];
+    expect(hash.crc32(helloChars) == hash.crc32("hello"), "crc32 chars match string");
+    expect(hash.crc32c(helloChars) == hash.crc32c("hello"), "crc32c chars match string");
+    expect(hash.fnv1(helloChars) == hash.fnv1("hello"), "fnv1 chars match string");
+
+    expect(hash.fnv1("hello", 0, 5) == hash.fnv1("hello"), "fnv1 range full");
+    expect(hash.fnv1("hello", 1, 4) == hash.fnv1("ell"), "fnv1 range slice");
+    expect(hash.fnv1("hello", 0, 100) == hash.fnv1("hello"), "fnv1 range end clamps");
+    expect(hash.fnv1("hello", 0) == hash.fnv1("hello", 0), "fnv1 kind call stable");
+
+    expect(hash.hash(0, "hello") == hash.fnv1("hello"), "hash dispatch fnv1");
+    expect(hash.hash(2, "hello") == hash.djb2("hello"), "hash dispatch djb2");
+    expect(hash.hash(4, "hello") == hash.crc32("hello"), "hash dispatch crc32");
+    expect(hash.hash(3, "hello") == hash.crc32c("hello"), "hash dispatch crc32c");
+    expect(hash.hash(0, helloBytes) == hash.fnv1(helloBytes), "hash dispatch bytes");
+    expect(hash.hash(1, "hello") == hash.fnv1("hello", 1), "hash dispatch fnv1a");
+    expect(hash.hash(99, "hello") == 0, "hash unknown algo is zero");
+
+    string probePath = "output/hash_fingerprint_tmp.txt";
+    file.writeString(probePath, "hash file probe");
+    expect(hash.djb2File(probePath) == hash.djb2("hash file probe"), "djb2File matches string");
+    expect(hash.fnv1File(probePath) == hash.fnv1("hash file probe"), "fnv1File matches string");
+    expect(hash.fnv1FileBytes(probePath) == hash.fnv1("hash file probe"), "fnv1FileBytes matches string");
+    file.delete(probePath);
+
+    printline("hash-fingerprint-ok");
+}

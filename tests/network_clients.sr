@@ -1,0 +1,146 @@
+// Network clients (DOCS/63-64, DOCS/162, DOCS/164, DOCS/170, DOCS/188,
+// DOCS/192): compile-only, no main, so no socket is opened and no packet
+// can be sent in a runner. Typechecks http, http_server, net, ws, dns,
+// and oauth surfaces.
+import * from http;
+import * from http_server;
+import * from net;
+import * from ws;
+import * from dns;
+import * from oauth;
+
+void checkNetworkSurface() {
+    string fetched = http.get("https://example.com");
+    string posted = http.post("https://example.com", "field=value");
+    string removed = http.delete("https://example.com");
+    if (fetched == posted) { printline(removed); }
+
+    http_server.headermap map = new http_server.headermap();
+    map.set("X-A", "1");
+    map.add("X-A", "2");
+    string first = map.get("X-A");
+    string[] all = map.getAll("X-A");
+    bool present = map.has("X-A");
+    string wire = map.serialize();
+    http_server.request request = new http_server.request("GET / HTTP/1.1");
+    http_server.response response = new http_server.response(0);
+    response.status(200).header("X-Test", "yes");
+    response.send("hello");
+    response.json({});
+    response.html("<p>hi</p>");
+    response.redirect("/next");
+    string rendered = response.render("body");
+    http_server.server server = new http_server.server(8080);
+    server.handle((void () {
+    }));
+    server.setPort(8080);
+    server.listenNow();
+    bool accepted = server.acceptOnce();
+    server.serveLoop();
+    server.serveBoundedLoop(1);
+    string raw = server.curRawPub();
+    int fd = server.curFdPub();
+    server.serve(8080, (void () {
+    }));
+    server.serveBounded(8080, (void () {
+    }), 1);
+    string curRaw = server.currentRaw();
+    int curSock = server.currentSocket();
+    string reqHead = server.requestHeader("Host");
+    string[] reqMethods = [request.method, request.path, request.version, request.body, first, wire, rendered, raw, curRaw, reqHead];
+    int[] nums = [fd, curSock];
+    bool[] flags = [present, accepted];
+    if (all.length == 0) { printline(reqMethods[0]); }
+    if (flags[0]) { printline(reqMethods[1]); }
+    if (nums[0] == nums[1]) { printline(reqMethods[2]); }
+
+    string[] resolved = net.lookup("localhost");
+    net.socket socket = net.connect("localhost", 80);
+    socket.send("ping");
+    string received = socket.receive(256);
+    socket.close();
+    int socketHandle = socket.handle();
+    net.listener listener = net.listen(8080);
+    net.socket client = listener.accept();
+    client.close();
+    listener.close();
+    int listenerHandle = listener.handle();
+    net.tls_client tls = new net.tls_client("example.com", 443);
+    tls.setCA("output/ca.pem");
+    tls.setCert("output/cert.pem");
+    bool tlsUp = tls.connect();
+    tls.send("ping");
+    string tlsRecv = tls.receive();
+    tls.close();
+    int rawFd = net.connectRaw("localhost", 80);
+    int bindFd = net.bindRaw(8080);
+    int listenFd = net.listenRaw(8080);
+    int acceptFd = net.acceptRaw(8080);
+    int sent = net.sendRaw(8080, "data");
+    byte[] sentBytes = net.sendBytesRaw(8080, [1, 2]);
+    int sentLen = net.sendRawLen(8080, "data", 4);
+    string rawRecv = net.recvRaw(8080, 64);
+    byte[] rawBytes = net.recvBytesRaw(8080, 64);
+    byte[] rawExact = net.recvBytesExactRaw(8080, 4);
+    string rawExactStr = net.recvRawExact(8080, 4);
+    net.closeRaw(8080);
+    net.setRecvTimeoutRaw(8080, 100);
+    string[] udp = net.lookup("localhost", 2);
+    int udpSock = net.udpOpenRaw();
+    int udpBound = net.udpBindRaw(53);
+    int udpSent = net.udpSendToRaw(udpSock, "8.8.8.8", 53, [1]);
+    byte[] udpBack = net.udpRecvFromRaw(udpSock, 64, [0, 0]);
+    if (resolved.length == 0) { printline(received); }
+    if (socketHandle == listenerHandle) { printline((string)rawFd); }
+    if (tlsUp) { printline(tlsRecv); }
+    if (bindFd == listenFd) { printline((string)acceptFd); }
+    if (sent == sentLen) { printline(rawRecv); }
+    if (sentBytes.length == 0) { printline((string)rawExact.length); }
+    if (rawExactStr == rawRecv) { printline("never"); }
+    if (udp.length == 0) { printline((string)udpSock); }
+    if (udpBound == udpSent) { printline((string)udpBack.length); }
+
+    ws.socket wsSock = ws.connect("ws://localhost:8080");
+    wsSock.onOpen((void () {
+    }));
+    wsSock.onMessage((void () {
+    }));
+    wsSock.onClose((void () {
+    }));
+    wsSock.send("hello");
+    string wsRecv = wsSock.receive(256);
+    byte[] frame = wsSock.encodeFrame("hello");
+    string decoded = wsSock.decodeFrame("frame");
+    wsSock.close();
+    ws.server wsServer = new ws.server(8080);
+    wsServer.onConnection((void () {
+    }));
+    wsServer.start();
+    ws.socket acceptedWs = wsServer.accept();
+    acceptedWs.close();
+    wsServer.wait();
+    if (wsRecv == decoded) { printline((string)frame.length); }
+    if (resolved.length == 0) { printline("never"); }
+
+    string[] mx = dns.lookup("example.com");
+    string[] ns = dns.resolveMX("example.com");
+    string[] txt = dns.resolveNS("example.com");
+    string[] txt2 = dns.resolveTXT("example.com");
+    string reverse = dns.reverse("1.1.1.1");
+    dns.task dnsTask = dns.resolveAsync("example.com");
+    dnsTask.setHost("example.com");
+    string dnsResult = dnsTask.awaitResult();
+    if (mx.length == 0) { printline(reverse); }
+    if (ns.length == 0) { printline(txt[0]); }
+    if (txt2.length == 0) { printline(dnsResult); }
+
+    oauth.request oauthReq = new oauth.request(new oauth.token());
+    string oauthPage = oauthReq.fetch("https://example.com");
+    oauth.client oauthCli = new oauth.client("id", "secret", "https://app.example.com/cb", "https://provider.example.com/auth", "https://provider.example.com/token", ["read"]);
+    string authUrl = oauthCli.authorizationUrl("code");
+    oauth.token token = oauthCli.exchangeCode("code123");
+    oauth.token refreshed = oauthCli.refreshToken("refresh123");
+    oauth.token creds = oauthCli.clientCredentials();
+    if (oauthPage == authUrl) { printline(token.accessToken); }
+    if (refreshed.accessToken == creds.refreshToken) { printline("never"); }
+}

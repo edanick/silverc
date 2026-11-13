@@ -1,0 +1,154 @@
+// Storage, system, and support modules (DOCS/172, DOCS/199, DOCS/178,
+// DOCS/243, DOCS/247, DOCS/194, DOCS/204): compile-only, no main, so no
+// database, registry, or OS call can fire in a runner. Typechecks sqlite,
+// registry, sysinfo, process, notifications, binary_metadata, image,
+// and io surfaces. The async and sys modules are intentionally not
+// imported here: async clashes with the async keyword in import position
+// and sys.sr fails to compile (ExitProcess without a grant); both are
+// documented in the final report.
+import * from sqlite;
+import * from registry;
+import * from sysinfo;
+import * from process;
+import * from notifications;
+import * from binary_metadata;
+import * from image;
+import * from io;
+
+void checkStorageSurface() {
+    sqlite.connection db = sqlite.open("output/storage_sysinfo.db");
+    db.execute("CREATE TABLE t (a TEXT)");
+    sqlite.result queryResult = db.query("SELECT 1");
+    sqlite.statement stmt = db.prepare("SELECT 1");
+    stmt.execute([]);
+    db.transaction((void () {
+    }));
+    db.close();
+    sqlite.row dbRow = new sqlite.row();
+    dbRow.set("a", "1");
+    string cell = dbRow.get("a");
+    bool hasCell = dbRow.has("a");
+    if (cell == "") { printline("never"); }
+    if (hasCell && queryResult != null) { printline("row"); }
+
+    registry.RegistryKey key = new registry.RegistryKey(2, "SOFTWARE\\Silver", 1);
+    int handle = key.getHandle();
+    int hive = key.getHive();
+    string keyPath = key.getPath();
+    int access = key.getAccess();
+    bool open = key.isOpen();
+    bool exists = key.exists();
+    string textValue = key.getString("Name", "default");
+    key.setString("Name", "value");
+    int intValue = key.getInt("Num", 0);
+    key.setInt("Num", 1);
+    int longValue = key.getInt64("Num", 0);
+    key.setInt64("Num", 1);
+    bool boolValue = key.getBool("Flag", false);
+    key.setBool("Flag", true);
+    registry.RegistryKey sub = key.GetKey("Sub");
+    registry.RegistryKey subAccess = key.GetKeyAccess("Sub", 1);
+    registry.RegistryKey viaGet = key.getKey("Sub");
+    registry.RegistryKey added = key.addKey("Sub", 1);
+    int subCount = key.getSubKeyCount();
+    int valCount = key.getValueCount();
+    string[] subNames = key.subKeyNames();
+    string[] valNames = key.valueNames();
+    bool hasVal = key.hasValue("Name");
+    key.deleteValue("Name");
+    key.deleteKey("Sub");
+    key.close();
+    key.flush();
+    registry.RegistryHive hiveKind = registry.RegistryHive.LOCAL_MACHINE;
+    registry.RegistryAccess writeAccess = registry.RegistryAccess.WRITE;
+    registry.RegistryValueKind stringKind = registry.RegistryValueKind.STRING;
+    if (handle == hive) { printline(keyPath); }
+    if (access == 0) { printline(textValue); }
+    if (open) { printline((string)intValue); }
+    if (exists) { printline((string)longValue); }
+    if (boolValue) { printline(sub.getPath()); }
+    if (subAccess.getHandle() == viaGet.getHandle()) { printline(added.getPath()); }
+    if (subCount == valCount) { printline((string)subNames.length); }
+    if (hasVal) { printline(valNames[0]); }
+    if ((int)hiveKind == 2) { printline((string)(int)writeAccess); }
+    if ((int)stringKind == 1) { printline("kind"); }
+
+    string sysOs = sysinfo.os();
+    string sysVersion = sysinfo.osVersion();
+    string arch = sysinfo.arch();
+    string host = sysinfo.hostname();
+    int cores = sysinfo.cpuCores();
+    string model = sysinfo.cpuModel();
+    double usage = sysinfo.cpuUsage();
+    int64 memTotal = sysinfo.memoryTotal();
+    int64 memFree = sysinfo.memoryFree();
+    int64 memUsed = sysinfo.memoryUsed();
+    double memPct = sysinfo.memoryUsagePercent();
+    int64 diskTotal = sysinfo.diskTotal();
+    int64 diskFree = sysinfo.diskFree();
+    double diskPct = sysinfo.diskUsagePercent();
+    string[] ips = sysinfo.networkIPs();
+    int pid = sysinfo.pid();
+    string procName = sysinfo.processName();
+    int64 uptime = sysinfo.uptime();
+    string user = sysinfo.username();
+    string home = sysinfo.homeDir();
+    string temp = sysinfo.tempDir();
+    string lang = sysinfo.lang();
+    string envVal = sysinfo.env("PATH");
+    if (sysOs == sysVersion) { printline(arch); }
+    if (host == model) { printline((string)cores); }
+    if (usage == 0.0) { printline((string)memTotal); }
+    if (memFree == memUsed) { printline((string)memPct); }
+    if (diskTotal == diskFree) { printline((string)diskPct); }
+    if (ips.length == 0) { printline((string)pid); }
+    if (procName == user) { printline((string)uptime); }
+    if (home == temp) { printline(lang); }
+    if (envVal == "") { printline("never"); }
+
+    process.result ran = process.run("echo", ["hi"]);
+    process.Process focused = process.Process.getFocusedProcess();
+    process.pipe pipe = new process.pipe();
+    pipe.write("input");
+    pipe.flush();
+    string piped = pipe.read();
+    if (ran.stdout == piped) { printline((string)ran.exitCode); }
+    if (focused.id == 0) { printline(focused.title); }
+
+    notifications.Notification note = new notifications.Notification();
+    notifications.show(note);
+    int sent = notifications.dbusNotify("app", "title", "body");
+    if (sent == 0) { printline("never"); }
+
+    binary_metadata.BinaryMetadata meta = binary_metadata.BinaryMetadata.getMetadata("output/app.exe");
+    if (meta.language == "") { printline("never"); }
+
+    image.Color white = image.Color.white();
+    image.Color black = image.Color.black();
+    image.img picture = new image.img(4, 4);
+    image.img resized = picture.resize(2, 2);
+    image.img scaled = picture.scale(2.0);
+    image.img cropped = picture.crop(0, 0, 2, 2);
+    image.img rotated = picture.rotate(90);
+    image.img flippedH = picture.flipHorizontal();
+    image.img flippedV = picture.flipVertical();
+    picture.save("output/picture.png");
+    picture.saveAs("output/picture.png", {});
+    picture.fill(white);
+    picture.drawRect(0, 0, 1, 1, black);
+    picture.drawCircle(0, 0, 1, black);
+    picture.drawLine(0, 0, 1, 1, black);
+    picture.drawText("hi", 0, 0, black, 12);
+    picture.paste(resized, 0, 0);
+    image.img loaded = picture.load("output/picture.png");
+    byte[] encoded = picture.encode(loaded, image.Format.PNG);
+    byte[] encodedQ = picture.encode(loaded, image.Format.PNG, 80);
+    if (resized.width == scaled.width) { printline((string)cropped.height); }
+    if (rotated.width == flippedH.width) { printline((string)flippedV.height); }
+    if (encoded.length == encodedQ.length) { printline("never"); }
+
+    string line = io.readLine();
+    string got = io.input();
+    string prompted = io.input("prompt? ");
+    if (line == got) { printline(prompted); }
+}

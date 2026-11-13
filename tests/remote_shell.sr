@@ -1,0 +1,73 @@
+// Remote shell and file transfer (DOCS/166, DOCS/189, DOCS/190): compile-only,
+// no main, so no connection is opened. Typechecks ssh, ftp, and ftps.
+import * from ssh;
+import * from ftp;
+import * from ftps;
+
+void checkRemoteSurface() {
+    string banner = ssh.clientBanner();
+    bool bannerGood = ssh.bannerOk("SSH-2.0-OpenSSH");
+    int bannerPos = ssh.bannerIndex("SSH-2.0-OpenSSH");
+    string version = ssh.versionString("SSH-2.0-OpenSSH_8.0");
+    ssh.client sshCli = new ssh.client("ssh.example.com", 22);
+    string sshReply = sshCli.getLastReply();
+    bool sshIn = sshCli.isLoggedIn();
+    string serverVer = sshCli.serverVersion();
+    sshCli.login("user", "pass");
+    sshCli.authWithKey("user", "output/id_rsa");
+    sshCli.authWithKey("user", "output/id_rsa", "passphrase");
+    string ran = sshCli.exec("ls");
+    ssh.shell shell = sshCli.shell();
+    shell.write("ls");
+    string shellOut = shell.read();
+    shell.close();
+    ssh.sftp sftp = sshCli.sftp();
+    sftp.list("/tmp");
+    sftp.get("/tmp/a", "output/a");
+    sftp.put("output/a", "/tmp/a");
+    sftp.delete("/tmp/a");
+    sftp.close();
+    sshCli.upload("output/a", "/tmp/a");
+    sshCli.download("/tmp/a", "output/a");
+    sshCli.close();
+    if (bannerGood) { printline(sshReply); }
+    if (bannerPos == 0) { printline(version); }
+    if (sshIn) { printline(serverVer); }
+    if (ran == shellOut) { printline("never"); }
+
+    int code = ftp.replyCode("220 ready");
+    bool complete = ftp.replyComplete("220 ready");
+    string pasvHost = ftp.pasvHost("227 (127,0,0,1,4,5)");
+    int pasvPort = ftp.pasvPort("227 (127,0,0,1,4,5)");
+    ftp.client ftpCli = new ftp.client("ftp.example.com");
+    ftpCli.setPort(21);
+    string ftpReply = ftpCli.getLastReply();
+    bool ftpIn = ftpCli.isLoggedIn();
+    ftpCli.login("user", "pass");
+    string[] ftpFiles = ftpCli.list("/pub");
+    ftpCli.download("/pub/a", "output/a");
+    ftpCli.upload("output/a", "/pub/a");
+    ftpCli.close();
+    ftp.server ftpSrv = new ftp.server("tests/output", 21);
+    ftpSrv.addUser("user", "pass", "read");
+    ftpSrv.start();
+    ftpSrv.wait();
+    if (complete) { printline(ftpReply); }
+    if (ftpIn) { printline(pasvHost); }
+    if (pasvPort == 0) { printline((string)code); }
+    if (ftpFiles.length == 0) { printline("never"); }
+
+    ftps.client ftpsCli = new ftps.client("ftps.example.com", 21);
+    ftpsCli.setTLS(ftps.TLSMode.Explicit);
+    ftpsCli.setCA("output/ca.pem");
+    ftpsCli.setVerifyMode(ftps.VerifyMode.Strict);
+    string ftpsReply = ftpsCli.getLastReply();
+    bool ftpsIn = ftpsCli.isLoggedIn();
+    ftpsCli.login("user", "pass");
+    string[] ftpsFiles = ftpsCli.list("/pub");
+    ftpsCli.download("/pub/a", "output/a");
+    ftpsCli.upload("output/a", "/pub/a");
+    ftpsCli.close();
+    if (ftpsIn) { printline(ftpsReply); }
+    if (ftpsFiles.length == 0) { printline("never"); }
+}

@@ -1,0 +1,66 @@
+// Output-image single-reference fixture (MEMORY.md row 8 / C9 builder half).
+// This program exercises the assembler + image-builder pipeline: wide
+// instruction coverage (register/memory forms, shifts, SSE doubles,
+// multiplies, div/rem), forward/backward labels and conditional branches
+// (relocation resolution), string data, and native imports. It must
+// compile and print `image-ok 125` identically on every target OS.
+//
+// The fix it pins (compiler/mini_asm.sr + compiler/mini_ef.sr): the PE
+// builder runs ONE layout pass shared by computeLayout and build
+// (cacheEvLayout), writes import hint/name bytes directly into the image
+// instead of materializing a hintNames copy first, and bounds-checks label
+// ids / frame sizes / image sizes. Emitted bytes must be identical before
+// and after (encodings, section layout, import tables unchanged).
+//
+// Final-phase checks (NOT run in the no-launch phase):
+// 1. Build+run with the self-host compiler; output must be
+//    `image-ok 1234` with no diagnostics.
+// 2. Byte-identity: compile with HEAD (pre-fix) and with the fixed
+//    compiler; both .exe images must diff empty (cmp).
+// 3. Layout determinism: compile twice with the fixed compiler; images
+//    identical (cached layout tables must not drift between calls).
+
+#on WINDOWS
+import * from win32.kernel32;
+#on LINUX
+import * from linux.libc;
+#on MAC
+import * from mac.libsystem;
+#off
+
+int compute(int n) {
+    int acc = 0;
+    int i = 0;
+    while (i < n) {
+        int sq = i * i;
+        if (sq % 2 == 0) {
+            acc += sq;
+        } else {
+            acc += 1;
+        }
+        i++;
+    }
+    return acc;
+}
+
+float64 poly(int x) {
+    float64 a = x + 1;
+    return a * a + 2.0 * a - 3.0;
+}
+
+void main() {
+#on WINDOWS
+    Sleep(0);
+#on LINUX
+    getpid();
+#on MAC
+    getpid();
+#off
+    string tag = "image-single-reference";
+    int total = compute(10);
+    float64 p = poly(3);
+    if (tag.length == 0) { printline("FAIL tag"); exit(1); }
+    if (total != 125) { printline("FAIL total"); exit(1); }
+    if (p != 21.0) { printline("FAIL poly"); exit(1); }
+    printline("image-ok " + total);
+}
