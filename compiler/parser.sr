@@ -1070,6 +1070,54 @@ class Parser {
     // Mirror of linuxResolvable for the mac grant trio above: a full `mac`
     // open, an opened `mac.<module>`, or a granted export name (aliases answer
     // to their local name only) resolves a free libSystem/objc call.
+    // Every name the program's native imports grant: the exports of the
+    // opened native modules plus the individually granted names (a full
+    // `import * from win32;` grants every export of every known DLL). The
+    // MemoryGuard reads the set so a native call whose name also matches a
+    // user declaration is not refused for arity -- the bootstrap's DLL
+    // fallback: when no user declaration accepts the argument count, the
+    // call reaches the export instead of failing the compile.
+    public string[] nativeGrantNames() {
+        string[] names = [];
+        for (int g = 0; g < this.win32GrantNames.length; g++) { names.add(this.win32GrantNames[g]); }
+        for (int m = 0; m < this.win32OpenModules.length; m++) {
+            string[] words = this.win32ExportSet(this.win32ModuleNameDll(this.win32OpenModules[m]));
+            for (int w = 0; w < words.length; w++) { names.add(words[w]); }
+        }
+        if (this.win32AllModules) {
+            string[] dlls = ["kernel32.dll", "ws2_32.dll", "winhttp.dll", "wininet.dll", "shell32.dll", "msvcrt.dll", "user32.dll", "advapi32.dll", "version.dll"];
+            for (int d = 0; d < dlls.length; d++) {
+                string[] words = this.win32ExportSet(dlls[d]);
+                for (int w = 0; w < words.length; w++) { names.add(words[w]); }
+            }
+        }
+        for (int g = 0; g < this.linuxGrantNames.length; g++) { names.add(this.linuxGrantNames[g]); }
+        for (int m = 0; m < this.linuxOpenModules.length; m++) {
+            string[] words = this.linuxExportSet(this.linuxModuleNameLib(this.linuxOpenModules[m]));
+            for (int w = 0; w < words.length; w++) { names.add(words[w]); }
+        }
+        if (this.linuxAllModules) {
+            string[] libs = ["libc.so.6", "libX11.so.6", "libXtst.so.6"];
+            for (int l = 0; l < libs.length; l++) {
+                string[] words = this.linuxExportSet(libs[l]);
+                for (int w = 0; w < words.length; w++) { names.add(words[w]); }
+            }
+        }
+        for (int g = 0; g < this.macGrantNames.length; g++) { names.add(this.macGrantNames[g]); }
+        for (int m = 0; m < this.macOpenModules.length; m++) {
+            string[] words = this.macExportSet(this.macModuleNameLib(this.macOpenModules[m]));
+            for (int w = 0; w < words.length; w++) { names.add(words[w]); }
+        }
+        if (this.macAllModules) {
+            string[] libs = ["/usr/lib/libSystem.B.dylib", "/usr/lib/libobjc.A.dylib"];
+            for (int l = 0; l < libs.length; l++) {
+                string[] words = this.macExportSet(libs[l]);
+                for (int w = 0; w < words.length; w++) { names.add(words[w]); }
+            }
+        }
+        return names;
+    }
+
     private bool macResolvable(string name) {
         if (this.macAllModules) { return true; }
         for (int g = 0; g < this.macGrantNames.length; g++) {

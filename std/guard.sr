@@ -253,9 +253,15 @@ class MemoryGuard {
     // allocation every time.
     private prop int[] unusedOrder;
     public prop string[] warnings;
+    // The names the program's native imports grant (the Driver hands them
+    // over from the parse): a call to one of them may reach the native
+    // export even when a user declaration of the same name takes a
+    // different argument count -- the bootstrap's DLL fallback.
+    public prop string[] nativeNames;
 
     construct {
         this.vars = [];
+        this.nativeNames = [];
         this.scopeEnds = [];
         this.globalNames = [];
         this.globalTypeNames = [];
@@ -2340,7 +2346,11 @@ class MemoryGuard {
         // signatures (lastNamed >= 0), but no declaration's parameter count
         // accepts the call — an argument count no overload takes is a
         // compile error, not a silent pass (the general free-call contract).
-        if (lastNamed >= 0 && !anyArityMatch) {
+        // The bootstrap's DLL fallback exempts a name an imported native
+        // export answers to: the call then reaches the export (std/env.sr's
+        // libc `open(path, flags, mode)` beside sqlite's `open(path)`),
+        // so the arity mismatch is not a refusal.
+        if (lastNamed >= 0 && !anyArityMatch && !this.nativeNames.contains(n.name)) {
             this.fail("OverloadArity", n.line, n.col, n.name, "no overload of '" + n.name + "' takes " + (string)argc + " argument(s)");
         }
         if (!anyCheckable || anyAccepts) { return; }
