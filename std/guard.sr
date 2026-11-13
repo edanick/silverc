@@ -99,6 +99,13 @@ class GuardVar {
     public prop bool holdsAddress;
     public prop string aliasOf;
     public prop string addrTarget;
+    // Inferred initializer type of an untyped (`var x = ...`) binding:
+    // the declared typeHint stays "" (permissive) so assignability and
+    // overload behavior are unchanged; this field is the only place the
+    // initializer's proven shape is remembered, read by the
+    // indexable-receiver check. Set once at the declaration and never
+    // rewritten, so branch checkpoints never have to carry it.
+    public prop string initTypeHint;
     public prop int line;
     public prop int col;
 
@@ -114,6 +121,7 @@ class GuardVar {
         this.holdsAddress = false;
         this.aliasOf = "";
         this.addrTarget = "";
+        this.initTypeHint = "";
         this.line = 0;
         this.col = 0;
     }
@@ -820,6 +828,20 @@ class MemoryGuard {
         return "";
     }
 
+    // The type a LITERAL proves itself to be (registration-order safe: no
+    // name resolution, so it may run while the tables are still being
+    // filled). Everything non-literal is unknown.
+    private string literalNodeType(Node e) {
+        int k = e.kind;
+        if (k == GND_INT_LIT) { return "int"; }
+        if (k == GND_FLOAT_LIT) { return "float"; }
+        if (k == GND_STRING_LIT) { return "string"; }
+        if (k == GND_CHAR_LIT) { return "char"; }
+        if (k == GND_BOOL_LIT) { return "bool"; }
+        if (k == GND_PAREN && e.childCount() > 0) { return this.literalNodeType(e.child(0)); }
+        return "";
+    }
+
     private bool isNumericTypeName(string t) {
         return t == "int" || t == "int32" || t == "int64" || t == "uint" || t == "uint64"
             || t == "float" || t == "float64" || t == "double" || t == "byte";
@@ -838,19 +860,119 @@ class MemoryGuard {
     }
 
     // The receiver type of an index expression, when the guard knows it: a
-    // local or parameter's declared type, a class field's declared type, a
-    // module-level binding's declared type, or a literal's type. Every
-    // other shape (a member read, a call result, an untyped `var`) is
-    // unknown and stays permissive.
+    // local or parameter's declared type (an untyped `var` through its
+    // recorded initializer type), a member read into a known class field, a
+    // call to a known function or class method, a module-level binding's
+    // declared type, or a literal's type. Every other shape is unknown and
+    // stays permissive.
     private string indexReceiverType(Node e) {
         if (e.kind == GND_IDENT) {
+            if (e.name == "this" && this.currentClass.length > 0) { return this.currentClass; }
             int idx = this.findVar(e.name);
-            if (idx >= 0) { return this.vars[idx].typeHint; }
+            if (idx >= 0) {
+                string t = this.vars[idx].typeHint;
+                if (t.length == 0 || t == "var") { return this.vars[idx].initTypeHint; }
+                return t;
+            }
             return this.globalTypeOf(e.name);
         }
+        if (e.kind == GND_MEMBER) { return this.memberExprType(e); }
+        if (e.kind == GND_CALL) { return this.callExprType(e); }
         if (e.kind == GND_PAREN) { return this.indexReceiverType(e.child(0)); }
         if (e.kind == GND_UNARY) { return this.indexReceiverType(e.child(0)); }
         return this.inferStaticType(e);
+    }
+
+    // Declared type of one field inside a class's flattened layout (own
+    // fields before inherited, first declaration wins). Unknown fields and
+    // classes report "" — the member read stays permissive.
+    private string classFieldType(string className, string field) {
+        GuardField[] flat = this.classFieldList(className);
+        for (int i = 0; i < flat.length; i++) {
+            if (flat[i].name == field) { return flat[i].typeHint; }
+        }
+        return "";
+    }
+
+    // Declared return type of one method inside a class's flattened layout
+    // (own methods before inherited, first declaration wins). Unknown
+    // methods and classes report "" — the member call stays permissive.
+    private string classMethodReturnType(string className, string method) {
+        string[] visited = [];
+        string[] stack = [];
+        stack.add(className);
+        while (stack.length > 0) {
+            string name = stack[stack.length - 1];
+            stack.pop();
+            if (visited.contains(name)) { continue; }
+            visited.add(name);
+            int ci = this.classIndexOf(name);
+            if (ci < 0) { continue; }
+            Node cd = this.classNodes[ci];
+            for (int f = 0; f < cd.childCount(); f++) {
+                Node m = cd.child(f);
+                if (m.kind == GND_FUNC && m.name == method) { return m.typeHint; }
+            }
+            for (int p = 0; p < cd.parentClasses.length; p++) {
+                stack.add(cd.parentClasses[p]);
+            }
+        }
+        return "";
+    }
+
+    // Class name of a member/call receiver when the guard can decide it:
+    // `this` inside a deep-checked class, or any receiver whose resolved
+    // type names a known class or struct. Everything else resolves
+    // dynamically and is never judged.
+    private string receiverClassName(Node obj) {
+        if (obj.kind == GND_IDENT && obj.name == "this" && this.currentClass.length > 0) {
+            return this.currentClass;
+        }
+        string t = this.indexReceiverType(obj);
+        if (t.length == 0 || t == "object") { return ""; }
+        if (this.classIndexOf(t) >= 0) { return t; }
+        return "";
+    }
+
+    // The type of a member read `obj.field`, when the receiver names a
+    // known class and the field's declared type is a real value type. An
+    // `object` record, an untyped field, and an unknown receiver or class
+    // prove nothing and stay permissive.
+    private string memberExprType(Node e) {
+        if (e.childCount() == 0) { return ""; }
+        string cls = this.receiverClassName(e.child(0));
+        if (cls.length == 0) { return ""; }
+        string t = this.classFieldType(cls, e.name);
+        if (t.length == 0 || t == "var") { return ""; }
+        return t;
+    }
+
+    // A declared return type is a usable receiver type only when it is a
+    // real Silver value type: `void`, `var` and the empty spelling prove
+    // nothing about the call's shape, so they stay permissive.
+    private string judgedCallReturn(string rt) {
+        if (rt.length == 0 || rt == "void" || rt == "var") { return ""; }
+        return rt;
+    }
+
+    // The type of a call result, when the callee is known: a free function
+    // through its declared return type (last declaration of the name wins,
+    // mirroring the registration table), a member call through its
+    // receiver class's flattened method table. Builtins, unknown names and
+    // dynamic receivers prove nothing and stay permissive.
+    private string callExprType(Node e) {
+        if (!e.isMember) {
+            string rt = "";
+            for (int s = 0; s < this.funcSigNames.length; s++) {
+                if (this.funcSigNames[s] != e.name) { continue; }
+                rt = this.funcSigNodes[s].typeHint;
+            }
+            return this.judgedCallReturn(rt);
+        }
+        if (e.childCount() == 0) { return ""; }
+        string cls = this.receiverClassName(e.child(0));
+        if (cls.length == 0) { return ""; }
+        return this.judgedCallReturn(this.classMethodReturnType(cls, e.name));
     }
 
     // Indexable-receiver check: an index expression addresses an element
@@ -860,13 +982,14 @@ class MemoryGuard {
     // as an offset from a number, so the program read or wrote through a
     // wild address instead of being refused.
     //
-    // The receiver's type counts as proven only where the guard knows it:
-    // a local, a parameter, a class field, a module-level binding, or a
-    // literal. Everything else -- a member read, a call result, an
-    // untyped `var` -- stays permissive, because an unknown shape is not a
+    // The receiver's type is resolved through every shape the guard can
+    // see: a binding (a local, a parameter, a module-level binding, or
+    // the inferred initializer of an untyped `var`), a member read into a
+    // known class field, and a call to a known function or class method.
+    // Everything else stays permissive, because an unknown shape is not a
     // proven scalar. A NAMED type (a class instance, a struct, a type
-    // alias) stays permissive too: the guard does not resolve aliases, so
-    // the name proves nothing.
+    // alias, an `object` record) stays permissive too: the guard does not
+    // resolve aliases, so the name proves nothing.
     private void checkIndexableReceiver(Node recv, Node at) {
         string t = this.indexReceiverType(recv);
         if (!this.isScalarTypeName(t)) { return; }
@@ -1344,6 +1467,13 @@ class MemoryGuard {
         GuardVar v = new GuardVar();
         v.name = name;
         v.typeHint = n.typeHint;
+        // An untyped (`var x = ...`) binding keeps its permissive empty
+        // typeHint, but the initializer's proven shape is remembered for
+        // the indexable-receiver check (`var v = 5; v[0]` is refused like
+        // `int v = 5; v[0]`).
+        if (n.typeHint.length == 0 || n.typeHint == "var") {
+            v.initTypeHint = initType;
+        }
         v.isInit = true;
         v.isAlive = true;
         v.isOnce = onceFlag;
@@ -2936,8 +3066,17 @@ class MemoryGuard {
             } else if (n.kind == GND_VAR_DECL) {
                 this.globalNames.add(n.name);
                 // The declared type of a module-level binding (a `var`
-                // global has no declared type and stays unknown).
-                this.noteGlobalType(n.name, n.typeHint);
+                // global has no declared type and stays unknown). A
+                // LITERAL initializer proves its own shape without
+                // registration-order dependence, so it is the one
+                // refinement kept (`var g = 5;` is an int everywhere,
+                // `var g = "s";` a string).
+                string gt = n.typeHint;
+                if ((gt.length == 0 || gt == "var") && n.childCount() > 0) {
+                    string lit = this.literalNodeType(n.child(0));
+                    if (lit.length > 0) { gt = lit; }
+                }
+                this.noteGlobalType(n.name, gt);
                 if (n.isShared) {
                     // A `shared` binding is a program-wide word every
                     // thread may read and write (THREAD_SAFETY.md §3.4).
