@@ -15,11 +15,12 @@ mod export threads;
 //
 // PLAIN IMPORT: the kernel32 grant is a plain full-table
 // `import * from win32.kernel32;` inside its own region -- no alias
-// imports. TABLE STATUS: Sleep, WaitForSingleObject, CloseHandle AND
-// CreateThread are tabled on BOTH compilers (silverc-rs/src/win32.rs and
-// the self-host win32ExportTable -- the self-host's three sites are
-// compiler/parser.sr, compiler/mini_cg/windows.sr and the native-call
-// classifier in compiler/mini_cg/mini_cg.sr), so the plain grant resolves
+// imports. TABLE STATUS: Sleep, WaitForSingleObject, CloseHandle,
+// CreateThread, CreateMutexA and ReleaseMutex are tabled on BOTH
+// compilers (silverc-rs/src/win32.rs and the self-host win32ExportTable
+// -- the self-host's three sites are compiler/parser.sr,
+// compiler/mini_cg/windows.sr and the native-call classifier in
+// compiler/mini_cg/mini_cg.sr), so the plain grant resolves
 // them directly. The plain full-table grant resolves calls strictly
 // against the tables (silverc-rs win32::resolve scans dll_exports first;
 // the self-host win32Allowed checks win32TableHas).
@@ -140,6 +141,157 @@ class ThreadGroup {
     public void joinAll() {
         foreach (Thread t in this.threads) { t.join(); }
     }
+}
+
+// A binary lock: one thread at a time holds it, and every mutation of the
+// object it guards happens between `lock()` and `unlock()`.
+//
+// WHAT IT IS NOT. The lock does not make an object shared. The object
+// still has to be reachable by every thread that touches it -- a program
+// global, or a class instance held in one. (A Silver closure captures by
+// value, so a local is invisible to a spawned thread; a program global is
+// visible to every thread by the same path.) What the lock adds is the
+// BARRIER THREAD_SAFETY.md 6.1 asks for: a named, visible synchronization
+// point every thread reaches the same way.
+//
+// THE CONTRACT.
+//   * One lock per critical section. A Mutex is NOT recursive: locking it
+//     twice from one thread is a programming error. On POSIX the
+//     platform's mutex is not recursive, so the error deadlocks the
+//     thread; on Windows the kernel mutex IS recursive, so the extra lock
+//     is accepted and must be matched by an extra unlock. Write the code
+//     so it never happens.
+//   * `lock()` waits for the lock. `tryLock()` never waits.
+//   * `unlock()` releases it, and fails when the calling thread does not
+//     hold it.
+//   * `destroy()` releases the operating-system object. It is idempotent.
+//     A Mutex that is never destroyed leaks its OS object, the same way a
+//     Thread that is never joined leaks its handle.
+//
+// THE OS OBJECT. On Windows the lock is a kernel32 mutex handle
+// (CreateMutexA / WaitForSingleObject / ReleaseMutex) -- an anonymous,
+// process-local mutex, so no name and no cross-process reach. On POSIX it
+// is a `pthread_mutex_t` the module allocated -- a POSIX mutex is a
+// struct, not a handle, and Silver cannot take the address of anything
+// heap-allocated, so the module mallocs a raw block and keeps the pointer
+// (256 bytes: a pthread_mutex_t is 40 on glibc and 64 on Darwin, so this
+// covers every POSIX platform Silver targets with headroom). Both live in
+// one private `int` slot: the raw object never leaves the module, and the
+// module is the only place that knows which of the two it is.
+//
+// THE 32-BIT RETURN. WaitForSingleObject and ReleaseMutex return a 32-bit
+// C value that the compilers do not sign-extend, so the code below
+// compares against 0 and 128 ONLY -- never against a negative value. (0
+// is WAIT_OBJECT_0, the lock is ours; 128 is WAIT_ABANDONED, the previous
+// owner died holding it -- the lock is ours all the same.) The pthread
+// returns are sign-extended (native_returns_32bit), so they compare
+// against 0 directly.
+class Mutex {
+    // The operating-system lock object: a kernel32 HANDLE on Windows, a
+    // pointer to a `pthread_mutex_t` on POSIX. 0 means "not usable": the
+    // object could not be created.
+    private prop int handle;
+
+    construct {
+        this.handle = 0;
+        #on WINDOWS
+        // CreateMutexA(NULL, FALSE, NULL): FALSE means the creating thread
+        // does NOT own the lock yet -- `lock()` takes it. A NULL name
+        // means an anonymous (process-local) mutex.
+        this.handle = CreateMutexA(null, 0, null);
+        #else
+        this.handle = malloc(256);
+        if (this.handle != 0) {
+            int created = pthread_mutex_init(this.handle, null);
+            if (created != 0) {
+                free(this.handle);
+                this.handle = 0;
+            }
+        }
+        #off
+    }
+
+    // Takes the lock, waiting for it when another thread holds it.
+    public void lock() {
+        if (this.handle == 0) {
+            throw "the mutex could not be created";
+        }
+        bool failed = false;
+        #on WINDOWS
+        int waited = WaitForSingleObject(this.handle, -1);
+        if (waited != 0 && waited != 128) {
+            failed = true;
+        }
+        #else
+        if (pthread_mutex_lock(this.handle) != 0) {
+            failed = true;
+        }
+        #off
+        if (failed) {
+            throw "the mutex wait failed";
+        }
+    }
+
+    // Takes the lock only when it is free. Never waits.
+    public bool tryLock() {
+        if (this.handle == 0) {
+            return false;
+        }
+        bool acquired = false;
+        #on WINDOWS
+        int waited = WaitForSingleObject(this.handle, 0);
+        if (waited == 0 || waited == 128) {
+            acquired = true;
+        }
+        #else
+        if (pthread_mutex_trylock(this.handle) == 0) {
+            acquired = true;
+        }
+        #off
+        return acquired;
+    }
+
+    // Releases the lock. Fails when the calling thread does not hold it.
+    public void unlock() {
+        if (this.handle == 0) {
+            throw "the mutex could not be created";
+        }
+        bool released = false;
+        #on WINDOWS
+        if (ReleaseMutex(this.handle) != 0) {
+            released = true;
+        }
+        #else
+        if (pthread_mutex_unlock(this.handle) == 0) {
+            released = true;
+        }
+        #off
+        if (!released) {
+            throw "the mutex release failed: this thread does not hold the lock";
+        }
+    }
+
+    // Releases the operating-system object. Idempotent: a second call does
+    // nothing.
+    public void destroy() {
+        if (this.handle == 0) {
+            return;
+        }
+        #on WINDOWS
+        CloseHandle(this.handle);
+        #else
+        pthread_mutex_destroy(this.handle);
+        free(this.handle);
+        #off
+        this.handle = 0;
+    }
+}
+
+// `new threads.Mutex()` does not resolve on the self-hosted compiler (a
+// dotted `new` target is unsupported there), so the module exposes a
+// factory beside `start`/`multi` -- the same shape those two use.
+public Mutex newMutex() {
+    return new Mutex();
 }
 
 public Thread start(void () fn) {

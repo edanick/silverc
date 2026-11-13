@@ -2458,7 +2458,12 @@ class MiniCg {
     // when the program uses a `shared` binding, so every other program
     // keeps its byte-identical output.
     public void padStringDataForGlobals(int[] stringData, int stringsStart) {
-        if (this.sharedGlobalNames.length == 0) { return; }
+        // Always: the globals block holds the program-wide call-depth
+        // counter (a LOCK inc/dec word in every function's prologue and
+        // epilogue), so its base must be 8-byte aligned in every program,
+        // not only in one that uses a `shared` binding. An unaligned slot
+        // can tear under concurrent plain stores, and any multithreaded
+        // program can tear ANY unaligned global 8-byte access.
         int misaligned = (stringsStart + stringData.length) % 8;
         if (misaligned == 0) { return; }
         for (int i = 0; i < 8 - misaligned; i++) { stringData.add(0); }
@@ -2675,9 +2680,17 @@ class MiniCg {
         int depthIdx = this.findGlobal("__call_depth");
         this.asm.pushR64(1);
         this.genGlobalBase(depthIdx);
+        // The depth counter is ONE program-wide word every thread's calls
+        // share. An unlocked load/inc/store pair loses updates when two
+        // threads interleave, and (worse) an unaligned slot can TEAR -- two
+        // plain 8-byte stores mixing halves into a garbage value that
+        // crosses the limit at an innocent thread's entry, a spurious
+        // StackOverflowException that abandons the thread mid-body. The
+        // LOCK makes the count a correct sum of every thread's live depth;
+        // the globals block is 8-byte aligned so the locked word is
+        // naturally aligned (see padStringDataForGlobals).
+        this.asm.lockIncMBase(0, 0);
         this.asm.movRMBase(1, 0, 0);
-        this.asm.incR64(1);
-        this.asm.movMBaseR(0, 1, 0);
         this.asm.cmpRI32(1, 1000);
         int depthOk = this.newLabel();
         this.asm.jleLabel(depthOk);
@@ -2692,9 +2705,9 @@ class MiniCg {
         this.asm.pushR64(0);
         this.asm.pushR64(1);
         this.genGlobalBase(depthIdx);
-        this.asm.movRMBase(1, 0, 0);
-        this.asm.decR64(1);
-        this.asm.movMBaseR(0, 1, 0);
+        // LOCK dec: the twin of the enter's LOCK inc (see above) -- the
+        // program-wide depth sum must not lose a decrement.
+        this.asm.lockDecMBase(0, 0);
         this.asm.popR64(1);
         this.asm.popR64(0);
     }
@@ -13913,7 +13926,7 @@ int strIdx = this.stringPatchIndices[i];
         }
         bool isWin32 = false;
         string win32Dll = "";
-        if (name == "FindFirstFileA" || name == "FindNextFileA" || name == "FindClose" || name == "GetFileTime" || name == "DeleteFileA" || name == "MoveFileA" || name == "GetFileAttributesA" || name == "CreateDirectoryA" || name == "RemoveDirectoryA" || name == "SetCurrentDirectoryA" || name == "CreateProcessA" || name == "WaitForSingleObject" || name == "GetStdHandle" || name == "SetConsoleTextAttribute" || name == "GetConsoleScreenBufferInfo" || name == "SetConsoleCursorPosition" || name == "GetModuleHandleA" || name == "LoadLibraryA" || name == "GetProcAddress" || name == "Sleep" || name == "GetTickCount" || name == "GetLastError" || name == "GetCurrentDirectoryA" || name == "WriteConsoleA" || name == "ReadConsoleA" || name == "GetConsoleMode" || name == "SetConsoleMode" || name == "CreatePipe" || name == "GetExitCodeProcess" || name == "CreateFileA" || name == "GetFileSize" || name == "ReadFile" || name == "WriteFile" || name == "CloseHandle" || name == "GetFileAttributesW" || name == "SetFilePointer" || name == "GetCurrentProcessId" || name == "GetCurrentProcess" || name == "GetCurrentThreadId" || name == "GetCurrentThread" || name == "GetEnvironmentVariableA" || name == "GetEnvironmentVariableW" || name == "SetEnvironmentVariableA" || name == "SetEnvironmentVariableW" || name == "ExpandEnvironmentStringsA" || name == "GetEnvironmentStringsA" || name == "FreeEnvironmentStringsA" || name == "GetTempPathA" || name == "GetComputerNameA" || name == "CopyFileA" || name == "SetFileAttributesA" || name == "GetFullPathNameA" || name == "GetModuleFileNameA" || name == "QueryPerformanceCounter" || name == "QueryPerformanceFrequency" || name == "GetTickCount64" || name == "TerminateProcess" || name == "OpenProcess" || name == "GetProcessId" || name == "FlushFileBuffers" || name == "GetFileSizeEx" || name == "CreateProcessW" || name == "CreateProcess" || name == "GetVersionExA" || name == "GetSystemDirectoryA" || name == "GetWindowsDirectoryA" || name == "GetLocalTime" || name == "GetSystemTime" || name == "OutputDebugStringA" || name == "IsDebuggerPresent" || name == "GetCommandLineA" || name == "GlobalAlloc" || name == "GlobalFree" || name == "VirtualAlloc" || name == "VirtualFree" || name == "HeapFree" || name == "GetProcessHeap" || name == "lstrlenA" || name == "lstrcpyA" || name == "lstrcatA" || name == "lstrcmpA" || name == "SetThreadPriority" || name == "QueryFullProcessImageNameA" || name == "GetSystemInfo" || name == "GlobalMemoryStatusEx" || name == "GetDiskFreeSpaceExA" || name == "GetUserDefaultUILanguage" || name == "CreateThread") {
+        if (name == "FindFirstFileA" || name == "FindNextFileA" || name == "FindClose" || name == "GetFileTime" || name == "DeleteFileA" || name == "MoveFileA" || name == "GetFileAttributesA" || name == "CreateDirectoryA" || name == "RemoveDirectoryA" || name == "SetCurrentDirectoryA" || name == "CreateProcessA" || name == "WaitForSingleObject" || name == "GetStdHandle" || name == "SetConsoleTextAttribute" || name == "GetConsoleScreenBufferInfo" || name == "SetConsoleCursorPosition" || name == "GetModuleHandleA" || name == "LoadLibraryA" || name == "GetProcAddress" || name == "Sleep" || name == "GetTickCount" || name == "GetLastError" || name == "GetCurrentDirectoryA" || name == "WriteConsoleA" || name == "ReadConsoleA" || name == "GetConsoleMode" || name == "SetConsoleMode" || name == "CreatePipe" || name == "GetExitCodeProcess" || name == "CreateFileA" || name == "GetFileSize" || name == "ReadFile" || name == "WriteFile" || name == "CloseHandle" || name == "GetFileAttributesW" || name == "SetFilePointer" || name == "GetCurrentProcessId" || name == "GetCurrentProcess" || name == "GetCurrentThreadId" || name == "GetCurrentThread" || name == "GetEnvironmentVariableA" || name == "GetEnvironmentVariableW" || name == "SetEnvironmentVariableA" || name == "SetEnvironmentVariableW" || name == "ExpandEnvironmentStringsA" || name == "GetEnvironmentStringsA" || name == "FreeEnvironmentStringsA" || name == "GetTempPathA" || name == "GetComputerNameA" || name == "CopyFileA" || name == "SetFileAttributesA" || name == "GetFullPathNameA" || name == "GetModuleFileNameA" || name == "QueryPerformanceCounter" || name == "QueryPerformanceFrequency" || name == "GetTickCount64" || name == "TerminateProcess" || name == "OpenProcess" || name == "GetProcessId" || name == "FlushFileBuffers" || name == "GetFileSizeEx" || name == "CreateProcessW" || name == "CreateProcess" || name == "GetVersionExA" || name == "GetSystemDirectoryA" || name == "GetWindowsDirectoryA" || name == "GetLocalTime" || name == "GetSystemTime" || name == "OutputDebugStringA" || name == "IsDebuggerPresent" || name == "GetCommandLineA" || name == "GlobalAlloc" || name == "GlobalFree" || name == "VirtualAlloc" || name == "VirtualFree" || name == "HeapFree" || name == "GetProcessHeap" || name == "lstrlenA" || name == "lstrcpyA" || name == "lstrcatA" || name == "lstrcmpA" || name == "SetThreadPriority" || name == "QueryFullProcessImageNameA" || name == "GetSystemInfo" || name == "GlobalMemoryStatusEx" || name == "GetDiskFreeSpaceExA" || name == "GetUserDefaultUILanguage" || name == "CreateThread" || name == "CreateMutexA" || name == "ReleaseMutex") {
             isWin32 = true;
             win32Dll = "kernel32.dll";
         } else if (name == "RegOpenKeyExA" || name == "RegQueryValueExA" || name == "RegCloseKey" || name == "GetUserNameA") {

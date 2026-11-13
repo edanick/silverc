@@ -1,0 +1,103 @@
+// THREAD_SAFETY.md §6.1/§6.3 -- a Mutex guards a shared object.
+//
+// A `shared` binding covers ONE machine word (§3.4). This fixture is the
+// shape the Mutex exists for: a shared object LARGER than one word -- a
+// Counter class instance -- mutated by eight threads, with every mutation
+// passing through the same named, visible barrier (§6.1).
+//
+// The counter and the lock are PROGRAM GLOBALS: a Silver closure captures
+// by value, so a local would be invisible to a spawned thread, while a
+// program global is visible to every thread by the same path.
+//
+// The counter's bump is a plain field increment -- a load, an add and a
+// store, nothing atomic about it. Without the lock, two threads read the
+// same old value and both write back the same new one, so the total comes
+// out short (the twin of this program without the two lock lines loses
+// updates on every run). With the lock, the total must be exactly 16000.
+//
+// The thread callback calls a MODULE-LEVEL helper rather than touching
+// the globals inline: the self-hosted compiler resolves names inside an
+// anonymous function body only through a helper (the same constraint the
+// thread_spawn fixture documents).
+
+import * from thread;
+
+class Counter {
+    private prop int count;
+
+    construct {
+        this.count = 0;
+    }
+
+    public void bump() {
+        this.count++;
+    }
+
+    public int total() {
+        return this.count;
+    }
+}
+
+threads.Mutex guard = threads.newMutex();
+Counter counter = new Counter();
+
+void bump(int times) {
+    for (int i = 0; i < times; i++) {
+        guard.lock();
+        counter.bump();
+        guard.unlock();
+    }
+}
+
+void main() {
+    // 1. The barrier: eight threads, one guarded object, no lost update.
+    threads.Thread t1 = threads.start((void () { bump(2000); }));
+    threads.Thread t2 = threads.start((void () { bump(2000); }));
+    threads.Thread t3 = threads.start((void () { bump(2000); }));
+    threads.Thread t4 = threads.start((void () { bump(2000); }));
+    threads.Thread t5 = threads.start((void () { bump(2000); }));
+    threads.Thread t6 = threads.start((void () { bump(2000); }));
+    threads.Thread t7 = threads.start((void () { bump(2000); }));
+    threads.Thread t8 = threads.start((void () { bump(2000); }));
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+    t5.join();
+    t6.join();
+    t7.join();
+    t8.join();
+    if (counter.total() != 16000) {
+        printline("FAIL mutex counter: expected 16000, got " + counter.total());
+        exit(1);
+    }
+
+    // 2. tryLock takes a free lock and refuses a held one. The lock is
+    //    held exactly once at a time (one lock per critical section -- a
+    //    Mutex is not recursive, and the portable shape must not depend
+    //    on which side tolerates a double lock).
+    threads.Mutex spare = threads.newMutex();
+    if (!spare.tryLock()) {
+        printline("FAIL mutex counter: tryLock refused a free lock");
+        exit(2);
+    }
+    if (spare.tryLock()) {
+        printline("FAIL mutex counter: tryLock took a held lock");
+        exit(3);
+    }
+    spare.unlock();
+
+    // 3. destroy is idempotent; a destroyed lock is refused loudly.
+    spare.destroy();
+    spare.destroy();
+    try {
+        spare.lock();
+        printline("FAIL mutex counter: a destroyed lock was taken");
+        exit(4);
+    } catch (Exception e) {
+        // "the mutex could not be created": the destroyed lock's handle
+        // is 0, the same state as a failed creation.
+    }
+
+    printline("mutex counter ok");
+}

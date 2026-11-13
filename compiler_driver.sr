@@ -237,9 +237,15 @@ int drvChunkByte(int[] chunk, int index) {
 // status 1 (matching silverc-rs). Empty input passes through unchanged.
 // `debugBuild` selects the build-mode axis (`#on DEBUG` vs `#on RELEASE`);
 // callers forward the --debug flag so every file filters alike.
-string drvPreprocessOrDie(string src, bool debugBuild) {
+string drvPreprocessOrDie(string src, string ppTarget, bool debugBuild) {
     string[] ppErrs = [];
-    string target = ppTargetOs();
+    // The REQUESTED target (the --os override resolved by the caller), not
+    // the host default: a cross build must filter its regions for the
+    // target it is building for. Before ppTarget was threaded through, the
+    // preprocessor always used the host default, so a `--os windows` build
+    // on a Linux host silently compiled the LINUX branches and stripped the
+    // WINDOWS ones -- the compile "verified" the wrong program.
+    string target = ppTarget.length > 0 ? ppTarget : ppTargetOs();
     string out = ppPreprocess(src, target, debugBuild, ppErrs);
     if (ppErrs.length > 0) {
         for (int peI = 0; peI < ppErrs.length; peI++) {
@@ -571,12 +577,12 @@ DrvModuleFile drvCachedModule(string name, string inputFile, DrvModuleCache cach
 // When progress is non-null, one progress line is printed per module.
 // `exeDir` arrives from main() (captured inline there): this helper must
 // never read cargs itself.
-void collectModuleInto(string name, string inputFile, string modPath, string modSrc, ProjectVisited visited, DrvModuleCache cache, bool emitMarkers, ProgressReporter progress, bool debugBuild, DrvSourcePieces out, string exeDir) {
+void collectModuleInto(string name, string inputFile, string modPath, string modSrc, ProjectVisited visited, DrvModuleCache cache, bool emitMarkers, ProgressReporter progress, bool debugBuild, string ppTarget, DrvSourcePieces out, string exeDir) {
     if (visited.contains(name)) { return; }
     visited.add(name);
     // DOCS/260 — filter the module BEFORE its imports are scanned so imports
     // inside non-matching regions are never resolved.
-    string modFiltered = drvPreprocessOrDie(modSrc, debugBuild);
+    string modFiltered = drvPreprocessOrDie(modSrc, ppTarget, debugBuild);
     modSrc = modFiltered;
     int cursor = 0;
     // Length read once (strlen is O(n)), not once per import occurrence.
@@ -615,7 +621,7 @@ void collectModuleInto(string name, string inputFile, string modPath, string mod
             // again here.
             DrvModuleFile depFile = drvCachedModule(depName, inputFile, cache, exeDir);
             if (depFile.path.length > 0 && depFile.text.length > 0) {
-                collectModuleInto(depName, inputFile, depFile.path, depFile.text, visited, cache, emitMarkers, progress, debugBuild, out, exeDir);
+                collectModuleInto(depName, inputFile, depFile.path, depFile.text, visited, cache, emitMarkers, progress, debugBuild, ppTarget, out, exeDir);
             }
         }
         cursor = semi + 1;
@@ -698,7 +704,7 @@ class DrvCollected {
     }
 }
 
-DrvCollected collectImports(string source, string inputFile, string ignored, bool emitMarkers, ProgressReporter progress, bool debugBuild, string exeDir) {
+DrvCollected collectImports(string source, string inputFile, string ignored, bool emitMarkers, ProgressReporter progress, bool debugBuild, string ppTarget, string exeDir) {
     ProjectVisited visited = new ProjectVisited();
     DrvModuleCache cache = new DrvModuleCache();
     DrvSourcePieces pieces = new DrvSourcePieces();
@@ -768,7 +774,7 @@ DrvCollected collectImports(string source, string inputFile, string ignored, boo
                         result.errors.add("unknown module \"" + moduleName + "\" was found at line " + (string)loc[0] + ", column " + (string)loc[1] + ". module either doesn't exist or not installed.");
                     }
                 } else {
-                    collectModuleInto(moduleName, inputFile, depFile.path, depFile.text, visited, cache, emitMarkers, progress, debugBuild, pieces, exeDir);
+                    collectModuleInto(moduleName, inputFile, depFile.path, depFile.text, visited, cache, emitMarkers, progress, debugBuild, ppTarget, pieces, exeDir);
                 }
             } else if (prepended && !visited.contains(moduleName)) {
                 // Hand-prepended or native-backed modules (llmai, exception,
@@ -778,7 +784,7 @@ DrvCollected collectImports(string source, string inputFile, string ignored, boo
                 // exactly like the old unconditional collectModule call did.
                 DrvModuleFile preFile = drvCachedModule(moduleName, inputFile, cache, exeDir);
                 if (preFile.path.length > 0 && preFile.text.length > 0) {
-                    collectModuleInto(moduleName, inputFile, preFile.path, preFile.text, visited, cache, emitMarkers, progress, debugBuild, pieces, exeDir);
+                    collectModuleInto(moduleName, inputFile, preFile.path, preFile.text, visited, cache, emitMarkers, progress, debugBuild, ppTarget, pieces, exeDir);
                 }
             }
         }
@@ -1621,6 +1627,10 @@ void main() {
 // this pass must never read cargs itself.
 int compileOnce(CliFlags flags, string outputFile, string exeDir) {
     float64 startTick = time.now();
+    // The preprocessor target for this compile: the --os override wins, so
+    // every filtered region (entry source, modules, library pieces) sees
+    // the REQUESTED target (threaded into drvPreprocessOrDie below).
+    string ppTarget = ppTargetOsFor(flags.targetOs);
     string inputFile = flags.input;
     bool inputIsProject = projectHasSuffix(inputFile, ".srp");
     int moduleCount = 1;
@@ -1675,7 +1685,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
         string builtSource = projectBuildSource(inputFile, flags.cacheBytecode || flags.cacheObject, flags.debugBuild, buildCount);
         moduleCount = buildCount[0];
         progress.setTotal(moduleCount);
-        source = drvPreprocessOrDie(builtSource, flags.debugBuild);
+        source = drvPreprocessOrDie(builtSource, ppTarget, flags.debugBuild);
     } else {
         visEntryText = file.readString(inputFile);
         // `.col` declarations require a project manifest with a configured
@@ -1685,7 +1695,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
 
         // DOCS/260 — the preprocessor runs before anything else scans the
         // entry source (import probes, module collection, the lexer).
-        source = drvPreprocessOrDie(source, flags.debugBuild);
+        source = drvPreprocessOrDie(source, ppTarget, flags.debugBuild);
 
         // The source-level standard libraries the driver prepends (llmai,
         // exception, bom, process, notifications) are collected as PIECES and
@@ -1735,7 +1745,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
             if (llmaiSource.length == 0) {
                 llmaiSource = tryReadFile(*"../../std/llmai.sr");
             }
-            string llmaiPiece = drvPreprocessOrDie(llmaiSource, flags.debugBuild);
+            string llmaiPiece = drvPreprocessOrDie(llmaiSource, ppTarget, flags.debugBuild);
             prependPieces.add(llmaiPiece);
             prependScan.add(llmaiPiece);
         }
@@ -1762,7 +1772,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
             if (excSource.length == 0) {
                 excSource = tryReadFile(*"../../std/exception.sr");
             }
-            string excPiece = drvPreprocessOrDie(excSource, flags.debugBuild);
+            string excPiece = drvPreprocessOrDie(excSource, ppTarget, flags.debugBuild);
             prependPieces.add(excPiece);
             prependScan.add(excPiece);
         }
@@ -1778,7 +1788,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
             if (bomSource.length == 0) { bomSource = tryReadFile(*"../std/bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile(*"../silverc/std/bom.sr"); }
             if (bomSource.length == 0) { bomSource = tryReadFile(*"../../std/bom.sr"); }
-            string bomPiece = drvPreprocessOrDie(bomSource, flags.debugBuild);
+            string bomPiece = drvPreprocessOrDie(bomSource, ppTarget, flags.debugBuild);
             prependPieces.add(bomPiece);
             prependScan.add(bomPiece);
         }
@@ -1790,7 +1800,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
             if (processSource.length == 0) { processSource = tryReadFile(*"../std/process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile(*"../silverc/std/process.sr"); }
             if (processSource.length == 0) { processSource = tryReadFile(*"../../std/process.sr"); }
-            string processPiece = drvPreprocessOrDie(processSource, flags.debugBuild);
+            string processPiece = drvPreprocessOrDie(processSource, ppTarget, flags.debugBuild);
             prependPieces.add(processPiece);
             prependScan.add(processPiece);
         }
@@ -1805,7 +1815,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
             if (notifSource.length == 0) { notifSource = tryReadFile(*"../std/notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile(*"../silverc/std/notifications.sr"); }
             if (notifSource.length == 0) { notifSource = tryReadFile(*"../../std/notifications.sr"); }
-            string notifPiece = drvPreprocessOrDie(notifSource, flags.debugBuild);
+            string notifPiece = drvPreprocessOrDie(notifSource, ppTarget, flags.debugBuild);
             prependPieces.add(notifPiece);
             prependScan.add(notifPiece);
         }
@@ -1836,7 +1846,7 @@ int compileOnce(CliFlags flags, string outputFile, string exeDir) {
         // total is pinned once the single pass below finishes.
         progress = new ProgressReporter(0);
         progress.moduleDone(inputFile);
-        DrvCollected collected = collectImports(source, inputFile, "", flags.cacheBytecode || flags.cacheObject, progress, flags.debugBuild, exeDir);
+        DrvCollected collected = collectImports(source, inputFile, "", flags.cacheBytecode || flags.cacheObject, progress, flags.debugBuild, ppTarget, exeDir);
         for (int visSeedI = 0; visSeedI < collected.cache.names.length; visSeedI++) {
             DrvModuleFile seedFile = collected.cache.files[visSeedI];
             visPreNames.add(collected.cache.names[visSeedI]);
