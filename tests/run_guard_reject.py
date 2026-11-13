@@ -32,10 +32,12 @@ refused the program, the message pins what it said.
 Usage:
     python tests/run_guard_reject.py [compiler]
 
-    compiler: path to the self-hosted compiler (default: the freshest of
-              `silverc` / `silverc.exe` in the project root -- a checkout
-              may hold a stale older build under the other name, so the
-              newer file wins; `silverc.exe` on Windows hosts)
+    compiler: path to the self-hosted compiler (default: the freshest
+              HOST-RUNNABLE build among `silverc` / `silverc.exe` in the
+              project root -- the file's magic bytes decide what this
+              host can run, ELF on Linux, PE on Windows; a newer mtime
+              never makes a foreign-target binary runnable, so it only
+              breaks ties between host-runnable candidates)
 
 Portability: relative paths only (everything resolves from this file's
 position), no OS-specific code. Linux checkouts on filesystems that
@@ -45,8 +47,10 @@ exactly like silverc-rs/tests/run_suite.py does. A binary can also be
 invoked through the loader (`/lib64/ld-linux-x86-64.so.2 <bin> <args>`);
 the runner execs the staged copy directly, which is equivalent.
 
-Wired into the self-host entry point: `build/run_selfhost.py` invokes this
-runner after its suites, so a normal test run executes the corpus.
+Wired into the self-host entry point: `tests/run_selfhost.py` (tracked)
+invokes this runner after its suites, so a normal test run executes the
+corpus. `build/run_selfhost.py` is a gitignored local shim that delegates
+to the tracked runner.
 """
 import os
 import re
@@ -83,23 +87,48 @@ CREATED_DIRS = []
 STALE_RUN_SECONDS = 3600
 
 
-def default_compiler() -> Path:
-    """The freshest self-host compiler in the project root.
+def binary_kind(path: Path):
+    """The executable format of `path` from its magic bytes, or None.
 
-    A Linux checkout may hold both `silverc` and `silverc.exe` (both ELF;
-    the .exe spelling stays directly executable on a vfat `showexec`
-    mount). An older build left under the other name must never be
-    preferred over a newer one, so the newer file wins; ties prefer the
-    extensionless Linux spelling.
+    `elf` for a Linux ELF image (\\x7fELF), `pe` for a Windows PE image
+    (MZ). The name alone cannot decide: a checkout may hold a PE named
+    `silverc.exe` beside an ELF named `silverc`, and only the magic says
+    which one this host can execute.
+    """
+    try:
+        with open(path, "rb") as f:
+            magic = f.read(4)
+    except OSError:
+        return None
+    if magic == b"\x7fELF":
+        return "elf"
+    if magic[:2] == b"MZ":
+        return "pe"
+    return None
+
+
+def default_compiler() -> Path:
+    """The freshest HOST-RUNNABLE self-host compiler in the project root.
+
+    A checkout may hold both `silverc` and `silverc.exe`, built for
+    different targets. Only a binary whose magic matches this host (ELF
+    on Linux, PE on Windows) can run, so foreign-target candidates are
+    excluded no matter how new their mtime is -- a freshly rebuilt
+    Windows PE must never shadow the runnable Linux ELF. Among
+    host-runnable candidates the newer file wins; ties prefer the
+    host's own spelling (extensionless on Linux, `.exe` on Windows).
     """
     candidates = [ROOT / name for name in ("silverc", "silverc.exe")]
-    existing = [p for p in candidates if p.exists()]
-    if not existing:
+    wanted = "pe" if IS_WINDOWS else "elf"
+    runnable = [p for p in candidates if binary_kind(p) == wanted]
+    if not runnable:
         sys.exit(
-            f"compiler not found: {candidates[1]}\n"
-            f"Build it first with:  silverc-rs --os linux silverc.srp"
+            f"no host-runnable compiler found among: {candidates}\n"
+            f"Build it first with:  silverc-rs --os "
+            f"{'windows' if IS_WINDOWS else 'linux'} silverc.srp"
         )
-    return max(existing, key=lambda p: (p.stat().st_mtime, p is candidates[1]))
+    preferred = candidates[1] if IS_WINDOWS else candidates[0]
+    return max(runnable, key=lambda p: (p.stat().st_mtime, p is preferred))
 
 
 COMPILER = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else default_compiler()
